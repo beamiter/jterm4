@@ -2,19 +2,21 @@ use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
+use gtk4::glib::translate::IntoGlib;
 use gtk4::gio::{self, Cancellable};
 use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
-use gtk4::{glib, Application, ApplicationWindow, Dialog, Entry, Label, Notebook, ResponseType};
-use gtk4::{EventControllerKey, GestureClick};
+use gtk4::{glib, Application, ApplicationWindow, Dialog, Entry, Label, Notebook, Orientation, Paned, ResponseType};
+use gtk4::{EventControllerKey, GestureClick, SearchBar, SearchEntry};
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::LazyLock;
 use vte4::Format;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -79,9 +81,10 @@ struct UiState {
     notebook: Notebook,
     tab_counter: Rc<Cell<u32>>,
     font_scale: Rc<Cell<f64>>,
-    ctrl_clicked: Rc<Cell<bool>>,
     shell_argv: Rc<Vec<String>>,
     config: Rc<Config>,
+    search_bar: SearchBar,
+    search_entry: SearchEntry,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -100,23 +103,83 @@ fn env_rgba(name: &str) -> Option<RGBA> {
     env_string(name).and_then(|v| RGBA::parse(&v).ok())
 }
 
+fn config_file_path() -> PathBuf {
+    glib::user_config_dir().join("jterm4").join("config.toml")
+}
+
+/// Parsed TOML config file structure.
+#[derive(Default)]
+struct FileConfig {
+    opacity: Option<f64>,
+    scrollback: Option<u32>,
+    font: Option<String>,
+    font_scale: Option<f64>,
+    foreground: Option<String>,
+    background: Option<String>,
+    cursor: Option<String>,
+    cursor_foreground: Option<String>,
+}
+
+fn load_file_config() -> FileConfig {
+    let path = config_file_path();
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return FileConfig::default();
+    };
+    let Ok(table) = contents.parse::<toml::Table>() else {
+        log::warn!("Failed to parse config file {}", path.display());
+        return FileConfig::default();
+    };
+
+    let colors = table.get("colors").and_then(|v| v.as_table());
+
+    FileConfig {
+        opacity: table.get("opacity").and_then(|v| v.as_float()),
+        scrollback: table.get("scrollback").and_then(|v| v.as_integer()).map(|v| v as u32),
+        font: table.get("font").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        font_scale: table.get("font_scale").and_then(|v| v.as_float()),
+        foreground: colors.and_then(|c| c.get("foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+        background: colors.and_then(|c| c.get("background")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+        cursor: colors.and_then(|c| c.get("cursor")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+        cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+    }
+}
+
 fn load_config() -> Config {
-    let default_font_desc = "SauceCodePro Nerd Font Regular 12".to_string();
+    let fc = load_file_config();
+
     let default_foreground = RGBA::parse("#f8f7e9").unwrap();
     let default_background = RGBA::parse("#121616").unwrap();
     let default_cursor = RGBA::parse("#7fb80e").unwrap();
     let default_cursor_foreground = RGBA::parse("#1b315e").unwrap();
 
-    let window_opacity = env_f64("JTERM4_OPACITY").unwrap_or(0.95).clamp(0.01, 1.0);
-    let terminal_scrollback_lines = env_u32("JTERM4_SCROLLBACK").unwrap_or(5000);
-    let default_font_scale = env_f64("JTERM4_FONT_SCALE").unwrap_or(1.0).clamp(0.1, 10.0);
+    // Priority: env var > config file > default
+    let window_opacity = env_f64("JTERM4_OPACITY")
+        .or(fc.opacity)
+        .unwrap_or(0.95)
+        .clamp(0.01, 1.0);
+    let terminal_scrollback_lines = env_u32("JTERM4_SCROLLBACK")
+        .or(fc.scrollback)
+        .unwrap_or(5000);
+    let default_font_scale = env_f64("JTERM4_FONT_SCALE")
+        .or(fc.font_scale)
+        .unwrap_or(1.0)
+        .clamp(0.1, 10.0);
+    let font_desc = env_string("JTERM4_FONT")
+        .or(fc.font)
+        .unwrap_or_else(|| "SauceCodePro Nerd Font Regular 12".to_string());
 
-    let font_desc = env_string("JTERM4_FONT").unwrap_or(default_font_desc);
-
-    let foreground = env_rgba("JTERM4_FG").unwrap_or(default_foreground);
-    let background = env_rgba("JTERM4_BG").unwrap_or(default_background);
-    let cursor = env_rgba("JTERM4_CURSOR").unwrap_or(default_cursor);
-    let cursor_foreground = env_rgba("JTERM4_CURSOR_FG").unwrap_or(default_cursor_foreground);
+    let foreground = env_rgba("JTERM4_FG")
+        .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
+        .unwrap_or(default_foreground);
+    let background = env_rgba("JTERM4_BG")
+        .or_else(|| fc.background.as_deref().and_then(|v| RGBA::parse(v).ok()))
+        .unwrap_or(default_background);
+    let cursor = env_rgba("JTERM4_CURSOR")
+        .or_else(|| fc.cursor.as_deref().and_then(|v| RGBA::parse(v).ok()))
+        .unwrap_or(default_cursor);
+    let cursor_foreground = env_rgba("JTERM4_CURSOR_FG")
+        .or_else(|| fc.cursor_foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
+        .unwrap_or(default_cursor_foreground);
 
     Config {
         window_opacity,
@@ -198,6 +261,25 @@ fn choose_shell_argv() -> Vec<String> {
     vec!["sh".to_string()]
 }
 
+static PALETTE: LazyLock<[RGBA; 16]> = LazyLock::new(|| [
+    RGBA::parse("#130c0e").unwrap(),
+    RGBA::parse("#ed1941").unwrap(),
+    RGBA::parse("#45b97c").unwrap(),
+    RGBA::parse("#fdb933").unwrap(),
+    RGBA::parse("#2585a6").unwrap(),
+    RGBA::parse("#ae5039").unwrap(),
+    RGBA::parse("#009ad6").unwrap(),
+    RGBA::parse("#fffef9").unwrap(),
+    RGBA::parse("#7c8577").unwrap(),
+    RGBA::parse("#f05b72").unwrap(),
+    RGBA::parse("#84bf96").unwrap(),
+    RGBA::parse("#ffc20e").unwrap(),
+    RGBA::parse("#7bbfea").unwrap(),
+    RGBA::parse("#f58f98").unwrap(),
+    RGBA::parse("#33a3dc").unwrap(),
+    RGBA::parse("#f6f5ec").unwrap(),
+]);
+
 fn create_terminal(config: &Config, font_scale: f64) -> Terminal {
     let terminal = Terminal::builder()
         .hexpand(true)
@@ -218,25 +300,8 @@ fn create_terminal(config: &Config, font_scale: f64) -> Terminal {
     terminal.set_mouse_autohide(true);
 
     // Set colors
-    let palette: [&RGBA; 16] = [
-        &RGBA::parse("#130c0e").unwrap(),
-        &RGBA::parse("#ed1941").unwrap(),
-        &RGBA::parse("#45b97c").unwrap(),
-        &RGBA::parse("#fdb933").unwrap(),
-        &RGBA::parse("#2585a6").unwrap(),
-        &RGBA::parse("#ae5039").unwrap(),
-        &RGBA::parse("#009ad6").unwrap(),
-        &RGBA::parse("#fffef9").unwrap(),
-        &RGBA::parse("#7c8577").unwrap(),
-        &RGBA::parse("#f05b72").unwrap(),
-        &RGBA::parse("#84bf96").unwrap(),
-        &RGBA::parse("#ffc20e").unwrap(),
-        &RGBA::parse("#7bbfea").unwrap(),
-        &RGBA::parse("#f58f98").unwrap(),
-        &RGBA::parse("#33a3dc").unwrap(),
-        &RGBA::parse("#f6f5ec").unwrap(),
-    ];
-    terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette);
+    let palette_refs: Vec<&RGBA> = PALETTE.iter().collect();
+    terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
@@ -380,14 +445,15 @@ fn save_tabs_state(notebook: &Notebook) {
         let Some(widget) = notebook.nth_page(Some(i)) else {
             continue;
         };
-        let Ok(terminal) = widget.downcast::<Terminal>() else {
+        // Find first terminal in possibly-split page
+        let Some(terminal) = find_first_terminal(&widget) else {
             continue;
         };
 
         let dir = terminal_working_directory(&terminal)
             .or_else(|| home.clone())
             .unwrap_or_else(|| "/".to_string());
-        let label_text = tab_label_text(notebook, &terminal.upcast::<gtk4::Widget>())
+        let label_text = tab_label_text(notebook, &widget)
             .unwrap_or_else(|| format!("Terminal {}", i + 1));
         let line = format!(
             "tab={}\t{}",
@@ -591,21 +657,17 @@ fn looks_like_legacy_default_title(title: &str) -> bool {
     rest.trim().parse::<u32>().is_ok()
 }
 
-fn setup_terminal_click_handler(terminal: &Terminal, ctrl_clicked: Rc<Cell<bool>>) {
+fn setup_terminal_click_handler(terminal: &Terminal) {
     let click_controller = GestureClick::new();
     click_controller.set_button(0);
     let terminal_clone = terminal.clone();
-    let ctrl_clicked_clone = ctrl_clicked.clone();
 
     click_controller.connect_pressed(move |controller, n_press, x, y| {
-        if n_press == 1 {
-            let button = controller.current_button();
-            if button == GDK_BUTTON_PRIMARY as u32 {
-                let tmp = terminal_clone.check_match_at(x, y);
-                if let Some(hyper_link) = tmp.0 {
-                    if ctrl_clicked_clone.get() {
-                        open_uri(&hyper_link);
-                    }
+        if n_press == 1 && controller.current_button() == GDK_BUTTON_PRIMARY as u32 {
+            let state = controller.current_event_state();
+            if state.contains(ModifierType::CONTROL_MASK) {
+                if let Some(uri) = terminal_clone.check_match_at(x, y).0 {
+                    open_uri(&uri);
                 }
             }
         }
@@ -614,7 +676,298 @@ fn setup_terminal_click_handler(terminal: &Terminal, ctrl_clicked: Rc<Cell<bool>
     terminal.add_controller(click_controller);
 }
 
+/// Find the first Terminal in a widget tree (depth-first).
+fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
+    if let Ok(term) = widget.clone().downcast::<Terminal>() {
+        return Some(term);
+    }
+    if let Ok(paned) = widget.clone().downcast::<Paned>() {
+        if let Some(child) = paned.start_child() {
+            if let Some(term) = find_first_terminal(&child) {
+                return Some(term);
+            }
+        }
+        if let Some(child) = paned.end_child() {
+            if let Some(term) = find_first_terminal(&child) {
+                return Some(term);
+            }
+        }
+    }
+    None
+}
+
+/// Find the focused Terminal in a widget tree.
+fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
+    if let Ok(term) = widget.clone().downcast::<Terminal>() {
+        if term.has_focus() {
+            return Some(term);
+        }
+    }
+    if let Ok(paned) = widget.clone().downcast::<Paned>() {
+        if let Some(child) = paned.start_child() {
+            if let Some(term) = find_focused_terminal(&child) {
+                return Some(term);
+            }
+        }
+        if let Some(child) = paned.end_child() {
+            if let Some(term) = find_focused_terminal(&child) {
+                return Some(term);
+            }
+        }
+    }
+    None
+}
+
+/// Collect all terminals in a widget tree.
+fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
+    if let Ok(term) = widget.clone().downcast::<Terminal>() {
+        out.push(term);
+        return;
+    }
+    if let Ok(paned) = widget.clone().downcast::<Paned>() {
+        if let Some(child) = paned.start_child() {
+            collect_terminals(&child, out);
+        }
+        if let Some(child) = paned.end_child() {
+            collect_terminals(&child, out);
+        }
+    }
+}
+
 impl UiState {
+    fn focus_current_terminal(&self) {
+        if let Some(page) = self.notebook.current_page() {
+            if let Some(widget) = self.notebook.nth_page(Some(page)) {
+                if let Some(term) = find_first_terminal(&widget) {
+                    term.grab_focus();
+                }
+            }
+        }
+    }
+
+    fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
+        if let Some(page_num) = self.notebook.page_num(widget) {
+            self.notebook.remove_page(Some(page_num));
+        }
+        if self.notebook.n_pages() == 0 {
+            self.window.destroy();
+        } else {
+            self.focus_current_terminal();
+        }
+    }
+
+    /// Handle a terminal exiting: unsplit if in a Paned, or close the tab.
+    fn handle_terminal_exited(&self, term_widget: &gtk4::Widget) {
+        let Some(parent) = term_widget.parent() else {
+            return;
+        };
+
+        if let Ok(paned) = parent.clone().downcast::<Paned>() {
+            let start = paned.start_child();
+            let end = paned.end_child();
+            let sibling = if start.as_ref() == Some(term_widget) {
+                end
+            } else {
+                start
+            };
+
+            if let Some(sibling) = sibling {
+                paned.set_start_child(None::<&gtk4::Widget>);
+                paned.set_end_child(None::<&gtk4::Widget>);
+
+                let paned_widget = paned.upcast::<gtk4::Widget>();
+                if let Some(grandparent) = paned_widget.parent() {
+                    if let Ok(gp_paned) = grandparent.clone().downcast::<Paned>() {
+                        if gp_paned.start_child().as_ref() == Some(&paned_widget) {
+                            gp_paned.set_start_child(Some(&sibling));
+                        } else {
+                            gp_paned.set_end_child(Some(&sibling));
+                        }
+                    } else {
+                        for i in 0..self.notebook.n_pages() {
+                            if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
+                                if page_widget == paned_widget {
+                                    let tab_label = self.notebook.tab_label(&page_widget);
+                                    self.notebook.remove_page(Some(i));
+                                    let new_page_num = self.notebook.insert_page(
+                                        &sibling,
+                                        tab_label.as_ref(),
+                                        Some(i),
+                                    );
+                                    self.notebook.set_tab_reorderable(&sibling, true);
+                                    self.notebook.set_current_page(Some(new_page_num));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(term) = find_first_terminal(&sibling) {
+                    term.grab_focus();
+                }
+            }
+        } else {
+            self.remove_tab_by_widget(term_widget);
+        }
+    }
+
+    fn set_font_scale_all(&self, new_scale: f64) {
+        self.font_scale.set(new_scale);
+        for i in 0..self.notebook.n_pages() {
+            if let Some(widget) = self.notebook.nth_page(Some(i)) {
+                let mut terms = Vec::new();
+                collect_terminals(&widget, &mut terms);
+                for term in terms {
+                    term.set_font_scale(new_scale);
+                }
+            }
+        }
+    }
+
+    fn switch_tab(&self, direction: i32) {
+        if let Some(page) = self.notebook.current_page() {
+            let n = self.notebook.n_pages();
+            if n == 0 {
+                return;
+            }
+            let next = if direction > 0 {
+                if page < n - 1 { page + 1 } else { 0 }
+            } else {
+                if page > 0 { page - 1 } else { n.saturating_sub(1) }
+            };
+            self.notebook.set_current_page(Some(next));
+        }
+    }
+
+    fn remove_current_tab(&self) {
+        if let Some(page_num) = self.notebook.current_page() {
+            self.notebook.remove_page(Some(page_num));
+            if self.notebook.n_pages() == 0 {
+                self.window.destroy();
+            } else {
+                self.focus_current_terminal();
+            }
+        }
+    }
+
+    fn current_terminal(&self) -> Option<Terminal> {
+        self.notebook.current_page().and_then(|page_num| {
+            self.notebook.nth_page(Some(page_num)).and_then(|widget| {
+                // Try focused terminal first (for split panes), then fall back to first terminal
+                find_focused_terminal(&widget).or_else(|| find_first_terminal(&widget))
+            })
+        })
+    }
+
+    fn toggle_search(&self) {
+        let visible = self.search_bar.is_search_mode();
+        self.search_bar.set_search_mode(!visible);
+        if !visible {
+            self.search_entry.grab_focus();
+        } else {
+            // Clear search highlight when closing
+            if let Some(term) = self.current_terminal() {
+                term.search_set_regex(None::<&vte4::Regex>, 0);
+            }
+            self.focus_current_terminal();
+        }
+    }
+
+    fn search_apply(&self) {
+        let text = self.search_entry.text();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(term) = self.current_terminal() {
+            let escaped = glib::Regex::escape_string(&text);
+            let regex = vte4::Regex::for_search(&escaped, pcre2_sys::PCRE2_CASELESS);
+            if let Ok(regex) = regex {
+                term.search_set_regex(Some(&regex), 0);
+                term.search_set_wrap_around(true);
+                term.search_find_next();
+            }
+        }
+    }
+
+    fn search_next(&self) {
+        if let Some(term) = self.current_terminal() {
+            term.search_find_next();
+        }
+    }
+
+    fn search_prev(&self) {
+        if let Some(term) = self.current_terminal() {
+            term.search_find_previous();
+        }
+    }
+
+    fn create_split_terminal(&self, working_directory: Option<&str>) -> Terminal {
+        let terminal = create_terminal(&self.config, self.font_scale.get());
+        setup_terminal_click_handler(&terminal);
+
+        let ui_for_exit = UiState::clone(self);
+        let terminal_clone = terminal.clone();
+        terminal.connect_child_exited(move |_, _| {
+            ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
+        });
+
+        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory);
+        terminal
+    }
+
+    fn split_current(&self, orientation: Orientation) {
+        let Some(current_term) = self.current_terminal() else {
+            return;
+        };
+        let working_directory = terminal_working_directory(&current_term);
+
+        let current_widget = current_term.clone().upcast::<gtk4::Widget>();
+        let parent = current_widget.parent();
+
+        let new_term = self.create_split_terminal(working_directory.as_deref());
+
+        let paned = Paned::new(orientation);
+        paned.set_hexpand(true);
+        paned.set_vexpand(true);
+
+        if let Some(ref parent) = parent {
+            if let Ok(parent_paned) = parent.clone().downcast::<Paned>() {
+                // Current terminal is in a Paned - replace it with a new nested Paned
+                let is_start = parent_paned.start_child().as_ref() == Some(&current_widget);
+                if is_start {
+                    parent_paned.set_start_child(Some(&paned));
+                } else {
+                    parent_paned.set_end_child(Some(&paned));
+                }
+                paned.set_start_child(Some(&current_term));
+                paned.set_end_child(Some(&new_term));
+            } else {
+                // Parent is the notebook - replace the page
+                for i in 0..self.notebook.n_pages() {
+                    if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
+                        if page_widget == current_widget {
+                            let tab_label = self.notebook.tab_label(&page_widget);
+                            self.notebook.remove_page(Some(i));
+                            paned.set_start_child(Some(&current_term));
+                            paned.set_end_child(Some(&new_term));
+                            let new_page_num = self.notebook.insert_page(
+                                &paned,
+                                tab_label.as_ref(),
+                                Some(i),
+                            );
+                            self.notebook.set_tab_reorderable(&paned, true);
+                            self.notebook.set_current_page(Some(new_page_num));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        new_term.grab_focus();
+    }
+
     fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
@@ -622,33 +975,13 @@ impl UiState {
         let terminal = create_terminal(&self.config, self.font_scale.get());
 
         // Setup click handler for hyperlinks
-        setup_terminal_click_handler(&terminal, self.ctrl_clicked.clone());
+        setup_terminal_click_handler(&terminal);
 
-        // Connect child-exited to close the tab
-        let notebook_clone = self.notebook.clone();
+        // Connect child-exited to close the tab (or unsplit if in a Paned)
+        let ui_for_exit = UiState::clone(self);
         let terminal_clone = terminal.clone();
-        let window_clone = self.window.clone();
         terminal.connect_child_exited(move |_, _| {
-            // Find and remove this terminal's page
-            let n_pages = notebook_clone.n_pages();
-            for i in 0..n_pages {
-                if let Some(page) = notebook_clone.nth_page(Some(i)) {
-                    if page == terminal_clone.clone().upcast::<gtk4::Widget>() {
-                        notebook_clone.remove_page(Some(i));
-                        break;
-                    }
-                }
-            }
-            // If no more tabs, close window; otherwise focus new current terminal
-            if notebook_clone.n_pages() == 0 {
-                window_clone.destroy();
-            } else if let Some(new_page) = notebook_clone.current_page() {
-                if let Some(widget) = notebook_clone.nth_page(Some(new_page)) {
-                    if let Ok(term) = widget.downcast::<Terminal>() {
-                        term.grab_focus();
-                    }
-                }
-            }
+            ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
         });
 
         // Spawn shell
@@ -718,29 +1051,10 @@ impl UiState {
         tab_box.append(&label);
         tab_box.append(&close_button);
 
-        let notebook_for_close = self.notebook.clone();
-        let window_for_close = self.window.clone();
+        let ui_for_close = UiState::clone(self);
         let terminal_widget_for_close = terminal.clone().upcast::<gtk4::Widget>();
         close_button.connect_clicked(move |_| {
-            let n_pages = notebook_for_close.n_pages();
-            for i in 0..n_pages {
-                if let Some(page) = notebook_for_close.nth_page(Some(i)) {
-                    if page == terminal_widget_for_close {
-                        notebook_for_close.remove_page(Some(i));
-                        break;
-                    }
-                }
-            }
-
-            if notebook_for_close.n_pages() == 0 {
-                window_for_close.destroy();
-            } else if let Some(new_page) = notebook_for_close.current_page() {
-                if let Some(widget) = notebook_for_close.nth_page(Some(new_page)) {
-                    if let Ok(term) = widget.downcast::<Terminal>() {
-                        term.grab_focus();
-                    }
-                }
-            }
+            ui_for_close.remove_tab_by_widget(&terminal_widget_for_close);
         });
 
         // Add to notebook right after the current tab when possible.
@@ -794,19 +1108,53 @@ fn main() -> glib::ExitCode {
             .show_border(false)
             .build();
 
+        // Create search bar
+        let search_entry = SearchEntry::new();
+        search_entry.set_hexpand(true);
+
+        let search_prev_btn = gtk4::Button::from_icon_name("go-up-symbolic");
+        search_prev_btn.set_tooltip_text(Some("Previous match (Shift+Enter)"));
+        search_prev_btn.set_focus_on_click(false);
+        let search_next_btn = gtk4::Button::from_icon_name("go-down-symbolic");
+        search_next_btn.set_tooltip_text(Some("Next match (Enter)"));
+        search_next_btn.set_focus_on_click(false);
+        let search_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        search_close_btn.set_tooltip_text(Some("Close search (Escape)"));
+        search_close_btn.set_focus_on_click(false);
+
+        let search_box = gtk4::Box::new(Orientation::Horizontal, 4);
+        search_box.append(&search_entry);
+        search_box.append(&search_prev_btn);
+        search_box.append(&search_next_btn);
+        search_box.append(&search_close_btn);
+        search_box.set_margin_start(4);
+        search_box.set_margin_end(4);
+        search_box.set_margin_top(2);
+        search_box.set_margin_bottom(2);
+
+        let search_bar = SearchBar::new();
+        search_bar.set_child(Some(&search_box));
+        search_bar.set_show_close_button(false);
+        search_bar.connect_entry(&search_entry);
+
+        // Main layout: notebook + search bar
+        let main_box = gtk4::Box::new(Orientation::Vertical, 0);
+        main_box.append(&notebook);
+        main_box.append(&search_bar);
+
         // Shared state
         let font_scale = Rc::new(Cell::new(config.default_font_scale));
         let tab_counter = Rc::new(Cell::new(0));
-        let ctrl_clicked = Rc::new(Cell::new(false));
 
         let ui = Rc::new(UiState {
             window: window.clone(),
             notebook: notebook.clone(),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
-            ctrl_clicked: ctrl_clicked.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
+            search_bar: search_bar.clone(),
+            search_entry: search_entry.clone(),
         });
 
         // Restore tabs from last session snapshot (and delete it immediately).
@@ -837,27 +1185,17 @@ fn main() -> glib::ExitCode {
         // This allows us to intercept shortcuts before the terminal processes them
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let font_step = 0.025;
-        let opacity_step = 0.025;
 
-        let notebook_clone = notebook.clone();
         let window_clone = window.clone();
-        let font_scale_clone = font_scale.clone();
-        let ctrl_clicked_clone = ctrl_clicked.clone();
         let window_opacity_clone = window_opacity.clone();
         let ui_clone = ui.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
-            // Only log for shortcut keys, not every keypress (to avoid IME interference)
-            // println!("connect_key_pressed state:{:?}, keyval: {}", state, keyval);
+            let font_step = 0.025;
+            let opacity_step = 0.025;
 
-            // Get current terminal
-            let current_page = notebook_clone.current_page();
-            let current_terminal = current_page.and_then(|page_num| {
-                notebook_clone
-                    .nth_page(Some(page_num))
-                    .and_then(|widget| widget.downcast::<Terminal>().ok())
-            });
+            // Get current terminal (split-aware)
+            let current_terminal = ui_clone.current_terminal();
 
             if state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) {
                 log::debug!(
@@ -867,7 +1205,6 @@ fn main() -> glib::ExitCode {
                 );
                 match keyval {
                     Key::T | Key::t => {
-                        // New tab
                         log::info!("New tab");
                         let working_directory = current_terminal
                             .as_ref()
@@ -876,23 +1213,8 @@ fn main() -> glib::ExitCode {
                         return true.into();
                     }
                     Key::W | Key::w => {
-                        // Close current tab
                         log::info!("Close tab");
-                        if let Some(page_num) = notebook_clone.current_page() {
-                            notebook_clone.remove_page(Some(page_num));
-                            if notebook_clone.n_pages() == 0 {
-                                window_clone.destroy();
-                            } else {
-                                // Focus the new current terminal
-                                if let Some(new_page) = notebook_clone.current_page() {
-                                    if let Some(widget) = notebook_clone.nth_page(Some(new_page)) {
-                                        if let Ok(term) = widget.downcast::<Terminal>() {
-                                            term.grab_focus();
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        ui_clone.remove_current_tab();
                         return true.into();
                     }
                     Key::C | Key::c => {
@@ -909,28 +1231,16 @@ fn main() -> glib::ExitCode {
                         }
                         return true.into();
                     }
-                    Key::plus => {
+                    Key::plus | Key::O | Key::o => {
                         log::debug!("Font increase");
-                        font_scale_clone.set((font_scale_clone.get() + font_step).min(10.0));
-                        if let Some(ref term) = current_terminal {
-                            term.set_font_scale(font_scale_clone.get());
-                        }
+                        let new_scale = (ui_clone.font_scale.get() + font_step).min(10.0);
+                        ui_clone.set_font_scale_all(new_scale);
                         return true.into();
                     }
                     Key::I | Key::i => {
                         log::debug!("Font decrease");
-                        font_scale_clone.set((font_scale_clone.get() - font_step).max(0.1));
-                        if let Some(ref term) = current_terminal {
-                            term.set_font_scale(font_scale_clone.get());
-                        }
-                        return true.into();
-                    }
-                    Key::O | Key::o => {
-                        log::debug!("Font increase");
-                        font_scale_clone.set((font_scale_clone.get() + font_step).min(10.0));
-                        if let Some(ref term) = current_terminal {
-                            term.set_font_scale(font_scale_clone.get());
-                        }
+                        let new_scale = (ui_clone.font_scale.get() - font_step).max(0.1);
+                        ui_clone.set_font_scale_all(new_scale);
                         return true.into();
                     }
                     Key::J | Key::j => {
@@ -947,32 +1257,27 @@ fn main() -> glib::ExitCode {
                         window_clone.set_opacity(window_opacity_clone.get());
                         return true.into();
                     }
+                    Key::F | Key::f => {
+                        log::debug!("Toggle search");
+                        ui_clone.toggle_search();
+                        return true.into();
+                    }
+                    Key::E | Key::e => {
+                        log::debug!("Split horizontal");
+                        ui_clone.split_current(Orientation::Horizontal);
+                        return true.into();
+                    }
+                    Key::D | Key::d => {
+                        log::debug!("Split vertical");
+                        ui_clone.split_current(Orientation::Vertical);
+                        return true.into();
+                    }
                     Key::Page_Up => {
-                        // Previous tab
-                        log::debug!("Previous tab");
-                        if let Some(page_num) = notebook_clone.current_page() {
-                            if page_num > 0 {
-                                notebook_clone.set_current_page(Some(page_num - 1));
-                            } else {
-                                // Wrap to last tab
-                                let last = notebook_clone.n_pages().saturating_sub(1);
-                                notebook_clone.set_current_page(Some(last));
-                            }
-                        }
+                        ui_clone.switch_tab(-1);
                         return true.into();
                     }
                     Key::Page_Down => {
-                        // Next tab
-                        log::debug!("Next tab");
-                        if let Some(page_num) = notebook_clone.current_page() {
-                            let n_pages = notebook_clone.n_pages();
-                            if page_num < n_pages - 1 {
-                                notebook_clone.set_current_page(Some(page_num + 1));
-                            } else {
-                                // Wrap to first tab
-                                notebook_clone.set_current_page(Some(0));
-                            }
-                        }
+                        ui_clone.switch_tab(1);
                         return true.into();
                     }
                     _ => {}
@@ -983,35 +1288,30 @@ fn main() -> glib::ExitCode {
                 match keyval {
                     Key::minus => {
                         log::debug!("Font decrease");
-                        font_scale_clone.set((font_scale_clone.get() - font_step).max(0.1));
-                        if let Some(ref term) = current_terminal {
-                            term.set_font_scale(font_scale_clone.get());
-                        }
+                        let new_scale = (ui_clone.font_scale.get() - font_step).max(0.1);
+                        ui_clone.set_font_scale_all(new_scale);
                         return true.into();
                     }
                     Key::Page_Up => {
-                        // Previous tab (Ctrl+Page_Up)
-                        log::debug!("Previous tab");
-                        if let Some(page_num) = notebook_clone.current_page() {
-                            if page_num > 0 {
-                                notebook_clone.set_current_page(Some(page_num - 1));
-                            } else {
-                                let last = notebook_clone.n_pages().saturating_sub(1);
-                                notebook_clone.set_current_page(Some(last));
-                            }
-                        }
+                        ui_clone.switch_tab(-1);
                         return true.into();
                     }
                     Key::Page_Down => {
-                        // Next tab (Ctrl+Page_Down)
-                        log::debug!("Next tab");
-                        if let Some(page_num) = notebook_clone.current_page() {
-                            let n_pages = notebook_clone.n_pages();
-                            if page_num < n_pages - 1 {
-                                notebook_clone.set_current_page(Some(page_num + 1));
+                        ui_clone.switch_tab(1);
+                        return true.into();
+                    }
+                    // Ctrl+1~9: quick switch to tab N
+                    Key::_1 | Key::_2 | Key::_3 | Key::_4 | Key::_5
+                    | Key::_6 | Key::_7 | Key::_8 | Key::_9 => {
+                        let n_pages = ui_clone.notebook.n_pages();
+                        if n_pages > 0 {
+                            let target = if keyval == Key::_9 {
+                                n_pages - 1
                             } else {
-                                notebook_clone.set_current_page(Some(0));
-                            }
+                                let idx = keyval.into_glib() - Key::_1.into_glib();
+                                idx.min(n_pages - 1)
+                            };
+                            ui_clone.notebook.set_current_page(Some(target));
                         }
                         return true.into();
                     }
@@ -1019,26 +1319,62 @@ fn main() -> glib::ExitCode {
                 }
             }
 
-            if keyval == Key::Control_L || keyval == Key::Control_R {
-                ctrl_clicked_clone.set(true);
-                log::trace!("ctrl pressed");
-            }
-
             false.into()
         });
 
-        let ctrl_clicked_clone2 = ctrl_clicked.clone();
-        key_controller.connect_key_released(move |_controller, keyval, _keycode, _state| {
-            if keyval == Key::Control_L || keyval == Key::Control_R {
-                log::trace!("ctrl released");
-                ctrl_clicked_clone2.set(false);
-            }
+        // Wire up search entry: activate (Enter) = next, Shift+Enter = prev
+        let ui_for_search_activate = ui.clone();
+        search_entry.connect_activate(move |_| {
+            ui_for_search_activate.search_apply();
         });
 
-        // Focus terminal when switching tabs
+        let ui_for_search_changed = ui.clone();
+        search_entry.connect_search_changed(move |_| {
+            ui_for_search_changed.search_apply();
+        });
+
+        let ui_for_search_next = ui.clone();
+        search_next_btn.connect_clicked(move |_| {
+            ui_for_search_next.search_next();
+        });
+
+        let ui_for_search_prev = ui.clone();
+        search_prev_btn.connect_clicked(move |_| {
+            ui_for_search_prev.search_prev();
+        });
+
+        let ui_for_search_close = ui.clone();
+        search_close_btn.connect_clicked(move |_| {
+            ui_for_search_close.toggle_search();
+        });
+
+        // Search entry key handler for Shift+Enter (prev) and Escape
+        let search_key_controller = EventControllerKey::new();
+        let ui_for_search_key = ui.clone();
+        search_key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            match keyval {
+                Key::Return | Key::KP_Enter => {
+                    if state.contains(ModifierType::SHIFT_MASK) {
+                        ui_for_search_key.search_prev();
+                    } else {
+                        ui_for_search_key.search_next();
+                    }
+                    return true.into();
+                }
+                Key::Escape => {
+                    ui_for_search_key.toggle_search();
+                    return true.into();
+                }
+                _ => {}
+            }
+            false.into()
+        });
+        search_entry.add_controller(search_key_controller);
+
+        // Focus terminal when switching tabs (split-aware)
         notebook.connect_switch_page(move |_, widget, _page_num| {
-            if let Ok(terminal) = widget.clone().downcast::<Terminal>() {
-                terminal.grab_focus();
+            if let Some(term) = find_first_terminal(widget) {
+                term.grab_focus();
             }
         });
 
@@ -1056,17 +1392,11 @@ fn main() -> glib::ExitCode {
             app_clone.quit();
         });
 
-        window.set_child(Some(&notebook));
+        window.set_child(Some(&main_box));
         window.show();
 
         // Focus the active terminal after window is shown
-        if let Some(page_num) = notebook.current_page() {
-            if let Some(widget) = notebook.nth_page(Some(page_num)) {
-                if let Ok(terminal) = widget.downcast::<Terminal>() {
-                    terminal.grab_focus();
-                }
-            }
-        }
+        ui.focus_current_terminal();
     });
 
     app.run()
