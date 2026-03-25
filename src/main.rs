@@ -14,7 +14,6 @@ use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::LazyLock;
 use vte4::Format;
@@ -213,46 +212,13 @@ fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn fish_has_working_bass(fish_path: &Path) -> bool {
-    // Spawn fish without user config to avoid startup-time side effects.
-    // We also *execute* bass once because some bass implementations try to
-    // translate bash aliases into fish aliases (which can fail for bash-only
-    // alias definitions). If bass can't run, we should not use it.
-    Command::new(fish_path)
-        .args([
-            "--no-config",
-            "-c",
-            // `type -q` checks autoloaded functions; `bass "true"` validates runtime.
-            "type -q bass; and bass \"true\"",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn choose_shell_argv() -> Vec<String> {
-    // Prefer fish.
-    if let Some(fish_path) = find_executable_in_path("fish") {
-        // If bass works, use it to import ~/.bashrc *before* the prompt.
-        if fish_has_working_bass(&fish_path) {
-            let init_cmd = "if test -f ~/.bashrc; bass source ~/.bashrc; end";
-            return vec![
-                fish_path.to_string_lossy().to_string(),
-                "-l".to_string(),
-                "-i".to_string(),
-                "-C".to_string(),
-                init_cmd.to_string(),
-            ];
-        }
-
-        // bass missing/broken: still use fish (as requested), just without importing bashrc.
-        return vec![
-            fish_path.to_string_lossy().to_string(),
-            "-l".to_string(),
-            "-i".to_string(),
-        ];
+    // Prefer rsh.
+    if let Some(rsh_path) = find_executable_in_path("rsh") {
+        return vec![rsh_path.to_string_lossy().to_string()];
     }
 
+    // Fallback: bash
     if let Some(bash_path) = find_executable_in_path("bash") {
         return vec![bash_path.to_string_lossy().to_string(), "-l".to_string()];
     }
