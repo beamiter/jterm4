@@ -1716,6 +1716,7 @@ impl UiState {
         strip_close_btn.set_tooltip_text(Some("Close tab"));
         strip_close_btn.set_focus_on_click(false);
         strip_close_btn.set_can_focus(false);
+        strip_close_btn.set_visible(false);
         strip_box.append(&strip_close_btn);
 
         let strip_btn = ToggleButton::new();
@@ -1726,6 +1727,18 @@ impl UiState {
         strip_btn.set_focus_on_click(false);
         strip_btn.set_can_focus(false);
         strip_btn.set_hexpand(false);
+
+        // Show close button on hover, hide on leave
+        let hover_ctrl = gtk4::EventControllerMotion::new();
+        let close_for_enter = strip_close_btn.clone();
+        hover_ctrl.connect_enter(move |_, _, _| {
+            close_for_enter.set_visible(true);
+        });
+        let close_for_leave = strip_close_btn.clone();
+        hover_ctrl.connect_leave(move |_| {
+            close_for_leave.set_visible(false);
+        });
+        strip_btn.add_controller(hover_ctrl);
         // Give button a unique name to correlate with notebook page
         strip_btn.set_widget_name(&format!("tab-{}", tab_num));
         // Also name the terminal widget so we can find the button when removing
