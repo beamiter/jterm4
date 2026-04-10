@@ -1001,8 +1001,11 @@ impl UiState {
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_ref_for_esc = self.keybindings_dialog.clone();
-        key_controller.connect_key_pressed(move |_, keyval, _, _| {
-            if keyval == Key::Escape {
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == Key::Escape
+                || (matches!(keyval, Key::P | Key::p)
+                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            {
                 if let Some(d) = dialog_ref_for_esc.borrow_mut().take() {
                     d.destroy();
                 }
