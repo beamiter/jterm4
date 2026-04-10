@@ -8,7 +8,7 @@ use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
 use gtk4::{glib, Adjustment, Entry, Label, ListBox, Notebook, Orientation, Paned, Scale, ScrolledWindow};
-use gtk4::{EventControllerKey, GestureClick, SearchBar, SearchEntry};
+use gtk4::{CssProvider, EventControllerKey, GestureClick, SearchBar, SearchEntry, ToggleButton};
 use libadwaita as adw;
 use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
@@ -88,6 +88,7 @@ struct UiState {
     available_themes: Rc<Vec<Theme>>,
     search_bar: SearchBar,
     search_entry: SearchEntry,
+    tab_strip: gtk4::Box,
     keybindings_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
 }
@@ -683,6 +684,43 @@ fn show_rename_dialog(window: &adw::ApplicationWindow, label: &Label, custom_tit
     dialog.present(Some(window));
 }
 
+fn show_rename_dialog_with_strip(
+    window: &adw::ApplicationWindow,
+    label: &Label,
+    strip_label: &Label,
+    custom_title: Rc<Cell<bool>>,
+) {
+    let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+
+    let entry = Entry::new();
+    entry.set_text(&label.text());
+    entry.set_activates_default(true);
+    dialog.set_extra_child(Some(&entry));
+
+    let label_clone = label.clone();
+    let strip_label_clone = strip_label.clone();
+    let custom_title_clone = custom_title.clone();
+    let value = entry.clone();
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "rename" {
+            let text = value.text();
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                label_clone.set_text(trimmed);
+                strip_label_clone.set_text(trimmed);
+                custom_title_clone.set(true);
+            }
+        }
+    });
+
+    dialog.present(Some(window));
+}
+
 fn default_tab_title(tab_index_1based: u32, working_directory: Option<&str>) -> String {
     let mut resolved_dir = working_directory.filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
 
@@ -861,6 +899,33 @@ fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
 }
 
 impl UiState {
+    /// Update which tab strip button is :checked to match the active notebook page.
+    fn sync_tab_strip_active(&self, active_page: Option<u32>) {
+        let active = active_page.or(self.notebook.current_page()).unwrap_or(0);
+        let mut idx = 0u32;
+        let mut child = self.tab_strip.first_child();
+        while let Some(c) = child {
+            if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+                btn.set_active(idx == active);
+            }
+            idx += 1;
+            child = c.next_sibling();
+        }
+    }
+
+    /// Remove the tab strip button that corresponds to a notebook page widget.
+    fn remove_strip_button_for(&self, widget: &gtk4::Widget) {
+        let name = widget.widget_name();
+        let mut child = self.tab_strip.first_child();
+        while let Some(c) = child {
+            if c.widget_name() == name {
+                self.tab_strip.remove(&c);
+                return;
+            }
+            child = c.next_sibling();
+        }
+    }
+
     fn focus_current_terminal(&self) {
         if let Some(page) = self.notebook.current_page() {
             if let Some(widget) = self.notebook.nth_page(Some(page)) {
@@ -872,15 +937,14 @@ impl UiState {
     }
 
     fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
+        self.remove_strip_button_for(widget);
         if let Some(page_num) = self.notebook.page_num(widget) {
             self.notebook.remove_page(Some(page_num));
         }
         if self.notebook.n_pages() == 0 {
             self.window.destroy();
         } else {
-            if self.notebook.n_pages() <= 1 {
-                self.notebook.set_show_tabs(false);
-            }
+            self.sync_tab_strip_active(None);
             self.focus_current_terminal();
         }
     }
@@ -916,6 +980,8 @@ impl UiState {
                         for i in 0..self.notebook.n_pages() {
                             if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
                                 if page_widget == paned_widget {
+                                    // Transfer widget name so strip button mapping is preserved
+                                    sibling.set_widget_name(&page_widget.widget_name());
                                     let tab_label = self.notebook.tab_label(&page_widget);
                                     self.notebook.remove_page(Some(i));
                                     let new_page_num = self.notebook.insert_page(
@@ -1022,13 +1088,15 @@ impl UiState {
 
     fn remove_current_tab(&self) {
         if let Some(page_num) = self.notebook.current_page() {
+            // Remove the strip button for the current page's widget
+            if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
+                self.remove_strip_button_for(&widget);
+            }
             self.notebook.remove_page(Some(page_num));
             if self.notebook.n_pages() == 0 {
                 self.window.destroy();
             } else {
-                if self.notebook.n_pages() <= 1 {
-                    self.notebook.set_show_tabs(false);
-                }
+                self.sync_tab_strip_active(None);
                 self.focus_current_terminal();
             }
         }
@@ -1460,6 +1528,8 @@ impl UiState {
                 for i in 0..self.notebook.n_pages() {
                     if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
                         if page_widget == current_widget {
+                            // Transfer widget name so strip button mapping is preserved
+                            paned.set_widget_name(&page_widget.widget_name());
                             let tab_label = self.notebook.tab_label(&page_widget);
                             self.notebook.remove_page(Some(i));
                             paned.set_start_child(Some(&current_term));
@@ -1557,6 +1627,9 @@ impl UiState {
         let label_for_pwd = label.clone();
         let custom_title_for_pwd = custom_title.clone();
         let tab_index_for_pwd = tab_num + 1;
+        // We'll also keep a reference to the strip button so its label can be synced.
+        let strip_btn_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
+        let strip_btn_label_for_pwd = strip_btn_label.clone();
         terminal.connect_notify_local(Some("current-directory-uri"), move |term, _| {
             if custom_title_for_pwd.get() {
                 return;
@@ -1567,6 +1640,10 @@ impl UiState {
             let new_title = default_tab_title(tab_index_for_pwd, Some(&dir));
             if label_for_pwd.text().as_str() != new_title {
                 label_for_pwd.set_text(&new_title);
+                // Also update the tab strip button label
+                if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
+                    btn_label.set_text(&new_title);
+                }
             }
         });
 
@@ -1595,9 +1672,82 @@ impl UiState {
         };
         self.notebook.set_tab_reorderable(&terminal, true);
         self.notebook.set_current_page(Some(page_num));
-        if self.notebook.n_pages() > 1 {
-            self.notebook.set_show_tabs(true);
+        // Force tabs hidden — GTK may re-show them after page insertion
+        self.notebook.set_show_tabs(false);
+
+        // Create tab strip toggle button
+        let strip_label = Label::new(Some(&label_text));
+        strip_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        strip_label.set_max_width_chars(24);
+        *strip_btn_label.borrow_mut() = Some(strip_label.clone());
+
+        let strip_btn = ToggleButton::new();
+        strip_btn.set_child(Some(&strip_label));
+        strip_btn.add_css_class("tab-strip-btn");
+        strip_btn.add_css_class("flat");
+        strip_btn.set_active(true); // new tab is current
+        strip_btn.set_focus_on_click(false);
+        strip_btn.set_can_focus(false);
+        strip_btn.set_hexpand(false);
+        // Give button a unique name to correlate with notebook page
+        strip_btn.set_widget_name(&format!("tab-{}", tab_num));
+        // Also name the terminal widget so we can find the button when removing
+        terminal.set_widget_name(&format!("tab-{}", tab_num));
+
+        // Double-click to rename on strip button too
+        let rename_click_strip = GestureClick::new();
+        rename_click_strip.set_button(GDK_BUTTON_PRIMARY as u32);
+        let label_for_rename_strip = label.clone();
+        let strip_label_for_rename = strip_label.clone();
+        let window_for_rename_strip = self.window.clone();
+        let custom_title_for_rename_strip = custom_title.clone();
+        rename_click_strip.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 2 {
+                show_rename_dialog_with_strip(
+                    &window_for_rename_strip,
+                    &label_for_rename_strip,
+                    &strip_label_for_rename,
+                    custom_title_for_rename_strip.clone(),
+                );
+            }
+        });
+        strip_btn.add_controller(rename_click_strip);
+
+        // Click to switch tab
+        let notebook_for_strip = self.notebook.clone();
+        let tab_strip_for_click = self.tab_strip.clone();
+        strip_btn.connect_clicked(move |btn| {
+            // Find the index of this button in the strip
+            let mut idx = 0u32;
+            let mut child = tab_strip_for_click.first_child();
+            while let Some(ref c) = child {
+                if c == btn.upcast_ref::<gtk4::Widget>() {
+                    break;
+                }
+                idx += 1;
+                child = c.next_sibling();
+            }
+            notebook_for_strip.set_current_page(Some(idx));
+        });
+
+        // Insert strip button at the correct position
+        if page_num as i32 >= self.tab_strip.observe_children().n_items() as i32 {
+            self.tab_strip.append(&strip_btn);
+        } else {
+            // Insert before the sibling at page_num position
+            let mut child = self.tab_strip.first_child();
+            for _ in 0..page_num {
+                child = child.and_then(|c| c.next_sibling());
+            }
+            if let Some(sibling) = child {
+                strip_btn.insert_before(&self.tab_strip, Some(&sibling));
+            } else {
+                self.tab_strip.append(&strip_btn);
+            }
         }
+
+        // Deactivate all other strip buttons
+        self.sync_tab_strip_active(Some(page_num));
 
         // Focus the new terminal
         terminal.grab_focus();
@@ -1647,7 +1797,7 @@ fn main() -> glib::ExitCode {
             .opacity(window_opacity.get())
             .build();
 
-        // Create notebook for tabs
+        // Create notebook for tabs (tabs hidden — custom tab bar is used instead)
         let notebook = Notebook::builder()
             .hexpand(true)
             .vexpand(true)
@@ -1655,6 +1805,7 @@ fn main() -> glib::ExitCode {
             .show_border(false)
             .show_tabs(false)
             .build();
+        notebook.add_css_class("hidden-tabs");
 
         // Create search bar
         let search_entry = SearchEntry::new();
@@ -1685,8 +1836,56 @@ fn main() -> glib::ExitCode {
         search_bar.set_show_close_button(false);
         search_bar.connect_entry(&search_entry);
 
-        // Main layout: notebook + search bar
+        // Custom tab bar CSS
+        let css_provider = CssProvider::new();
+        css_provider.load_from_data(
+            ".tab-strip-btn { padding: 2px 8px; border-radius: 4px; }
+             .tab-strip-btn:checked { font-weight: bold; }
+             .tab-bar-box { padding: 2px 4px; }
+             .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
+             .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("display"),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // Custom tab bar: [scrollable tab strip] [+] [close]
+        let tab_strip = gtk4::Box::new(Orientation::Horizontal, 2);
+        tab_strip.set_hexpand(false);
+        tab_strip.set_halign(gtk4::Align::Start);
+
+        let scrolled_tabs = ScrolledWindow::builder()
+            .hexpand(true)
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&tab_strip)
+            .build();
+
+        let add_tab_button = gtk4::Button::with_label("+");
+        add_tab_button.set_focus_on_click(false);
+        add_tab_button.set_can_focus(false);
+        add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
+        add_tab_button.add_css_class("flat");
+        add_tab_button.set_hexpand(false);
+
+        let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
+        close_window_button.set_focus_on_click(false);
+        close_window_button.set_can_focus(false);
+        close_window_button.set_tooltip_text(Some("Close window"));
+        close_window_button.add_css_class("flat");
+        close_window_button.set_hexpand(false);
+
+        let tab_bar_box = gtk4::Box::new(Orientation::Horizontal, 4);
+        tab_bar_box.add_css_class("tab-bar-box");
+        tab_bar_box.append(&scrolled_tabs);
+        tab_bar_box.append(&add_tab_button);
+        tab_bar_box.append(&close_window_button);
+
+        // Main layout: tab bar + notebook + search bar
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
+        main_box.append(&tab_bar_box);
         main_box.append(&notebook);
         main_box.append(&search_bar);
 
@@ -1705,8 +1904,21 @@ fn main() -> glib::ExitCode {
             available_themes: available_themes.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
+            tab_strip: tab_strip.clone(),
             keybindings_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
+        });
+
+        // Wire "+" button
+        let ui_for_add = ui.clone();
+        add_tab_button.connect_clicked(move |_| {
+            ui_for_add.add_new_tab(None, None);
+        });
+
+        // Wire close-window button
+        let window_for_close = window.clone();
+        close_window_button.connect_clicked(move |_| {
+            window_for_close.close();
         });
 
         // Restore tabs from last session snapshot (and delete it immediately).
@@ -1975,11 +2187,13 @@ fn main() -> glib::ExitCode {
         });
         search_entry.add_controller(search_key_controller);
 
-        // Focus terminal when switching tabs (split-aware)
-        notebook.connect_switch_page(move |_, widget, _page_num| {
+        // Focus terminal when switching tabs (split-aware) and sync tab strip
+        let ui_for_switch = ui.clone();
+        notebook.connect_switch_page(move |_, widget, page_num| {
             if let Some(term) = find_first_terminal(widget) {
                 term.grab_focus();
             }
+            ui_for_switch.sync_tab_strip_active(Some(page_num));
         });
 
         window.add_controller(key_controller);
