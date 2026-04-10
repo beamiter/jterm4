@@ -1043,6 +1043,11 @@ impl UiState {
 fn main() -> glib::ExitCode {
     init_logging();
 
+    // fcitx4 has no GTK4 IM module; remove it so GTK4 uses its built-in IM context
+    if std::env::var("GTK_IM_MODULE").as_deref() == Ok("fcitx") {
+        unsafe { std::env::remove_var("GTK_IM_MODULE"); }
+    }
+
     // Shell selection is handled per-terminal spawn:
     // - prefer fish if available
     // - if bass works, import ~/.bashrc before showing the prompt
