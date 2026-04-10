@@ -7,9 +7,10 @@ use gtk4::gio::{self, Cancellable};
 use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
-use gtk4::prelude::*;
-use gtk4::{glib, Adjustment, Application, ApplicationWindow, Dialog, DropDown, Entry, Label, ListBox, Notebook, Orientation, Paned, ResponseType, Scale, ScrolledWindow, SpinButton};
+use gtk4::{glib, Adjustment, Entry, Label, ListBox, Notebook, Orientation, Paned, Scale, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchBar, SearchEntry};
+use libadwaita as adw;
+use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::fs;
@@ -77,7 +78,7 @@ struct Config {
 
 #[derive(Clone)]
 struct UiState {
-    window: ApplicationWindow,
+    window: adw::ApplicationWindow,
     notebook: Notebook,
     tab_counter: Rc<Cell<u32>>,
     font_scale: Rc<Cell<f64>>,
@@ -87,8 +88,8 @@ struct UiState {
     available_themes: Rc<Vec<Theme>>,
     search_bar: SearchBar,
     search_entry: SearchEntry,
-    keybindings_dialog: Rc<RefCell<Option<Dialog>>>,
-    settings_dialog: Rc<RefCell<Option<Dialog>>>,
+    keybindings_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -652,26 +653,24 @@ fn open_uri(uri: &str) {
     }
 }
 
-fn show_rename_dialog(window: &ApplicationWindow, label: &Label, custom_title: Rc<Cell<bool>>) {
-    let dialog = Dialog::builder()
-        .transient_for(window)
-        .modal(true)
-        .title("Rename tab")
-        .build();
-    dialog.add_button("Cancel", ResponseType::Cancel);
-    dialog.add_button("Rename", ResponseType::Accept);
-    dialog.set_default_response(ResponseType::Accept);
+fn show_rename_dialog(window: &adw::ApplicationWindow, label: &Label, custom_title: Rc<Cell<bool>>) {
+    let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
 
     let entry = Entry::new();
     entry.set_text(&label.text());
     entry.set_activates_default(true);
-    dialog.content_area().append(&entry);
+    dialog.set_extra_child(Some(&entry));
 
     let label_clone = label.clone();
     let custom_title_clone = custom_title.clone();
     let value = entry.clone();
-    dialog.connect_response(move |dialog, response| {
-        if response == ResponseType::Accept {
+    dialog.connect_response(None, move |_dialog, response| {
+        if response == "rename" {
             let text = value.text();
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -679,11 +678,9 @@ fn show_rename_dialog(window: &ApplicationWindow, label: &Label, custom_title: R
                 custom_title_clone.set(true);
             }
         }
-        dialog.close();
     });
 
-    dialog.show();
-    entry.grab_focus();
+    dialog.present(Some(window));
 }
 
 fn default_tab_title(tab_index_1based: u32, working_directory: Option<&str>) -> String {
@@ -1104,9 +1101,8 @@ impl UiState {
     }
 
     fn toggle_keybindings_panel(&self) {
-        // If dialog already open, close it
         if let Some(dialog) = self.keybindings_dialog.borrow_mut().take() {
-            dialog.destroy();
+            dialog.force_close();
             return;
         }
 
@@ -1141,58 +1137,52 @@ impl UiState {
             ("Ctrl+Click link", "Open hyperlink"),
         ];
 
-        let dialog = Dialog::builder()
-            .transient_for(&self.window)
-            .modal(true)
+        let dialog = adw::Dialog::builder()
             .title("Keybindings")
-            .default_width(480)
-            .default_height(420)
+            .content_width(480)
+            .content_height(420)
             .build();
 
-        let content = dialog.content_area();
-        content.set_spacing(8);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        content.set_margin_top(8);
-        content.set_margin_bottom(8);
-
+        let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
         filter_entry.set_placeholder_text(Some("Search keybindings..."));
         filter_entry.set_hexpand(true);
-        content.append(&filter_entry);
 
         let list_box = ListBox::new();
         list_box.set_selection_mode(gtk4::SelectionMode::None);
         list_box.add_css_class("boxed-list");
+        list_box.set_margin_start(12);
+        list_box.set_margin_end(12);
+        list_box.set_margin_bottom(12);
 
         for &(shortcut, description) in KEYBINDINGS {
-            let row_box = gtk4::Box::new(Orientation::Horizontal, 12);
-            row_box.set_margin_start(8);
-            row_box.set_margin_end(8);
-            row_box.set_margin_top(6);
-            row_box.set_margin_bottom(6);
-
+            let row = adw::ActionRow::builder()
+                .title(description)
+                .build();
             let key_label = Label::new(Some(shortcut));
-            key_label.set_xalign(0.0);
-            key_label.set_width_chars(24);
             key_label.add_css_class("dim-label");
-
-            let desc_label = Label::new(Some(description));
-            desc_label.set_xalign(0.0);
-            desc_label.set_hexpand(true);
-
-            row_box.append(&key_label);
-            row_box.append(&desc_label);
-            list_box.append(&row_box);
+            row.add_suffix(&key_label);
+            list_box.append(&row);
         }
 
         let scrolled = ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
-            .min_content_height(300)
             .child(&list_box)
             .build();
-        content.append(&scrolled);
+
+        let search_box = gtk4::Box::new(Orientation::Vertical, 0);
+        filter_entry.set_margin_start(12);
+        filter_entry.set_margin_end(12);
+        filter_entry.set_margin_top(8);
+        filter_entry.set_margin_bottom(8);
+        search_box.append(&filter_entry);
+        search_box.append(&scrolled);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&search_box));
+        dialog.set_child(Some(&toolbar_view));
 
         // Filter rows based on search text
         let list_box_clone = list_box.clone();
@@ -1211,17 +1201,17 @@ impl UiState {
             }
         });
 
-        // Escape to close (Capture phase so it works even when SearchEntry has focus)
+        // Key controller: Escape / Ctrl+Shift+P to close
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let dialog_ref_for_esc = self.keybindings_dialog.clone();
+        let dialog_ref = self.keybindings_dialog.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::P | Key::p)
                     && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
             {
-                if let Some(d) = dialog_ref_for_esc.borrow_mut().take() {
-                    d.destroy();
+                if let Some(d) = dialog_ref.borrow_mut().take() {
+                    d.force_close();
                 }
                 return true.into();
             }
@@ -1229,49 +1219,43 @@ impl UiState {
         });
         dialog.add_controller(key_controller);
 
-        // Clear tracking when dialog is closed via window manager
+        // Clear tracking when dialog is closed
         let dialog_ref = self.keybindings_dialog.clone();
-        dialog.connect_close_request(move |_| {
+        dialog.connect_closed(move |_| {
             *dialog_ref.borrow_mut() = None;
-            false.into()
         });
 
         *self.keybindings_dialog.borrow_mut() = Some(dialog.clone());
-        dialog.show();
+        dialog.present(Some(&self.window));
         filter_entry.grab_focus();
     }
 
     fn toggle_settings_panel(&self) {
         if let Some(dialog) = self.settings_dialog.borrow_mut().take() {
-            dialog.destroy();
+            dialog.force_close();
             return;
         }
 
-        let dialog = Dialog::builder()
-            .transient_for(&self.window)
-            .modal(true)
-            .title("Settings")
-            .default_width(520)
-            .default_height(460)
-            .build();
+        let dialog = adw::PreferencesDialog::new();
+        dialog.set_title("Settings");
 
-        let content = dialog.content_area();
-        content.set_spacing(12);
-        content.set_margin_start(16);
-        content.set_margin_end(16);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::new();
 
         let config = self.config.borrow();
 
         // --- Theme ---
-        let theme_names: Vec<&str> = self.available_themes.iter().map(|t| t.name.as_str()).collect();
-        let theme_dropdown = DropDown::from_strings(&theme_names);
+        let theme_names: Vec<String> = self.available_themes.iter().map(|t| t.name.clone()).collect();
+        let theme_model = gtk4::StringList::new(&theme_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let theme_row = adw::ComboRow::builder()
+            .title("Theme")
+            .model(&theme_model)
+            .build();
         let current_theme_idx = self.available_themes.iter()
             .position(|t| t.name == config.theme_name)
             .unwrap_or(0);
-        theme_dropdown.set_selected(current_theme_idx as u32);
-        content.append(&self.settings_row("Theme", &theme_dropdown));
+        theme_row.set_selected(current_theme_idx as u32);
+        group.add(&theme_row);
 
         // --- Font (monospace fonts from Pango) ---
         let pango_ctx = self.window.pango_context();
@@ -1287,46 +1271,59 @@ impl UiState {
             .map(|f| f.to_string())
             .unwrap_or_default();
 
-        let font_strs: Vec<&str> = mono_fonts.iter().map(|s| s.as_str()).collect();
-        let font_dropdown = DropDown::from_strings(&font_strs);
+        let font_model = gtk4::StringList::new(&mono_fonts.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let font_row = adw::ComboRow::builder()
+            .title("Font")
+            .model(&font_model)
+            .build();
         let current_font_idx = mono_fonts.iter()
             .position(|f| f == &current_family)
             .unwrap_or(0);
-        font_dropdown.set_selected(current_font_idx as u32);
-        content.append(&self.settings_row("Font", &font_dropdown));
+        font_row.set_selected(current_font_idx as u32);
+        group.add(&font_row);
 
         // --- Font Size ---
         let current_size = current_font_desc.size() as f64 / gtk4::pango::SCALE as f64;
         let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 1.0, 4.0, 0.0);
-        let font_size_spin = SpinButton::new(Some(&font_size_adj), 1.0, 0);
-        content.append(&self.settings_row("Font Size", &font_size_spin));
+        let font_size_row = adw::SpinRow::new(Some(&font_size_adj), 1.0, 0);
+        font_size_row.set_title("Font Size");
+        group.add(&font_size_row);
 
         // --- Font Scale ---
         let font_scale_adj = Adjustment::new(self.font_scale.get(), 0.1, 10.0, 0.025, 0.1, 0.0);
-        let font_scale_spin = SpinButton::new(Some(&font_scale_adj), 0.025, 3);
-        content.append(&self.settings_row("Font Scale", &font_scale_spin));
+        let font_scale_row = adw::SpinRow::new(Some(&font_scale_adj), 0.025, 3);
+        font_scale_row.set_title("Font Scale");
+        group.add(&font_scale_row);
 
         // --- Opacity ---
+        let opacity_row = adw::ActionRow::builder()
+            .title("Opacity")
+            .build();
         let opacity_scale = Scale::with_range(Orientation::Horizontal, 0.01, 1.0, 0.025);
         opacity_scale.set_value(self.window_opacity.get());
         opacity_scale.set_hexpand(true);
-        content.append(&self.settings_row("Opacity", &opacity_scale));
+        opacity_row.add_suffix(&opacity_scale);
+        group.add(&opacity_row);
 
         // --- Scrollback ---
         let scrollback_adj = Adjustment::new(
             config.terminal_scrollback_lines as f64,
             0.0, 1_000_000.0, 100.0, 1000.0, 0.0,
         );
-        let scrollback_spin = SpinButton::new(Some(&scrollback_adj), 100.0, 0);
-        content.append(&self.settings_row("Scrollback", &scrollback_spin));
+        let scrollback_row = adw::SpinRow::new(Some(&scrollback_adj), 100.0, 0);
+        scrollback_row.set_title("Scrollback Lines");
+        group.add(&scrollback_row);
 
-        drop(config); // release borrow before connecting signals
+        page.add(&group);
+        dialog.add(&page);
+
+        drop(config);
 
         // --- Signal: Theme ---
         let ui = self.clone();
         let themes = self.available_themes.clone();
-        theme_dropdown.connect_notify_local(Some("selected"), move |dropdown, _| {
-            let idx = dropdown.selected() as usize;
+        theme_row.connect_notify_local(Some("selected"), move |row, _| {
+            let idx = row.selected() as usize;
             if let Some(theme) = themes.get(idx) {
                 ui.apply_theme(theme);
                 save_config(&ui.config.borrow());
@@ -1336,11 +1333,11 @@ impl UiState {
         // --- Signal: Font ---
         let ui = self.clone();
         let mono_fonts_clone = mono_fonts.clone();
-        let font_size_spin_clone = font_size_spin.clone();
-        font_dropdown.connect_notify_local(Some("selected"), move |dropdown, _| {
-            let idx = dropdown.selected() as usize;
+        let font_size_row_clone = font_size_row.clone();
+        font_row.connect_notify_local(Some("selected"), move |row, _| {
+            let idx = row.selected() as usize;
             if let Some(family) = mono_fonts_clone.get(idx) {
-                let size = font_size_spin_clone.value() as i32;
+                let size = font_size_row_clone.value() as i32;
                 let new_desc = format!("{} {}", family, size);
                 ui.config.borrow_mut().font_desc = new_desc;
                 ui.apply_font_all();
@@ -1351,13 +1348,13 @@ impl UiState {
         // --- Signal: Font Size ---
         let ui = self.clone();
         let mono_fonts_clone2 = mono_fonts;
-        let font_dropdown_clone = font_dropdown.clone();
-        font_size_spin.connect_value_changed(move |spin| {
-            let idx = font_dropdown_clone.selected() as usize;
+        let font_row_clone = font_row.clone();
+        font_size_row.connect_notify_local(Some("value"), move |row, _| {
+            let idx = font_row_clone.selected() as usize;
             let family = mono_fonts_clone2.get(idx)
                 .map(|s| s.as_str())
                 .unwrap_or("Monospace");
-            let size = spin.value() as i32;
+            let size = row.value() as i32;
             let new_desc = format!("{} {}", family, size);
             ui.config.borrow_mut().font_desc = new_desc;
             ui.apply_font_all();
@@ -1366,8 +1363,8 @@ impl UiState {
 
         // --- Signal: Font Scale ---
         let ui = self.clone();
-        font_scale_spin.connect_value_changed(move |spin| {
-            let new_scale = spin.value();
+        font_scale_row.connect_notify_local(Some("value"), move |row, _| {
+            let new_scale = row.value();
             ui.set_font_scale_all(new_scale);
             ui.config.borrow_mut().default_font_scale = new_scale;
             save_config(&ui.config.borrow());
@@ -1385,24 +1382,23 @@ impl UiState {
 
         // --- Signal: Scrollback ---
         let ui = self.clone();
-        scrollback_spin.connect_value_changed(move |spin| {
-            let val = spin.value() as u32;
+        scrollback_row.connect_notify_local(Some("value"), move |row, _| {
+            let val = row.value() as u32;
             ui.config.borrow_mut().terminal_scrollback_lines = val;
             ui.apply_scrollback_all();
             save_config(&ui.config.borrow());
         });
 
-        // Key controller: Escape / Ctrl+Shift+O to close
+        // Key controller: Ctrl+Shift+O to close
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_ref = self.settings_dialog.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
-            if keyval == Key::Escape
-                || (matches!(keyval, Key::O | Key::o)
-                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            if matches!(keyval, Key::O | Key::o)
+                && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
             {
                 if let Some(d) = dialog_ref.borrow_mut().take() {
-                    d.destroy();
+                    d.force_close();
                 }
                 return true.into();
             }
@@ -1411,26 +1407,12 @@ impl UiState {
         dialog.add_controller(key_controller);
 
         let dialog_ref = self.settings_dialog.clone();
-        dialog.connect_close_request(move |_| {
+        dialog.connect_closed(move |_| {
             *dialog_ref.borrow_mut() = None;
-            false.into()
         });
 
         *self.settings_dialog.borrow_mut() = Some(dialog.clone());
-        dialog.show();
-    }
-
-    fn settings_row(&self, label_text: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::Box {
-        let row = gtk4::Box::new(Orientation::Horizontal, 12);
-        row.set_margin_top(4);
-        row.set_margin_bottom(4);
-        let label = Label::new(Some(label_text));
-        label.set_xalign(0.0);
-        label.set_width_chars(14);
-        widget.set_hexpand(true);
-        row.append(&label);
-        row.append(widget);
-        row
+        dialog.present(Some(&self.window));
     }
 
     fn create_split_terminal(&self, working_directory: Option<&str>) -> Terminal {
@@ -1645,7 +1627,7 @@ fn main() -> glib::ExitCode {
     // - if bass works, import ~/.bashrc before showing the prompt
     // - otherwise fall back to plain fish, and if fish is missing then bash
 
-    let app = Application::builder().application_id("app.jterm4").build();
+    let app = adw::Application::builder().application_id("app.jterm4").build();
 
     app.connect_activate(|app| {
         let (config, themes) = load_config();
@@ -1656,7 +1638,7 @@ fn main() -> glib::ExitCode {
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
         let config = Rc::new(RefCell::new(config));
         let available_themes = Rc::new(themes);
-        let window = ApplicationWindow::builder()
+        let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(800)
             .default_height(600)
@@ -2014,7 +1996,7 @@ fn main() -> glib::ExitCode {
             app_clone.quit();
         });
 
-        window.set_child(Some(&main_box));
+        window.set_content(Some(&main_box));
         window.show();
 
         // Focus the active terminal after window is shown
