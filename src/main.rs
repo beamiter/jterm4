@@ -90,6 +90,7 @@ struct UiState {
     search_entry: SearchEntry,
     tab_strip: gtk4::Box,
     tab_bar_box: gtk4::Box,
+    tabs_container: gtk4::Box,
     keybindings_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
 }
@@ -935,6 +936,69 @@ impl UiState {
         self.tab_bar_box.set_visible(self.notebook.n_pages() > 1);
     }
 
+    /// Sliding-window tab layout: active tab gets maximum width to show its full
+    /// name; inactive tabs are compressed to a small fixed width; tabs that don't
+    /// fit are hidden entirely.  The visible window is centred on the active tab.
+    fn sync_tab_strip_widths(&self, active_page: Option<u32>) {
+        const INACTIVE_WIDTH: i32 = 72;
+        const ACTIVE_MAX_WIDTH: i32 = 360;
+        const ACTIVE_MIN_WIDTH: i32 = 120;
+        const TAB_SPACING: i32 = 2;
+        // Reserve width for the "+" button
+        const ADD_BTN_RESERVE: i32 = 34;
+
+        let n_tabs = self.notebook.n_pages() as i32;
+        if n_tabs == 0 {
+            return;
+        }
+        let active = active_page.or(self.notebook.current_page()).unwrap_or(0) as i32;
+
+        let avail = self.tabs_container.width() - ADD_BTN_RESERVE;
+        if avail <= 0 {
+            return;
+        }
+
+        // Active tab gets as much room as possible (up to ACTIVE_MAX_WIDTH).
+        let active_width = avail.min(ACTIVE_MAX_WIDTH).max(ACTIVE_MIN_WIDTH);
+        let remaining = (avail - active_width - TAB_SPACING).max(0);
+
+        // How many inactive tabs can we fit alongside the active tab?
+        let slot = INACTIVE_WIDTH + TAB_SPACING;
+        let max_inactive = if slot > 0 { remaining / slot } else { 0 };
+
+        // Distribute visible slots: try equal on each side of active, then
+        // overflow to the other side.
+        let left_avail = active;
+        let right_avail = n_tabs - 1 - active;
+
+        let half = max_inactive / 2;
+        let mut left_count = half.min(left_avail);
+        let right_count = (max_inactive - left_count).min(right_avail);
+        // Re-distribute leftover slots to the other side
+        left_count = (max_inactive - right_count).min(left_avail);
+
+        let vis_start = active - left_count;
+        let vis_end = active + right_count; // inclusive
+
+        // Apply: show/hide and set widths
+        let mut idx = 0i32;
+        let mut child = self.tab_strip.first_child();
+        while let Some(c) = child {
+            if idx >= vis_start && idx <= vis_end {
+                c.set_visible(true);
+                if idx == active {
+                    c.set_size_request(active_width, -1);
+                } else {
+                    c.set_size_request(INACTIVE_WIDTH, -1);
+                }
+            } else {
+                c.set_visible(false);
+            }
+            idx += 1;
+            child = c.next_sibling();
+        }
+    }
+
     /// Remove the tab strip button that corresponds to a notebook page widget.
     fn remove_strip_button_for(&self, widget: &gtk4::Widget) {
         let name = widget.widget_name();
@@ -968,6 +1032,7 @@ impl UiState {
         } else {
             self.sync_tab_strip_active(None);
             self.sync_tab_bar_visibility();
+            self.sync_tab_strip_widths(None);
             self.focus_current_terminal();
         }
     }
@@ -1121,6 +1186,7 @@ impl UiState {
             } else {
                 self.sync_tab_strip_active(None);
                 self.sync_tab_bar_visibility();
+                self.sync_tab_strip_widths(None);
                 self.focus_current_terminal();
             }
         }
@@ -1702,8 +1768,8 @@ impl UiState {
         // Create tab strip toggle button
         let strip_label = Label::new(Some(&label_text));
         strip_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        strip_label.set_width_chars(12);
-        strip_label.set_max_width_chars(24);
+        strip_label.set_hexpand(true);
+        strip_label.set_xalign(0.0);
         *strip_btn_label.borrow_mut() = Some(strip_label.clone());
 
         let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -1716,7 +1782,7 @@ impl UiState {
         strip_close_btn.set_tooltip_text(Some("Close tab"));
         strip_close_btn.set_focus_on_click(false);
         strip_close_btn.set_can_focus(false);
-        strip_close_btn.set_visible(false);
+        strip_close_btn.set_opacity(0.0);
         strip_box.append(&strip_close_btn);
 
         let strip_btn = ToggleButton::new();
@@ -1732,11 +1798,11 @@ impl UiState {
         let hover_ctrl = gtk4::EventControllerMotion::new();
         let close_for_enter = strip_close_btn.clone();
         hover_ctrl.connect_enter(move |_, _, _| {
-            close_for_enter.set_visible(true);
+            close_for_enter.set_opacity(1.0);
         });
         let close_for_leave = strip_close_btn.clone();
         hover_ctrl.connect_leave(move |_| {
-            close_for_leave.set_visible(false);
+            close_for_leave.set_opacity(0.0);
         });
         strip_btn.add_controller(hover_ctrl);
         // Give button a unique name to correlate with notebook page
@@ -1891,6 +1957,7 @@ impl UiState {
         // Deactivate all other strip buttons
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
+        self.sync_tab_strip_widths(Some(page_num));
 
         // Focus the new terminal
         terminal.grab_focus();
@@ -1982,7 +2049,7 @@ fn main() -> glib::ExitCode {
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
-            ".tab-strip-btn { padding: 2px 4px 2px 8px; border-radius: 4px; }
+            ".tab-strip-btn { padding: 2px 4px 2px 8px; border-radius: 4px; overflow: hidden; }
              .tab-strip-btn:checked { font-weight: bold; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .tab-bar-box { padding: 2px 4px; }
@@ -2009,15 +2076,9 @@ fn main() -> glib::ExitCode {
 
         // Inner box: [tab buttons...] [+] — keeps "+" adjacent to the last tab
         let tabs_and_add = gtk4::Box::new(Orientation::Horizontal, 2);
+        tabs_and_add.set_hexpand(true);
         tabs_and_add.append(&tab_strip);
         tabs_and_add.append(&add_tab_button);
-
-        let scrolled_tabs = ScrolledWindow::builder()
-            .hexpand(true)
-            .hscrollbar_policy(gtk4::PolicyType::Automatic)
-            .vscrollbar_policy(gtk4::PolicyType::Never)
-            .child(&tabs_and_add)
-            .build();
 
         let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_window_button.set_focus_on_click(false);
@@ -2028,7 +2089,7 @@ fn main() -> glib::ExitCode {
 
         let tab_bar_box = gtk4::Box::new(Orientation::Horizontal, 4);
         tab_bar_box.add_css_class("tab-bar-box");
-        tab_bar_box.append(&scrolled_tabs);
+        tab_bar_box.append(&tabs_and_add);
         tab_bar_box.append(&close_window_button);
 
         // Main layout: tab bar + notebook + search bar
@@ -2054,6 +2115,7 @@ fn main() -> glib::ExitCode {
             search_entry: search_entry.clone(),
             tab_strip: tab_strip.clone(),
             tab_bar_box: tab_bar_box.clone(),
+            tabs_container: tabs_and_add.clone(),
             keybindings_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
         });
@@ -2347,6 +2409,13 @@ fn main() -> glib::ExitCode {
                 term.grab_focus();
             }
             ui_for_switch.sync_tab_strip_active(Some(page_num));
+            ui_for_switch.sync_tab_strip_widths(Some(page_num));
+        });
+
+        // Recalculate tab widths when the window is resized
+        let ui_for_resize = ui.clone();
+        window.connect_notify_local(Some("default-width"), move |_, _| {
+            ui_for_resize.sync_tab_strip_widths(None);
         });
 
         window.add_controller(key_controller);
@@ -2368,6 +2437,12 @@ fn main() -> glib::ExitCode {
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();
+
+        // Initial tab width sync (deferred so GTK has allocated sizes)
+        let ui_for_init = ui.clone();
+        glib::idle_add_local_once(move || {
+            ui_for_init.sync_tab_strip_widths(None);
+        });
     });
 
     app.run()
