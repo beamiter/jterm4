@@ -907,6 +907,32 @@ fn create_terminal(config: &Config) -> Terminal {
     terminal
 }
 
+/// Wrap a terminal in an hbox with a scrollbar on the right side.
+fn wrap_with_scrollbar(terminal: &Terminal) -> gtk4::Box {
+    let hbox = gtk4::Box::new(Orientation::Horizontal, 0);
+    hbox.set_hexpand(true);
+    hbox.set_vexpand(true);
+    hbox.add_css_class("terminal-box");
+    let scrollbar = gtk4::Scrollbar::new(
+        Orientation::Vertical,
+        terminal.vadjustment().as_ref(),
+    );
+    hbox.append(terminal);
+    hbox.append(&scrollbar);
+    hbox
+}
+
+/// If the widget is a terminal inside a scrollbar wrapper box, return the wrapper box.
+fn scrollbar_wrapper_of(term_widget: &gtk4::Widget) -> Option<gtk4::Box> {
+    let parent = term_widget.parent()?;
+    let bx = parent.clone().downcast::<gtk4::Box>().ok()?;
+    if bx.has_css_class("terminal-box") {
+        Some(bx)
+    } else {
+        None
+    }
+}
+
 fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
     // Prefer OSC 7 reported directory
     if let Some(uri) = terminal.current_directory_uri() {
@@ -1313,6 +1339,17 @@ fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         return Some(term);
     }
+    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
+        if bx.has_css_class("terminal-box") {
+            let mut child = bx.first_child();
+            while let Some(c) = child {
+                if let Some(term) = find_first_terminal(&c) {
+                    return Some(term);
+                }
+                child = c.next_sibling();
+            }
+        }
+    }
     if let Ok(paned) = widget.clone().downcast::<Paned>() {
         if let Some(child) = paned.start_child() {
             if let Some(term) = find_first_terminal(&child) {
@@ -1333,6 +1370,17 @@ fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         if term.has_focus() {
             return Some(term);
+        }
+    }
+    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
+        if bx.has_css_class("terminal-box") {
+            let mut child = bx.first_child();
+            while let Some(c) = child {
+                if let Some(term) = find_focused_terminal(&c) {
+                    return Some(term);
+                }
+                child = c.next_sibling();
+            }
         }
     }
     if let Ok(paned) = widget.clone().downcast::<Paned>() {
@@ -1356,6 +1404,16 @@ fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
         out.push(term);
         return;
     }
+    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
+        if bx.has_css_class("terminal-box") {
+            let mut child = bx.first_child();
+            while let Some(c) = child {
+                collect_terminals(&c, out);
+                child = c.next_sibling();
+            }
+            return;
+        }
+    }
     if let Ok(paned) = widget.clone().downcast::<Paned>() {
         if let Some(child) = paned.start_child() {
             collect_terminals(&child, out);
@@ -1367,23 +1425,23 @@ fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
 }
 
 /// Walk the Paned tree and reattach a terminal to the first None child slot found.
-fn reattach_terminal_to_tree(widget: &gtk4::Widget, terminal: &Terminal) -> bool {
+fn reattach_terminal_to_tree(widget: &gtk4::Widget, child_to_reattach: &gtk4::Widget) -> bool {
     if let Ok(paned) = widget.clone().downcast::<Paned>() {
         if paned.start_child().is_none() {
-            paned.set_start_child(Some(terminal));
+            paned.set_start_child(Some(child_to_reattach));
             return true;
         }
         if paned.end_child().is_none() {
-            paned.set_end_child(Some(terminal));
+            paned.set_end_child(Some(child_to_reattach));
             return true;
         }
         if let Some(start) = paned.start_child() {
-            if reattach_terminal_to_tree(&start, terminal) {
+            if reattach_terminal_to_tree(&start, child_to_reattach) {
                 return true;
             }
         }
         if let Some(end) = paned.end_child() {
-            if reattach_terminal_to_tree(&end, terminal) {
+            if reattach_terminal_to_tree(&end, child_to_reattach) {
                 return true;
             }
         }
@@ -1673,14 +1731,20 @@ impl UiState {
             }
         }
 
-        let Some(parent) = term_widget.parent() else {
+        // The terminal may be wrapped in a scrollbar Box. The "effective widget"
+        // is the wrapper Box if present, otherwise the terminal itself.
+        let effective_widget = scrollbar_wrapper_of(term_widget)
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| term_widget.clone());
+
+        let Some(parent) = effective_widget.parent() else {
             return;
         };
 
         if let Ok(paned) = parent.clone().downcast::<Paned>() {
             let start = paned.start_child();
             let end = paned.end_child();
-            let sibling = if start.as_ref() == Some(term_widget) {
+            let sibling = if start.as_ref() == Some(&effective_widget) {
                 end
             } else {
                 start
@@ -1725,7 +1789,7 @@ impl UiState {
                 }
             }
         } else {
-            self.remove_tab_by_widget(term_widget);
+            self.remove_tab_by_widget(&effective_widget);
         }
     }
 
@@ -2283,10 +2347,15 @@ impl UiState {
         };
         let working_directory = terminal_working_directory(&current_term);
 
-        let current_widget = current_term.clone().upcast::<gtk4::Widget>();
+        // The effective widget in the Paned/notebook tree is the scrollbar wrapper
+        // (if present) rather than the bare terminal.
+        let current_widget = scrollbar_wrapper_of(&current_term.clone().upcast::<gtk4::Widget>())
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| current_term.clone().upcast::<gtk4::Widget>());
         let parent = current_widget.parent();
 
         let new_term = self.create_split_terminal(working_directory.as_deref());
+        let new_widget = wrap_with_scrollbar(&new_term);
 
         let paned = Paned::new(orientation);
         paned.set_hexpand(true);
@@ -2301,8 +2370,8 @@ impl UiState {
                 } else {
                     parent_paned.set_end_child(Some(&paned));
                 }
-                paned.set_start_child(Some(&current_term));
-                paned.set_end_child(Some(&new_term));
+                paned.set_start_child(Some(&current_widget));
+                paned.set_end_child(Some(&new_widget));
             } else {
                 // Parent is the notebook - replace the page
                 for i in 0..self.notebook.n_pages() {
@@ -2312,8 +2381,8 @@ impl UiState {
                             paned.set_widget_name(&page_widget.widget_name());
                             let tab_label = self.notebook.tab_label(&page_widget);
                             self.notebook.remove_page(Some(i));
-                            paned.set_start_child(Some(&current_term));
-                            paned.set_end_child(Some(&new_term));
+                            paned.set_start_child(Some(&current_widget));
+                            paned.set_end_child(Some(&new_widget));
                             let new_page_num = self.notebook.insert_page(
                                 &paned,
                                 tab_label.as_ref(),
@@ -2434,14 +2503,17 @@ impl UiState {
         if page_widget.clone().downcast::<Paned>().is_err() { return; }
 
         let Some(term) = find_focused_terminal(&page_widget) else { return };
-        let term_widget = term.clone().upcast::<gtk4::Widget>();
-        let Some(parent) = term_widget.parent() else { return };
+        // The effective widget (wrapper box or bare terminal) is what sits in the Paned.
+        let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
+        let Some(parent) = eff_widget.parent() else { return };
         let Ok(parent_paned) = parent.downcast::<Paned>() else { return };
 
         let tab_label = self.notebook.tab_label(&page_widget);
 
         // Detach terminal from its parent paned (leave None slot for reattach)
-        if parent_paned.start_child().as_ref() == Some(&term_widget) {
+        if parent_paned.start_child().as_ref() == Some(&eff_widget) {
             parent_paned.set_start_child(None::<&gtk4::Widget>);
         } else {
             parent_paned.set_end_child(None::<&gtk4::Widget>);
@@ -2450,14 +2522,14 @@ impl UiState {
         let widget_name = page_widget.widget_name().to_string();
         self.notebook.remove_page(Some(page_num));
 
-        // Add terminal as a standalone page
-        term.set_widget_name(&widget_name);
+        // Add terminal (with scrollbar wrapper) as a standalone page
+        eff_widget.set_widget_name(&widget_name);
         let new_page = self.notebook.insert_page(
-            &term,
+            &eff_widget,
             tab_label.as_ref(),
             Some(page_num),
         );
-        self.notebook.set_tab_reorderable(&term, true);
+        self.notebook.set_tab_reorderable(&eff_widget, true);
         self.notebook.set_current_page(Some(new_page));
         self.sync_tab_strip_active(Some(new_page));
         term.grab_focus();
@@ -2476,11 +2548,14 @@ impl UiState {
         // Remove the zoomed terminal's standalone page
         self.notebook.remove_page(Some(page_num));
 
-        // Re-attach terminal to its position in the Paned tree
-        reattach_terminal_to_tree(&state.original_page, &state.zoomed_terminal);
+        // Re-attach the effective widget (wrapper box or terminal) to the Paned tree
+        let eff_widget = scrollbar_wrapper_of(&state.zoomed_terminal.clone().upcast::<gtk4::Widget>())
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| state.zoomed_terminal.clone().upcast::<gtk4::Widget>());
+        reattach_terminal_to_tree(&state.original_page, &eff_widget);
 
         // Re-add the original Paned tree as the page
-        let widget_name = state.zoomed_terminal.widget_name().to_string();
+        let widget_name = eff_widget.widget_name().to_string();
         state.original_page.set_widget_name(&widget_name);
         let new_page = self.notebook.insert_page(
             &state.original_page,
@@ -2501,13 +2576,15 @@ impl UiState {
         if page_widget.clone().downcast::<Paned>().is_err() { return; }
 
         let Some(term) = find_focused_terminal(&page_widget) else { return };
-        let term_widget = term.clone().upcast::<gtk4::Widget>();
-        let Some(parent) = term_widget.parent() else { return };
+        let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
+        let Some(parent) = eff_widget.parent() else { return };
         let Ok(paned) = parent.clone().downcast::<Paned>() else { return };
 
         let start = paned.start_child();
         let end = paned.end_child();
-        let sibling = if start.as_ref() == Some(&term_widget) {
+        let sibling = if start.as_ref() == Some(&eff_widget) {
             end
         } else {
             start
@@ -2565,13 +2642,16 @@ impl UiState {
 
         let tab_name = default_tab_title(tab_num, working_directory.as_deref());
 
-        let terminal_widget = terminal.clone().upcast::<gtk4::Widget>();
-        terminal_widget.set_widget_name(&format!("tab-{tab_num}"));
+        // Use existing scrollbar wrapper if present, otherwise create one
+        let page_widget: gtk4::Widget = scrollbar_wrapper_of(&terminal.clone().upcast::<gtk4::Widget>())
+            .map(|bx| bx.upcast::<gtk4::Widget>())
+            .unwrap_or_else(|| wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>());
+        page_widget.set_widget_name(&format!("tab-{tab_num}"));
 
         // Notebook label
         let label = Label::new(Some(&tab_name));
-        let page_num = self.notebook.append_page(&terminal, Some(&label));
-        self.notebook.set_tab_reorderable(&terminal, true);
+        let page_num = self.notebook.append_page(&page_widget, Some(&label));
+        self.notebook.set_tab_reorderable(&page_widget, true);
 
         // Tab strip button
         let btn = ToggleButton::builder()
@@ -2691,20 +2771,23 @@ impl UiState {
         tab_box.append(&label);
         tab_box.append(&close_button);
 
+        // Wrap terminal with scrollbar
+        let term_wrapper = wrap_with_scrollbar(&terminal);
+
         let ui_for_close = UiState::clone(self);
-        let terminal_widget_for_close = terminal.clone().upcast::<gtk4::Widget>();
+        let wrapper_for_close = term_wrapper.clone().upcast::<gtk4::Widget>();
         close_button.connect_clicked(move |_| {
-            ui_for_close.remove_tab_by_widget(&terminal_widget_for_close);
+            ui_for_close.remove_tab_by_widget(&wrapper_for_close);
         });
 
         // Add to notebook right after the current tab when possible.
         let page_num = if let Some(current_page) = self.notebook.current_page() {
             self.notebook
-                .insert_page(&terminal, Some(&tab_box), Some(current_page + 1))
+                .insert_page(&term_wrapper, Some(&tab_box), Some(current_page + 1))
         } else {
-            self.notebook.append_page(&terminal, Some(&tab_box))
+            self.notebook.append_page(&term_wrapper, Some(&tab_box))
         };
-        self.notebook.set_tab_reorderable(&terminal, true);
+        self.notebook.set_tab_reorderable(&term_wrapper, true);
         self.notebook.set_current_page(Some(page_num));
         // Force tabs hidden — GTK may re-show them after page insertion
         self.notebook.set_show_tabs(false);
@@ -2747,8 +2830,8 @@ impl UiState {
         strip_btn.add_controller(hover_ctrl);
         // Give button a unique name to correlate with notebook page
         strip_btn.set_widget_name(&format!("tab-{}", tab_num));
-        // Also name the terminal widget so we can find the button when removing
-        terminal.set_widget_name(&format!("tab-{}", tab_num));
+        // Also name the wrapper widget so we can find the button when removing
+        term_wrapper.set_widget_name(&format!("tab-{}", tab_num));
 
         // Double-click to rename on strip button too
         let rename_click_strip = GestureClick::new();
@@ -2773,10 +2856,10 @@ impl UiState {
         // so the parent ToggleButton does not intercept it.
         let close_gesture = GestureClick::new();
         let ui_for_strip_close = self.clone();
-        let terminal_widget_for_strip_close = terminal.clone().upcast::<gtk4::Widget>();
+        let wrapper_for_strip_close = term_wrapper.clone().upcast::<gtk4::Widget>();
         close_gesture.connect_released(move |gesture, _, _, _| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
-            ui_for_strip_close.remove_tab_by_widget(&terminal_widget_for_strip_close);
+            ui_for_strip_close.remove_tab_by_widget(&wrapper_for_strip_close);
         });
         strip_close_icon.add_controller(close_gesture);
 
@@ -2998,7 +3081,10 @@ fn main() -> glib::ExitCode {
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .tab-bar-box { padding: 2px 4px; }
              .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
-             .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }",
+             .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }
+             .terminal-box scrollbar { opacity: 0.3; }
+             .terminal-box scrollbar:hover { opacity: 0.8; }
+             .terminal-box scrollbar slider { min-width: 6px; }",
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
