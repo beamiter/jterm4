@@ -8,10 +8,10 @@ use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
-use gtk4::{glib, Application, ApplicationWindow, Dialog, Entry, Label, Notebook, Orientation, Paned, ResponseType};
+use gtk4::{glib, Application, ApplicationWindow, Dialog, Entry, Label, ListBox, Notebook, Orientation, Paned, ResponseType, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchBar, SearchEntry};
 use log::{LevelFilter, Log, Metadata, Record};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -84,6 +84,7 @@ struct UiState {
     config: Rc<Config>,
     search_bar: SearchBar,
     search_entry: SearchEntry,
+    keybindings_dialog: Rc<RefCell<Option<Dialog>>>,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -889,6 +890,140 @@ impl UiState {
         }
     }
 
+    fn toggle_keybindings_panel(&self) {
+        // If dialog already open, close it
+        if let Some(dialog) = self.keybindings_dialog.borrow_mut().take() {
+            dialog.destroy();
+            return;
+        }
+
+        const KEYBINDINGS: &[(&str, &str)] = &[
+            ("Ctrl+Shift+T", "New tab"),
+            ("Ctrl+Shift+W", "Close focused pane or tab"),
+            ("Ctrl+Shift+C", "Copy"),
+            ("Ctrl+Shift+V", "Paste"),
+            ("Ctrl+Shift++", "Font size increase"),
+            ("Ctrl+Shift+I", "Font size decrease"),
+            ("Ctrl+Shift+J", "Opacity decrease"),
+            ("Ctrl+Shift+K", "Opacity increase"),
+            ("Ctrl+Shift+F", "Toggle search"),
+            ("Ctrl+Shift+P", "Toggle keybindings panel"),
+            ("Ctrl+Shift+E", "Split horizontal"),
+            ("Ctrl+Shift+D", "Split vertical"),
+            ("Ctrl+Shift+PageUp", "Previous tab"),
+            ("Ctrl+Shift+PageDown", "Next tab"),
+            ("Ctrl+Shift+Tab", "Previous tab"),
+            ("Ctrl+W", "Close tab"),
+            ("Ctrl+Tab", "Next tab"),
+            ("Ctrl+Up", "Scroll up"),
+            ("Ctrl+Down", "Scroll down"),
+            ("Ctrl+-", "Font size decrease"),
+            ("Ctrl+PageUp", "Previous tab"),
+            ("Ctrl+PageDown", "Next tab"),
+            ("Ctrl+0~9", "Quick switch to tab N"),
+            ("Alt+Tab", "Cycle pane focus forward"),
+            ("Alt+Shift+Tab", "Cycle pane focus backward"),
+            ("Double-click tab", "Rename tab"),
+            ("Ctrl+Click link", "Open hyperlink"),
+        ];
+
+        let dialog = Dialog::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Keybindings")
+            .default_width(480)
+            .default_height(420)
+            .build();
+
+        let content = dialog.content_area();
+        content.set_spacing(8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+
+        let filter_entry = SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Search keybindings..."));
+        filter_entry.set_hexpand(true);
+        content.append(&filter_entry);
+
+        let list_box = ListBox::new();
+        list_box.set_selection_mode(gtk4::SelectionMode::None);
+        list_box.add_css_class("boxed-list");
+
+        for &(shortcut, description) in KEYBINDINGS {
+            let row_box = gtk4::Box::new(Orientation::Horizontal, 12);
+            row_box.set_margin_start(8);
+            row_box.set_margin_end(8);
+            row_box.set_margin_top(6);
+            row_box.set_margin_bottom(6);
+
+            let key_label = Label::new(Some(shortcut));
+            key_label.set_xalign(0.0);
+            key_label.set_width_chars(24);
+            key_label.add_css_class("dim-label");
+
+            let desc_label = Label::new(Some(description));
+            desc_label.set_xalign(0.0);
+            desc_label.set_hexpand(true);
+
+            row_box.append(&key_label);
+            row_box.append(&desc_label);
+            list_box.append(&row_box);
+        }
+
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .min_content_height(300)
+            .child(&list_box)
+            .build();
+        content.append(&scrolled);
+
+        // Filter rows based on search text
+        let list_box_clone = list_box.clone();
+        filter_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string().to_lowercase();
+            let mut idx = 0;
+            while let Some(row) = list_box_clone.row_at_index(idx) {
+                if query.is_empty() {
+                    row.set_visible(true);
+                } else {
+                    let shortcut = KEYBINDINGS[idx as usize].0.to_lowercase();
+                    let desc = KEYBINDINGS[idx as usize].1.to_lowercase();
+                    row.set_visible(shortcut.contains(&query) || desc.contains(&query));
+                }
+                idx += 1;
+            }
+        });
+
+        // Escape to close (Capture phase so it works even when SearchEntry has focus)
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref_for_esc = self.keybindings_dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == Key::Escape {
+                if let Some(d) = dialog_ref_for_esc.borrow_mut().take() {
+                    d.destroy();
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        // Clear tracking when dialog is closed via window manager
+        let dialog_ref = self.keybindings_dialog.clone();
+        dialog.connect_close_request(move |_| {
+            *dialog_ref.borrow_mut() = None;
+            false.into()
+        });
+
+        *self.keybindings_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.show();
+        filter_entry.grab_focus();
+    }
+
     fn create_split_terminal(&self, working_directory: Option<&str>) -> Terminal {
         let terminal = create_terminal(&self.config, self.font_scale.get());
         setup_terminal_click_handler(&terminal);
@@ -1175,6 +1310,7 @@ fn main() -> glib::ExitCode {
             config: config.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
+            keybindings_dialog: Rc::new(RefCell::new(None)),
         });
 
         // Restore tabs from last session snapshot (and delete it immediately).
@@ -1280,6 +1416,11 @@ fn main() -> glib::ExitCode {
                     Key::F | Key::f => {
                         log::debug!("Toggle search");
                         ui_clone.toggle_search();
+                        return true.into();
+                    }
+                    Key::P | Key::p => {
+                        log::debug!("Toggle keybindings panel");
+                        ui_clone.toggle_keybindings_panel();
                         return true.into();
                     }
                     Key::E | Key::e => {
