@@ -89,6 +89,7 @@ struct UiState {
     search_bar: SearchBar,
     search_entry: SearchEntry,
     tab_strip: gtk4::Box,
+    tab_bar_box: gtk4::Box,
     keybindings_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
 }
@@ -913,6 +914,11 @@ impl UiState {
         }
     }
 
+    /// Hide tab bar when only one tab exists (zen mode).
+    fn sync_tab_bar_visibility(&self) {
+        self.tab_bar_box.set_visible(self.notebook.n_pages() > 1);
+    }
+
     /// Remove the tab strip button that corresponds to a notebook page widget.
     fn remove_strip_button_for(&self, widget: &gtk4::Widget) {
         let name = widget.widget_name();
@@ -945,6 +951,7 @@ impl UiState {
             self.window.destroy();
         } else {
             self.sync_tab_strip_active(None);
+            self.sync_tab_bar_visibility();
             self.focus_current_terminal();
         }
     }
@@ -1097,6 +1104,7 @@ impl UiState {
                 self.window.destroy();
             } else {
                 self.sync_tab_strip_active(None);
+                self.sync_tab_bar_visibility();
                 self.focus_current_terminal();
             }
         }
@@ -1749,6 +1757,7 @@ impl UiState {
 
         // Deactivate all other strip buttons
         self.sync_tab_strip_active(Some(page_num));
+        self.sync_tab_bar_visibility();
 
         // Focus the new terminal
         terminal.grab_focus();
@@ -1910,6 +1919,7 @@ fn main() -> glib::ExitCode {
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
             tab_strip: tab_strip.clone(),
+            tab_bar_box: tab_bar_box.clone(),
             keybindings_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
         });
