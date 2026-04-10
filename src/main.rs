@@ -457,11 +457,18 @@ fn create_terminal(config: &Config) -> Terminal {
 }
 
 fn terminal_working_directory(terminal: &Terminal) -> Option<String> {
-    let uri = terminal.current_directory_uri()?;
-    let file = gio::File::for_uri(uri.as_str());
-    file.path()
+    // Prefer OSC 7 reported directory
+    if let Some(uri) = terminal.current_directory_uri() {
+        let file = gio::File::for_uri(uri.as_str());
+        if let Some(path) = file.path().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()) {
+            return Some(path);
+        }
+    }
+    // Fallback: read /proc/<pid>/cwd
+    let pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
         .map(|p| p.to_string_lossy().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn tabs_state_file_path() -> PathBuf {
@@ -636,6 +643,7 @@ fn spawn_shell(terminal: &Terminal, argv_owned: &[String], working_directory: Op
     let cancellable: Option<&Cancellable> = None;
     let home = std::env::var("HOME").ok();
     let working_directory = working_directory.or(home.as_deref());
+    let terminal_for_pid = terminal.clone();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         working_directory,
@@ -645,7 +653,15 @@ fn spawn_shell(terminal: &Terminal, argv_owned: &[String], working_directory: Op
         || {},
         -1,
         cancellable,
-        |res| log::debug!("spawn_async: {res:?}"),
+        move |res| {
+            log::debug!("spawn_async: {res:?}");
+            if let Ok(pid) = res {
+                let pid_i32: i32 = pid.into_glib();
+                unsafe {
+                    terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+                }
+            }
+        },
     );
 }
 
@@ -1739,6 +1755,91 @@ impl UiState {
             notebook_for_strip.set_current_page(Some(idx));
         });
 
+        // Drag source: carry the widget name so we can identify the dragged button
+        let drag_source = gtk4::DragSource::new();
+        drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+        let strip_btn_for_drag = strip_btn.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            let name = strip_btn_for_drag.widget_name().to_string();
+            Some(gtk4::gdk::ContentProvider::for_value(&name.to_value()))
+        });
+        strip_btn.add_controller(drag_source);
+
+        // Drop target: reorder strip buttons and notebook pages
+        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+        let tab_strip_for_drop = self.tab_strip.clone();
+        let notebook_for_drop = self.notebook.clone();
+        let strip_btn_for_drop = strip_btn.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Ok(drag_name) = value.get::<String>() else { return false };
+            let target_name = strip_btn_for_drop.widget_name().to_string();
+            if drag_name == target_name {
+                return false; // dropped on itself
+            }
+
+            // Find source and target indices in the strip
+            let mut src_idx: Option<u32> = None;
+            let mut dst_idx: Option<u32> = None;
+            let mut src_widget: Option<gtk4::Widget> = None;
+            let mut idx = 0u32;
+            let mut child = tab_strip_for_drop.first_child();
+            while let Some(ref c) = child {
+                if c.widget_name().as_str() == drag_name {
+                    src_idx = Some(idx);
+                    src_widget = Some(c.clone());
+                }
+                if c.widget_name().as_str() == target_name {
+                    dst_idx = Some(idx);
+                }
+                idx += 1;
+                child = c.next_sibling();
+            }
+
+            let (Some(src), Some(dst), Some(src_w)) = (src_idx, dst_idx, src_widget) else {
+                return false;
+            };
+
+            // Reorder strip button: move src before/after dst
+            // Find the target widget again for insert_after/insert_before
+            let mut target_w: Option<gtk4::Widget> = None;
+            let mut child = tab_strip_for_drop.first_child();
+            while let Some(ref c) = child {
+                if c.widget_name().as_str() == target_name {
+                    target_w = Some(c.clone());
+                    break;
+                }
+                child = c.next_sibling();
+            }
+            let Some(target_w) = target_w else { return false };
+
+            if src < dst {
+                src_w.insert_after(&tab_strip_for_drop, Some(&target_w));
+            } else {
+                src_w.insert_before(&tab_strip_for_drop, Some(&target_w));
+            }
+
+            // Reorder notebook page to match
+            if let Some(page_widget) = notebook_for_drop.nth_page(Some(src)) {
+                notebook_for_drop.reorder_child(&page_widget, Some(dst));
+            }
+
+            // Sync active indicator
+            if let Some(current) = notebook_for_drop.current_page() {
+                let mut child = tab_strip_for_drop.first_child();
+                let mut i = 0u32;
+                while let Some(c) = child {
+                    if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+                        btn.set_active(i == current);
+                    }
+                    i += 1;
+                    child = c.next_sibling();
+                }
+            }
+
+            true
+        });
+        strip_btn.add_controller(drop_target);
+
         // Insert strip button at the correct position
         if page_num as i32 >= self.tab_strip.observe_children().n_items() as i32 {
             self.tab_strip.append(&strip_btn);
@@ -1924,10 +2025,14 @@ fn main() -> glib::ExitCode {
             settings_dialog: Rc::new(RefCell::new(None)),
         });
 
-        // Wire "+" button
+        // Wire "+" button — inherit working directory from current session
         let ui_for_add = ui.clone();
         add_tab_button.connect_clicked(move |_| {
-            ui_for_add.add_new_tab(None, None);
+            let working_directory = ui_for_add
+                .current_terminal()
+                .as_ref()
+                .and_then(terminal_working_directory);
+            ui_for_add.add_new_tab(working_directory, None);
         });
 
         // Wire close-window button
