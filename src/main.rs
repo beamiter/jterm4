@@ -8,14 +8,13 @@ use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
-use gtk4::{glib, Application, ApplicationWindow, Dialog, Entry, Label, ListBox, Notebook, Orientation, Paned, ResponseType, ScrolledWindow};
+use gtk4::{glib, Adjustment, Application, ApplicationWindow, Dialog, DropDown, Entry, Label, ListBox, Notebook, Orientation, Paned, ResponseType, Scale, ScrolledWindow, SpinButton};
 use gtk4::{EventControllerKey, GestureClick, SearchBar, SearchEntry};
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::LazyLock;
 use vte4::Format;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -68,10 +67,12 @@ struct Config {
     terminal_scrollback_lines: u32,
     font_desc: String,
     default_font_scale: f64,
+    theme_name: String,
     foreground: RGBA,
     background: RGBA,
     cursor: RGBA,
     cursor_foreground: RGBA,
+    palette: [RGBA; 16],
 }
 
 #[derive(Clone)]
@@ -80,11 +81,14 @@ struct UiState {
     notebook: Notebook,
     tab_counter: Rc<Cell<u32>>,
     font_scale: Rc<Cell<f64>>,
+    window_opacity: Rc<Cell<f64>>,
     shell_argv: Rc<Vec<String>>,
-    config: Rc<Config>,
+    config: Rc<RefCell<Config>>,
+    available_themes: Rc<Vec<Theme>>,
     search_bar: SearchBar,
     search_entry: SearchEntry,
     keybindings_dialog: Rc<RefCell<Option<Dialog>>>,
+    settings_dialog: Rc<RefCell<Option<Dialog>>>,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -114,6 +118,7 @@ struct FileConfig {
     scrollback: Option<u32>,
     font: Option<String>,
     font_scale: Option<f64>,
+    theme: Option<String>,
     foreground: Option<String>,
     background: Option<String>,
     cursor: Option<String>,
@@ -137,6 +142,7 @@ fn load_file_config() -> FileConfig {
         scrollback: table.get("scrollback").and_then(|v| v.as_integer()).map(|v| v as u32),
         font: table.get("font").and_then(|v| v.as_str()).map(|s| s.to_string()),
         font_scale: table.get("font_scale").and_then(|v| v.as_float()),
+        theme: table.get("theme").and_then(|v| v.as_str()).map(|s| s.to_string()),
         foreground: colors.and_then(|c| c.get("foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         background: colors.and_then(|c| c.get("background")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         cursor: colors.and_then(|c| c.get("cursor")).and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -144,15 +150,18 @@ fn load_file_config() -> FileConfig {
     }
 }
 
-fn load_config() -> Config {
+fn load_config() -> (Config, Vec<Theme>) {
     let fc = load_file_config();
+    let themes = builtin_themes();
 
-    let default_foreground = RGBA::parse("#f8f7e9").unwrap();
-    let default_background = RGBA::parse("#121616").unwrap();
-    let default_cursor = RGBA::parse("#7fb80e").unwrap();
-    let default_cursor_foreground = RGBA::parse("#1b315e").unwrap();
+    // Resolve active theme
+    let theme_name = env_string("JTERM4_THEME")
+        .or(fc.theme)
+        .unwrap_or_else(|| "default".to_string());
+    let theme = themes.iter().find(|t| t.name == theme_name)
+        .unwrap_or(&themes[0]);
 
-    // Priority: env var > config file > default
+    // Priority: env var > config file > theme default
     let window_opacity = env_f64("JTERM4_OPACITY")
         .or(fc.opacity)
         .unwrap_or(0.95)
@@ -170,26 +179,74 @@ fn load_config() -> Config {
 
     let foreground = env_rgba("JTERM4_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
-        .unwrap_or(default_foreground);
+        .unwrap_or(theme.foreground);
     let background = env_rgba("JTERM4_BG")
         .or_else(|| fc.background.as_deref().and_then(|v| RGBA::parse(v).ok()))
-        .unwrap_or(default_background);
+        .unwrap_or(theme.background);
     let cursor = env_rgba("JTERM4_CURSOR")
         .or_else(|| fc.cursor.as_deref().and_then(|v| RGBA::parse(v).ok()))
-        .unwrap_or(default_cursor);
+        .unwrap_or(theme.cursor);
     let cursor_foreground = env_rgba("JTERM4_CURSOR_FG")
         .or_else(|| fc.cursor_foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
-        .unwrap_or(default_cursor_foreground);
+        .unwrap_or(theme.cursor_foreground);
 
-    Config {
+    let config = Config {
         window_opacity,
         terminal_scrollback_lines,
         font_desc,
         default_font_scale,
+        theme_name: theme.name.clone(),
         foreground,
         background,
         cursor,
         cursor_foreground,
+        palette: theme.palette,
+    };
+    (config, themes)
+}
+
+fn rgba_to_hex(c: &RGBA) -> String {
+    format!("#{:02x}{:02x}{:02x}",
+        (c.red() * 255.0) as u8,
+        (c.green() * 255.0) as u8,
+        (c.blue() * 255.0) as u8)
+}
+
+fn save_config(config: &Config) {
+    let path = config_file_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            log::warn!("Failed to create config dir {}: {err}", parent.display());
+            return;
+        }
+    }
+
+    let mut table = toml::Table::new();
+    table.insert("opacity".into(), toml::Value::Float(config.window_opacity));
+    table.insert("scrollback".into(), toml::Value::Integer(config.terminal_scrollback_lines as i64));
+    table.insert("font".into(), toml::Value::String(config.font_desc.clone()));
+    table.insert("font_scale".into(), toml::Value::Float(config.default_font_scale));
+    table.insert("theme".into(), toml::Value::String(config.theme_name.clone()));
+
+    let mut colors = toml::Table::new();
+    colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));
+    colors.insert("background".into(), toml::Value::String(rgba_to_hex(&config.background)));
+    colors.insert("cursor".into(), toml::Value::String(rgba_to_hex(&config.cursor)));
+    colors.insert("cursor_foreground".into(), toml::Value::String(rgba_to_hex(&config.cursor_foreground)));
+    table.insert("colors".into(), toml::Value::Table(colors));
+
+    let content = table.to_string();
+    let tmp_path = path.with_extension("toml.tmp");
+    if let Err(err) = fs::write(&tmp_path, &content) {
+        log::warn!("Failed to write config {}: {err}", tmp_path.display());
+        return;
+    }
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        let _ = fs::remove_file(&path);
+        if let Err(err2) = fs::rename(&tmp_path, &path) {
+            log::warn!("Failed to move config into place: {err} / {err2}");
+            let _ = fs::remove_file(&tmp_path);
+        }
     }
 }
 
@@ -228,26 +285,131 @@ fn choose_shell_argv() -> Vec<String> {
     vec!["sh".to_string()]
 }
 
-static PALETTE: LazyLock<[RGBA; 16]> = LazyLock::new(|| [
-    RGBA::parse("#130c0e").unwrap(),
-    RGBA::parse("#ed1941").unwrap(),
-    RGBA::parse("#45b97c").unwrap(),
-    RGBA::parse("#fdb933").unwrap(),
-    RGBA::parse("#2585a6").unwrap(),
-    RGBA::parse("#ae5039").unwrap(),
-    RGBA::parse("#009ad6").unwrap(),
-    RGBA::parse("#fffef9").unwrap(),
-    RGBA::parse("#7c8577").unwrap(),
-    RGBA::parse("#f05b72").unwrap(),
-    RGBA::parse("#84bf96").unwrap(),
-    RGBA::parse("#ffc20e").unwrap(),
-    RGBA::parse("#7bbfea").unwrap(),
-    RGBA::parse("#f58f98").unwrap(),
-    RGBA::parse("#33a3dc").unwrap(),
-    RGBA::parse("#f6f5ec").unwrap(),
-]);
+#[derive(Clone)]
+struct Theme {
+    name: String,
+    foreground: RGBA,
+    background: RGBA,
+    cursor: RGBA,
+    cursor_foreground: RGBA,
+    palette: [RGBA; 16],
+}
 
-fn create_terminal(config: &Config, font_scale: f64) -> Terminal {
+fn parse_palette(hex: [&str; 16]) -> [RGBA; 16] {
+    hex.map(|s| RGBA::parse(s).unwrap())
+}
+
+fn builtin_themes() -> Vec<Theme> {
+    vec![
+        Theme {
+            name: "default".into(),
+            foreground: RGBA::parse("#f8f7e9").unwrap(),
+            background: RGBA::parse("#121616").unwrap(),
+            cursor: RGBA::parse("#7fb80e").unwrap(),
+            cursor_foreground: RGBA::parse("#1b315e").unwrap(),
+            palette: parse_palette([
+                "#130c0e", "#ed1941", "#45b97c", "#fdb933",
+                "#2585a6", "#ae5039", "#009ad6", "#fffef9",
+                "#7c8577", "#f05b72", "#84bf96", "#ffc20e",
+                "#7bbfea", "#f58f98", "#33a3dc", "#f6f5ec",
+            ]),
+        },
+        Theme {
+            name: "light".into(),
+            foreground: RGBA::parse("#2e3440").unwrap(),
+            background: RGBA::parse("#eceff4").unwrap(),
+            cursor: RGBA::parse("#4c566a").unwrap(),
+            cursor_foreground: RGBA::parse("#eceff4").unwrap(),
+            palette: parse_palette([
+                "#3b4252", "#bf616a", "#a3be8c", "#ebcb8b",
+                "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+                "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b",
+                "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4",
+            ]),
+        },
+        Theme {
+            name: "solarized-dark".into(),
+            foreground: RGBA::parse("#839496").unwrap(),
+            background: RGBA::parse("#002b36").unwrap(),
+            cursor: RGBA::parse("#93a1a1").unwrap(),
+            cursor_foreground: RGBA::parse("#002b36").unwrap(),
+            palette: parse_palette([
+                "#073642", "#dc322f", "#859900", "#b58900",
+                "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+                "#002b36", "#cb4b16", "#586e75", "#657b83",
+                "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
+            ]),
+        },
+        Theme {
+            name: "solarized-light".into(),
+            foreground: RGBA::parse("#657b83").unwrap(),
+            background: RGBA::parse("#fdf6e3").unwrap(),
+            cursor: RGBA::parse("#586e75").unwrap(),
+            cursor_foreground: RGBA::parse("#fdf6e3").unwrap(),
+            palette: parse_palette([
+                "#073642", "#dc322f", "#859900", "#b58900",
+                "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+                "#002b36", "#cb4b16", "#586e75", "#657b83",
+                "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
+            ]),
+        },
+        Theme {
+            name: "gruvbox-dark".into(),
+            foreground: RGBA::parse("#ebdbb2").unwrap(),
+            background: RGBA::parse("#282828").unwrap(),
+            cursor: RGBA::parse("#ebdbb2").unwrap(),
+            cursor_foreground: RGBA::parse("#282828").unwrap(),
+            palette: parse_palette([
+                "#282828", "#cc241d", "#98971a", "#d79921",
+                "#458588", "#b16286", "#689d6a", "#a89984",
+                "#928374", "#fb4934", "#b8bb26", "#fabd2f",
+                "#83a598", "#d3869b", "#8ec07c", "#ebdbb2",
+            ]),
+        },
+        Theme {
+            name: "gruvbox-light".into(),
+            foreground: RGBA::parse("#3c3836").unwrap(),
+            background: RGBA::parse("#fbf1c7").unwrap(),
+            cursor: RGBA::parse("#3c3836").unwrap(),
+            cursor_foreground: RGBA::parse("#fbf1c7").unwrap(),
+            palette: parse_palette([
+                "#fbf1c7", "#cc241d", "#98971a", "#d79921",
+                "#458588", "#b16286", "#689d6a", "#7c6f64",
+                "#928374", "#9d0006", "#79740e", "#b57614",
+                "#076678", "#8f3f71", "#427b58", "#3c3836",
+            ]),
+        },
+        Theme {
+            name: "dracula".into(),
+            foreground: RGBA::parse("#f8f8f2").unwrap(),
+            background: RGBA::parse("#282a36").unwrap(),
+            cursor: RGBA::parse("#f8f8f2").unwrap(),
+            cursor_foreground: RGBA::parse("#282a36").unwrap(),
+            palette: parse_palette([
+                "#21222c", "#ff5555", "#50fa7b", "#f1fa8c",
+                "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
+                "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5",
+                "#d6acff", "#ff92df", "#a4ffff", "#ffffff",
+            ]),
+        },
+        Theme {
+            name: "nord".into(),
+            foreground: RGBA::parse("#d8dee9").unwrap(),
+            background: RGBA::parse("#2e3440").unwrap(),
+            cursor: RGBA::parse("#d8dee9").unwrap(),
+            cursor_foreground: RGBA::parse("#2e3440").unwrap(),
+            palette: parse_palette([
+                "#3b4252", "#bf616a", "#a3be8c", "#ebcb8b",
+                "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+                "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b",
+                "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4",
+            ]),
+        },
+    ]
+}
+
+fn create_terminal(config: &Config) -> Terminal {
+    let font_scale = config.default_font_scale;
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(true)
@@ -267,7 +429,7 @@ fn create_terminal(config: &Config, font_scale: f64) -> Terminal {
     terminal.set_mouse_autohide(true);
 
     // Set colors
-    let palette_refs: Vec<&RGBA> = PALETTE.iter().collect();
+    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
@@ -795,6 +957,57 @@ impl UiState {
         }
     }
 
+    fn for_each_terminal(&self, f: impl Fn(&Terminal)) {
+        for i in 0..self.notebook.n_pages() {
+            if let Some(widget) = self.notebook.nth_page(Some(i)) {
+                let mut terms = Vec::new();
+                collect_terminals(&widget, &mut terms);
+                for term in terms {
+                    f(&term);
+                }
+            }
+        }
+    }
+
+    fn apply_colors_all(&self) {
+        let config = self.config.borrow();
+        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+        self.for_each_terminal(|term| {
+            term.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+            term.set_color_bold(None);
+            term.set_color_cursor(Some(&config.cursor));
+            term.set_color_cursor_foreground(Some(&config.cursor_foreground));
+        });
+    }
+
+    fn apply_font_all(&self) {
+        let config = self.config.borrow();
+        let font_desc = FontDescription::from_string(&config.font_desc);
+        self.for_each_terminal(|term| {
+            term.set_font(Some(&font_desc));
+        });
+    }
+
+    fn apply_scrollback_all(&self) {
+        let lines = self.config.borrow().terminal_scrollback_lines;
+        self.for_each_terminal(|term| {
+            term.set_scrollback_lines(lines as i64);
+        });
+    }
+
+    fn apply_theme(&self, theme: &Theme) {
+        {
+            let mut config = self.config.borrow_mut();
+            config.theme_name = theme.name.clone();
+            config.foreground = theme.foreground;
+            config.background = theme.background;
+            config.cursor = theme.cursor;
+            config.cursor_foreground = theme.cursor_foreground;
+            config.palette = theme.palette;
+        }
+        self.apply_colors_all();
+    }
+
     fn switch_tab(&self, direction: i32) {
         if let Some(page) = self.notebook.current_page() {
             let n = self.notebook.n_pages();
@@ -907,6 +1120,7 @@ impl UiState {
             ("Ctrl+Shift+J", "Opacity decrease"),
             ("Ctrl+Shift+K", "Opacity increase"),
             ("Ctrl+Shift+F", "Toggle search"),
+            ("Ctrl+Shift+O", "Toggle settings panel"),
             ("Ctrl+Shift+P", "Toggle keybindings panel"),
             ("Ctrl+Shift+E", "Split horizontal"),
             ("Ctrl+Shift+D", "Split vertical"),
@@ -1027,8 +1241,200 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
+    fn toggle_settings_panel(&self) {
+        if let Some(dialog) = self.settings_dialog.borrow_mut().take() {
+            dialog.destroy();
+            return;
+        }
+
+        let dialog = Dialog::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Settings")
+            .default_width(520)
+            .default_height(460)
+            .build();
+
+        let content = dialog.content_area();
+        content.set_spacing(12);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+
+        let config = self.config.borrow();
+
+        // --- Theme ---
+        let theme_names: Vec<&str> = self.available_themes.iter().map(|t| t.name.as_str()).collect();
+        let theme_dropdown = DropDown::from_strings(&theme_names);
+        let current_theme_idx = self.available_themes.iter()
+            .position(|t| t.name == config.theme_name)
+            .unwrap_or(0);
+        theme_dropdown.set_selected(current_theme_idx as u32);
+        content.append(&self.settings_row("Theme", &theme_dropdown));
+
+        // --- Font (monospace fonts from Pango) ---
+        let pango_ctx = self.window.pango_context();
+        let families = pango_ctx.list_families();
+        let mut mono_fonts: Vec<String> = families.iter()
+            .filter(|f| f.is_monospace())
+            .map(|f| f.name().to_string())
+            .collect();
+        mono_fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+
+        let current_font_desc = FontDescription::from_string(&config.font_desc);
+        let current_family = current_font_desc.family()
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+
+        let font_strs: Vec<&str> = mono_fonts.iter().map(|s| s.as_str()).collect();
+        let font_dropdown = DropDown::from_strings(&font_strs);
+        let current_font_idx = mono_fonts.iter()
+            .position(|f| f == &current_family)
+            .unwrap_or(0);
+        font_dropdown.set_selected(current_font_idx as u32);
+        content.append(&self.settings_row("Font", &font_dropdown));
+
+        // --- Font Size ---
+        let current_size = current_font_desc.size() as f64 / gtk4::pango::SCALE as f64;
+        let font_size_adj = Adjustment::new(current_size, 6.0, 72.0, 1.0, 4.0, 0.0);
+        let font_size_spin = SpinButton::new(Some(&font_size_adj), 1.0, 0);
+        content.append(&self.settings_row("Font Size", &font_size_spin));
+
+        // --- Font Scale ---
+        let font_scale_adj = Adjustment::new(self.font_scale.get(), 0.1, 10.0, 0.025, 0.1, 0.0);
+        let font_scale_spin = SpinButton::new(Some(&font_scale_adj), 0.025, 3);
+        content.append(&self.settings_row("Font Scale", &font_scale_spin));
+
+        // --- Opacity ---
+        let opacity_scale = Scale::with_range(Orientation::Horizontal, 0.01, 1.0, 0.025);
+        opacity_scale.set_value(self.window_opacity.get());
+        opacity_scale.set_hexpand(true);
+        content.append(&self.settings_row("Opacity", &opacity_scale));
+
+        // --- Scrollback ---
+        let scrollback_adj = Adjustment::new(
+            config.terminal_scrollback_lines as f64,
+            0.0, 1_000_000.0, 100.0, 1000.0, 0.0,
+        );
+        let scrollback_spin = SpinButton::new(Some(&scrollback_adj), 100.0, 0);
+        content.append(&self.settings_row("Scrollback", &scrollback_spin));
+
+        drop(config); // release borrow before connecting signals
+
+        // --- Signal: Theme ---
+        let ui = self.clone();
+        let themes = self.available_themes.clone();
+        theme_dropdown.connect_notify_local(Some("selected"), move |dropdown, _| {
+            let idx = dropdown.selected() as usize;
+            if let Some(theme) = themes.get(idx) {
+                ui.apply_theme(theme);
+                save_config(&ui.config.borrow());
+            }
+        });
+
+        // --- Signal: Font ---
+        let ui = self.clone();
+        let mono_fonts_clone = mono_fonts.clone();
+        let font_size_spin_clone = font_size_spin.clone();
+        font_dropdown.connect_notify_local(Some("selected"), move |dropdown, _| {
+            let idx = dropdown.selected() as usize;
+            if let Some(family) = mono_fonts_clone.get(idx) {
+                let size = font_size_spin_clone.value() as i32;
+                let new_desc = format!("{} {}", family, size);
+                ui.config.borrow_mut().font_desc = new_desc;
+                ui.apply_font_all();
+                save_config(&ui.config.borrow());
+            }
+        });
+
+        // --- Signal: Font Size ---
+        let ui = self.clone();
+        let mono_fonts_clone2 = mono_fonts;
+        let font_dropdown_clone = font_dropdown.clone();
+        font_size_spin.connect_value_changed(move |spin| {
+            let idx = font_dropdown_clone.selected() as usize;
+            let family = mono_fonts_clone2.get(idx)
+                .map(|s| s.as_str())
+                .unwrap_or("Monospace");
+            let size = spin.value() as i32;
+            let new_desc = format!("{} {}", family, size);
+            ui.config.borrow_mut().font_desc = new_desc;
+            ui.apply_font_all();
+            save_config(&ui.config.borrow());
+        });
+
+        // --- Signal: Font Scale ---
+        let ui = self.clone();
+        font_scale_spin.connect_value_changed(move |spin| {
+            let new_scale = spin.value();
+            ui.set_font_scale_all(new_scale);
+            ui.config.borrow_mut().default_font_scale = new_scale;
+            save_config(&ui.config.borrow());
+        });
+
+        // --- Signal: Opacity ---
+        let ui = self.clone();
+        opacity_scale.connect_value_changed(move |scale| {
+            let val = scale.value();
+            ui.window_opacity.set(val);
+            ui.window.set_opacity(val);
+            ui.config.borrow_mut().window_opacity = val;
+            save_config(&ui.config.borrow());
+        });
+
+        // --- Signal: Scrollback ---
+        let ui = self.clone();
+        scrollback_spin.connect_value_changed(move |spin| {
+            let val = spin.value() as u32;
+            ui.config.borrow_mut().terminal_scrollback_lines = val;
+            ui.apply_scrollback_all();
+            save_config(&ui.config.borrow());
+        });
+
+        // Key controller: Escape / Ctrl+Shift+O to close
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref = self.settings_dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == Key::Escape
+                || (matches!(keyval, Key::O | Key::o)
+                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            {
+                if let Some(d) = dialog_ref.borrow_mut().take() {
+                    d.destroy();
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        let dialog_ref = self.settings_dialog.clone();
+        dialog.connect_close_request(move |_| {
+            *dialog_ref.borrow_mut() = None;
+            false.into()
+        });
+
+        *self.settings_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.show();
+    }
+
+    fn settings_row(&self, label_text: &str, widget: &impl IsA<gtk4::Widget>) -> gtk4::Box {
+        let row = gtk4::Box::new(Orientation::Horizontal, 12);
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        let label = Label::new(Some(label_text));
+        label.set_xalign(0.0);
+        label.set_width_chars(14);
+        widget.set_hexpand(true);
+        row.append(&label);
+        row.append(widget);
+        row
+    }
+
     fn create_split_terminal(&self, working_directory: Option<&str>) -> Terminal {
-        let terminal = create_terminal(&self.config, self.font_scale.get());
+        let terminal = create_terminal(&self.config.borrow());
         setup_terminal_click_handler(&terminal);
 
         let ui_for_exit = UiState::clone(self);
@@ -1113,7 +1519,7 @@ impl UiState {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
-        let terminal = create_terminal(&self.config, self.font_scale.get());
+        let terminal = create_terminal(&self.config.borrow());
 
         // Setup click handler for hyperlinks
         setup_terminal_click_handler(&terminal);
@@ -1242,12 +1648,14 @@ fn main() -> glib::ExitCode {
     let app = Application::builder().application_id("app.jterm4").build();
 
     app.connect_activate(|app| {
-        let config = Rc::new(load_config());
+        let (config, themes) = load_config();
 
         // Cache shell selection once to avoid extra process probes per new tab.
         let shell_argv = Rc::new(choose_shell_argv());
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
+        let config = Rc::new(RefCell::new(config));
+        let available_themes = Rc::new(themes);
         let window = ApplicationWindow::builder()
             .application(app)
             .default_width(800)
@@ -1301,7 +1709,7 @@ fn main() -> glib::ExitCode {
         main_box.append(&search_bar);
 
         // Shared state
-        let font_scale = Rc::new(Cell::new(config.default_font_scale));
+        let font_scale = Rc::new(Cell::new(config.borrow().default_font_scale));
         let tab_counter = Rc::new(Cell::new(0));
 
         let ui = Rc::new(UiState {
@@ -1309,11 +1717,14 @@ fn main() -> glib::ExitCode {
             notebook: notebook.clone(),
             tab_counter: tab_counter.clone(),
             font_scale: font_scale.clone(),
+            window_opacity: window_opacity.clone(),
             shell_argv: shell_argv.clone(),
             config: config.clone(),
+            available_themes: available_themes.clone(),
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
             keybindings_dialog: Rc::new(RefCell::new(None)),
+            settings_dialog: Rc::new(RefCell::new(None)),
         });
 
         // Restore tabs from last session snapshot (and delete it immediately).
@@ -1345,8 +1756,6 @@ fn main() -> glib::ExitCode {
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
-        let window_clone = window.clone();
-        let window_opacity_clone = window_opacity.clone();
         let ui_clone = ui.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
@@ -1404,16 +1813,16 @@ fn main() -> glib::ExitCode {
                     }
                     Key::J | Key::j => {
                         log::debug!("Opacity decrease");
-                        window_opacity_clone
-                            .set((window_opacity_clone.get() - opacity_step).clamp(0.01, 1.0));
-                        window_clone.set_opacity(window_opacity_clone.get());
+                        ui_clone.window_opacity
+                            .set((ui_clone.window_opacity.get() - opacity_step).clamp(0.01, 1.0));
+                        ui_clone.window.set_opacity(ui_clone.window_opacity.get());
                         return true.into();
                     }
                     Key::K | Key::k => {
                         log::debug!("Opacity increase");
-                        window_opacity_clone
-                            .set((window_opacity_clone.get() + opacity_step).clamp(0.01, 1.0));
-                        window_clone.set_opacity(window_opacity_clone.get());
+                        ui_clone.window_opacity
+                            .set((ui_clone.window_opacity.get() + opacity_step).clamp(0.01, 1.0));
+                        ui_clone.window.set_opacity(ui_clone.window_opacity.get());
                         return true.into();
                     }
                     Key::F | Key::f => {
@@ -1424,6 +1833,11 @@ fn main() -> glib::ExitCode {
                     Key::P | Key::p => {
                         log::debug!("Toggle keybindings panel");
                         ui_clone.toggle_keybindings_panel();
+                        return true.into();
+                    }
+                    Key::O | Key::o => {
+                        log::debug!("Toggle settings panel");
+                        ui_clone.toggle_settings_panel();
                         return true.into();
                     }
                     Key::E | Key::e => {
