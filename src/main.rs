@@ -1706,8 +1706,20 @@ impl UiState {
         strip_label.set_max_width_chars(24);
         *strip_btn_label.borrow_mut() = Some(strip_label.clone());
 
+        let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        strip_box.append(&strip_label);
+
+        let strip_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        strip_close_btn.add_css_class("flat");
+        strip_close_btn.add_css_class("circular");
+        strip_close_btn.add_css_class("tab-strip-close");
+        strip_close_btn.set_tooltip_text(Some("Close tab"));
+        strip_close_btn.set_focus_on_click(false);
+        strip_close_btn.set_can_focus(false);
+        strip_box.append(&strip_close_btn);
+
         let strip_btn = ToggleButton::new();
-        strip_btn.set_child(Some(&strip_label));
+        strip_btn.set_child(Some(&strip_box));
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
         strip_btn.set_active(true); // new tab is current
@@ -1737,6 +1749,13 @@ impl UiState {
             }
         });
         strip_btn.add_controller(rename_click_strip);
+
+        // Strip close button: close the tab
+        let ui_for_strip_close = self.clone();
+        let terminal_widget_for_strip_close = terminal.clone().upcast::<gtk4::Widget>();
+        strip_close_btn.connect_clicked(move |_| {
+            ui_for_strip_close.remove_tab_by_widget(&terminal_widget_for_strip_close);
+        });
 
         // Click to switch tab
         let notebook_for_strip = self.notebook.clone();
@@ -1950,8 +1969,9 @@ fn main() -> glib::ExitCode {
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
-            ".tab-strip-btn { padding: 2px 8px; border-radius: 4px; }
+            ".tab-strip-btn { padding: 2px 4px 2px 8px; border-radius: 4px; }
              .tab-strip-btn:checked { font-weight: bold; }
+             .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .tab-bar-box { padding: 2px 4px; }
              .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
              .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }",
