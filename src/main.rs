@@ -530,6 +530,7 @@ struct UiState {
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     keybinding_map: Rc<RefCell<KeybindingMap>>,
     zoom_state: Rc<RefCell<Option<ZoomState>>>,
+    scrollbar_css: CssProvider,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -1827,6 +1828,31 @@ impl UiState {
             term.set_color_cursor(Some(&config.cursor));
             term.set_color_cursor_foreground(Some(&config.cursor_foreground));
         });
+        drop(config);
+        self.apply_dynamic_css();
+    }
+
+    fn apply_dynamic_css(&self) {
+        let config = self.config.borrow();
+        let bg = &config.background;
+        let fg = &config.foreground;
+        let br = (bg.red() * 255.0) as u8;
+        let bg_g = (bg.green() * 255.0) as u8;
+        let bb = (bg.blue() * 255.0) as u8;
+        let fr = (fg.red() * 255.0) as u8;
+        let fg_g = (fg.green() * 255.0) as u8;
+        let fb = (fg.blue() * 255.0) as u8;
+        let css = format!(
+            ".terminal-box scrollbar {{ background-color: rgb({br},{bg_g},{bb}); }}
+             .terminal-box scrollbar trough {{ background-color: rgb({br},{bg_g},{bb}); }}
+             .terminal-box scrollbar slider {{ background-color: rgba({fr},{fg_g},{fb},0.4); }}
+             .terminal-box scrollbar slider:hover {{ background-color: rgba({fr},{fg_g},{fb},0.7); }}
+             .tab-bar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
+             .tab-bar-box button {{ color: rgb({fr},{fg_g},{fb}); }}
+             .tab-strip-btn {{ color: rgba({fr},{fg_g},{fb},0.6); }}
+             .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}"
+        );
+        self.scrollbar_css.load_from_data(&css);
     }
 
     fn apply_font_all(&self) {
@@ -3082,9 +3108,8 @@ fn main() -> glib::ExitCode {
              .tab-bar-box { padding: 2px 4px; }
              .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
              .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }
-             .terminal-box scrollbar { opacity: 0.3; }
-             .terminal-box scrollbar:hover { opacity: 0.8; }
-             .terminal-box scrollbar slider { min-width: 6px; }",
+             .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
+             .terminal-box scrollbar { padding: 0; }",
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
@@ -3150,7 +3175,16 @@ fn main() -> glib::ExitCode {
             settings_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
+            scrollbar_css: CssProvider::new(),
         });
+
+        // Register the dynamic scrollbar CSS provider and apply initial colors
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("display"),
+            &ui.scrollbar_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        );
+        ui.apply_dynamic_css();
 
         // Wire "+" button — inherit working directory from current session
         let ui_for_add = ui.clone();
