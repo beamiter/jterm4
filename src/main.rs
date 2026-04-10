@@ -1043,9 +1043,17 @@ impl UiState {
 fn main() -> glib::ExitCode {
     init_logging();
 
-    // fcitx4 has no GTK4 IM module; remove it so GTK4 uses its built-in IM context
-    if std::env::var("GTK_IM_MODULE").as_deref() == Ok("fcitx") {
-        unsafe { std::env::remove_var("GTK_IM_MODULE"); }
+    // Ensure fcitx5 GTK4 IM module is discoverable at runtime.
+    // FCITX5_GTK_PATH is baked in at compile time (set by nix develop shellHook).
+    if let Some(fcitx5_path) = option_env!("FCITX5_GTK_PATH") {
+        let gtk_path = match std::env::var("GTK_PATH") {
+            Ok(existing) if !existing.contains(fcitx5_path) => {
+                format!("{}:{}", fcitx5_path, existing)
+            }
+            Ok(existing) => existing,
+            Err(_) => fcitx5_path.to_string(),
+        };
+        unsafe { std::env::set_var("GTK_PATH", &gtk_path); }
     }
 
     // Shell selection is handled per-terminal spawn:

@@ -57,6 +57,8 @@
             export QT_IM_MODULE=fcitx
             # Let Nix GTK4 find fcitx5 IM module from Nix package
             export GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0''${GTK_PATH:+:$GTK_PATH}"
+            # Bake fcitx5-gtk path into binary at compile time
+            export FCITX5_GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0"
             echo "Rust GTK4 development and bundling environment is ready."
           '';
         };
