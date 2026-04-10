@@ -39,6 +39,8 @@
             pkgs.librsvg
             pkgs.libcanberra-gtk3
 
+            pkgs.fcitx5-gtk
+
             # pkgs.appimageTools
             pkgs.patchelf
             pkgs.fuse
@@ -50,6 +52,11 @@
           shellHook = ''
             export GSETTINGS_SCHEMA_DIR="${pkgs.gtk4}/share/gsettings-schemas/:${pkgs.glib}/share/gsettings-schemas/"
             export RUST_BACKTRACE=1
+            export GTK_IM_MODULE=fcitx
+            export XMODIFIERS=@im=fcitx
+            export QT_IM_MODULE=fcitx
+            # Let Nix GTK4 find fcitx5 IM module from Nix package
+            export GTK_PATH="${pkgs.fcitx5-gtk}/lib/gtk-4.0''${GTK_PATH:+:$GTK_PATH}"
             echo "Rust GTK4 development and bundling environment is ready."
           '';
         };
