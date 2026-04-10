@@ -13,7 +13,9 @@ use libadwaita as adw;
 use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use vte4::Format;
@@ -76,6 +78,439 @@ struct Config {
     palette: [RGBA; 16],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Action {
+    NewTab,
+    CloseTab,
+    ClosePaneOrTab,
+    Copy,
+    Paste,
+    FontIncrease,
+    FontDecrease,
+    OpacityIncrease,
+    OpacityDecrease,
+    ToggleSearch,
+    ToggleCommandPalette,
+    ToggleSettings,
+    SplitHorizontal,
+    SplitVertical,
+    PrevTab,
+    NextTab,
+    ScrollUp,
+    ScrollDown,
+    CyclePaneFocusForward,
+    CyclePaneFocusBackward,
+    QuickSwitchTab(u8),
+    ResizePaneLeft,
+    ResizePaneRight,
+    ResizePaneUp,
+    ResizePaneDown,
+    TogglePaneZoom,
+    MovePaneToNewTab,
+    FocusPaneLeft,
+    FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
+}
+
+impl Action {
+    fn name(&self) -> &'static str {
+        match self {
+            Action::NewTab => "New tab",
+            Action::CloseTab => "Close tab",
+            Action::ClosePaneOrTab => "Close focused pane or tab",
+            Action::Copy => "Copy",
+            Action::Paste => "Paste",
+            Action::FontIncrease => "Font size increase",
+            Action::FontDecrease => "Font size decrease",
+            Action::OpacityIncrease => "Opacity increase",
+            Action::OpacityDecrease => "Opacity decrease",
+            Action::ToggleSearch => "Toggle search",
+            Action::ToggleCommandPalette => "Command palette",
+            Action::ToggleSettings => "Toggle settings panel",
+            Action::SplitHorizontal => "Split horizontal",
+            Action::SplitVertical => "Split vertical",
+            Action::PrevTab => "Previous tab",
+            Action::NextTab => "Next tab",
+            Action::ScrollUp => "Scroll up",
+            Action::ScrollDown => "Scroll down",
+            Action::CyclePaneFocusForward => "Cycle pane focus forward",
+            Action::CyclePaneFocusBackward => "Cycle pane focus backward",
+            Action::QuickSwitchTab(n) => match n {
+                0 => "Switch to tab 1",
+                1 => "Switch to tab 2",
+                2 => "Switch to tab 3",
+                3 => "Switch to tab 4",
+                4 => "Switch to tab 5",
+                5 => "Switch to tab 6",
+                6 => "Switch to tab 7",
+                7 => "Switch to tab 8",
+                8 => "Switch to tab 9",
+                _ => "Switch to last tab",
+            },
+            Action::ResizePaneLeft => "Resize pane left",
+            Action::ResizePaneRight => "Resize pane right",
+            Action::ResizePaneUp => "Resize pane up",
+            Action::ResizePaneDown => "Resize pane down",
+            Action::TogglePaneZoom => "Toggle pane zoom",
+            Action::MovePaneToNewTab => "Move pane to new tab",
+            Action::FocusPaneLeft => "Focus pane left",
+            Action::FocusPaneRight => "Focus pane right",
+            Action::FocusPaneUp => "Focus pane up",
+            Action::FocusPaneDown => "Focus pane down",
+        }
+    }
+
+    fn config_key(&self) -> Option<&'static str> {
+        match self {
+            Action::NewTab => Some("new_tab"),
+            Action::CloseTab => Some("close_tab"),
+            Action::ClosePaneOrTab => Some("close_pane_or_tab"),
+            Action::Copy => Some("copy"),
+            Action::Paste => Some("paste"),
+            Action::FontIncrease => Some("font_increase"),
+            Action::FontDecrease => Some("font_decrease"),
+            Action::OpacityIncrease => Some("opacity_increase"),
+            Action::OpacityDecrease => Some("opacity_decrease"),
+            Action::ToggleSearch => Some("toggle_search"),
+            Action::ToggleCommandPalette => Some("toggle_command_palette"),
+            Action::ToggleSettings => Some("toggle_settings"),
+            Action::SplitHorizontal => Some("split_horizontal"),
+            Action::SplitVertical => Some("split_vertical"),
+            Action::PrevTab => Some("prev_tab"),
+            Action::NextTab => Some("next_tab"),
+            Action::ScrollUp => Some("scroll_up"),
+            Action::ScrollDown => Some("scroll_down"),
+            Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
+            Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
+            Action::QuickSwitchTab(_) => None,
+            Action::ResizePaneLeft => Some("resize_pane_left"),
+            Action::ResizePaneRight => Some("resize_pane_right"),
+            Action::ResizePaneUp => Some("resize_pane_up"),
+            Action::ResizePaneDown => Some("resize_pane_down"),
+            Action::TogglePaneZoom => Some("toggle_pane_zoom"),
+            Action::MovePaneToNewTab => Some("move_pane_to_new_tab"),
+            Action::FocusPaneLeft => Some("focus_pane_left"),
+            Action::FocusPaneRight => Some("focus_pane_right"),
+            Action::FocusPaneUp => Some("focus_pane_up"),
+            Action::FocusPaneDown => Some("focus_pane_down"),
+        }
+    }
+
+    fn all_actions() -> Vec<Action> {
+        vec![
+            Action::NewTab,
+            Action::CloseTab,
+            Action::ClosePaneOrTab,
+            Action::Copy,
+            Action::Paste,
+            Action::FontIncrease,
+            Action::FontDecrease,
+            Action::OpacityIncrease,
+            Action::OpacityDecrease,
+            Action::ToggleSearch,
+            Action::ToggleCommandPalette,
+            Action::ToggleSettings,
+            Action::SplitHorizontal,
+            Action::SplitVertical,
+            Action::PrevTab,
+            Action::NextTab,
+            Action::ScrollUp,
+            Action::ScrollDown,
+            Action::CyclePaneFocusForward,
+            Action::CyclePaneFocusBackward,
+            Action::ResizePaneLeft,
+            Action::ResizePaneRight,
+            Action::ResizePaneUp,
+            Action::ResizePaneDown,
+            Action::TogglePaneZoom,
+            Action::MovePaneToNewTab,
+            Action::FocusPaneLeft,
+            Action::FocusPaneRight,
+            Action::FocusPaneUp,
+            Action::FocusPaneDown,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyCombo {
+    modifiers: ModifierType,
+    key: Key,
+}
+
+impl PartialEq for KeyCombo {
+    fn eq(&self, other: &Self) -> bool {
+        self.modifiers == other.modifiers && self.key == other.key
+    }
+}
+
+impl Eq for KeyCombo {}
+
+impl Hash for KeyCombo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.modifiers.bits().hash(state);
+        self.key.into_glib().hash(state);
+    }
+}
+
+fn normalize_key(key: Key) -> Key {
+    // ISO_Left_Tab is what GTK sends for Shift+Tab - normalize to Tab
+    if key == Key::ISO_Left_Tab {
+        return Key::Tab;
+    }
+    key.to_lower()
+}
+
+fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
+    let mut modifiers = ModifierType::empty();
+    let parts: Vec<&str> = s.split('+').collect();
+    if parts.is_empty() {
+        return Err("Empty key combo".to_string());
+    }
+
+    // The last part is the key, but "+" itself is special:
+    // "Ctrl+Shift++" means Ctrl+Shift and key is "+"
+    let (mod_parts, key_str) = if s.ends_with("++") && parts.len() >= 3 {
+        (&parts[..parts.len() - 2], "+")
+    } else if parts.last() == Some(&"") && parts.len() >= 2 {
+        // "Ctrl++" case
+        (&parts[..parts.len() - 2], "+")
+    } else {
+        (&parts[..parts.len() - 1], *parts.last().unwrap())
+    };
+
+    for part in mod_parts {
+        match *part {
+            "Ctrl" => modifiers |= ModifierType::CONTROL_MASK,
+            "Shift" => modifiers |= ModifierType::SHIFT_MASK,
+            "Alt" => modifiers |= ModifierType::ALT_MASK,
+            other => return Err(format!("Unknown modifier: {other}")),
+        }
+    }
+
+    let key = match key_str {
+        "+" | "plus" => Key::plus,
+        "-" | "minus" => Key::minus,
+        "PageUp" => Key::Page_Up,
+        "PageDown" => Key::Page_Down,
+        "Tab" => Key::Tab,
+        "Escape" | "Esc" => Key::Escape,
+        "Return" | "Enter" => Key::Return,
+        "Up" => Key::Up,
+        "Down" => Key::Down,
+        "Left" => Key::Left,
+        "Right" => Key::Right,
+        "!" | "exclam" => Key::exclam,
+        "Space" => Key::space,
+        "Backspace" => Key::BackSpace,
+        "Delete" => Key::Delete,
+        "Home" => Key::Home,
+        "End" => Key::End,
+        "Insert" => Key::Insert,
+        s if s.len() == 1 => {
+            let c = s.chars().next().unwrap();
+            if c.is_ascii_digit() {
+                match c {
+                    '0' => Key::_0,
+                    '1' => Key::_1,
+                    '2' => Key::_2,
+                    '3' => Key::_3,
+                    '4' => Key::_4,
+                    '5' => Key::_5,
+                    '6' => Key::_6,
+                    '7' => Key::_7,
+                    '8' => Key::_8,
+                    '9' => Key::_9,
+                    _ => unreachable!(),
+                }
+            } else if c.is_ascii_alphabetic() {
+                Key::from_name(c.to_lowercase().to_string())
+                    .ok_or_else(|| format!("Unknown key: {s}"))?
+            } else {
+                return Err(format!("Unknown key: {s}"));
+            }
+        }
+        s => Key::from_name(s).ok_or_else(|| format!("Unknown key: {s}"))?,
+    };
+
+    Ok(KeyCombo {
+        modifiers,
+        key: normalize_key(key),
+    })
+}
+
+fn key_combo_to_string(combo: &KeyCombo) -> String {
+    let mut parts = Vec::new();
+    if combo.modifiers.contains(ModifierType::CONTROL_MASK) {
+        parts.push("Ctrl");
+    }
+    if combo.modifiers.contains(ModifierType::SHIFT_MASK) {
+        parts.push("Shift");
+    }
+    if combo.modifiers.contains(ModifierType::ALT_MASK) {
+        parts.push("Alt");
+    }
+
+    let key_name = match combo.key {
+        Key::plus => "+".to_string(),
+        Key::minus => "-".to_string(),
+        Key::Page_Up => "PageUp".to_string(),
+        Key::Page_Down => "PageDown".to_string(),
+        Key::Tab | Key::ISO_Left_Tab => "Tab".to_string(),
+        Key::Escape => "Escape".to_string(),
+        Key::Return => "Enter".to_string(),
+        Key::Up => "Up".to_string(),
+        Key::Down => "Down".to_string(),
+        Key::Left => "Left".to_string(),
+        Key::Right => "Right".to_string(),
+        Key::exclam => "!".to_string(),
+        Key::space => "Space".to_string(),
+        Key::BackSpace => "Backspace".to_string(),
+        Key::Delete => "Delete".to_string(),
+        Key::Home => "Home".to_string(),
+        Key::End => "End".to_string(),
+        k => k.name().map(|n| {
+            let s = n.to_string();
+            if s.len() == 1 { s.to_uppercase() } else { s }
+        }).unwrap_or_else(|| "?".to_string()),
+    };
+
+    let mut result = parts.join("+");
+    if !result.is_empty() {
+        result.push('+');
+    }
+    result.push_str(&key_name);
+    result
+}
+
+#[derive(Clone)]
+struct KeybindingMap {
+    bindings: HashMap<KeyCombo, Action>,
+}
+
+impl KeybindingMap {
+    fn from_defaults() -> Self {
+        let mut bindings = HashMap::new();
+
+        let mut bind = |s: &str, action: Action| {
+            if let Ok(combo) = parse_key_combo(s) {
+                bindings.insert(combo, action);
+            }
+        };
+
+        // Existing keybindings
+        bind("Ctrl+Shift+T", Action::NewTab);
+        bind("Ctrl+Shift+W", Action::ClosePaneOrTab);
+        bind("Ctrl+Shift+C", Action::Copy);
+        bind("Ctrl+Shift+V", Action::Paste);
+        bind("Ctrl+Shift++", Action::FontIncrease);
+        bind("Ctrl+Shift+I", Action::FontDecrease);
+        bind("Ctrl+Shift+J", Action::OpacityDecrease);
+        bind("Ctrl+Shift+K", Action::OpacityIncrease);
+        bind("Ctrl+Shift+F", Action::ToggleSearch);
+        bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
+        bind("Ctrl+Shift+O", Action::ToggleSettings);
+        bind("Ctrl+Shift+E", Action::SplitHorizontal);
+        bind("Ctrl+Shift+D", Action::SplitVertical);
+        bind("Ctrl+Shift+PageUp", Action::PrevTab);
+        bind("Ctrl+Shift+PageDown", Action::NextTab);
+        bind("Ctrl+Shift+Tab", Action::PrevTab);
+        bind("Ctrl+W", Action::CloseTab);
+        bind("Ctrl+Tab", Action::NextTab);
+        bind("Ctrl+Up", Action::ScrollUp);
+        bind("Ctrl+Down", Action::ScrollDown);
+        bind("Ctrl+minus", Action::FontDecrease);
+        bind("Ctrl+PageUp", Action::PrevTab);
+        bind("Ctrl+PageDown", Action::NextTab);
+        for i in 0..=9u8 {
+            bind(&format!("Ctrl+{i}"), Action::QuickSwitchTab(i));
+        }
+        bind("Alt+Tab", Action::CyclePaneFocusForward);
+        bind("Alt+Shift+Tab", Action::CyclePaneFocusBackward);
+
+        // New pane management keybindings
+        bind("Alt+Shift+Left", Action::ResizePaneLeft);
+        bind("Alt+Shift+Right", Action::ResizePaneRight);
+        bind("Alt+Shift+Up", Action::ResizePaneUp);
+        bind("Alt+Shift+Down", Action::ResizePaneDown);
+        bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
+        bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
+        bind("Alt+Left", Action::FocusPaneLeft);
+        bind("Alt+Right", Action::FocusPaneRight);
+        bind("Alt+Up", Action::FocusPaneUp);
+        bind("Alt+Down", Action::FocusPaneDown);
+
+        KeybindingMap { bindings }
+    }
+
+    fn apply_user_overrides(&mut self, table: &toml::Table) {
+        // Build reverse map: config_key -> Action
+        let mut key_to_action: HashMap<&str, Action> = HashMap::new();
+        for action in Action::all_actions() {
+            if let Some(key) = action.config_key() {
+                key_to_action.insert(key, action);
+            }
+        }
+
+        for (config_key, value) in table {
+            let Some(&action) = key_to_action.get(config_key.as_str()) else {
+                log::warn!("Unknown keybinding action: {config_key}");
+                continue;
+            };
+            let Some(key_str) = value.as_str() else {
+                log::warn!("Keybinding value for {config_key} must be a string");
+                continue;
+            };
+
+            // Remove old bindings for this action
+            self.bindings.retain(|_, a| *a != action);
+
+            // Parse and add new binding
+            match parse_key_combo(key_str) {
+                Ok(combo) => { self.bindings.insert(combo, action); }
+                Err(e) => { log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}"); }
+            }
+        }
+    }
+
+    fn lookup(&self, combo: &KeyCombo) -> Option<Action> {
+        self.bindings.get(combo).copied()
+    }
+
+    fn binding_display(&self, action: &Action) -> String {
+        let combos: Vec<_> = self.bindings.iter()
+            .filter(|(_, a)| *a == action)
+            .map(|(k, _)| key_combo_to_string(k))
+            .collect();
+        combos.join(", ")
+    }
+
+    fn all_bound_actions(&self) -> Vec<(Action, String)> {
+        let mut result = Vec::new();
+        for action in Action::all_actions() {
+            let display = self.binding_display(&action);
+            result.push((action, display));
+        }
+        result
+    }
+}
+
+struct ZoomState {
+    original_page: gtk4::Widget,
+    zoomed_terminal: Terminal,
+    page_index: u32,
+    tab_label: Option<gtk4::Widget>,
+}
+
 #[derive(Clone)]
 struct UiState {
     window: adw::ApplicationWindow,
@@ -91,8 +526,10 @@ struct UiState {
     tab_strip: gtk4::Box,
     tab_bar_box: gtk4::Box,
     tabs_container: gtk4::Box,
-    keybindings_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+    keybinding_map: Rc<RefCell<KeybindingMap>>,
+    zoom_state: Rc<RefCell<Option<ZoomState>>>,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -127,6 +564,7 @@ struct FileConfig {
     background: Option<String>,
     cursor: Option<String>,
     cursor_foreground: Option<String>,
+    keybindings: Option<toml::Table>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -151,10 +589,11 @@ fn load_file_config() -> FileConfig {
         background: colors.and_then(|c| c.get("background")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         cursor: colors.and_then(|c| c.get("cursor")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+        keybindings: table.get("keybindings").and_then(|v| v.as_table()).cloned(),
     }
 }
 
-fn load_config() -> (Config, Vec<Theme>) {
+fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let fc = load_file_config();
     let themes = builtin_themes();
 
@@ -206,7 +645,13 @@ fn load_config() -> (Config, Vec<Theme>) {
         cursor_foreground,
         palette: theme.palette,
     };
-    (config, themes)
+
+    let mut keybinding_map = KeybindingMap::from_defaults();
+    if let Some(ref kb_table) = fc.keybindings {
+        keybinding_map.apply_user_overrides(kb_table);
+    }
+
+    (config, themes, keybinding_map)
 }
 
 fn rgba_to_hex(c: &RGBA) -> String {
@@ -225,7 +670,12 @@ fn save_config(config: &Config) {
         }
     }
 
-    let mut table = toml::Table::new();
+    // Read existing config to preserve user-authored sections (e.g. [keybindings])
+    let mut table = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+
     table.insert("opacity".into(), toml::Value::Float(config.window_opacity));
     table.insert("scrollback".into(), toml::Value::Integer(config.terminal_scrollback_lines as i64));
     table.insert("font".into(), toml::Value::String(config.font_desc.clone()));
@@ -916,7 +1366,180 @@ fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) {
     }
 }
 
+/// Walk the Paned tree and reattach a terminal to the first None child slot found.
+fn reattach_terminal_to_tree(widget: &gtk4::Widget, terminal: &Terminal) -> bool {
+    if let Ok(paned) = widget.clone().downcast::<Paned>() {
+        if paned.start_child().is_none() {
+            paned.set_start_child(Some(terminal));
+            return true;
+        }
+        if paned.end_child().is_none() {
+            paned.set_end_child(Some(terminal));
+            return true;
+        }
+        if let Some(start) = paned.start_child() {
+            if reattach_terminal_to_tree(&start, terminal) {
+                return true;
+            }
+        }
+        if let Some(end) = paned.end_child() {
+            if reattach_terminal_to_tree(&end, terminal) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl UiState {
+    fn execute_action(&self, action: Action) {
+        let font_step = 0.025;
+        let opacity_step = 0.025;
+        let current_terminal = self.current_terminal();
+
+        match action {
+            Action::NewTab => {
+                log::info!("New tab");
+                let working_directory = current_terminal
+                    .as_ref()
+                    .and_then(terminal_working_directory);
+                self.add_new_tab(working_directory, None);
+            }
+            Action::CloseTab => {
+                log::info!("Close tab");
+                self.remove_current_tab();
+            }
+            Action::ClosePaneOrTab => {
+                log::info!("Close focused pane or tab");
+                self.close_focused_pane_or_tab();
+            }
+            Action::Copy => {
+                log::debug!("Copy");
+                if let Some(ref term) = current_terminal {
+                    term.copy_clipboard_format(Format::Text);
+                }
+            }
+            Action::Paste => {
+                log::debug!("Paste");
+                if let Some(ref term) = current_terminal {
+                    term.paste_clipboard();
+                }
+            }
+            Action::FontIncrease => {
+                log::debug!("Font increase");
+                let new_scale = (self.font_scale.get() + font_step).min(10.0);
+                self.set_font_scale_all(new_scale);
+            }
+            Action::FontDecrease => {
+                log::debug!("Font decrease");
+                let new_scale = (self.font_scale.get() - font_step).max(0.1);
+                self.set_font_scale_all(new_scale);
+            }
+            Action::OpacityIncrease => {
+                log::debug!("Opacity increase");
+                self.window_opacity
+                    .set((self.window_opacity.get() + opacity_step).clamp(0.01, 1.0));
+                self.window.set_opacity(self.window_opacity.get());
+            }
+            Action::OpacityDecrease => {
+                log::debug!("Opacity decrease");
+                self.window_opacity
+                    .set((self.window_opacity.get() - opacity_step).clamp(0.01, 1.0));
+                self.window.set_opacity(self.window_opacity.get());
+            }
+            Action::ToggleSearch => {
+                log::debug!("Toggle search");
+                self.toggle_search();
+            }
+            Action::ToggleCommandPalette => {
+                log::debug!("Toggle command palette");
+                self.toggle_command_palette();
+            }
+            Action::ToggleSettings => {
+                log::debug!("Toggle settings panel");
+                self.toggle_settings_panel();
+            }
+            Action::SplitHorizontal => {
+                log::debug!("Split horizontal");
+                self.split_current(Orientation::Horizontal);
+            }
+            Action::SplitVertical => {
+                log::debug!("Split vertical");
+                self.split_current(Orientation::Vertical);
+            }
+            Action::PrevTab => {
+                self.switch_tab(-1);
+            }
+            Action::NextTab => {
+                self.switch_tab(1);
+            }
+            Action::ScrollUp => {
+                if let Some(ref term) = current_terminal {
+                    if let Some(adj) = term.vadjustment() {
+                        let new_val = (adj.value() - adj.step_increment() * 3.0).max(adj.lower());
+                        adj.set_value(new_val);
+                    }
+                }
+            }
+            Action::ScrollDown => {
+                if let Some(ref term) = current_terminal {
+                    if let Some(adj) = term.vadjustment() {
+                        let max_val = adj.upper() - adj.page_size();
+                        let new_val = (adj.value() + adj.step_increment() * 3.0).min(max_val);
+                        adj.set_value(new_val);
+                    }
+                }
+            }
+            Action::CyclePaneFocusForward => {
+                self.cycle_pane_focus(1);
+            }
+            Action::CyclePaneFocusBackward => {
+                self.cycle_pane_focus(-1);
+            }
+            Action::QuickSwitchTab(n) => {
+                let n_pages = self.notebook.n_pages();
+                if n_pages > 0 {
+                    let target = if n == 9 {
+                        n_pages - 1
+                    } else {
+                        (n as u32).min(n_pages - 1)
+                    };
+                    self.notebook.set_current_page(Some(target));
+                }
+            }
+            Action::ResizePaneLeft => {
+                self.resize_pane(Orientation::Horizontal, -30);
+            }
+            Action::ResizePaneRight => {
+                self.resize_pane(Orientation::Horizontal, 30);
+            }
+            Action::ResizePaneUp => {
+                self.resize_pane(Orientation::Vertical, -30);
+            }
+            Action::ResizePaneDown => {
+                self.resize_pane(Orientation::Vertical, 30);
+            }
+            Action::TogglePaneZoom => {
+                self.toggle_pane_zoom();
+            }
+            Action::MovePaneToNewTab => {
+                self.move_pane_to_new_tab();
+            }
+            Action::FocusPaneLeft => {
+                self.focus_pane_directional(Direction::Left);
+            }
+            Action::FocusPaneRight => {
+                self.focus_pane_directional(Direction::Right);
+            }
+            Action::FocusPaneUp => {
+                self.focus_pane_directional(Direction::Up);
+            }
+            Action::FocusPaneDown => {
+                self.focus_pane_directional(Direction::Down);
+            }
+        }
+    }
+
     /// Update which tab strip button is :checked to match the active notebook page.
     fn sync_tab_strip_active(&self, active_page: Option<u32>) {
         let active = active_page.or(self.notebook.current_page()).unwrap_or(0);
@@ -1039,6 +1662,17 @@ impl UiState {
 
     /// Handle a terminal exiting: unsplit if in a Paned, or close the tab.
     fn handle_terminal_exited(&self, term_widget: &gtk4::Widget) {
+        // Clear zoom state if the exiting terminal is the zoomed one
+        {
+            let zoom = self.zoom_state.borrow();
+            if let Some(ref zs) = *zoom {
+                if zs.zoomed_terminal.upcast_ref::<gtk4::Widget>() == term_widget {
+                    drop(zoom);
+                    self.zoom_state.borrow_mut().take();
+                }
+            }
+        }
+
         let Some(parent) = term_widget.parent() else {
             return;
         };
@@ -1258,69 +1892,64 @@ impl UiState {
         }
     }
 
-    fn toggle_keybindings_panel(&self) {
-        if let Some(dialog) = self.keybindings_dialog.borrow_mut().take() {
+    fn toggle_command_palette(&self) {
+        if let Some(dialog) = self.command_palette_dialog.borrow_mut().take() {
             dialog.force_close();
             return;
         }
 
-        const KEYBINDINGS: &[(&str, &str)] = &[
-            ("Ctrl+Shift+T", "New tab"),
-            ("Ctrl+Shift+W", "Close focused pane or tab"),
-            ("Ctrl+Shift+C", "Copy"),
-            ("Ctrl+Shift+V", "Paste"),
-            ("Ctrl+Shift++", "Font size increase"),
-            ("Ctrl+Shift+I", "Font size decrease"),
-            ("Ctrl+Shift+J", "Opacity decrease"),
-            ("Ctrl+Shift+K", "Opacity increase"),
-            ("Ctrl+Shift+F", "Toggle search"),
-            ("Ctrl+Shift+O", "Toggle settings panel"),
-            ("Ctrl+Shift+P", "Toggle keybindings panel"),
-            ("Ctrl+Shift+E", "Split horizontal"),
-            ("Ctrl+Shift+D", "Split vertical"),
-            ("Ctrl+Shift+PageUp", "Previous tab"),
-            ("Ctrl+Shift+PageDown", "Next tab"),
-            ("Ctrl+Shift+Tab", "Previous tab"),
-            ("Ctrl+W", "Close tab"),
-            ("Ctrl+Tab", "Next tab"),
-            ("Ctrl+Up", "Scroll up"),
-            ("Ctrl+Down", "Scroll down"),
-            ("Ctrl+-", "Font size decrease"),
-            ("Ctrl+PageUp", "Previous tab"),
-            ("Ctrl+PageDown", "Next tab"),
-            ("Ctrl+0~9", "Quick switch to tab N"),
-            ("Alt+Tab", "Cycle pane focus forward"),
-            ("Alt+Shift+Tab", "Cycle pane focus backward"),
+        let bound_actions = self.keybinding_map.borrow().all_bound_actions();
+        // Include non-keyboard actions at end
+        let extra_hints: &[(&str, &str)] = &[
             ("Double-click tab", "Rename tab"),
             ("Ctrl+Click link", "Open hyperlink"),
         ];
 
         let dialog = adw::Dialog::builder()
-            .title("Keybindings")
+            .title("Command Palette")
             .content_width(480)
-            .content_height(420)
+            .content_height(480)
             .build();
 
         let header_bar = adw::HeaderBar::new();
         let filter_entry = SearchEntry::new();
-        filter_entry.set_placeholder_text(Some("Search keybindings..."));
+        filter_entry.set_placeholder_text(Some("Search commands..."));
         filter_entry.set_hexpand(true);
 
         let list_box = ListBox::new();
-        list_box.set_selection_mode(gtk4::SelectionMode::None);
+        list_box.set_selection_mode(gtk4::SelectionMode::Single);
         list_box.add_css_class("boxed-list");
         list_box.set_margin_start(12);
         list_box.set_margin_end(12);
         list_box.set_margin_bottom(12);
 
-        for &(shortcut, description) in KEYBINDINGS {
+        // Store action data for filtering and execution
+        let actions_data: Rc<Vec<(Option<Action>, String, String)>> = Rc::new(
+            bound_actions.iter().map(|(action, binding)| {
+                (Some(*action), action.name().to_string(), binding.clone())
+            }).chain(
+                extra_hints.iter().map(|(shortcut, desc)| {
+                    (None, desc.to_string(), shortcut.to_string())
+                })
+            ).collect()
+        );
+
+        for (_, description, binding) in actions_data.iter() {
             let row = adw::ActionRow::builder()
-                .title(description)
+                .title(description.as_str())
+                .activatable(true)
                 .build();
-            let key_label = Label::new(Some(shortcut));
-            key_label.add_css_class("dim-label");
-            row.add_suffix(&key_label);
+            if !binding.is_empty() {
+                let key_label = Label::new(Some(binding));
+                key_label.add_css_class("dim-label");
+                row.add_suffix(&key_label);
+            }
             list_box.append(&row);
+        }
+
+        // Select the first row by default
+        if let Some(first_row) = list_box.row_at_index(0) {
+            list_box.select_row(Some(&first_row));
         }
 
         let scrolled = ScrolledWindow::builder()
@@ -1343,26 +1972,49 @@ impl UiState {
         dialog.set_child(Some(&toolbar_view));
 
         // Filter rows based on search text
-        let list_box_clone = list_box.clone();
+        let list_box_for_filter = list_box.clone();
+        let actions_data_for_filter = actions_data.clone();
         filter_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string().to_lowercase();
-            let mut idx = 0;
-            while let Some(row) = list_box_clone.row_at_index(idx) {
-                if query.is_empty() {
-                    row.set_visible(true);
-                } else {
-                    let shortcut = KEYBINDINGS[idx as usize].0.to_lowercase();
-                    let desc = KEYBINDINGS[idx as usize].1.to_lowercase();
-                    row.set_visible(shortcut.contains(&query) || desc.contains(&query));
+            let mut first_visible: Option<gtk4::ListBoxRow> = None;
+            for (idx, (_, desc, binding)) in actions_data_for_filter.iter().enumerate() {
+                if let Some(row) = list_box_for_filter.row_at_index(idx as i32) {
+                    let visible = query.is_empty()
+                        || desc.to_lowercase().contains(&query)
+                        || binding.to_lowercase().contains(&query);
+                    row.set_visible(visible);
+                    if visible && first_visible.is_none() {
+                        first_visible = Some(row);
+                    }
                 }
-                idx += 1;
+            }
+            // Select first visible row
+            if let Some(row) = first_visible {
+                list_box_for_filter.select_row(Some(&row));
             }
         });
 
-        // Key controller: Escape / Ctrl+Shift+P to close
+        // Execute action on row activation (double-click or Enter via row activate)
+        let ui_for_activate = self.clone();
+        let actions_data_for_activate = actions_data.clone();
+        let dialog_for_activate = dialog.clone();
+        list_box.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            if let Some((Some(action), _, _)) = actions_data_for_activate.get(idx) {
+                let action = *action;
+                dialog_for_activate.force_close();
+                ui_for_activate.execute_action(action);
+            }
+        });
+
+        // Key controller: Escape to close, Enter to execute selected, up/down to navigate
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-        let dialog_ref = self.keybindings_dialog.clone();
+        let dialog_ref = self.command_palette_dialog.clone();
+        let ui_for_key = self.clone();
+        let list_box_for_key = list_box.clone();
+        let actions_data_for_key = actions_data.clone();
+        let dialog_for_key = dialog.clone();
         key_controller.connect_key_pressed(move |_, keyval, _, state| {
             if keyval == Key::Escape
                 || (matches!(keyval, Key::P | Key::p)
@@ -1373,17 +2025,55 @@ impl UiState {
                 }
                 return true.into();
             }
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(row) = list_box_for_key.selected_row() {
+                    let idx = row.index() as usize;
+                    if let Some((Some(action), _, _)) = actions_data_for_key.get(idx) {
+                        let action = *action;
+                        dialog_for_key.force_close();
+                        ui_for_key.execute_action(action);
+                    }
+                }
+                return true.into();
+            }
+            // Up/Down arrow navigate the list while keeping focus on the search entry
+            if keyval == Key::Down {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let mut next = current + 1;
+                while let Some(row) = list_box_for_key.row_at_index(next) {
+                    if row.is_visible() {
+                        list_box_for_key.select_row(Some(&row));
+                        break;
+                    }
+                    next += 1;
+                }
+                return true.into();
+            }
+            if keyval == Key::Up {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let mut prev = current - 1;
+                while prev >= 0 {
+                    if let Some(row) = list_box_for_key.row_at_index(prev) {
+                        if row.is_visible() {
+                            list_box_for_key.select_row(Some(&row));
+                            break;
+                        }
+                    }
+                    prev -= 1;
+                }
+                return true.into();
+            }
             false.into()
         });
         dialog.add_controller(key_controller);
 
         // Clear tracking when dialog is closed
-        let dialog_ref = self.keybindings_dialog.clone();
+        let dialog_ref = self.command_palette_dialog.clone();
         dialog.connect_closed(move |_| {
             *dialog_ref.borrow_mut() = None;
         });
 
-        *self.keybindings_dialog.borrow_mut() = Some(dialog.clone());
+        *self.command_palette_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         filter_entry.grab_focus();
     }
@@ -1655,6 +2345,260 @@ impl UiState {
             if focused_idx == 0 { terms.len() - 1 } else { focused_idx - 1 }
         };
         terms[next_idx].grab_focus();
+    }
+
+    fn resize_pane(&self, target_orientation: Orientation, delta: i32) {
+        let Some(term) = self.current_terminal() else { return };
+        let term_widget = term.upcast::<gtk4::Widget>();
+        // Walk up from the terminal to find the nearest Paned with matching orientation
+        let mut widget = term_widget.parent();
+        while let Some(w) = widget {
+            if let Ok(paned) = w.clone().downcast::<Paned>() {
+                if paned.orientation() == target_orientation {
+                    let new_pos = (paned.position() + delta).max(0);
+                    paned.set_position(new_pos);
+                    return;
+                }
+            }
+            widget = w.parent();
+        }
+    }
+
+    fn focus_pane_directional(&self, direction: Direction) {
+        let Some(page_num) = self.notebook.current_page() else { return };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let mut terms = Vec::new();
+        collect_terminals(&page_widget, &mut terms);
+        if terms.len() <= 1 { return; }
+
+        let focused = terms.iter().find(|t| t.has_focus());
+        let Some(focused) = focused else { return };
+
+        let focused_widget = focused.clone().upcast::<gtk4::Widget>();
+        let Some(focused_bounds) = focused_widget.compute_bounds(&page_widget) else { return };
+        let focused_cx = focused_bounds.x() + focused_bounds.width() / 2.0;
+        let focused_cy = focused_bounds.y() + focused_bounds.height() / 2.0;
+
+        let mut best: Option<(f32, &Terminal)> = None;
+
+        for term in &terms {
+            if term.has_focus() { continue; }
+
+            let tw = term.clone().upcast::<gtk4::Widget>();
+            let Some(bounds) = tw.compute_bounds(&page_widget) else { continue };
+            let cx = bounds.x() + bounds.width() / 2.0;
+            let cy = bounds.y() + bounds.height() / 2.0;
+
+            let dx = cx - focused_cx;
+            let dy = cy - focused_cy;
+
+            let in_direction = match direction {
+                Direction::Left => dx < -1.0,
+                Direction::Right => dx > 1.0,
+                Direction::Up => dy < -1.0,
+                Direction::Down => dy > 1.0,
+            };
+
+            if !in_direction { continue; }
+
+            let dist = match direction {
+                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
+                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
+            };
+
+            if best.is_none() || dist < best.unwrap().0 {
+                best = Some((dist, term));
+            }
+        }
+
+        if let Some((_, term)) = best {
+            term.grab_focus();
+        }
+    }
+
+    fn toggle_pane_zoom(&self) {
+        let has_zoom = self.zoom_state.borrow().is_some();
+        if has_zoom {
+            let state = self.zoom_state.borrow_mut().take().unwrap();
+            self.unzoom_pane(state);
+        } else {
+            self.zoom_pane();
+        }
+    }
+
+    fn zoom_pane(&self) {
+        let Some(page_num) = self.notebook.current_page() else { return };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+
+        // Only zoom if there are splits (page is a Paned)
+        if page_widget.clone().downcast::<Paned>().is_err() { return; }
+
+        let Some(term) = find_focused_terminal(&page_widget) else { return };
+        let term_widget = term.clone().upcast::<gtk4::Widget>();
+        let Some(parent) = term_widget.parent() else { return };
+        let Ok(parent_paned) = parent.downcast::<Paned>() else { return };
+
+        let tab_label = self.notebook.tab_label(&page_widget);
+
+        // Detach terminal from its parent paned (leave None slot for reattach)
+        if parent_paned.start_child().as_ref() == Some(&term_widget) {
+            parent_paned.set_start_child(None::<&gtk4::Widget>);
+        } else {
+            parent_paned.set_end_child(None::<&gtk4::Widget>);
+        }
+
+        let widget_name = page_widget.widget_name().to_string();
+        self.notebook.remove_page(Some(page_num));
+
+        // Add terminal as a standalone page
+        term.set_widget_name(&widget_name);
+        let new_page = self.notebook.insert_page(
+            &term,
+            tab_label.as_ref(),
+            Some(page_num),
+        );
+        self.notebook.set_tab_reorderable(&term, true);
+        self.notebook.set_current_page(Some(new_page));
+        self.sync_tab_strip_active(Some(new_page));
+        term.grab_focus();
+
+        *self.zoom_state.borrow_mut() = Some(ZoomState {
+            original_page: page_widget,
+            zoomed_terminal: term,
+            page_index: page_num,
+            tab_label,
+        });
+    }
+
+    fn unzoom_pane(&self, state: ZoomState) {
+        let Some(page_num) = self.notebook.current_page() else { return };
+
+        // Remove the zoomed terminal's standalone page
+        self.notebook.remove_page(Some(page_num));
+
+        // Re-attach terminal to its position in the Paned tree
+        reattach_terminal_to_tree(&state.original_page, &state.zoomed_terminal);
+
+        // Re-add the original Paned tree as the page
+        let widget_name = state.zoomed_terminal.widget_name().to_string();
+        state.original_page.set_widget_name(&widget_name);
+        let new_page = self.notebook.insert_page(
+            &state.original_page,
+            state.tab_label.as_ref(),
+            Some(state.page_index),
+        );
+        self.notebook.set_tab_reorderable(&state.original_page, true);
+        self.notebook.set_current_page(Some(new_page));
+        self.sync_tab_strip_active(Some(new_page));
+        state.zoomed_terminal.grab_focus();
+    }
+
+    fn move_pane_to_new_tab(&self) {
+        let Some(page_num) = self.notebook.current_page() else { return };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+
+        // Only works if there are splits
+        if page_widget.clone().downcast::<Paned>().is_err() { return; }
+
+        let Some(term) = find_focused_terminal(&page_widget) else { return };
+        let term_widget = term.clone().upcast::<gtk4::Widget>();
+        let Some(parent) = term_widget.parent() else { return };
+        let Ok(paned) = parent.clone().downcast::<Paned>() else { return };
+
+        let start = paned.start_child();
+        let end = paned.end_child();
+        let sibling = if start.as_ref() == Some(&term_widget) {
+            end
+        } else {
+            start
+        };
+
+        // Detach both children
+        paned.set_start_child(None::<&gtk4::Widget>);
+        paned.set_end_child(None::<&gtk4::Widget>);
+
+        // Promote sibling (same logic as handle_terminal_exited)
+        if let Some(sibling) = sibling {
+            let paned_widget = paned.upcast::<gtk4::Widget>();
+            if let Some(grandparent) = paned_widget.parent() {
+                if let Ok(gp_paned) = grandparent.clone().downcast::<Paned>() {
+                    if gp_paned.start_child().as_ref() == Some(&paned_widget) {
+                        gp_paned.set_start_child(Some(&sibling));
+                    } else {
+                        gp_paned.set_end_child(Some(&sibling));
+                    }
+                } else {
+                    for i in 0..self.notebook.n_pages() {
+                        if let Some(pw) = self.notebook.nth_page(Some(i)) {
+                            if pw == paned_widget {
+                                sibling.set_widget_name(&pw.widget_name());
+                                let tab_label = self.notebook.tab_label(&pw);
+                                self.notebook.remove_page(Some(i));
+                                let new_page_num = self.notebook.insert_page(
+                                    &sibling,
+                                    tab_label.as_ref(),
+                                    Some(i),
+                                );
+                                self.notebook.set_tab_reorderable(&sibling, true);
+                                self.notebook.set_current_page(Some(new_page_num));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(sibling_term) = find_first_terminal(&sibling) {
+                sibling_term.grab_focus();
+            }
+        }
+
+        // Now the terminal is detached - add it as a new tab
+        let working_directory = terminal_working_directory(&term);
+        self.add_terminal_as_new_tab(term, working_directory);
+    }
+
+    /// Add an existing terminal widget as a new tab (used by move_pane_to_new_tab).
+    fn add_terminal_as_new_tab(&self, terminal: Terminal, working_directory: Option<String>) {
+        let tab_num = self.tab_counter.get();
+        self.tab_counter.set(tab_num + 1);
+
+        let tab_name = default_tab_title(tab_num, working_directory.as_deref());
+
+        let terminal_widget = terminal.clone().upcast::<gtk4::Widget>();
+        terminal_widget.set_widget_name(&format!("tab-{tab_num}"));
+
+        // Notebook label
+        let label = Label::new(Some(&tab_name));
+        let page_num = self.notebook.append_page(&terminal, Some(&label));
+        self.notebook.set_tab_reorderable(&terminal, true);
+
+        // Tab strip button
+        let btn = ToggleButton::builder()
+            .label(&tab_name)
+            .css_classes(["flat", "tab-button"])
+            .build();
+        btn.set_widget_name(&format!("tab-{tab_num}"));
+
+        let ui_for_btn = self.clone();
+        btn.connect_clicked(move |b| {
+            let target_name = b.widget_name();
+            for i in 0..ui_for_btn.notebook.n_pages() {
+                if let Some(page_widget) = ui_for_btn.notebook.nth_page(Some(i)) {
+                    if page_widget.widget_name() == target_name {
+                        ui_for_btn.notebook.set_current_page(Some(i));
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.tab_strip.append(&btn);
+        self.notebook.set_current_page(Some(page_num));
+        self.sync_tab_strip_widths(Some(page_num));
+        self.sync_tab_strip_active(Some(page_num));
+        self.sync_tab_bar_visibility();
+        terminal.grab_focus();
     }
 
     fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>) -> Terminal {
@@ -1990,7 +2934,7 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id("app.jterm4").build();
 
     app.connect_activate(|app| {
-        let (config, themes) = load_config();
+        let (config, themes, keybinding_map) = load_config();
 
         // Cache shell selection once to avoid extra process probes per new tab.
         let shell_argv = Rc::new(choose_shell_argv());
@@ -2116,8 +3060,10 @@ fn main() -> glib::ExitCode {
             tab_strip: tab_strip.clone(),
             tab_bar_box: tab_bar_box.clone(),
             tabs_container: tabs_and_add.clone(),
-            keybindings_dialog: Rc::new(RefCell::new(None)),
+            command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
+            keybinding_map: Rc::new(RefCell::new(keybinding_map)),
+            zoom_state: Rc::new(RefCell::new(None)),
         });
 
         // Wire "+" button — inherit working directory from current session
@@ -2168,186 +3114,16 @@ fn main() -> glib::ExitCode {
         let ui_clone = ui.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
-            let font_step = 0.025;
-            let opacity_step = 0.025;
+            // Mask to only the modifier keys we care about
+            let mods = state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK);
+            let combo = KeyCombo {
+                modifiers: mods,
+                key: normalize_key(keyval),
+            };
 
-            // Get current terminal (split-aware)
-            let current_terminal = ui_clone.current_terminal();
-
-            if state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK) {
-                log::debug!(
-                    "Ctrl+Shift shortcut: {} ({})",
-                    keyval,
-                    keyval.name().unwrap_or_default()
-                );
-                match keyval {
-                    Key::T | Key::t => {
-                        log::info!("New tab");
-                        let working_directory = current_terminal
-                            .as_ref()
-                            .and_then(terminal_working_directory);
-                        ui_clone.add_new_tab(working_directory, None);
-                        return true.into();
-                    }
-                    Key::W | Key::w => {
-                        log::info!("Close focused pane or tab");
-                        ui_clone.close_focused_pane_or_tab();
-                        return true.into();
-                    }
-                    Key::C | Key::c => {
-                        log::debug!("Copy");
-                        if let Some(ref term) = current_terminal {
-                            term.copy_clipboard_format(Format::Text);
-                        }
-                        return true.into();
-                    }
-                    Key::V | Key::v => {
-                        log::debug!("Paste");
-                        if let Some(ref term) = current_terminal {
-                            term.paste_clipboard();
-                        }
-                        return true.into();
-                    }
-                    Key::plus => {
-                        log::debug!("Font increase");
-                        let new_scale = (ui_clone.font_scale.get() + font_step).min(10.0);
-                        ui_clone.set_font_scale_all(new_scale);
-                        return true.into();
-                    }
-                    Key::I | Key::i => {
-                        log::debug!("Font decrease");
-                        let new_scale = (ui_clone.font_scale.get() - font_step).max(0.1);
-                        ui_clone.set_font_scale_all(new_scale);
-                        return true.into();
-                    }
-                    Key::J | Key::j => {
-                        log::debug!("Opacity decrease");
-                        ui_clone.window_opacity
-                            .set((ui_clone.window_opacity.get() - opacity_step).clamp(0.01, 1.0));
-                        ui_clone.window.set_opacity(ui_clone.window_opacity.get());
-                        return true.into();
-                    }
-                    Key::K | Key::k => {
-                        log::debug!("Opacity increase");
-                        ui_clone.window_opacity
-                            .set((ui_clone.window_opacity.get() + opacity_step).clamp(0.01, 1.0));
-                        ui_clone.window.set_opacity(ui_clone.window_opacity.get());
-                        return true.into();
-                    }
-                    Key::F | Key::f => {
-                        log::debug!("Toggle search");
-                        ui_clone.toggle_search();
-                        return true.into();
-                    }
-                    Key::P | Key::p => {
-                        log::debug!("Toggle keybindings panel");
-                        ui_clone.toggle_keybindings_panel();
-                        return true.into();
-                    }
-                    Key::O | Key::o => {
-                        log::debug!("Toggle settings panel");
-                        ui_clone.toggle_settings_panel();
-                        return true.into();
-                    }
-                    Key::E | Key::e => {
-                        log::debug!("Split horizontal");
-                        ui_clone.split_current(Orientation::Horizontal);
-                        return true.into();
-                    }
-                    Key::D | Key::d => {
-                        log::debug!("Split vertical");
-                        ui_clone.split_current(Orientation::Vertical);
-                        return true.into();
-                    }
-                    Key::Page_Up => {
-                        ui_clone.switch_tab(-1);
-                        return true.into();
-                    }
-                    Key::Page_Down => {
-                        ui_clone.switch_tab(1);
-                        return true.into();
-                    }
-                    Key::Tab | Key::ISO_Left_Tab => {
-                        ui_clone.switch_tab(-1);
-                        return true.into();
-                    }
-                    _ => {}
-                }
-            }
-
-            if state.contains(ModifierType::CONTROL_MASK) && !state.contains(ModifierType::SHIFT_MASK) {
-                match keyval {
-                    Key::W | Key::w => {
-                        log::info!("Close tab (Ctrl+W)");
-                        ui_clone.remove_current_tab();
-                        return true.into();
-                    }
-                    Key::Tab => {
-                        ui_clone.switch_tab(1);
-                        return true.into();
-                    }
-                    Key::Up => {
-                        if let Some(ref term) = current_terminal {
-                            if let Some(adj) = term.vadjustment() {
-                                let new_val = (adj.value() - adj.step_increment() * 3.0).max(adj.lower());
-                                adj.set_value(new_val);
-                            }
-                        }
-                        return true.into();
-                    }
-                    Key::Down => {
-                        if let Some(ref term) = current_terminal {
-                            if let Some(adj) = term.vadjustment() {
-                                let max_val = adj.upper() - adj.page_size();
-                                let new_val = (adj.value() + adj.step_increment() * 3.0).min(max_val);
-                                adj.set_value(new_val);
-                            }
-                        }
-                        return true.into();
-                    }
-                    Key::minus => {
-                        log::debug!("Font decrease");
-                        let new_scale = (ui_clone.font_scale.get() - font_step).max(0.1);
-                        ui_clone.set_font_scale_all(new_scale);
-                        return true.into();
-                    }
-                    Key::Page_Up => {
-                        ui_clone.switch_tab(-1);
-                        return true.into();
-                    }
-                    Key::Page_Down => {
-                        ui_clone.switch_tab(1);
-                        return true.into();
-                    }
-                    // Ctrl+0~9: quick switch to tab N (0-indexed, Ctrl+9 = last)
-                    Key::_0 | Key::_1 | Key::_2 | Key::_3 | Key::_4 | Key::_5
-                    | Key::_6 | Key::_7 | Key::_8 | Key::_9 => {
-                        let n_pages = ui_clone.notebook.n_pages();
-                        if n_pages > 0 {
-                            let target = if keyval == Key::_9 {
-                                n_pages - 1
-                            } else {
-                                let idx = keyval.into_glib() - Key::_0.into_glib();
-                                idx.min(n_pages - 1)
-                            };
-                            ui_clone.notebook.set_current_page(Some(target));
-                        }
-                        return true.into();
-                    }
-                    _ => {}
-                }
-            }
-
-            // Alt+Tab / Alt+Shift+Tab: cycle pane focus
-            if state.contains(ModifierType::ALT_MASK) && !state.contains(ModifierType::CONTROL_MASK) {
-                if matches!(keyval, Key::Tab | Key::ISO_Left_Tab) {
-                    if state.contains(ModifierType::SHIFT_MASK) {
-                        ui_clone.cycle_pane_focus(-1);
-                    } else {
-                        ui_clone.cycle_pane_focus(1);
-                    }
-                    return true.into();
-                }
+            if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
+                ui_clone.execute_action(action);
+                return true.into();
             }
 
             false.into()
