@@ -1775,15 +1775,11 @@ impl UiState {
         let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         strip_box.append(&strip_label);
 
-        let strip_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
-        strip_close_btn.add_css_class("flat");
-        strip_close_btn.add_css_class("circular");
-        strip_close_btn.add_css_class("tab-strip-close");
-        strip_close_btn.set_tooltip_text(Some("Close tab"));
-        strip_close_btn.set_focus_on_click(false);
-        strip_close_btn.set_can_focus(false);
-        strip_close_btn.set_opacity(0.0);
-        strip_box.append(&strip_close_btn);
+        let strip_close_icon = gtk4::Image::from_icon_name("window-close-symbolic");
+        strip_close_icon.add_css_class("tab-strip-close");
+        strip_close_icon.set_tooltip_text(Some("Close tab"));
+        strip_close_icon.set_opacity(0.0);
+        strip_box.append(&strip_close_icon);
 
         let strip_btn = ToggleButton::new();
         strip_btn.set_child(Some(&strip_box));
@@ -1794,13 +1790,13 @@ impl UiState {
         strip_btn.set_can_focus(false);
         strip_btn.set_hexpand(false);
 
-        // Show close button on hover, hide on leave
+        // Show close icon on hover, hide on leave
         let hover_ctrl = gtk4::EventControllerMotion::new();
-        let close_for_enter = strip_close_btn.clone();
+        let close_for_enter = strip_close_icon.clone();
         hover_ctrl.connect_enter(move |_, _, _| {
             close_for_enter.set_opacity(1.0);
         });
-        let close_for_leave = strip_close_btn.clone();
+        let close_for_leave = strip_close_icon.clone();
         hover_ctrl.connect_leave(move |_| {
             close_for_leave.set_opacity(0.0);
         });
@@ -1829,12 +1825,16 @@ impl UiState {
         });
         strip_btn.add_controller(rename_click_strip);
 
-        // Strip close button: close the tab
+        // Strip close icon: close the tab via GestureClick that claims the event
+        // so the parent ToggleButton does not intercept it.
+        let close_gesture = GestureClick::new();
         let ui_for_strip_close = self.clone();
         let terminal_widget_for_strip_close = terminal.clone().upcast::<gtk4::Widget>();
-        strip_close_btn.connect_clicked(move |_| {
+        close_gesture.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
             ui_for_strip_close.remove_tab_by_widget(&terminal_widget_for_strip_close);
         });
+        strip_close_icon.add_controller(close_gesture);
 
         // Click to switch tab
         let notebook_for_strip = self.notebook.clone();
