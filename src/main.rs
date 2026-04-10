@@ -718,6 +718,9 @@ impl UiState {
         if self.notebook.n_pages() == 0 {
             self.window.destroy();
         } else {
+            if self.notebook.n_pages() <= 1 {
+                self.notebook.set_show_tabs(false);
+            }
             self.focus_current_terminal();
         }
     }
@@ -812,9 +815,27 @@ impl UiState {
             if self.notebook.n_pages() == 0 {
                 self.window.destroy();
             } else {
+                if self.notebook.n_pages() <= 1 {
+                    self.notebook.set_show_tabs(false);
+                }
                 self.focus_current_terminal();
             }
         }
+    }
+
+    fn close_focused_pane_or_tab(&self) {
+        if let Some(page_num) = self.notebook.current_page() {
+            if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
+                // If the page has splits, close the focused pane only
+                if widget.clone().downcast::<Paned>().is_ok() {
+                    if let Some(term) = find_focused_terminal(&widget) {
+                        self.handle_terminal_exited(&term.upcast::<gtk4::Widget>());
+                        return;
+                    }
+                }
+            }
+        }
+        self.remove_current_tab();
     }
 
     fn current_terminal(&self) -> Option<Terminal> {
@@ -934,6 +955,22 @@ impl UiState {
         new_term.grab_focus();
     }
 
+    fn cycle_pane_focus(&self, direction: i32) {
+        let Some(page_num) = self.notebook.current_page() else { return };
+        let Some(widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let mut terms = Vec::new();
+        collect_terminals(&widget, &mut terms);
+        if terms.len() <= 1 { return; }
+
+        let focused_idx = terms.iter().position(|t| t.has_focus()).unwrap_or(0);
+        let next_idx = if direction > 0 {
+            (focused_idx + 1) % terms.len()
+        } else {
+            if focused_idx == 0 { terms.len() - 1 } else { focused_idx - 1 }
+        };
+        terms[next_idx].grab_focus();
+    }
+
     fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
@@ -1032,6 +1069,9 @@ impl UiState {
         };
         self.notebook.set_tab_reorderable(&terminal, true);
         self.notebook.set_current_page(Some(page_num));
+        if self.notebook.n_pages() > 1 {
+            self.notebook.set_show_tabs(true);
+        }
 
         // Focus the new terminal
         terminal.grab_focus();
@@ -1085,6 +1125,7 @@ fn main() -> glib::ExitCode {
             .vexpand(true)
             .scrollable(true)
             .show_border(false)
+            .show_tabs(false)
             .build();
 
         // Create search bar
@@ -1192,8 +1233,8 @@ fn main() -> glib::ExitCode {
                         return true.into();
                     }
                     Key::W | Key::w => {
-                        log::info!("Close tab");
-                        ui_clone.remove_current_tab();
+                        log::info!("Close focused pane or tab");
+                        ui_clone.close_focused_pane_or_tab();
                         return true.into();
                     }
                     Key::C | Key::c => {
@@ -1210,7 +1251,7 @@ fn main() -> glib::ExitCode {
                         }
                         return true.into();
                     }
-                    Key::plus | Key::O | Key::o => {
+                    Key::plus => {
                         log::debug!("Font increase");
                         let new_scale = (ui_clone.font_scale.get() + font_step).min(10.0);
                         ui_clone.set_font_scale_all(new_scale);
@@ -1259,12 +1300,44 @@ fn main() -> glib::ExitCode {
                         ui_clone.switch_tab(1);
                         return true.into();
                     }
+                    Key::Tab | Key::ISO_Left_Tab => {
+                        ui_clone.switch_tab(-1);
+                        return true.into();
+                    }
                     _ => {}
                 }
             }
 
             if state.contains(ModifierType::CONTROL_MASK) && !state.contains(ModifierType::SHIFT_MASK) {
                 match keyval {
+                    Key::W | Key::w => {
+                        log::info!("Close tab (Ctrl+W)");
+                        ui_clone.remove_current_tab();
+                        return true.into();
+                    }
+                    Key::Tab => {
+                        ui_clone.switch_tab(1);
+                        return true.into();
+                    }
+                    Key::Up => {
+                        if let Some(ref term) = current_terminal {
+                            if let Some(adj) = term.vadjustment() {
+                                let new_val = (adj.value() - adj.step_increment() * 3.0).max(adj.lower());
+                                adj.set_value(new_val);
+                            }
+                        }
+                        return true.into();
+                    }
+                    Key::Down => {
+                        if let Some(ref term) = current_terminal {
+                            if let Some(adj) = term.vadjustment() {
+                                let max_val = adj.upper() - adj.page_size();
+                                let new_val = (adj.value() + adj.step_increment() * 3.0).min(max_val);
+                                adj.set_value(new_val);
+                            }
+                        }
+                        return true.into();
+                    }
                     Key::minus => {
                         log::debug!("Font decrease");
                         let new_scale = (ui_clone.font_scale.get() - font_step).max(0.1);
@@ -1279,15 +1352,15 @@ fn main() -> glib::ExitCode {
                         ui_clone.switch_tab(1);
                         return true.into();
                     }
-                    // Ctrl+1~9: quick switch to tab N
-                    Key::_1 | Key::_2 | Key::_3 | Key::_4 | Key::_5
+                    // Ctrl+0~9: quick switch to tab N (0-indexed, Ctrl+9 = last)
+                    Key::_0 | Key::_1 | Key::_2 | Key::_3 | Key::_4 | Key::_5
                     | Key::_6 | Key::_7 | Key::_8 | Key::_9 => {
                         let n_pages = ui_clone.notebook.n_pages();
                         if n_pages > 0 {
                             let target = if keyval == Key::_9 {
                                 n_pages - 1
                             } else {
-                                let idx = keyval.into_glib() - Key::_1.into_glib();
+                                let idx = keyval.into_glib() - Key::_0.into_glib();
                                 idx.min(n_pages - 1)
                             };
                             ui_clone.notebook.set_current_page(Some(target));
@@ -1295,6 +1368,18 @@ fn main() -> glib::ExitCode {
                         return true.into();
                     }
                     _ => {}
+                }
+            }
+
+            // Alt+Tab / Alt+Shift+Tab: cycle pane focus
+            if state.contains(ModifierType::ALT_MASK) && !state.contains(ModifierType::CONTROL_MASK) {
+                if matches!(keyval, Key::Tab | Key::ISO_Left_Tab) {
+                    if state.contains(ModifierType::SHIFT_MASK) {
+                        ui_clone.cycle_pane_focus(-1);
+                    } else {
+                        ui_clone.cycle_pane_focus(1);
+                    }
+                    return true.into();
                 }
             }
 
