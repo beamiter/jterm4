@@ -1678,6 +1678,7 @@ impl UiState {
         // Create tab strip toggle button
         let strip_label = Label::new(Some(&label_text));
         strip_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        strip_label.set_width_chars(12);
         strip_label.set_max_width_chars(24);
         *strip_btn_label.borrow_mut() = Some(strip_label.clone());
 
@@ -1856,19 +1857,24 @@ fn main() -> glib::ExitCode {
         tab_strip.set_hexpand(false);
         tab_strip.set_halign(gtk4::Align::Start);
 
-        let scrolled_tabs = ScrolledWindow::builder()
-            .hexpand(true)
-            .hscrollbar_policy(gtk4::PolicyType::Automatic)
-            .vscrollbar_policy(gtk4::PolicyType::Never)
-            .child(&tab_strip)
-            .build();
-
         let add_tab_button = gtk4::Button::with_label("+");
         add_tab_button.set_focus_on_click(false);
         add_tab_button.set_can_focus(false);
         add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
         add_tab_button.add_css_class("flat");
         add_tab_button.set_hexpand(false);
+
+        // Inner box: [tab buttons...] [+] — keeps "+" adjacent to the last tab
+        let tabs_and_add = gtk4::Box::new(Orientation::Horizontal, 2);
+        tabs_and_add.append(&tab_strip);
+        tabs_and_add.append(&add_tab_button);
+
+        let scrolled_tabs = ScrolledWindow::builder()
+            .hexpand(true)
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .child(&tabs_and_add)
+            .build();
 
         let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_window_button.set_focus_on_click(false);
@@ -1880,7 +1886,6 @@ fn main() -> glib::ExitCode {
         let tab_bar_box = gtk4::Box::new(Orientation::Horizontal, 4);
         tab_bar_box.add_css_class("tab-bar-box");
         tab_bar_box.append(&scrolled_tabs);
-        tab_bar_box.append(&add_tab_button);
         tab_bar_box.append(&close_window_button);
 
         // Main layout: tab bar + notebook + search bar
