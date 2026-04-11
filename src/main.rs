@@ -1623,8 +1623,8 @@ impl UiState {
     /// fit are hidden entirely.  The visible window is centred on the active tab.
     fn sync_tab_strip_widths(&self, active_page: Option<u32>) {
         const INACTIVE_WIDTH: i32 = 72;
-        const ACTIVE_MAX_WIDTH: i32 = 360;
-        const ACTIVE_MIN_WIDTH: i32 = 120;
+        const ACTIVE_MAX_WIDTH: i32 = 260;
+        const ACTIVE_MIN_WIDTH: i32 = INACTIVE_WIDTH * 2;
         const TAB_SPACING: i32 = 2;
         // Reserve width for the "+" button
         const ADD_BTN_RESERVE: i32 = 34;
