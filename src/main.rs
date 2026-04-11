@@ -1479,14 +1479,9 @@ impl UiState {
                 }
             }
             Action::Paste => {
-                log::info!("[PasteTrace] Action::Paste triggered (Ctrl+Shift+V) — calling VTE paste_clipboard()");
+                log::debug!("Paste");
                 if let Some(ref term) = current_terminal {
-                    // VTE paste_clipboard() reads GDK_CLIPBOARD and feeds text into the PTY
-                    // It does NOT handle images — only text content
-                    log::info!("[PasteTrace] Calling term.paste_clipboard() on VTE terminal");
                     term.paste_clipboard();
-                } else {
-                    log::warn!("[PasteTrace] No current terminal for paste");
                 }
             }
             Action::FontIncrease => {
@@ -3245,19 +3240,6 @@ fn main() -> glib::ExitCode {
                 modifiers: mods,
                 key: normalize_key(keyval),
             };
-
-            // Log Ctrl+V specifically to trace clipboard/paste path
-            if mods.contains(ModifierType::CONTROL_MASK) && matches!(keyval, Key::v | Key::V) {
-                log::info!(
-                    "[KeyTrace] Ctrl+V detected: keyval={:?}, mods={:?}, normalized_key={:?}",
-                    keyval, mods, normalize_key(keyval)
-                );
-                if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
-                    log::info!("[KeyTrace] Ctrl+V matched action: {:?} — jterm4 will handle paste", action);
-                } else {
-                    log::info!("[KeyTrace] Ctrl+V NOT matched in keybinding_map — passing through to VTE/PTY (app handles it)");
-                }
-            }
 
             if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
                 ui_clone.execute_action(action);
