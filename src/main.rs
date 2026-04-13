@@ -1090,6 +1090,34 @@ fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Option<String> 
 
 extern "C" {
     fn tcgetpgrp(fd: std::ffi::c_int) -> std::ffi::c_int;
+    fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+}
+
+/// Send SIGHUP to a terminal's child process group so the shell exits cleanly.
+fn kill_terminal_child(terminal: &Terminal) {
+    let pid: i32 = unsafe {
+        match terminal.data::<i32>("child-pid") {
+            Some(p) => *p.as_ref(),
+            None => return,
+        }
+    };
+    if pid > 0 {
+        // Negative PID signals the entire process group
+        unsafe { kill(-pid, 1 /* SIGHUP */); }
+    }
+}
+
+/// Send SIGHUP to all child process groups across every terminal in the notebook.
+fn kill_all_terminal_children(notebook: &Notebook) {
+    for i in 0..notebook.n_pages() {
+        if let Some(page_widget) = notebook.nth_page(Some(i)) {
+            let mut terms = Vec::new();
+            collect_terminals(&page_widget, &mut terms);
+            for term in &terms {
+                kill_terminal_child(term);
+            }
+        }
+    }
 }
 
 /// Read /proc/<pid>/cmdline and return the argv as a Vec<String>.
@@ -1907,6 +1935,12 @@ impl UiState {
     }
 
     fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
+        // Kill all shell processes in this tab before removing it
+        let mut terms = Vec::new();
+        collect_terminals(widget, &mut terms);
+        for term in &terms {
+            kill_terminal_child(term);
+        }
         self.remove_strip_button_for(widget);
         if let Some(page_num) = self.notebook.page_num(widget) {
             self.notebook.remove_page(Some(page_num));
@@ -2102,8 +2136,13 @@ impl UiState {
 
     fn remove_current_tab(&self) {
         if let Some(page_num) = self.notebook.current_page() {
-            // Remove the strip button for the current page's widget
+            // Kill shell processes and remove the strip button for the current page
             if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
+                let mut terms = Vec::new();
+                collect_terminals(&widget, &mut terms);
+                for term in &terms {
+                    kill_terminal_child(term);
+                }
                 self.remove_strip_button_for(&widget);
             }
             self.notebook.remove_page(Some(page_num));
@@ -2124,6 +2163,7 @@ impl UiState {
                 // If the page has splits, close the focused pane only
                 if widget.clone().downcast::<Paned>().is_ok() {
                     if let Some(term) = find_focused_terminal(&widget) {
+                        kill_terminal_child(&term);
                         self.handle_terminal_exited(&term.upcast::<gtk4::Widget>());
                         return;
                     }
@@ -3549,6 +3589,7 @@ fn main() -> glib::ExitCode {
         let notebook_for_close_request = notebook.clone();
         let session_ids_for_close = ui.session_ids.clone();
         window.connect_close_request(move |_| {
+            kill_all_terminal_children(&notebook_for_close_request);
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             false.into()
         });
