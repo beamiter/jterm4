@@ -77,6 +77,8 @@ struct Config {
     cursor: RGBA,
     cursor_foreground: RGBA,
     palette: [RGBA; 16],
+    /// Commands to feed to new shells on startup (comma-separated).
+    startup_commands: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -569,6 +571,8 @@ struct FileConfig {
     cursor: Option<String>,
     cursor_foreground: Option<String>,
     keybindings: Option<toml::Table>,
+    /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
+    startup_commands: Option<String>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -594,6 +598,7 @@ fn load_file_config() -> FileConfig {
         cursor: colors.and_then(|c| c.get("cursor")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         keybindings: table.get("keybindings").and_then(|v| v.as_table()).cloned(),
+        startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
     }
 }
 
@@ -648,6 +653,7 @@ fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor,
         cursor_foreground,
         palette: theme.palette,
+        startup_commands: fc.startup_commands,
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
@@ -1149,6 +1155,7 @@ fn spawn_shell(
     argv_owned: &[String],
     working_directory: Option<&str>,
     session_id: Option<&str>,
+    initial_commands: Option<&str>,
 ) {
     // Append --session <id> to argv when restoring a session
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
@@ -1165,6 +1172,11 @@ fn spawn_shell(
     let home = std::env::var("HOME").ok();
     let working_directory = working_directory.or(home.as_deref());
     let terminal_for_pid = terminal.clone();
+
+    // If initial commands are provided, send them after the shell starts.
+    let init_cmds = initial_commands.map(|s| s.to_string());
+    let terminal_for_init = terminal.clone();
+
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         working_directory,
@@ -1180,6 +1192,19 @@ fn spawn_shell(
                 let pid_i32: i32 = pid.into_glib();
                 unsafe {
                     terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
+                }
+            }
+            // Feed initial commands to the shell after it starts.
+            // Each command separated by "," or ";" in the input becomes a separate line.
+            if let Some(ref cmds) = init_cmds {
+                if !cmds.is_empty() {
+                    // Commands are separated by ", " (comma-space) in the config.
+                    // Each one is sent as a line to the shell.
+                    let lines: Vec<&str> = cmds.split(", ").collect();
+                    for line in lines {
+                        let text = format!("{}\n", line.trim());
+                        terminal_for_init.feed_child(text.as_bytes());
+                    }
                 }
             }
         },
@@ -1505,7 +1530,8 @@ impl UiState {
                 let working_directory = current_terminal
                     .as_ref()
                     .and_then(terminal_working_directory);
-                self.add_new_tab(working_directory, None, None);
+                let startup = self.config.borrow().startup_commands.clone();
+                self.add_new_tab(working_directory, None, None, startup);
             }
             Action::CloseTab => {
                 log::info!("Close tab");
@@ -2408,7 +2434,7 @@ impl UiState {
 
         // Split panes get a fresh session ID (new shell instance)
         let sid = generate_session_id();
-        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory, Some(&sid));
+        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory, Some(&sid), None);
         terminal
     }
 
@@ -2756,7 +2782,7 @@ impl UiState {
         terminal.grab_focus();
     }
 
-    fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>) -> Terminal {
+    fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -2782,6 +2808,7 @@ impl UiState {
             self.shell_argv.as_ref(),
             working_directory.as_deref(),
             Some(&sid),
+            initial_commands.as_deref(),
         );
 
         // Create tab header with a close button
@@ -3248,7 +3275,8 @@ fn main() -> glib::ExitCode {
                 .current_terminal()
                 .as_ref()
                 .and_then(terminal_working_directory);
-            ui_for_add.add_new_tab(working_directory, None, None);
+            let startup = ui_for_add.config.borrow().startup_commands.clone();
+            ui_for_add.add_new_tab(working_directory, None, None, startup);
         });
 
         // Wire close-window button
@@ -3261,7 +3289,8 @@ fn main() -> glib::ExitCode {
         // Each instance saves its own state on close; the last one closed wins.
         let (saved_current, saved_tabs) = load_tabs_state();
         if saved_tabs.is_empty() {
-            ui.add_new_tab(None, None, None);
+            let startup = ui.config.borrow().startup_commands.clone();
+            ui.add_new_tab(None, None, None, startup);
         } else {
             for (name, path, session_id) in saved_tabs {
                 let dir = if Path::new(&path).is_dir() { Some(path) } else { None };
@@ -3270,7 +3299,7 @@ fn main() -> glib::ExitCode {
                 } else {
                     name
                 };
-                ui.add_new_tab(dir, effective_name, session_id);
+                ui.add_new_tab(dir, effective_name, session_id, None);
             }
 
             if let Some(page) = saved_current {
