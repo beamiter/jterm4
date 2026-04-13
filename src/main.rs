@@ -18,6 +18,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::os::fd::AsRawFd;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Format;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
@@ -1007,9 +1008,9 @@ fn unescape_tab_state(value: &str) -> String {
     out
 }
 
-fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String, Option<String>)>) {
+fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String, Option<String>, Option<String>)>) {
     let mut current_page: Option<u32> = None;
-    let mut tabs: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+    let mut tabs: Vec<(Option<String>, String, Option<String>, Option<String>)> = Vec::new();
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -1021,33 +1022,50 @@ fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String
             continue;
         }
         if let Some(rest) = line.strip_prefix("tab=") {
-            if let Some((name_raw, remainder)) = rest.split_once('\t') {
-                let name = unescape_tab_state(name_raw);
-                // Check for a third field (session_id)
-                if let Some((dir_raw, sid_raw)) = remainder.split_once('\t') {
-                    let dir = unescape_tab_state(dir_raw);
-                    let sid = unescape_tab_state(sid_raw);
-                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
-                    tabs.push((Some(name), dir, effective_sid));
-                } else {
-                    // Two fields: name + dir (legacy or no session_id)
-                    let dir = unescape_tab_state(remainder);
-                    tabs.push((Some(name), dir, None));
+            // Split into all tab-separated fields
+            let fields: Vec<&str> = rest.splitn(4, '\t').collect();
+            match fields.len() {
+                1 => {
+                    // Just dir (legacy)
+                    let dir = unescape_tab_state(fields[0]);
+                    tabs.push((None, dir, None, None));
                 }
-            } else {
-                let dir = unescape_tab_state(rest);
-                tabs.push((None, dir, None));
+                2 => {
+                    // name + dir
+                    let name = unescape_tab_state(fields[0]);
+                    let dir = unescape_tab_state(fields[1]);
+                    tabs.push((Some(name), dir, None, None));
+                }
+                3 => {
+                    // name + dir + session_id
+                    let name = unescape_tab_state(fields[0]);
+                    let dir = unescape_tab_state(fields[1]);
+                    let sid = unescape_tab_state(fields[2]);
+                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
+                    tabs.push((Some(name), dir, effective_sid, None));
+                }
+                4 => {
+                    // name + dir + session_id + commands
+                    let name = unescape_tab_state(fields[0]);
+                    let dir = unescape_tab_state(fields[1]);
+                    let sid = unescape_tab_state(fields[2]);
+                    let cmds = unescape_tab_state(fields[3]);
+                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
+                    let effective_cmds = if cmds.is_empty() { None } else { Some(cmds) };
+                    tabs.push((Some(name), dir, effective_sid, effective_cmds));
+                }
+                _ => {}
             }
             continue;
         }
         // Legacy: bare path line
-        tabs.push((None, line.to_string(), None));
+        tabs.push((None, line.to_string(), None, None));
     }
 
     (current_page, tabs)
 }
 
-fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, String, Option<String>)>) {
+fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, String, Option<String>, Option<String>)>) {
     let path = tabs_state_file_path();
     let Ok(contents) = fs::read_to_string(&path) else {
         return (None, Vec::new());
@@ -1068,6 +1086,113 @@ fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Option<String> 
     let first_child = tab_box.first_child()?;
     let label = first_child.downcast::<Label>().ok()?;
     Some(label.text().to_string())
+}
+
+extern "C" {
+    fn tcgetpgrp(fd: std::ffi::c_int) -> std::ffi::c_int;
+}
+
+/// Read /proc/<pid>/cmdline and return the argv as a Vec<String>.
+fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let args: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    if args.is_empty() { None } else { Some(args) }
+}
+
+/// Read the parent PID from /proc/<pid>/stat.
+fn read_ppid(pid: i32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "<pid> (<comm>) <state> <ppid> ..."
+    // comm may contain spaces/parens, so find the last ')' first.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    fields.next(); // state
+    fields.next()?.parse::<i32>().ok()
+}
+
+/// Check if an argv matches a known restorable command pattern.
+/// Returns the command string to replay, or None.
+fn match_restorable_command(args: &[String]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    let bin = Path::new(&args[0])
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    match bin.as_str() {
+        "nix" => {
+            // e.g. nix develop, nix develop /path/to/flake
+            if args.len() >= 2 && args[1] == "develop" {
+                Some(args.join(" "))
+            } else {
+                None
+            }
+        }
+        "bash" | "zsh" | "fish" => {
+            // nix develop execs into: bash --rcfile /tmp/nix-shell.XXXXX
+            // Detect this pattern and restore as "nix develop" using the CWD's flake.
+            for arg in &args[1..] {
+                if arg.starts_with("/tmp/nix-shell.") || arg.starts_with("/tmp/nix-shell-") {
+                    return Some("nix develop".to_string());
+                }
+            }
+            None
+        }
+        "ssh" | "mosh" => Some(args.join(" ")),
+        "docker" | "podman" => {
+            if args.len() >= 2
+                && (args[1] == "exec"
+                    || (args[1] == "compose" && args.len() >= 3 && args[2] == "exec"))
+            {
+                Some(args.join(" "))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Detect restorable interactive commands running in a terminal by inspecting the
+/// foreground process group and walking up the process tree to the shell.
+fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
+    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+
+    // Find the foreground process group via the PTY fd.
+    let pty = terminal.pty()?;
+    let raw_fd = pty.fd().as_raw_fd();
+    let fg_pgid = unsafe { tcgetpgrp(raw_fd) };
+    if fg_pgid <= 0 || fg_pgid == shell_pid {
+        return None; // shell itself is foreground — nothing to restore
+    }
+
+    // Walk from the foreground process up to the shell, checking each level.
+    // This handles cases like: rsh → nix develop → bash (fg)
+    // as well as: rsh → bash --rcfile /tmp/nix-shell.* (fg, nix exec'd)
+    let mut pid = fg_pgid;
+    let mut visited = 0;
+    while pid != shell_pid && pid > 1 && visited < 16 {
+        if let Some(args) = read_proc_cmdline(pid) {
+            if let Some(cmd) = match_restorable_command(&args) {
+                return Some(cmd);
+            }
+        }
+        pid = match read_ppid(pid) {
+            Some(ppid) => ppid,
+            None => break,
+        };
+        visited += 1;
+    }
+    None
 }
 
 fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
@@ -1109,11 +1234,16 @@ fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
             .map(|s| escape_tab_state(s))
             .unwrap_or_default();
 
+        let commands = get_restorable_commands(&terminal)
+            .map(|c| escape_tab_state(&c))
+            .unwrap_or_default();
+
         let line = format!(
-            "tab={}\t{}\t{}",
+            "tab={}\t{}\t{}\t{}",
             escape_tab_state(&label_text),
             escape_tab_state(&dir),
-            sid
+            sid,
+            commands
         );
         lines.push(line);
     }
@@ -1202,7 +1332,7 @@ fn spawn_shell(
                     // Each one is sent as a line to the shell.
                     let lines: Vec<&str> = cmds.split(", ").collect();
                     for line in lines {
-                        let text = format!("{}\n", line.trim());
+                        let text = format!("{}\r", line.trim());
                         terminal_for_init.feed_child(text.as_bytes());
                     }
                 }
@@ -3292,14 +3422,14 @@ fn main() -> glib::ExitCode {
             let startup = ui.config.borrow().startup_commands.clone();
             ui.add_new_tab(None, None, None, startup);
         } else {
-            for (name, path, session_id) in saved_tabs {
+            for (name, path, session_id, commands) in saved_tabs {
                 let dir = if Path::new(&path).is_dir() { Some(path) } else { None };
                 let effective_name = if dir.is_some() {
                     name.and_then(|n| if looks_like_legacy_default_title(&n) { None } else { Some(n) })
                 } else {
                     name
                 };
-                ui.add_new_tab(dir, effective_name, session_id, None);
+                ui.add_new_tab(dir, effective_name, session_id, commands);
             }
 
             if let Some(page) = saved_current {
