@@ -18,6 +18,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Format;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -531,6 +532,8 @@ struct UiState {
     keybinding_map: Rc<RefCell<KeybindingMap>>,
     zoom_state: Rc<RefCell<Option<ZoomState>>>,
     scrollbar_css: CssProvider,
+    /// Maps tab_num → session_id for rsh session persistence.
+    session_ids: Rc<RefCell<HashMap<u32, String>>>,
 }
 
 fn env_f64(name: &str) -> Option<f64> {
@@ -955,6 +958,15 @@ fn tabs_state_file_path() -> PathBuf {
         .join("tabs.state")
 }
 
+/// Generate a unique session ID for rsh session persistence.
+fn generate_session_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{}", std::process::id(), ts)
+}
+
 fn escape_tab_state(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -989,9 +1001,9 @@ fn unescape_tab_state(value: &str) -> String {
     out
 }
 
-fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String)>) {
+fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String, Option<String>)>) {
     let mut current_page: Option<u32> = None;
-    let mut tabs: Vec<(Option<String>, String)> = Vec::new();
+    let mut tabs: Vec<(Option<String>, String, Option<String>)> = Vec::new();
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -1003,23 +1015,33 @@ fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, String
             continue;
         }
         if let Some(rest) = line.strip_prefix("tab=") {
-            if let Some((name_raw, dir_raw)) = rest.split_once('\t') {
+            if let Some((name_raw, remainder)) = rest.split_once('\t') {
                 let name = unescape_tab_state(name_raw);
-                let dir = unescape_tab_state(dir_raw);
-                tabs.push((Some(name), dir));
+                // Check for a third field (session_id)
+                if let Some((dir_raw, sid_raw)) = remainder.split_once('\t') {
+                    let dir = unescape_tab_state(dir_raw);
+                    let sid = unescape_tab_state(sid_raw);
+                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
+                    tabs.push((Some(name), dir, effective_sid));
+                } else {
+                    // Two fields: name + dir (legacy or no session_id)
+                    let dir = unescape_tab_state(remainder);
+                    tabs.push((Some(name), dir, None));
+                }
             } else {
                 let dir = unescape_tab_state(rest);
-                tabs.push((None, dir));
+                tabs.push((None, dir, None));
             }
             continue;
         }
-        tabs.push((None, line.to_string()));
+        // Legacy: bare path line
+        tabs.push((None, line.to_string(), None));
     }
 
     (current_page, tabs)
 }
 
-fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, String)>) {
+fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, String, Option<String>)>) {
     let path = tabs_state_file_path();
     let Ok(contents) = fs::read_to_string(&path) else {
         return (None, Vec::new());
@@ -1042,7 +1064,7 @@ fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Option<String> 
     Some(label.text().to_string())
 }
 
-fn save_tabs_state(notebook: &Notebook) {
+fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
     let path = tabs_state_file_path();
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -1072,10 +1094,20 @@ fn save_tabs_state(notebook: &Notebook) {
             .unwrap_or_else(|| "/".to_string());
         let label_text = tab_label_text(notebook, &widget)
             .unwrap_or_else(|| format!("Terminal {}", i + 1));
+
+        // Extract tab_num from widget name (format: "tab-N")
+        let sid = widget.widget_name().as_str()
+            .strip_prefix("tab-")
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(|tab_num| session_ids.get(&tab_num))
+            .map(|s| escape_tab_state(s))
+            .unwrap_or_default();
+
         let line = format!(
-            "tab={}\t{}",
+            "tab={}\t{}\t{}",
             escape_tab_state(&label_text),
-            escape_tab_state(&dir)
+            escape_tab_state(&dir),
+            sid
         );
         lines.push(line);
     }
@@ -1112,8 +1144,19 @@ fn save_tabs_state(notebook: &Notebook) {
     }
 }
 
-fn spawn_shell(terminal: &Terminal, argv_owned: &[String], working_directory: Option<&str>) {
-    let argv: Vec<&str> = argv_owned.iter().map(|s| s.as_str()).collect();
+fn spawn_shell(
+    terminal: &Terminal,
+    argv_owned: &[String],
+    working_directory: Option<&str>,
+    session_id: Option<&str>,
+) {
+    // Append --session <id> to argv when restoring a session
+    let mut argv_vec: Vec<String> = argv_owned.to_vec();
+    if let Some(sid) = session_id {
+        argv_vec.push("--session".to_string());
+        argv_vec.push(sid.to_string());
+    }
+    let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
     // Use empty envv to inherit all environment variables from parent process
     let envv: &[&str] = &[];
@@ -1462,7 +1505,7 @@ impl UiState {
                 let working_directory = current_terminal
                     .as_ref()
                     .and_then(terminal_working_directory);
-                self.add_new_tab(working_directory, None);
+                self.add_new_tab(working_directory, None, None);
             }
             Action::CloseTab => {
                 log::info!("Close tab");
@@ -2363,7 +2406,9 @@ impl UiState {
             ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
         });
 
-        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory);
+        // Split panes get a fresh session ID (new shell instance)
+        let sid = generate_session_id();
+        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory, Some(&sid));
         terminal
     }
 
@@ -2666,6 +2711,10 @@ impl UiState {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
+        // Assign a session ID for the moved pane's new tab
+        let sid = generate_session_id();
+        self.session_ids.borrow_mut().insert(tab_num, sid);
+
         let tab_name = default_tab_title(tab_num, working_directory.as_deref());
 
         // Use existing scrollbar wrapper if present, otherwise create one
@@ -2707,9 +2756,13 @@ impl UiState {
         terminal.grab_focus();
     }
 
-    fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>) -> Terminal {
+    fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
+
+        // Generate or reuse session ID for rsh session persistence
+        let sid = session_id.unwrap_or_else(generate_session_id);
+        self.session_ids.borrow_mut().insert(tab_num, sid.clone());
 
         let terminal = create_terminal(&self.config.borrow());
 
@@ -2723,11 +2776,12 @@ impl UiState {
             ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
         });
 
-        // Spawn shell
+        // Spawn shell with session ID for state persistence
         spawn_shell(
             &terminal,
             self.shell_argv.as_ref(),
             working_directory.as_deref(),
+            Some(&sid),
         );
 
         // Create tab header with a close button
@@ -3176,6 +3230,7 @@ fn main() -> glib::ExitCode {
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),
+            session_ids: Rc::new(RefCell::new(HashMap::new())),
         });
 
         // Register the dynamic scrollbar CSS provider and apply initial colors
@@ -3193,7 +3248,7 @@ fn main() -> glib::ExitCode {
                 .current_terminal()
                 .as_ref()
                 .and_then(terminal_working_directory);
-            ui_for_add.add_new_tab(working_directory, None);
+            ui_for_add.add_new_tab(working_directory, None, None);
         });
 
         // Wire close-window button
@@ -3206,16 +3261,16 @@ fn main() -> glib::ExitCode {
         // Each instance saves its own state on close; the last one closed wins.
         let (saved_current, saved_tabs) = load_tabs_state();
         if saved_tabs.is_empty() {
-            ui.add_new_tab(None, None);
+            ui.add_new_tab(None, None, None);
         } else {
-            for (name, path) in saved_tabs {
+            for (name, path, session_id) in saved_tabs {
                 let dir = if Path::new(&path).is_dir() { Some(path) } else { None };
                 let effective_name = if dir.is_some() {
                     name.and_then(|n| if looks_like_legacy_default_title(&n) { None } else { Some(n) })
                 } else {
                     name
                 };
-                ui.add_new_tab(dir, effective_name);
+                ui.add_new_tab(dir, effective_name, session_id);
             }
 
             if let Some(page) = saved_current {
@@ -3318,8 +3373,9 @@ fn main() -> glib::ExitCode {
 
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();
+        let session_ids_for_close = ui.session_ids.clone();
         window.connect_close_request(move |_| {
-            save_tabs_state(&notebook_for_close_request);
+            save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             false.into()
         });
 
