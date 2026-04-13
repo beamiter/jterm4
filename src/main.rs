@@ -1324,17 +1324,20 @@ fn spawn_shell(
                     terminal_for_pid.set_data::<i32>("child-pid", pid_i32);
                 }
             }
-            // Feed initial commands to the shell after it starts.
-            // Each command separated by "," or ";" in the input becomes a separate line.
+            // Feed initial commands after the shell has fully initialized.
+            // We delay to ensure the shell has entered raw mode; sending \r
+            // too early would hit the kernel's cooked-mode icrnl translation
+            // (turning \r into \n), which raw-mode shells don't treat as Enter.
             if let Some(ref cmds) = init_cmds {
                 if !cmds.is_empty() {
-                    // Commands are separated by ", " (comma-space) in the config.
-                    // Each one is sent as a line to the shell.
-                    let lines: Vec<&str> = cmds.split(", ").collect();
-                    for line in lines {
-                        let text = format!("{}\r", line.trim());
-                        terminal_for_init.feed_child(text.as_bytes());
-                    }
+                    let cmds = cmds.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                        let lines: Vec<&str> = cmds.split(", ").collect();
+                        for line in lines {
+                            let text = format!("{}\r", line.trim());
+                            terminal_for_init.feed_child(text.as_bytes());
+                        }
+                    });
                 }
             }
         },
