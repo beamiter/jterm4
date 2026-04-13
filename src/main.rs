@@ -1807,8 +1807,11 @@ impl UiState {
         let mut idx = 0u32;
         let mut child = self.tab_strip.first_child();
         while let Some(c) = child {
-            if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
-                btn.set_active(idx == active);
+            // The strip item is a Box containing [ToggleButton, CloseBtn].
+            if let Some(first) = c.first_child() {
+                if let Ok(btn) = first.downcast::<ToggleButton>() {
+                    btn.set_active(idx == active);
+                }
             }
             idx += 1;
             child = c.next_sibling();
@@ -2887,27 +2890,53 @@ impl UiState {
         let page_num = self.notebook.append_page(&page_widget, Some(&label));
         self.notebook.set_tab_reorderable(&page_widget, true);
 
-        // Tab strip button
+        // Tab strip button (wrapped in a Box for consistency with add_new_tab)
         let btn = ToggleButton::builder()
             .label(&tab_name)
-            .css_classes(["flat", "tab-button"])
+            .css_classes(["flat", "tab-strip-btn"])
             .build();
-        btn.set_widget_name(&format!("tab-{tab_num}"));
+        btn.set_focus_on_click(false);
+        btn.set_can_focus(false);
+
+        let strip_close = gtk4::Button::from_icon_name("window-close-symbolic");
+        strip_close.add_css_class("tab-strip-close");
+        strip_close.add_css_class("flat");
+        strip_close.set_opacity(0.0);
+        strip_close.set_focus_on_click(false);
+        strip_close.set_can_focus(false);
+
+        let item_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        item_box.append(&btn);
+        item_box.append(&strip_close);
+        item_box.set_widget_name(&format!("tab-{tab_num}"));
+
+        let hover = gtk4::EventControllerMotion::new();
+        let close_for_enter = strip_close.clone();
+        hover.connect_enter(move |_, _, _| { close_for_enter.set_opacity(1.0); });
+        let close_for_leave = strip_close.clone();
+        hover.connect_leave(move |_| { close_for_leave.set_opacity(0.0); });
+        item_box.add_controller(hover);
 
         let ui_for_btn = self.clone();
-        btn.connect_clicked(move |b| {
-            let target_name = b.widget_name();
-            for i in 0..ui_for_btn.notebook.n_pages() {
-                if let Some(page_widget) = ui_for_btn.notebook.nth_page(Some(i)) {
-                    if page_widget.widget_name() == target_name {
-                        ui_for_btn.notebook.set_current_page(Some(i));
-                        break;
-                    }
-                }
+        let item_box_for_click = item_box.clone();
+        let tab_strip_for_click = self.tab_strip.clone();
+        btn.connect_clicked(move |_| {
+            let mut idx = 0u32;
+            let mut child = tab_strip_for_click.first_child();
+            while let Some(ref c) = child {
+                if c == item_box_for_click.upcast_ref::<gtk4::Widget>() { break; }
+                idx += 1;
+                child = c.next_sibling();
             }
+            ui_for_btn.notebook.set_current_page(Some(idx));
         });
 
-        self.tab_strip.append(&btn);
+        let ui_for_close = self.clone();
+        strip_close.connect_clicked(move |_| {
+            ui_for_close.remove_tab_by_widget(&page_widget.clone().upcast::<gtk4::Widget>());
+        });
+
+        self.tab_strip.append(&item_box);
         self.notebook.set_current_page(Some(page_num));
         self.sync_tab_strip_widths(Some(page_num));
         self.sync_tab_strip_active(Some(page_num));
@@ -3039,17 +3068,8 @@ impl UiState {
         strip_label.set_xalign(0.0);
         *strip_btn_label.borrow_mut() = Some(strip_label.clone());
 
-        let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-        strip_box.append(&strip_label);
-
-        let strip_close_icon = gtk4::Image::from_icon_name("window-close-symbolic");
-        strip_close_icon.add_css_class("tab-strip-close");
-        strip_close_icon.set_tooltip_text(Some("Close tab"));
-        strip_close_icon.set_opacity(0.0);
-        strip_box.append(&strip_close_icon);
-
         let strip_btn = ToggleButton::new();
-        strip_btn.set_child(Some(&strip_box));
+        strip_btn.set_child(Some(&strip_label));
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
         strip_btn.set_active(true); // new tab is current
@@ -3057,19 +3077,33 @@ impl UiState {
         strip_btn.set_can_focus(false);
         strip_btn.set_hexpand(false);
 
-        // Show close icon on hover, hide on leave
+        let strip_close_btn = gtk4::Button::from_icon_name("window-close-symbolic");
+        strip_close_btn.add_css_class("tab-strip-close");
+        strip_close_btn.add_css_class("flat");
+        strip_close_btn.set_tooltip_text(Some("Close tab"));
+        strip_close_btn.set_opacity(0.0);
+        strip_close_btn.set_focus_on_click(false);
+        strip_close_btn.set_can_focus(false);
+
+        // Outer container: [ToggleButton][CloseBtn] — close btn is outside
+        // the ToggleButton so it receives its own click events.
+        let strip_item = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        strip_item.append(&strip_btn);
+        strip_item.append(&strip_close_btn);
+
+        // Show close button on hover over the whole strip item
         let hover_ctrl = gtk4::EventControllerMotion::new();
-        let close_for_enter = strip_close_icon.clone();
+        let close_for_enter = strip_close_btn.clone();
         hover_ctrl.connect_enter(move |_, _, _| {
             close_for_enter.set_opacity(1.0);
         });
-        let close_for_leave = strip_close_icon.clone();
+        let close_for_leave = strip_close_btn.clone();
         hover_ctrl.connect_leave(move |_| {
             close_for_leave.set_opacity(0.0);
         });
-        strip_btn.add_controller(hover_ctrl);
-        // Give button a unique name to correlate with notebook page
-        strip_btn.set_widget_name(&format!("tab-{}", tab_num));
+        strip_item.add_controller(hover_ctrl);
+        // Give outer container a unique name to correlate with notebook page
+        strip_item.set_widget_name(&format!("tab-{}", tab_num));
         // Also name the wrapper widget so we can find the button when removing
         term_wrapper.set_widget_name(&format!("tab-{}", tab_num));
 
@@ -3092,26 +3126,23 @@ impl UiState {
         });
         strip_btn.add_controller(rename_click_strip);
 
-        // Strip close icon: close the tab via GestureClick that claims the event
-        // so the parent ToggleButton does not intercept it.
-        let close_gesture = GestureClick::new();
+        // Strip close button: close the tab on click.
         let ui_for_strip_close = self.clone();
         let wrapper_for_strip_close = term_wrapper.clone().upcast::<gtk4::Widget>();
-        close_gesture.connect_released(move |gesture, _, _, _| {
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        strip_close_btn.connect_clicked(move |_| {
             ui_for_strip_close.remove_tab_by_widget(&wrapper_for_strip_close);
         });
-        strip_close_icon.add_controller(close_gesture);
 
         // Click to switch tab
         let notebook_for_strip = self.notebook.clone();
         let tab_strip_for_click = self.tab_strip.clone();
-        strip_btn.connect_clicked(move |btn| {
-            // Find the index of this button in the strip
+        let strip_item_for_click = strip_item.clone();
+        strip_btn.connect_clicked(move |_| {
+            // Find the index of the parent strip_item in the strip
             let mut idx = 0u32;
             let mut child = tab_strip_for_click.first_child();
             while let Some(ref c) = child {
-                if c == btn.upcast_ref::<gtk4::Widget>() {
+                if c == strip_item_for_click.upcast_ref::<gtk4::Widget>() {
                     break;
                 }
                 idx += 1;
@@ -3120,24 +3151,24 @@ impl UiState {
             notebook_for_strip.set_current_page(Some(idx));
         });
 
-        // Drag source: carry the widget name so we can identify the dragged button
+        // Drag source: carry the widget name so we can identify the dragged item
         let drag_source = gtk4::DragSource::new();
         drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
-        let strip_btn_for_drag = strip_btn.clone();
+        let strip_item_for_drag = strip_item.clone();
         drag_source.connect_prepare(move |_, _, _| {
-            let name = strip_btn_for_drag.widget_name().to_string();
+            let name = strip_item_for_drag.widget_name().to_string();
             Some(gtk4::gdk::ContentProvider::for_value(&name.to_value()))
         });
-        strip_btn.add_controller(drag_source);
+        strip_item.add_controller(drag_source);
 
-        // Drop target: reorder strip buttons and notebook pages
+        // Drop target: reorder strip items and notebook pages
         let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
         let tab_strip_for_drop = self.tab_strip.clone();
         let notebook_for_drop = self.notebook.clone();
-        let strip_btn_for_drop = strip_btn.clone();
+        let strip_item_for_drop = strip_item.clone();
         drop_target.connect_drop(move |_, value, _, _| {
             let Ok(drag_name) = value.get::<String>() else { return false };
-            let target_name = strip_btn_for_drop.widget_name().to_string();
+            let target_name = strip_item_for_drop.widget_name().to_string();
             if drag_name == target_name {
                 return false; // dropped on itself
             }
@@ -3164,8 +3195,7 @@ impl UiState {
                 return false;
             };
 
-            // Reorder strip button: move src before/after dst
-            // Find the target widget again for insert_after/insert_before
+            // Reorder strip item: move src before/after dst
             let mut target_w: Option<gtk4::Widget> = None;
             let mut child = tab_strip_for_drop.first_child();
             while let Some(ref c) = child {
@@ -3193,8 +3223,10 @@ impl UiState {
                 let mut child = tab_strip_for_drop.first_child();
                 let mut i = 0u32;
                 while let Some(c) = child {
-                    if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
-                        btn.set_active(i == current);
+                    if let Some(first) = c.first_child() {
+                        if let Ok(btn) = first.downcast::<ToggleButton>() {
+                            btn.set_active(i == current);
+                        }
                     }
                     i += 1;
                     child = c.next_sibling();
@@ -3203,11 +3235,11 @@ impl UiState {
 
             true
         });
-        strip_btn.add_controller(drop_target);
+        strip_item.add_controller(drop_target);
 
-        // Insert strip button at the correct position
+        // Insert strip item at the correct position
         if page_num as i32 >= self.tab_strip.observe_children().n_items() as i32 {
-            self.tab_strip.append(&strip_btn);
+            self.tab_strip.append(&strip_item);
         } else {
             // Insert before the sibling at page_num position
             let mut child = self.tab_strip.first_child();
@@ -3215,9 +3247,9 @@ impl UiState {
                 child = child.and_then(|c| c.next_sibling());
             }
             if let Some(sibling) = child {
-                strip_btn.insert_before(&self.tab_strip, Some(&sibling));
+                strip_item.insert_before(&self.tab_strip, Some(&sibling));
             } else {
-                self.tab_strip.append(&strip_btn);
+                self.tab_strip.append(&strip_item);
             }
         }
 
@@ -3317,7 +3349,7 @@ fn main() -> glib::ExitCode {
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
             ".tab-strip-btn { padding: 2px 4px 2px 8px; border-radius: 4px; overflow: hidden; }
-             .tab-strip-btn:checked { font-weight: bold; }
+             .tab-strip-btn:checked { font-weight: bold; border-bottom: 2px solid currentColor; border-radius: 0; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .tab-bar-box { padding: 2px 4px; }
              .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
