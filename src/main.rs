@@ -8,7 +8,7 @@ use gtk4::gio::prelude::FileExt as GioFileExt;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
 use gtk4::{glib, Adjustment, Entry, Label, ListBox, Notebook, Orientation, Paned, Scale, ScrolledWindow};
-use gtk4::{CssProvider, EventControllerKey, GestureClick, SearchBar, SearchEntry, ToggleButton};
+use gtk4::{CssProvider, EventControllerKey, EventControllerScroll, EventControllerScrollFlags, GestureClick, SearchBar, SearchEntry, ToggleButton};
 use libadwaita as adw;
 use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
@@ -3584,6 +3584,27 @@ fn main() -> glib::ExitCode {
         });
 
         window.add_controller(key_controller);
+
+        // Ctrl+scroll to zoom font
+        let scroll_controller = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+        scroll_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let ui_for_scroll = ui.clone();
+        scroll_controller.connect_scroll(move |controller, _dx, dy| {
+            let state = controller.current_event_state();
+            if state.contains(ModifierType::CONTROL_MASK) {
+                let font_step = 0.025;
+                let current = ui_for_scroll.font_scale.get();
+                let new_scale = if dy < 0.0 {
+                    (current + font_step).min(10.0)
+                } else {
+                    (current - font_step).max(0.1)
+                };
+                ui_for_scroll.set_font_scale_all(new_scale);
+                return true.into();
+            }
+            false.into()
+        });
+        window.add_controller(scroll_controller);
 
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();
