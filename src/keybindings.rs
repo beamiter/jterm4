@@ -350,7 +350,6 @@ impl KeybindingMap {
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
         bind("Ctrl+Shift+PageDown", Action::NextTab);
         bind("Ctrl+Shift+Tab", Action::PrevTab);
-        bind("Ctrl+W", Action::CloseTab);
         bind("Ctrl+Tab", Action::NextTab);
         bind("Ctrl+Up", Action::ScrollUp);
         bind("Ctrl+Down", Action::ScrollDown);
