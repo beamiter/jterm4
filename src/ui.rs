@@ -230,9 +230,8 @@ impl UiState {
     /// name; inactive tabs are compressed to a small fixed width; tabs that don't
     /// fit are hidden entirely.  The visible window is centred on the active tab.
     pub(crate) fn sync_tab_strip_widths(&self, active_page: Option<u32>) {
-        const INACTIVE_WIDTH: i32 = 72;
-        const ACTIVE_MAX_WIDTH: i32 = 260;
-        const ACTIVE_MIN_WIDTH: i32 = INACTIVE_WIDTH * 2;
+        const INACTIVE_WIDTH: i32 = 96;
+        const ACTIVE_MAX_WIDTH: i32 = INACTIVE_WIDTH * 2;
         const TAB_SPACING: i32 = 2;
         // Reserve width for the "+" button
         const ADD_BTN_RESERVE: i32 = 34;
@@ -248,8 +247,26 @@ impl UiState {
             return;
         }
 
-        // Active tab gets as much room as possible (up to ACTIVE_MAX_WIDTH).
-        let active_width = avail.min(ACTIVE_MAX_WIDTH).max(ACTIVE_MIN_WIDTH);
+        // Measure the active tab's natural (preferred) width so it adapts to
+        // its title, clamped between INACTIVE_WIDTH and ACTIVE_MAX_WIDTH.
+        let active_width = {
+            let mut natural = INACTIVE_WIDTH;
+            let mut idx = 0i32;
+            let mut child = self.tab_strip.first_child();
+            while let Some(c) = child {
+                if idx == active {
+                    // Temporarily clear size request so measure returns the
+                    // content's natural width, not the previously forced value.
+                    c.set_size_request(-1, -1);
+                    let (_, nat, _, _) = c.measure(gtk4::Orientation::Horizontal, -1);
+                    natural = nat;
+                    break;
+                }
+                idx += 1;
+                child = c.next_sibling();
+            }
+            natural.clamp(INACTIVE_WIDTH, ACTIVE_MAX_WIDTH).min(avail)
+        };
         let remaining = (avail - active_width - TAB_SPACING).max(0);
 
         // How many inactive tabs can we fit alongside the active tab?
