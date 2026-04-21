@@ -229,6 +229,19 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                     }
                 }
             }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            // OSC sequence: skip until BEL or ST (ESC \)
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    i += 1;
+                    break;
+                } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             // Skip unknown escape sequences (e.g. ESC + single char like ESC D)
             i += 2;
