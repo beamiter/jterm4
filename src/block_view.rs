@@ -691,6 +691,7 @@ impl TermView {
 
                                 let output = active_rc.borrow().output_text();
                                 let output_trimmed = output.trim_end().to_string();
+                                log::debug!("CommandEnd: cmd={:?}, output_len={}, output_empty={}", cmd, output_trimmed.len(), output_trimmed.is_empty());
 
                                 let finished = FinishedBlock::new(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb,
@@ -704,6 +705,13 @@ impl TermView {
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
                                 active_rc.borrow().output_buf.set_text("");
+
+                                // Scroll to bottom after layout updates
+                                let scroll_for_finished = block_scroll_rc.clone();
+                                glib::idle_add_local_once(move || {
+                                    let adj = scroll_for_finished.vadjustment();
+                                    adj.set_value(adj.upper() - adj.page_size());
+                                });
 
                                 bstate_rc.set(BlockState::Idle);
                             }
