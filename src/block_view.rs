@@ -603,13 +603,15 @@ impl TermView {
                                         let current_stripped = strip_ansi(&current_raw_buf);
 
                                         // Skip the prompt visible characters to get to the command
-                                        let prompt_visible_len = prompt_clean.len();
+                                        // Use character count, not byte length (important for UTF-8 chars like ❯)
+                                        let prompt_char_count = prompt_clean.chars().count();
                                         let mut raw_cmd = if !prompt_clean.is_empty() {
-                                            if let Some(after_prompt) = current_stripped.strip_prefix(prompt_clean) {
+                                            if let Some(_after_prompt) = current_stripped.strip_prefix(prompt_clean) {
                                                 // Calculate visible chars to skip in raw text
-                                                skip_ansi_visible_chars(&current_raw_buf, prompt_visible_len)
+                                                skip_ansi_visible_chars(&current_raw_buf, prompt_char_count)
                                             } else if let Some(pos) = current_stripped.find(prompt_clean) {
-                                                skip_ansi_visible_chars(&current_raw_buf, pos + prompt_clean.len())
+                                                let pos_chars = current_stripped[..pos].chars().count();
+                                                skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count)
                                             } else {
                                                 current_raw_buf.clone()
                                             }
@@ -664,8 +666,9 @@ impl TermView {
 
                                 // Still handle \r just in case
                                 let (raw_last_line, last_line) = if let Some(idx) = stripped_cmd_buf.rfind('\r') {
+                                    let idx_chars = stripped_cmd_buf[..idx].chars().count();
                                     (
-                                        skip_ansi_visible_chars(&raw_cmd_buf, idx + 1),
+                                        skip_ansi_visible_chars(&raw_cmd_buf, idx_chars + 1),
                                         &stripped_cmd_buf[idx+1..],
                                     )
                                 } else {
@@ -680,7 +683,7 @@ impl TermView {
                                 };
 
                                 // Extract raw command with ANSI codes for markup conversion
-                                let prompt_visible_len = prompt.trim().len();
+                                let prompt_char_count = prompt.trim().chars().count();
                                 let raw_cmd_with_ansi = if !prompt.is_empty() {
                                     let raw_last_trimmed = raw_last_line.trim_start();
                                     if raw_last_line != raw_last_trimmed {
@@ -689,8 +692,8 @@ impl TermView {
                                     } else {
                                         // Try to find prompt and skip past it
                                         let raw_stripped = strip_ansi(&raw_last_line);
-                                        if let Some(after_prompt) = raw_stripped.strip_prefix(prompt.trim()) {
-                                            skip_ansi_visible_chars(&raw_last_line, prompt_visible_len).trim_start().to_string()
+                                        if let Some(_after_prompt) = raw_stripped.strip_prefix(prompt.trim()) {
+                                            skip_ansi_visible_chars(&raw_last_line, prompt_char_count).trim_start().to_string()
                                         } else {
                                             raw_last_line.clone()
                                         }
