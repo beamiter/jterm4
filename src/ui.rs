@@ -400,8 +400,9 @@ impl UiState {
              .terminal-box scrollbar trough {{ background-color: rgb({br},{bg_g},{bb}); }}
              .terminal-box scrollbar slider {{ background-color: rgba({fr},{fg_g},{fb},0.4); }}
              .terminal-box scrollbar slider:hover {{ background-color: rgba({fr},{fg_g},{fb},0.7); }}
-             .tab-bar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
-             .tab-bar-box button {{ color: rgb({fr},{fg_g},{fb}); }}
+             .top-bar {{ background-color: rgb({br},{bg_g},{bb}); color: rgb({fr},{fg_g},{fb}); }}
+             .top-bar button {{ color: rgb({fr},{fg_g},{fb}); }}
+             .sidebar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
              .tab-strip-btn {{ color: rgba({fr},{fg_g},{fb},0.6); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}"
         );
