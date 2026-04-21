@@ -77,6 +77,211 @@ fn strip_ansi(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
+    match idx {
+        0..=15 => {
+            let c = palette[idx as usize];
+            (
+                (c.red() * 255.0) as u8,
+                (c.green() * 255.0) as u8,
+                (c.blue() * 255.0) as u8,
+            )
+        }
+        16..=231 => {
+            let idx = idx - 16;
+            let r = (idx / 36) * 51;
+            let g = ((idx % 36) / 6) * 51;
+            let b = (idx % 6) * 51;
+            (r, g, b)
+        }
+        232..=255 => {
+            let gray = 8 + (idx - 232) * 10;
+            (gray, gray, gray)
+        }
+    }
+}
+
+fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && count > 0 {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() { i += 1; }
+                }
+                b']' => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == 0x07 { i += 1; }
+                }
+                _ => {
+                    i += 2;
+                }
+            }
+        } else {
+            let ch_len = if bytes[i] & 0x80 == 0 {
+                1
+            } else if bytes[i] & 0xe0 == 0xc0 {
+                2
+            } else if bytes[i] & 0xf0 == 0xe0 {
+                3
+            } else if bytes[i] & 0xf8 == 0xf0 {
+                4
+            } else {
+                1
+            };
+            i += ch_len;
+            if count > 0 { count -= 1; }
+        }
+    }
+    input[i..].to_string()
+}
+
+fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut open_spans = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            let mut params = Vec::new();
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                if bytes[i] == b';' {
+                    params.push(String::new());
+                } else if let Some(last) = params.last_mut() {
+                    last.push(bytes[i] as char);
+                } else {
+                    params.push(String::from(bytes[i] as char));
+                }
+                i += 1;
+            }
+
+            if i < bytes.len() {
+                let final_byte = bytes[i];
+                i += 1;
+
+                if final_byte == b'm' {
+                    if params.is_empty() || params[0].is_empty() {
+                        params = vec!["0".to_string()];
+                    }
+
+                    for param_str in &params {
+                        if param_str.is_empty() { continue; }
+                        match param_str.parse::<u32>() {
+                            Ok(0) => {
+                                while open_spans > 0 {
+                                    out.push_str("</span>");
+                                    open_spans -= 1;
+                                }
+                            }
+                            Ok(1) => {
+                                out.push_str("<span weight=\"bold\">");
+                                open_spans += 1;
+                            }
+                            Ok(3) => {
+                                out.push_str("<span style=\"italic\">");
+                                open_spans += 1;
+                            }
+                            Ok(30..=37) => {
+                                let idx = (param_str.parse::<u32>().unwrap() - 30) as usize;
+                                let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
+                                out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                open_spans += 1;
+                            }
+                            Ok(90..=97) => {
+                                let idx = (param_str.parse::<u32>().unwrap() - 90 + 8) as u8;
+                                let (r, g, b) = ansi256_to_rgb(idx, palette);
+                                out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                open_spans += 1;
+                            }
+                            Ok(38) => {
+                                let j = params.iter().position(|p| p == param_str).unwrap_or(0);
+                                if j + 2 < params.len() {
+                                    if params[j + 1] == "5" {
+                                        if let Ok(idx) = params[j + 2].parse::<u8>() {
+                                            let (r, g, b) = ansi256_to_rgb(idx, palette);
+                                            out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            open_spans += 1;
+                                        }
+                                    } else if params[j + 1] == "2" && j + 4 < params.len() {
+                                        if let (Ok(r), Ok(g), Ok(b)) = (
+                                            params[j + 2].parse::<u8>(),
+                                            params[j + 3].parse::<u8>(),
+                                            params[j + 4].parse::<u8>(),
+                                        ) {
+                                            out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            open_spans += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            // Skip unknown escape sequences (e.g. ESC + single char like ESC D)
+            i += 2;
+        } else {
+            // Collect UTF-8 characters
+            let ch_start = i;
+            let ch_len = if bytes[i] & 0x80 == 0 {
+                1
+            } else if bytes[i] & 0xe0 == 0xc0 {
+                2
+            } else if bytes[i] & 0xf0 == 0xe0 {
+                3
+            } else if bytes[i] & 0xf8 == 0xf0 {
+                4
+            } else {
+                1
+            };
+            i += ch_len;
+
+            if i > bytes.len() {
+                i = bytes.len();
+            }
+
+            let char_bytes = &bytes[ch_start..i];
+            match String::from_utf8(char_bytes.to_vec()) {
+                Ok(s) => {
+                    for ch in s.chars() {
+                        match ch {
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            '&' => out.push_str("&amp;"),
+                            '"' => out.push_str("&quot;"),
+                            '\'' => out.push_str("&apos;"),
+                            _ => out.push(ch),
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Replacement character for invalid UTF-8
+                    out.push('\u{FFFD}');
+                }
+            }
+        }
+    }
+
+    while open_spans > 0 {
+        out.push_str("</span>");
+        open_spans -= 1;
+    }
+
+    out
+}
+
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 struct FinishedBlock {
@@ -84,7 +289,7 @@ struct FinishedBlock {
 }
 
 impl FinishedBlock {
-    fn new(prompt: &str, cmd: &str, output: &str, exit_code: i32, _config: &Config) -> Self {
+    fn new(prompt: &str, cmd: &str, cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
 
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
@@ -107,11 +312,18 @@ impl FinishedBlock {
         let sep = gtk4::Label::new(Some("❯"));
         sep.add_css_class("block-chevron");
 
-        let cmd_label = gtk4::Label::new(Some(if cmd.is_empty() { "(empty)" } else { cmd }));
+        let cmd_label = gtk4::Label::new(None);
         cmd_label.add_css_class("block-cmd");
         cmd_label.set_xalign(0.0);
         cmd_label.set_hexpand(true);
         cmd_label.set_selectable(true);
+        if cmd.is_empty() {
+            cmd_label.set_text("(empty)");
+        } else if let Some(markup) = cmd_markup {
+            cmd_label.set_markup(markup);
+        } else {
+            cmd_label.set_text(cmd);
+        }
 
         header.append(&prompt_label);
         header.append(&sep);
@@ -218,6 +430,10 @@ impl ActiveBlock {
 
     fn set_cmd(&self, text: &str) {
         self.cmd_label.set_text(text);
+    }
+
+    fn set_cmd_markup(&self, markup: &str) {
+        self.cmd_label.set_markup(markup);
     }
 
     fn append_output(&self, text: &str) {
@@ -367,39 +583,44 @@ impl TermView {
                                     }
                                     BlockState::AwaitingCommand => {
                                         // Shell's line editor sends the full line (prompt + input) with each keystroke.
-                                        // When the prompt appears at the start, it's a fresh redraw - replace buffer.
-                                        // Otherwise it's continuation - append to buffer.
-                                        let stripped = strip_ansi(&text);
+                                        // Store raw text with ANSI codes preserved
+                                        let raw_text = text.clone();
+                                        let stripped = strip_ansi(&raw_text);
 
                                         let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
                                         let prompt_clean = prompt_text.trim();
 
                                         // If this chunk starts with the prompt, it's a fresh redraw - replace buffer
                                         if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
-                                            *cmd_buf_rc.borrow_mut() = stripped;
+                                            *cmd_buf_rc.borrow_mut() = raw_text.clone();
                                         } else {
                                             // No prompt at start means this is continuation input
-                                            cmd_buf_rc.borrow_mut().push_str(&stripped);
+                                            cmd_buf_rc.borrow_mut().push_str(&raw_text);
                                         }
 
-                                        // Now extract the command from the buffer
-                                        let current_buf = cmd_buf_rc.borrow().clone();
+                                        // Now extract the command from the raw buffer
+                                        let current_raw_buf = cmd_buf_rc.borrow().clone();
+                                        let current_stripped = strip_ansi(&current_raw_buf);
 
-                                        // Strip the prompt prefix to get just the command
-                                        let cmd = if !prompt_clean.is_empty() {
-                                            if let Some(after_prompt) = current_buf.strip_prefix(prompt_clean) {
-                                                after_prompt.trim_start()
-                                            } else if let Some(pos) = current_buf.find(prompt_clean) {
-                                                current_buf[pos + prompt_clean.len()..].trim_start()
+                                        // Skip the prompt visible characters to get to the command
+                                        let prompt_visible_len = prompt_clean.len();
+                                        let mut raw_cmd = if !prompt_clean.is_empty() {
+                                            if let Some(after_prompt) = current_stripped.strip_prefix(prompt_clean) {
+                                                // Calculate visible chars to skip in raw text
+                                                skip_ansi_visible_chars(&current_raw_buf, prompt_visible_len)
+                                            } else if let Some(pos) = current_stripped.find(prompt_clean) {
+                                                skip_ansi_visible_chars(&current_raw_buf, pos + prompt_clean.len())
                                             } else {
-                                                &current_buf
+                                                current_raw_buf.clone()
                                             }
                                         } else {
-                                            &current_buf
+                                            current_raw_buf.clone()
                                         };
 
-                                        let display = cmd.trim_end_matches('\n').trim_end();
-                                        active_rc.borrow().set_cmd(display);
+                                        raw_cmd = raw_cmd.trim_start().to_string();
+                                        let display = raw_cmd.trim_end_matches('\n').trim_end();
+                                        let markup = ansi_to_pango(display, &config_for_cb.palette);
+                                        active_rc.borrow().set_cmd_markup(&markup);
                                     }
                                     BlockState::CollectingOutput => {
                                         let clean = strip_ansi(&text);
@@ -437,26 +658,59 @@ impl TermView {
                                 // Freeze the active block into a finished block
                                 let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
 
-                                // Extract command from line-editor buffer
-                                // Since we now clean cmd_buf in AwaitingCommand when \r is seen,
-                                // cmd_buf should already contain only the current line.
-                                let stripped_cmd_buf = strip_ansi(&cmd_buf_rc.borrow());
+                                // Extract command from raw buffer (preserving ANSI codes)
+                                let raw_cmd_buf = cmd_buf_rc.borrow().clone();
+                                let stripped_cmd_buf = strip_ansi(&raw_cmd_buf);
+
                                 // Still handle \r just in case
-                                let last_line = if let Some(idx) = stripped_cmd_buf.rfind('\r') {
-                                    &stripped_cmd_buf[idx+1..]
+                                let (raw_last_line, last_line) = if let Some(idx) = stripped_cmd_buf.rfind('\r') {
+                                    (
+                                        skip_ansi_visible_chars(&raw_cmd_buf, idx + 1),
+                                        &stripped_cmd_buf[idx+1..],
+                                    )
                                 } else {
-                                    &stripped_cmd_buf
+                                    (raw_cmd_buf.clone(), &stripped_cmd_buf[..])
                                 };
+
+                                // Extract command by removing prompt prefix
                                 let cmd = if let Some(cmd_part) = last_line.strip_prefix(prompt.trim()) {
                                     cmd_part.trim().to_string()
                                 } else {
                                     last_line.trim().to_string()
                                 };
+
+                                // Extract raw command with ANSI codes for markup conversion
+                                let prompt_visible_len = prompt.trim().len();
+                                let raw_cmd_with_ansi = if !prompt.is_empty() {
+                                    let raw_last_trimmed = raw_last_line.trim_start();
+                                    if raw_last_line != raw_last_trimmed {
+                                        // We trimmed whitespace, just use what we have
+                                        raw_last_trimmed.to_string()
+                                    } else {
+                                        // Try to find prompt and skip past it
+                                        let raw_stripped = strip_ansi(&raw_last_line);
+                                        if let Some(after_prompt) = raw_stripped.strip_prefix(prompt.trim()) {
+                                            skip_ansi_visible_chars(&raw_last_line, prompt_visible_len).trim_start().to_string()
+                                        } else {
+                                            raw_last_line.clone()
+                                        }
+                                    }
+                                } else {
+                                    raw_last_line
+                                };
+
+                                let cmd_trimmed = raw_cmd_with_ansi.trim_end().to_string();
+                                let cmd_markup = if !cmd_trimmed.is_empty() {
+                                    ansi_to_pango(&cmd_trimmed, &config_for_cb.palette)
+                                } else {
+                                    String::new()
+                                };
+
                                 let output = active_rc.borrow().output_text();
                                 let output_trimmed = output.trim_end().to_string();
 
                                 let finished = FinishedBlock::new(
-                                    &prompt, &cmd, &output_trimmed, *code, &config_for_cb,
+                                    &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb,
                                 );
 
                                 // Insert before the active block (which is always last)
