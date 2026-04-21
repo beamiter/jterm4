@@ -8,7 +8,7 @@ use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
 use gtk4::gio::{self, Cancellable};
 use gtk4::{glib, Notebook, Orientation, CssProvider, EventControllerKey, EventControllerScroll,
-           EventControllerScrollFlags, SearchBar, SearchEntry};
+           EventControllerScrollFlags, ScrolledWindow, SearchBar, SearchEntry};
 use libadwaita as adw;
 use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
@@ -145,10 +145,11 @@ fn main() -> glib::ExitCode {
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
-            ".tab-strip-btn { padding: 2px 4px 2px 8px; border-radius: 4px; overflow: hidden; }
-             .tab-strip-btn:checked { font-weight: bold; border-bottom: 2px solid currentColor; border-radius: 0; }
+            ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; overflow: hidden; }
+             .tab-strip-btn:checked { font-weight: bold; border-left: 3px solid currentColor; border-radius: 0; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
-             .tab-bar-box { padding: 2px 4px; }
+             .sidebar-box { min-width: 140px; padding: 2px 4px; }
+             .top-bar { padding: 2px 4px; }
              .hidden-tabs > header { min-height: 0; border: none; background: none; padding: 0; margin: 0; }
              .hidden-tabs > header > * { min-height: 0; min-width: 0; padding: 0; margin: 0; }
              .terminal-box scrollbar slider { min-width: 6px; border-radius: 3px; }
@@ -164,41 +165,66 @@ fn main() -> glib::ExitCode {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        // Custom tab bar: [scrollable tab strip] [+] [close]
-        let tab_strip = gtk4::Box::new(Orientation::Horizontal, 2);
-        tab_strip.set_hexpand(false);
-        tab_strip.set_halign(gtk4::Align::Start);
+        // Top bar: [☰ toggle] [spacer] [+ new tab] [✕ close window]
+        let toggle_sidebar_btn = gtk4::Button::from_icon_name("open-menu-symbolic");
+        toggle_sidebar_btn.set_focus_on_click(false);
+        toggle_sidebar_btn.set_can_focus(false);
+        toggle_sidebar_btn.set_tooltip_text(Some("Toggle sidebar (Ctrl+\\)"));
+        toggle_sidebar_btn.add_css_class("flat");
 
-        let add_tab_button = gtk4::Button::with_label("+");
+        let add_tab_button = gtk4::Button::from_icon_name("list-add-symbolic");
         add_tab_button.set_focus_on_click(false);
         add_tab_button.set_can_focus(false);
         add_tab_button.set_tooltip_text(Some("New tab (Ctrl+Shift+T)"));
         add_tab_button.add_css_class("flat");
-        add_tab_button.set_hexpand(false);
-
-        // Inner box: [tab buttons...] [+] — keeps "+" adjacent to the last tab
-        let tabs_and_add = gtk4::Box::new(Orientation::Horizontal, 2);
-        tabs_and_add.set_hexpand(true);
-        tabs_and_add.append(&tab_strip);
-        tabs_and_add.append(&add_tab_button);
 
         let close_window_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_window_button.set_focus_on_click(false);
         close_window_button.set_can_focus(false);
         close_window_button.set_tooltip_text(Some("Close window"));
         close_window_button.add_css_class("flat");
-        close_window_button.set_hexpand(false);
 
-        let tab_bar_box = gtk4::Box::new(Orientation::Horizontal, 4);
-        tab_bar_box.add_css_class("tab-bar-box");
-        tab_bar_box.append(&tabs_and_add);
-        tab_bar_box.append(&close_window_button);
+        let top_bar = gtk4::Box::new(Orientation::Horizontal, 4);
+        top_bar.add_css_class("top-bar");
+        top_bar.append(&toggle_sidebar_btn);
+        // Spacer pushes + and ✕ to the right
+        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        top_bar.append(&spacer);
+        top_bar.append(&add_tab_button);
+        top_bar.append(&close_window_button);
 
-        // Main layout: tab bar + notebook + search bar
+        // Vertical sidebar with tab buttons (collapsible)
+        let tab_strip = gtk4::Box::new(Orientation::Vertical, 2);
+        tab_strip.set_hexpand(false);
+        tab_strip.set_vexpand(true);
+        tab_strip.set_valign(gtk4::Align::Start);
+
+        let tab_strip_scroll = ScrolledWindow::new();
+        tab_strip_scroll.set_hexpand(false);
+        tab_strip_scroll.set_vexpand(true);
+        tab_strip_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        tab_strip_scroll.set_child(Some(&tab_strip));
+
+        let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
+        sidebar.add_css_class("sidebar-box");
+        sidebar.append(&tab_strip_scroll);
+
+        // Content area: sidebar + notebook side by side
+        let content_box = gtk4::Box::new(Orientation::Horizontal, 0);
+        content_box.set_vexpand(true);
+        content_box.append(&sidebar);
+        let right_col = gtk4::Box::new(Orientation::Vertical, 0);
+        right_col.set_hexpand(true);
+        right_col.set_vexpand(true);
+        right_col.append(&notebook);
+        right_col.append(&search_bar);
+        content_box.append(&right_col);
+
+        // Main layout: top_bar + content_box (vertical)
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
-        main_box.append(&tab_bar_box);
-        main_box.append(&notebook);
-        main_box.append(&search_bar);
+        main_box.append(&top_bar);
+        main_box.append(&content_box);
 
         // Shared state
         let font_scale = Rc::new(Cell::new(config.borrow().default_font_scale));
@@ -216,8 +242,7 @@ fn main() -> glib::ExitCode {
             search_bar: search_bar.clone(),
             search_entry: search_entry.clone(),
             tab_strip: tab_strip.clone(),
-            tab_bar_box: tab_bar_box.clone(),
-            tabs_container: tabs_and_add.clone(),
+            sidebar: sidebar.clone(),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
@@ -234,6 +259,18 @@ fn main() -> glib::ExitCode {
         );
         ui.apply_dynamic_css();
 
+        // Wire toggle sidebar button
+        let ui_for_toggle = ui.clone();
+        toggle_sidebar_btn.connect_clicked(move |_| {
+            ui_for_toggle.toggle_sidebar();
+        });
+
+        // Wire close-window button
+        let window_for_close = window.clone();
+        close_window_button.connect_clicked(move |_| {
+            window_for_close.close();
+        });
+
         // Wire "+" button — inherit working directory from current session
         let ui_for_add = ui.clone();
         add_tab_button.connect_clicked(move |_| {
@@ -243,12 +280,6 @@ fn main() -> glib::ExitCode {
                 .and_then(terminal_working_directory);
             let startup = ui_for_add.config.borrow().startup_commands.clone();
             ui_for_add.add_new_tab(working_directory, None, None, startup);
-        });
-
-        // Wire close-window button
-        let window_for_close = window.clone();
-        close_window_button.connect_clicked(move |_| {
-            window_for_close.close();
         });
 
         // Restore tabs from last session snapshot (and delete it immediately).
@@ -358,13 +389,6 @@ fn main() -> glib::ExitCode {
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
             ui_for_switch.sync_tab_strip_active(Some(page_num));
-            ui_for_switch.sync_tab_strip_widths(Some(page_num));
-        });
-
-        // Recalculate tab widths when the window is resized
-        let ui_for_resize = ui.clone();
-        window.connect_notify_local(Some("default-width"), move |_, _| {
-            ui_for_resize.sync_tab_strip_widths(None);
         });
 
         window.add_controller(key_controller);
@@ -409,12 +433,6 @@ fn main() -> glib::ExitCode {
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();
-
-        // Initial tab width sync (deferred so GTK has allocated sizes)
-        let ui_for_init = ui.clone();
-        glib::idle_add_local_once(move || {
-            ui_for_init.sync_tab_strip_widths(None);
-        });
 
         // Config file hot reload: watch config.toml for external changes
         let config_path = config_file_path();

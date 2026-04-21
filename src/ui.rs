@@ -46,8 +46,7 @@ pub(crate) struct UiState {
     pub(crate) search_bar: SearchBar,
     pub(crate) search_entry: SearchEntry,
     pub(crate) tab_strip: gtk4::Box,
-    pub(crate) tab_bar_box: gtk4::Box,
-    pub(crate) tabs_container: gtk4::Box,
+    pub(crate) sidebar: gtk4::Box,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
@@ -125,6 +124,10 @@ impl UiState {
             Action::ToggleSettings => {
                 log::debug!("Toggle settings panel");
                 self.toggle_settings_panel();
+            }
+            Action::ToggleSidebar => {
+                log::debug!("Toggle sidebar");
+                self.toggle_sidebar();
             }
             Action::SplitHorizontal => {
                 log::debug!("Split horizontal");
@@ -221,89 +224,9 @@ impl UiState {
         }
     }
 
-    /// Hide tab bar when only one tab exists (zen mode).
+    /// Hide sidebar when only one tab exists (zen mode).
     pub(crate) fn sync_tab_bar_visibility(&self) {
-        self.tab_bar_box.set_visible(self.notebook.n_pages() > 1);
-    }
-
-    /// Sliding-window tab layout: active tab gets maximum width to show its full
-    /// name; inactive tabs are compressed to a small fixed width; tabs that don't
-    /// fit are hidden entirely.  The visible window is centred on the active tab.
-    pub(crate) fn sync_tab_strip_widths(&self, active_page: Option<u32>) {
-        const INACTIVE_WIDTH: i32 = 96;
-        const ACTIVE_MAX_WIDTH: i32 = INACTIVE_WIDTH * 2;
-        const TAB_SPACING: i32 = 2;
-        // Reserve width for the "+" button
-        const ADD_BTN_RESERVE: i32 = 34;
-
-        let n_tabs = self.notebook.n_pages() as i32;
-        if n_tabs == 0 {
-            return;
-        }
-        let active = active_page.or(self.notebook.current_page()).unwrap_or(0) as i32;
-
-        let avail = self.tabs_container.width() - ADD_BTN_RESERVE;
-        if avail <= 0 {
-            return;
-        }
-
-        // Measure the active tab's natural (preferred) width so it adapts to
-        // its title, clamped between INACTIVE_WIDTH and ACTIVE_MAX_WIDTH.
-        let active_width = {
-            let mut natural = INACTIVE_WIDTH;
-            let mut idx = 0i32;
-            let mut child = self.tab_strip.first_child();
-            while let Some(c) = child {
-                if idx == active {
-                    // Temporarily clear size request so measure returns the
-                    // content's natural width, not the previously forced value.
-                    c.set_size_request(-1, -1);
-                    let (_, nat, _, _) = c.measure(gtk4::Orientation::Horizontal, -1);
-                    natural = nat;
-                    break;
-                }
-                idx += 1;
-                child = c.next_sibling();
-            }
-            natural.clamp(INACTIVE_WIDTH, ACTIVE_MAX_WIDTH).min(avail)
-        };
-        let remaining = (avail - active_width - TAB_SPACING).max(0);
-
-        // How many inactive tabs can we fit alongside the active tab?
-        let slot = INACTIVE_WIDTH + TAB_SPACING;
-        let max_inactive = if slot > 0 { remaining / slot } else { 0 };
-
-        // Distribute visible slots: try equal on each side of active, then
-        // overflow to the other side.
-        let left_avail = active;
-        let right_avail = n_tabs - 1 - active;
-
-        let half = max_inactive / 2;
-        let mut left_count = half.min(left_avail);
-        let right_count = (max_inactive - left_count).min(right_avail);
-        // Re-distribute leftover slots to the other side
-        left_count = (max_inactive - right_count).min(left_avail);
-
-        let vis_start = active - left_count;
-        let vis_end = active + right_count; // inclusive
-
-        // Apply: show/hide and set widths
-        let mut idx = 0i32;
-        let mut child = self.tab_strip.first_child();
-        while let Some(c) = child {
-            if idx >= vis_start && idx <= vis_end {
-                c.set_visible(true);
-                if idx == active {
-                    c.set_size_request(active_width, -1);
-                } else {
-                    c.set_size_request(INACTIVE_WIDTH, -1);
-                }
-            } else {
-                c.set_visible(false);
-            }
-            idx += 1;
-            child = c.next_sibling();
-        }
+        self.sidebar.set_visible(self.notebook.n_pages() > 1);
     }
 
     /// Remove the tab strip button that corresponds to a notebook page widget.
@@ -345,7 +268,6 @@ impl UiState {
         } else {
             self.sync_tab_strip_active(None);
             self.sync_tab_bar_visibility();
-            self.sync_tab_strip_widths(None);
             self.focus_current_terminal();
         }
     }
@@ -546,7 +468,6 @@ impl UiState {
             } else {
                 self.sync_tab_strip_active(None);
                 self.sync_tab_bar_visibility();
-                self.sync_tab_strip_widths(None);
                 self.focus_current_terminal();
             }
         }
@@ -617,6 +538,10 @@ impl UiState {
         if let Some(term) = self.current_terminal() {
             term.search_find_previous();
         }
+    }
+
+    pub(crate) fn toggle_sidebar(&self) {
+        self.sidebar.set_visible(!self.sidebar.is_visible());
     }
 
     pub(crate) fn toggle_command_palette(&self) {
@@ -1564,7 +1489,6 @@ impl UiState {
 
         self.tab_strip.append(&btn);
         self.notebook.set_current_page(Some(page_num));
-        self.sync_tab_strip_widths(Some(page_num));
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
         terminal.grab_focus();
@@ -1710,7 +1634,7 @@ impl UiState {
         strip_btn.set_active(true); // new tab is current
         strip_btn.set_focus_on_click(false);
         strip_btn.set_can_focus(false);
-        strip_btn.set_hexpand(false);
+        strip_btn.set_hexpand(true); // Fill sidebar width
 
         // Show close icon on hover, hide on leave
         let hover_ctrl = gtk4::EventControllerMotion::new();
@@ -1906,7 +1830,6 @@ impl UiState {
         // Deactivate all other strip buttons
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
-        self.sync_tab_strip_widths(Some(page_num));
 
         // Focus the new terminal
         terminal.grab_focus();

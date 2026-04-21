@@ -18,6 +18,7 @@ pub(crate) enum Action {
     ToggleSearch,
     ToggleCommandPalette,
     ToggleSettings,
+    ToggleSidebar,
     SplitHorizontal,
     SplitVertical,
     PrevTab,
@@ -54,6 +55,7 @@ impl Action {
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
             Action::ToggleSettings => "Toggle settings panel",
+            Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split horizontal",
             Action::SplitVertical => "Split vertical",
             Action::PrevTab => "Previous tab",
@@ -101,6 +103,7 @@ impl Action {
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
+            Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
             Action::SplitVertical => Some("split_vertical"),
             Action::PrevTab => Some("prev_tab"),
@@ -137,6 +140,7 @@ impl Action {
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
             Action::ToggleSettings,
+            Action::ToggleSidebar,
             Action::SplitHorizontal,
             Action::SplitVertical,
             Action::PrevTab,
@@ -345,6 +349,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
+        bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
