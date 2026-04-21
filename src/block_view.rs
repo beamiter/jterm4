@@ -515,10 +515,10 @@ impl TermView {
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
             key_ctrl.connect_key_pressed(move |_, keyval, _keycode, modifiers| {
-                // If VTE is visible (alt-screen), let VTE handle keys
-                if vte_box_for_key.is_visible() {
-                    return glib::Propagation::Proceed;
-                }
+                // All keyboard input goes through here to the PTY.
+                // VTE has no PTY attached — it's display-only (fed via feed()).
+                // Main app's key_controller on the window (also Capture phase) runs first
+                // and will intercept keybindings before we get here.
                 let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let bytes: Option<Vec<u8>> = match keyval {
                     v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
