@@ -728,6 +728,22 @@ fn install_block_css(config: &Config) {
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
+
+    // Parse font description to extract font family and size
+    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Regular 14"
+    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
+    let (font_family, font_size) = if parts.len() >= 2 {
+        // Last part is usually the size
+        if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
+            let family = parts[..parts.len() - 1].join(" ");
+            (family, format!("{}pt", size))
+        } else {
+            (config.font_desc.clone(), "14pt".to_string())
+        }
+    } else {
+        (config.font_desc.clone(), "14pt".to_string())
+    };
+
     let css = format!(
         r#"
         .block-finished {{
@@ -750,6 +766,7 @@ fn install_block_css(config: &Config) {
         .block-prompt {{
             color: {dim_fg};
             font-size: 0.82em;
+            font-family: "{font_family}";
         }}
         .block-chevron {{
             color: {dim_fg};
@@ -761,11 +778,13 @@ fn install_block_css(config: &Config) {
         }}
         .block-cmd {{
             color: {fg_hex};
-            font-family: monospace;
+            font-family: "{font_family}";
+            font-size: {font_size};
         }}
         .block-cmd-active {{
             color: {fg_hex};
-            font-family: monospace;
+            font-family: "{font_family}";
+            font-size: {font_size};
             font-weight: bold;
         }}
         .block-exit-bad {{
@@ -777,7 +796,8 @@ fn install_block_css(config: &Config) {
         .block-output {{
             background-color: {bg_hex};
             color: {fg_hex};
-            font-family: monospace;
+            font-family: "{font_family}";
+            font-size: {font_size};
         }}
         "#,
     );
