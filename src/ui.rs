@@ -18,6 +18,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 use crate::config::{Config, Theme, load_config, save_config};
 use crate::keybindings::{Action, Direction, KeybindingMap};
 use crate::state::{generate_session_id, kill_terminal_child};
+use crate::block_view::TermView;
 use crate::terminal::{
     create_terminal, wrap_with_scrollbar, scrollbar_wrapper_of,
     terminal_working_directory, spawn_shell, open_uri,

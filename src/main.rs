@@ -1,5 +1,8 @@
+mod block_view;
 mod config;
 mod keybindings;
+mod parser;
+mod pty;
 mod state;
 mod terminal;
 mod ui;

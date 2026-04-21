@@ -14,7 +14,17 @@ use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
+use crate::block_view::TermView;
 use crate::config::Config;
+
+/// Create a block-mode TermView.  This is the preferred constructor for new tabs.
+pub(crate) fn create_block_terminal(
+    config: &Config,
+    shell_argv: &[String],
+    working_directory: Option<&str>,
+) -> TermView {
+    TermView::new(config, shell_argv, working_directory)
+}
 
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
