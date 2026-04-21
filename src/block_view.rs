@@ -512,12 +512,13 @@ impl TermView {
             let vte_box_for_key = vte_box.clone();
             let bstate_for_key = bstate.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+
             key_ctrl.connect_key_pressed(move |_, keyval, _keycode, modifiers| {
                 // If VTE is visible (alt-screen), let VTE handle keys
                 if vte_box_for_key.is_visible() {
                     return glib::Propagation::Proceed;
                 }
-                log::debug!("Key pressed in block mode: keyval={:?} state={:?}", keyval, bstate_for_key.get());
                 let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let bytes: Option<Vec<u8>> = match keyval {
                     v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
