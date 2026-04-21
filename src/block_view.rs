@@ -545,6 +545,11 @@ impl TermView {
             OwnedPty::spawn(&argv, cwd, &[]).expect("PTY spawn failed"),
         );
 
+        // Store child PID on VTE widget so kill_all_terminal_children can find it
+        unsafe {
+            vte.set_data::<i32>("child-pid", pty.pid_i32());
+        }
+
         // ── Register CSS ──────────────────────────────────────────────────
         install_block_css(config);
 
