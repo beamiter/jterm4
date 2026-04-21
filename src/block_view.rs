@@ -539,6 +539,7 @@ impl TermView {
         let bstate = Rc::new(Cell::new(BlockState::Idle));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
 
@@ -548,6 +549,7 @@ impl TermView {
             let bstate_rc = bstate.clone();
             let prompt_buf_rc = prompt_buf.clone();
             let cmd_buf_rc = cmd_buf.clone();
+            let cmd_display_raw_rc = cmd_display_raw.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
             let vte_for_alt = vte.clone();
@@ -623,6 +625,8 @@ impl TermView {
                                         let display = raw_cmd.trim_end_matches('\n').trim_end();
                                         let markup = ansi_to_pango(display, &config_for_cb.palette);
                                         active_rc.borrow().set_cmd_markup(&markup);
+                                        // Save the raw command for CommandEnd
+                                        *cmd_display_raw_rc.borrow_mut() = display.to_string();
                                     }
                                     BlockState::CollectingOutput => {
                                         let clean = strip_ansi(&text);
@@ -649,6 +653,7 @@ impl TermView {
                             ParserEvent::PromptEnd => {
                                 bstate_rc.set(BlockState::AwaitingCommand);
                                 cmd_buf_rc.borrow_mut().clear();
+                                cmd_display_raw_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
                             }
 
@@ -660,51 +665,13 @@ impl TermView {
                                 // Freeze the active block into a finished block
                                 let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
 
-                                // Extract command from raw buffer (preserving ANSI codes)
-                                let raw_cmd_buf = cmd_buf_rc.borrow().clone();
-                                let stripped_cmd_buf = strip_ansi(&raw_cmd_buf);
+                                // Use the last displayed command (saved in AwaitingCommand)
+                                // This avoids issues when the shell redraws with just the prompt after Enter
+                                let raw_cmd_with_ansi = cmd_display_raw_rc.borrow().clone();
+                                let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
 
-                                // Still handle \r just in case
-                                let (raw_last_line, last_line) = if let Some(idx) = stripped_cmd_buf.rfind('\r') {
-                                    let idx_chars = stripped_cmd_buf[..idx].chars().count();
-                                    (
-                                        skip_ansi_visible_chars(&raw_cmd_buf, idx_chars + 1),
-                                        &stripped_cmd_buf[idx+1..],
-                                    )
-                                } else {
-                                    (raw_cmd_buf.clone(), &stripped_cmd_buf[..])
-                                };
-
-                                // Extract command by removing prompt prefix
-                                let cmd = if let Some(cmd_part) = last_line.strip_prefix(prompt.trim()) {
-                                    cmd_part.trim().to_string()
-                                } else {
-                                    last_line.trim().to_string()
-                                };
-
-                                // Extract raw command with ANSI codes for markup conversion
-                                let prompt_char_count = prompt.trim().chars().count();
-                                let raw_cmd_with_ansi = if !prompt.is_empty() {
-                                    let raw_last_trimmed = raw_last_line.trim_start();
-                                    if raw_last_line != raw_last_trimmed {
-                                        // We trimmed whitespace, just use what we have
-                                        raw_last_trimmed.to_string()
-                                    } else {
-                                        // Try to find prompt and skip past it
-                                        let raw_stripped = strip_ansi(&raw_last_line);
-                                        if let Some(_after_prompt) = raw_stripped.strip_prefix(prompt.trim()) {
-                                            skip_ansi_visible_chars(&raw_last_line, prompt_char_count).trim_start().to_string()
-                                        } else {
-                                            raw_last_line.clone()
-                                        }
-                                    }
-                                } else {
-                                    raw_last_line
-                                };
-
-                                let cmd_trimmed = raw_cmd_with_ansi.trim_end().to_string();
-                                let cmd_markup = if !cmd_trimmed.is_empty() {
-                                    ansi_to_pango(&cmd_trimmed, &config_for_cb.palette)
+                                let cmd_markup = if !raw_cmd_with_ansi.is_empty() {
+                                    ansi_to_pango(&raw_cmd_with_ansi, &config_for_cb.palette)
                                 } else {
                                     String::new()
                                 };
