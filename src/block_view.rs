@@ -560,6 +560,21 @@ impl TermView {
                     v if v == gtk4::gdk::Key::Home => Some(b"\x1b[H".to_vec()),
                     v if v == gtk4::gdk::Key::End => Some(b"\x1b[F".to_vec()),
                     v if v == gtk4::gdk::Key::Delete => Some(b"\x1b[3~".to_vec()),
+                    v if v == gtk4::gdk::Key::Insert => Some(b"\x1b[2~".to_vec()),
+                    v if v == gtk4::gdk::Key::Page_Up => Some(b"\x1b[5~".to_vec()),
+                    v if v == gtk4::gdk::Key::Page_Down => Some(b"\x1b[6~".to_vec()),
+                    v if v == gtk4::gdk::Key::F1 => Some(b"\x1bOP".to_vec()),
+                    v if v == gtk4::gdk::Key::F2 => Some(b"\x1bOQ".to_vec()),
+                    v if v == gtk4::gdk::Key::F3 => Some(b"\x1bOR".to_vec()),
+                    v if v == gtk4::gdk::Key::F4 => Some(b"\x1bOS".to_vec()),
+                    v if v == gtk4::gdk::Key::F5 => Some(b"\x1b[15~".to_vec()),
+                    v if v == gtk4::gdk::Key::F6 => Some(b"\x1b[17~".to_vec()),
+                    v if v == gtk4::gdk::Key::F7 => Some(b"\x1b[18~".to_vec()),
+                    v if v == gtk4::gdk::Key::F8 => Some(b"\x1b[19~".to_vec()),
+                    v if v == gtk4::gdk::Key::F9 => Some(b"\x1b[20~".to_vec()),
+                    v if v == gtk4::gdk::Key::F10 => Some(b"\x1b[21~".to_vec()),
+                    v if v == gtk4::gdk::Key::F11 => Some(b"\x1b[23~".to_vec()),
+                    v if v == gtk4::gdk::Key::F12 => Some(b"\x1b[24~".to_vec()),
                     v if ctrl => {
                         if let Some(ch) = v.to_unicode() {
                             let ctrl_byte = (ch as u8).wrapping_sub(b'`');
