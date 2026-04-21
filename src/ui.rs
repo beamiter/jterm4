@@ -1504,34 +1504,31 @@ impl UiState {
         let sid = session_id.unwrap_or_else(generate_session_id);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
 
-        let terminal = create_terminal(&self.config.borrow());
+        // Create block-mode terminal view (owns PTY + parser + block rendering)
+        let term_view = Rc::new(TermView::new(
+            &self.config.borrow(),
+            self.shell_argv.as_ref(),
+            working_directory.as_deref(),
+        ));
+        let terminal = term_view.vte().clone();
+        let term_view_widget = term_view.widget();
 
-        // Setup click handler for hyperlinks and context menu
+        // Setup click handler for hyperlinks and context menu (uses VTE inside TermView)
         setup_terminal_click_handler(&terminal);
         self.setup_context_menu(&terminal);
 
-        // Connect child-exited to close the tab (or unsplit if in a Paned)
+        // Connect child-exited to close the tab
         let ui_for_exit = UiState::clone(self);
-        let terminal_clone = terminal.clone();
-        terminal.connect_child_exited(move |_, _| {
-            ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
+        let exit_widget = term_view_widget.clone();
+        term_view.connect_exited(move |_code| {
+            ui_for_exit.handle_terminal_exited(&exit_widget);
         });
-
-        // Spawn shell with session ID for state persistence
-        spawn_shell(
-            &terminal,
-            self.shell_argv.as_ref(),
-            working_directory.as_deref(),
-            Some(&sid),
-            initial_commands.as_deref(),
-        );
 
         // Create tab header with a close button
         let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
         let computed_default_title = default_tab_title(tab_num + 1, working_directory.as_deref());
         let (label_text, is_custom) = match tab_name {
             Some(name) => {
-                // Treat as non-custom if it matches the computed default title.
                 let custom = name != computed_default_title;
                 (name, custom)
             }
@@ -1541,8 +1538,6 @@ impl UiState {
         let custom_title = Rc::new(Cell::new(is_custom));
         label.set_xalign(0.0);
         label.set_hexpand(true);
-        // Make tabs wider by default so the title is visible.
-        // These are character-based hints; the notebook may still shrink tabs when crowded.
         label.set_width_chars(24);
         label.set_max_width_chars(64);
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -1559,24 +1554,19 @@ impl UiState {
         });
         label.add_controller(rename_click);
 
-        // Auto-update tab title when PWD changes (unless user manually renamed it).
+        // Auto-update tab title from CWD changes reported via OSC 7
         let label_for_pwd = label.clone();
         let custom_title_for_pwd = custom_title.clone();
         let tab_index_for_pwd = tab_num + 1;
-        // We'll also keep a reference to the strip button so its label can be synced.
         let strip_btn_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
         let strip_btn_label_for_pwd = strip_btn_label.clone();
-        terminal.connect_notify_local(Some("current-directory-uri"), move |term, _| {
+        term_view.connect_cwd_changed(move |dir| {
             if custom_title_for_pwd.get() {
                 return;
             }
-            let Some(dir) = terminal_working_directory(term) else {
-                return;
-            };
-            let new_title = default_tab_title(tab_index_for_pwd, Some(&dir));
+            let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
             if label_for_pwd.text().as_str() != new_title {
                 label_for_pwd.set_text(&new_title);
-                // Also update the tab strip button label
                 if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
                     btn_label.set_text(&new_title);
                 }
@@ -1593,8 +1583,11 @@ impl UiState {
         tab_box.append(&label);
         tab_box.append(&close_button);
 
-        // Wrap terminal with scrollbar
-        let term_wrapper = wrap_with_scrollbar(&terminal);
+        // TermView root widget (replaces wrap_with_scrollbar)
+        let term_wrapper = {
+            let w = term_view.widget();
+            w.downcast::<gtk4::Box>().expect("TermView root must be a Box")
+        };
 
         let ui_for_close = UiState::clone(self);
         let wrapper_for_close = term_wrapper.clone().upcast::<gtk4::Widget>();
@@ -1834,7 +1827,7 @@ impl UiState {
         self.sync_tab_bar_visibility();
 
         // Focus the new terminal
-        terminal.grab_focus();
+        term_view.grab_focus();
 
         terminal
     }

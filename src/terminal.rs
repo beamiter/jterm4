@@ -371,7 +371,7 @@ pub(crate) fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
         return Some(term);
     }
     if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") {
+        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
             let mut child = bx.first_child();
             while let Some(c) = child {
                 if let Some(term) = find_first_terminal(&c) {
@@ -404,7 +404,7 @@ pub(crate) fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
         }
     }
     if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") {
+        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
             let mut child = bx.first_child();
             while let Some(c) = child {
                 if let Some(term) = find_focused_terminal(&c) {
@@ -436,7 +436,7 @@ pub(crate) fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) 
         return;
     }
     if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") {
+        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
             let mut child = bx.first_child();
             while let Some(c) = child {
                 collect_terminals(&c, out);

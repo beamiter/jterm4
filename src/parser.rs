@@ -29,6 +29,8 @@ enum State {
     Csi { buf: Vec<u8> },
     /// Inside OSC (ESC ]): collecting bytes until ST (BEL or ESC \)
     Osc { buf: Vec<u8> },
+    /// Just saw ESC while in OSC — next byte should be '\' for ST
+    OscEsc { payload: Vec<u8> },
     /// Inside DCS/PM/APC — just consume until ST
     Ignore { buf: Vec<u8> },
 }
@@ -117,24 +119,32 @@ impl Parser {
 
                 State::Osc { buf } => {
                     match b {
-                        // BEL terminates OSC
                         0x07 => {
                             let payload = std::mem::take(buf);
                             self.state = State::Ground;
+                            log::debug!("OSC terminated by BEL, payload length: {}", payload.len());
                             flush!();
                             handle_osc(&payload, &mut events);
                         }
-                        // ESC starts the ST (ESC \) but we treat lone ESC as terminator too
                         0x1b => {
                             let payload = std::mem::take(buf);
-                            // next byte should be '\' — consume it in Ground
-                            self.state = State::Ground;
-                            flush!();
-                            handle_osc(&payload, &mut events);
+                            self.state = State::OscEsc { payload };
                         }
                         _ => {
                             buf.push(b);
                         }
+                    }
+                }
+
+                State::OscEsc { payload } => {
+                    let payload = std::mem::take(payload);
+                    self.state = State::Ground;
+                    log::debug!("OSC terminated by ESC\\, payload length: {}", payload.len());
+                    flush!();
+                    handle_osc(&payload, &mut events);
+                    if b != b'\\' {
+                        // Not ST — re-process this byte in Ground
+                        passthrough.push(b);
                     }
                 }
 
@@ -155,21 +165,42 @@ impl Parser {
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     let s = match std::str::from_utf8(payload) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            log::debug!("OSC payload not UTF-8: {:?}", payload);
+            return;
+        }
     };
+
+    log::debug!("OSC received: {:?}", s);
 
     // OSC 133 ; <mark> — shell integration
     if let Some(rest) = s.strip_prefix("133;") {
+        log::debug!("OSC 133 matched, rest={:?}", rest);
         match rest {
-            "A" => events.push(ParserEvent::PromptStart),
-            "B" => events.push(ParserEvent::PromptEnd),
-            "C" => events.push(ParserEvent::CommandStart),
+            "A" => {
+                log::debug!("Emitting PromptStart");
+                events.push(ParserEvent::PromptStart);
+            }
+            "B" => {
+                log::debug!("Emitting PromptEnd");
+                events.push(ParserEvent::PromptEnd);
+            }
+            "C" => {
+                log::debug!("Emitting CommandStart");
+                events.push(ParserEvent::CommandStart);
+            }
             _ if rest.starts_with("D;") => {
                 let code = rest[2..].parse::<i32>().unwrap_or(0);
+                log::debug!("Emitting CommandEnd({})", code);
                 events.push(ParserEvent::CommandEnd(code));
             }
-            "D" => events.push(ParserEvent::CommandEnd(0)),
-            _ => {}
+            "D" => {
+                log::debug!("Emitting CommandEnd(0)");
+                events.push(ParserEvent::CommandEnd(0));
+            }
+            _ => {
+                log::debug!("OSC 133 unrecognized marker: {:?}", rest);
+            }
         }
         return;
     }

@@ -9,6 +9,11 @@ use std::os::unix::io::RawFd;
 use std::sync::mpsc;
 use gtk4::glib;
 
+enum PtyMsg {
+    Data(Vec<u8>),
+    Exit(i32),
+}
+
 pub struct OwnedPty {
     master: OwnedFd,
     pid: Pid,
@@ -102,9 +107,15 @@ impl OwnedPty {
 
     /// Start an async reader: spawns a background thread to read PTY output
     /// and delivers chunks to `callback` on the GLib main thread via idle_add_local.
-    pub fn start_reader<F: FnMut(Vec<u8>) + 'static>(&self, mut callback: F) {
+    /// When the child exits, sends `PtyMsg::Exit(code)` so `on_exit` is called on the main thread.
+    pub fn start_reader<F, E>(&self, mut callback: F, on_exit: E)
+    where
+        F: FnMut(Vec<u8>) + 'static,
+        E: FnOnce(i32) + 'static,
+    {
         let fd = self.master.as_raw_fd();
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let child_pid = self.pid;
+        let (tx, rx) = mpsc::channel::<PtyMsg>();
         let rx = std::cell::RefCell::new(rx);
 
         std::thread::spawn(move || {
@@ -112,22 +123,42 @@ impl OwnedPty {
             let mut buf = [0u8; 8192];
             loop {
                 match file.read(&mut buf) {
-                    Ok(0) | Err(_) => { std::mem::forget(file); break; }
+                    Ok(0) | Err(_) => {
+                        std::mem::forget(file);
+                        break;
+                    }
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
                             std::mem::forget(file);
                             break;
                         }
                     }
                 }
             }
+            let exit_code = match nix::sys::wait::waitpid(child_pid, None) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
+                _ => 1,
+            };
+            let _ = tx.send(PtyMsg::Exit(exit_code));
         });
 
+        let on_exit = std::cell::Cell::new(Some(on_exit));
         glib::idle_add_local(move || {
-            match rx.borrow().try_recv() {
-                Ok(data) => { callback(data); glib::ControlFlow::Continue }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+            loop {
+                match rx.borrow().try_recv() {
+                    Ok(PtyMsg::Data(data)) => {
+                        callback(data);
+                    }
+                    Ok(PtyMsg::Exit(code)) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+                }
             }
         });
     }

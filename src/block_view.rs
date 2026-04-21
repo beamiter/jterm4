@@ -18,7 +18,6 @@ use gtk4::pango::FontDescription;
 use gtk4::{glib, Orientation, ScrolledWindow, WrapMode};
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::os::fd::FromRawFd;
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -40,6 +39,42 @@ fn rgba_to_hex(c: &RGBA) -> String {
 
 fn dim_rgba(c: &RGBA, alpha: f32) -> RGBA {
     RGBA::new(c.red(), c.green(), c.blue(), alpha)
+}
+
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    // CSI sequence: skip until final byte 0x40..0x7e
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() { i += 1; }
+                }
+                b']' => {
+                    // OSC sequence: skip until BEL or ST
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == 0x07 { i += 1; }
+                }
+                _ => {
+                    // Other ESC sequence: skip ESC + one byte
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
@@ -243,6 +278,7 @@ impl TermView {
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.set_vexpand(true);
+        root.add_css_class("term-view-root");
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
@@ -305,137 +341,228 @@ impl TermView {
             let config_for_cb = config.clone();
             let parser = Rc::new(RefCell::new(Parser::new()));
 
-            pty.start_reader(move |data: Vec<u8>| {
-                let events = parser.borrow_mut().feed(&data);
-                let state = bstate_rc.get();
+            pty.start_reader(
+                move |data: Vec<u8>| {
+                    log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
+                    if data.len() < 512 {
+                        log::debug!("PTY hex: {:02x?}", &data);
+                    }
+                    let events = parser.borrow_mut().feed(&data);
 
-                for event in events {
-                    match event {
-                        ParserEvent::Bytes(bytes) => {
-                            let text = String::from_utf8_lossy(&bytes).to_string();
-                            match state {
-                                BlockState::CollectingPrompt => {
-                                    prompt_buf_rc.borrow_mut().push_str(&text);
-                                    // strip trailing whitespace/newlines from prompt display
-                                    let clean = text.trim_end().to_string();
-                                    if !clean.is_empty() {
-                                        active_rc.borrow().set_prompt(&clean);
+                    for event in &events {
+                        let state = bstate_rc.get();
+                        log::debug!("ParserEvent: {:?} (state={:?})", event, state);
+                        match event {
+                            ParserEvent::Bytes(bytes) => {
+                                let text = String::from_utf8_lossy(bytes).to_string();
+                                match state {
+                                    BlockState::CollectingPrompt => {
+                                        prompt_buf_rc.borrow_mut().push_str(&text);
+                                        // strip trailing whitespace/newlines and ANSI codes from prompt display
+                                        let clean = strip_ansi(&text).trim_end().to_string();
+                                        if !clean.is_empty() {
+                                            active_rc.borrow().set_prompt(&clean);
+                                        }
+                                    }
+                                    BlockState::AwaitingCommand => {
+                                        // Shell's line editor sends the full line (prompt + input) with each keystroke.
+                                        // When the prompt appears at the start, it's a fresh redraw - replace buffer.
+                                        // Otherwise it's continuation - append to buffer.
+                                        let stripped = strip_ansi(&text);
+
+                                        let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
+                                        let prompt_clean = prompt_text.trim();
+
+                                        // If this chunk starts with the prompt, it's a fresh redraw - replace buffer
+                                        if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
+                                            *cmd_buf_rc.borrow_mut() = stripped;
+                                        } else {
+                                            // No prompt at start means this is continuation input
+                                            cmd_buf_rc.borrow_mut().push_str(&stripped);
+                                        }
+
+                                        // Now extract the command from the buffer
+                                        let current_buf = cmd_buf_rc.borrow().clone();
+
+                                        // Strip the prompt prefix to get just the command
+                                        let cmd = if !prompt_clean.is_empty() {
+                                            if let Some(after_prompt) = current_buf.strip_prefix(prompt_clean) {
+                                                after_prompt.trim_start()
+                                            } else if let Some(pos) = current_buf.find(prompt_clean) {
+                                                current_buf[pos + prompt_clean.len()..].trim_start()
+                                            } else {
+                                                &current_buf
+                                            }
+                                        } else {
+                                            &current_buf
+                                        };
+
+                                        let display = cmd.trim_end_matches('\n').trim_end();
+                                        active_rc.borrow().set_cmd(display);
+                                    }
+                                    BlockState::CollectingOutput => {
+                                        let clean = strip_ansi(&text);
+                                        active_rc.borrow().append_output(&clean);
+                                        // Auto-scroll to bottom
+                                        let adj = block_scroll_rc.vadjustment();
+                                        adj.set_value(adj.upper() - adj.page_size());
+                                    }
+                                    BlockState::AltScreen => {
+                                        // Feed raw bytes directly to VTE
+                                        vte_for_alt.feed(bytes);
+                                    }
+                                    BlockState::Idle => {
+                                        // Bytes before first prompt — ignore (pre-prompt noise)
                                     }
                                 }
-                                BlockState::AwaitingCommand => {
-                                    // User typed characters echoed back
-                                    cmd_buf_rc.borrow_mut().push_str(&text);
-                                    let trimmed = cmd_buf_rc.borrow().trim_end_matches('\n').to_string();
-                                    active_rc.borrow().set_cmd(&trimmed);
-                                }
-                                BlockState::CollectingOutput => {
-                                    active_rc.borrow().append_output(&text);
-                                    // Auto-scroll to bottom
-                                    let adj = block_scroll_rc.vadjustment();
-                                    adj.set_value(adj.upper() - adj.page_size());
-                                }
-                                BlockState::AltScreen => {
-                                    // Feed raw bytes directly to VTE
-                                    vte_for_alt.feed(&bytes);
-                                }
-                                BlockState::Idle => {
-                                    // Bytes before first prompt — treat as pre-prompt output
-                                    active_rc.borrow().append_output(&text);
+                            }
+
+                            ParserEvent::PromptStart => {
+                                bstate_rc.set(BlockState::CollectingPrompt);
+                                prompt_buf_rc.borrow_mut().clear();
+                            }
+
+                            ParserEvent::PromptEnd => {
+                                bstate_rc.set(BlockState::AwaitingCommand);
+                                cmd_buf_rc.borrow_mut().clear();
+                                active_rc.borrow().set_cmd("");
+                            }
+
+                            ParserEvent::CommandStart => {
+                                bstate_rc.set(BlockState::CollectingOutput);
+                            }
+
+                            ParserEvent::CommandEnd(code) => {
+                                // Freeze the active block into a finished block
+                                let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
+
+                                // Extract command from line-editor buffer
+                                // Since we now clean cmd_buf in AwaitingCommand when \r is seen,
+                                // cmd_buf should already contain only the current line.
+                                let stripped_cmd_buf = strip_ansi(&cmd_buf_rc.borrow());
+                                // Still handle \r just in case
+                                let last_line = if let Some(idx) = stripped_cmd_buf.rfind('\r') {
+                                    &stripped_cmd_buf[idx+1..]
+                                } else {
+                                    &stripped_cmd_buf
+                                };
+                                let cmd = if let Some(cmd_part) = last_line.strip_prefix(prompt.trim()) {
+                                    cmd_part.trim().to_string()
+                                } else {
+                                    last_line.trim().to_string()
+                                };
+                                let output = active_rc.borrow().output_text();
+                                let output_trimmed = output.trim_end().to_string();
+
+                                let finished = FinishedBlock::new(
+                                    &prompt, &cmd, &output_trimmed, *code, &config_for_cb,
+                                );
+
+                                // Insert before the active block (which is always last)
+                                let active_widget = active_rc.borrow().widget().clone().upcast::<gtk4::Widget>();
+                                finished.widget().insert_before(&block_list_rc, Some(&active_widget));
+
+                                // Reset active block for next command
+                                active_rc.borrow().set_prompt("");
+                                active_rc.borrow().set_cmd("");
+                                active_rc.borrow().output_buf.set_text("");
+
+                                bstate_rc.set(BlockState::Idle);
+                            }
+
+                            ParserEvent::CwdUpdate(path) => {
+                                for cb in cwd_cbs.borrow().iter() {
+                                    cb(&path);
                                 }
                             }
-                        }
 
-                        ParserEvent::PromptStart => {
-                            bstate_rc.set(BlockState::CollectingPrompt);
-                            prompt_buf_rc.borrow_mut().clear();
-                        }
+                            ParserEvent::AltScreenEnter => {
+                                bstate_rc.set(BlockState::AltScreen);
+                                block_scroll_rc.set_visible(false);
+                                vte_box_rc.set_visible(true);
+                                vte_for_alt.grab_focus();
+                            }
 
-                        ParserEvent::PromptEnd => {
-                            bstate_rc.set(BlockState::AwaitingCommand);
-                            cmd_buf_rc.borrow_mut().clear();
-                            active_rc.borrow().set_cmd("");
-                        }
-
-                        ParserEvent::CommandStart => {
-                            bstate_rc.set(BlockState::CollectingOutput);
-                        }
-
-                        ParserEvent::CommandEnd(code) => {
-                            // Freeze the active block into a finished block
-                            let prompt = prompt_buf_rc.borrow().trim().to_string();
-                            let cmd = cmd_buf_rc.borrow().trim_end_matches('\n').trim().to_string();
-                            let output = active_rc.borrow().output_text();
-                            let output_trimmed = output.trim_end().to_string();
-
-                            let finished = FinishedBlock::new(
-                                &prompt, &cmd, &output_trimmed, code, &config_for_cb,
-                            );
-
-                            // Insert before the active block (which is always last)
-                            let active_widget = active_rc.borrow().widget().clone().upcast::<gtk4::Widget>();
-                            finished.widget().insert_before(&block_list_rc, Some(&active_widget));
-
-                            // Reset active block for next command
-                            active_rc.borrow().set_prompt("");
-                            active_rc.borrow().set_cmd("");
-                            active_rc.borrow().output_buf.set_text("");
-
-                            bstate_rc.set(BlockState::Idle);
-                        }
-
-                        ParserEvent::CwdUpdate(path) => {
-                            for cb in cwd_cbs.borrow().iter() {
-                                cb(&path);
+                            ParserEvent::AltScreenLeave => {
+                                vte_box_rc.set_visible(false);
+                                block_scroll_rc.set_visible(true);
+                                bstate_rc.set(BlockState::Idle);
+                                // Reset active block ready for next prompt
+                                active_rc.borrow().set_prompt("");
+                                active_rc.borrow().set_cmd("");
                             }
                         }
-
-                        ParserEvent::AltScreenEnter => {
-                            bstate_rc.set(BlockState::AltScreen);
-                            block_scroll_rc.set_visible(false);
-                            vte_box_rc.set_visible(true);
-                            vte_for_alt.grab_focus();
-                        }
-
-                        ParserEvent::AltScreenLeave => {
-                            vte_box_rc.set_visible(false);
-                            block_scroll_rc.set_visible(true);
-                            bstate_rc.set(BlockState::Idle);
-                            // Reset active block ready for next prompt
-                            active_rc.borrow().set_prompt("");
-                            active_rc.borrow().set_cmd("");
-                        }
                     }
-                }
-            });
+                },
+                move |exit_code| {
+                    log::debug!("Shell exited with code {}", exit_code);
+                    for cb in exited_cbs.borrow().iter() {
+                        cb(exit_code);
+                    }
+                },
+            );
         }
 
-        // ── VTE child-exited: relay to our callbacks ───────────────────────
+        // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
+        //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
+
+        // ── Keyboard input → PTY ──────────────────────────────────────────
         {
-            let exited_cbs = exited_callbacks.clone();
-            vte.connect_child_exited(move |_, code| {
-                for cb in exited_cbs.borrow().iter() {
-                    cb(code);
+            let pty_for_key = pty.clone();
+            let vte_box_for_key = vte_box.clone();
+            let bstate_for_key = bstate.clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, keyval, _keycode, modifiers| {
+                // If VTE is visible (alt-screen), let VTE handle keys
+                if vte_box_for_key.is_visible() {
+                    return glib::Propagation::Proceed;
+                }
+                log::debug!("Key pressed in block mode: keyval={:?} state={:?}", keyval, bstate_for_key.get());
+                let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let bytes: Option<Vec<u8>> = match keyval {
+                    v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
+                        Some(b"\r".to_vec())
+                    }
+                    v if v == gtk4::gdk::Key::BackSpace => Some(b"\x7f".to_vec()),
+                    v if v == gtk4::gdk::Key::Tab => Some(b"\t".to_vec()),
+                    v if v == gtk4::gdk::Key::Escape => Some(b"\x1b".to_vec()),
+                    v if v == gtk4::gdk::Key::Up => Some(b"\x1b[A".to_vec()),
+                    v if v == gtk4::gdk::Key::Down => Some(b"\x1b[B".to_vec()),
+                    v if v == gtk4::gdk::Key::Right => Some(b"\x1b[C".to_vec()),
+                    v if v == gtk4::gdk::Key::Left => Some(b"\x1b[D".to_vec()),
+                    v if v == gtk4::gdk::Key::Home => Some(b"\x1b[H".to_vec()),
+                    v if v == gtk4::gdk::Key::End => Some(b"\x1b[F".to_vec()),
+                    v if v == gtk4::gdk::Key::Delete => Some(b"\x1b[3~".to_vec()),
+                    v if ctrl => {
+                        if let Some(ch) = v.to_unicode() {
+                            let ctrl_byte = (ch as u8).wrapping_sub(b'`');
+                            if ctrl_byte < 32 {
+                                Some(vec![ctrl_byte])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    v => {
+                        if let Some(ch) = v.to_unicode() {
+                            let mut buf = [0u8; 4];
+                            Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(data) = bytes {
+                    pty_for_key.write_bytes(&data);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
                 }
             });
-        }
-
-        // ── Attach VTE to the PTY fd for alt-screen rendering ─────────────
-        {
-            let master_fd = pty.master_fd();
-            let dup_fd = unsafe { nix::libc::dup(master_fd) };
-            if dup_fd >= 0 {
-                // vte4 0.10 uses io_lifetimes::OwnedFd in Pty::foreign_sync
-                let owned = unsafe { io_lifetimes::OwnedFd::from_raw_fd(dup_fd) };
-                match vte4::Pty::foreign_sync(owned, None::<&gtk4::gio::Cancellable>) {
-                    Ok(vte_pty) => {
-                        vte.set_pty(Some(&vte_pty));
-                        let pid = glib::Pid(pty.pid_i32());
-                        unsafe { vte.set_data::<i32>("child-pid", pty.pid_i32()); }
-                        vte.watch_child(pid);
-                    }
-                    Err(e) => log::warn!("Could not attach VTE to PTY: {e}"),
-                }
-            }
+            root.add_controller(key_ctrl);
+            root.set_focusable(true);
         }
 
         TermView {
