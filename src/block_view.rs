@@ -765,8 +765,8 @@ fn install_block_css(config: &Config) {
         }}
         .block-prompt {{
             color: {dim_fg};
-            font-size: 0.82em;
             font-family: "{font_family}";
+            font-size: {font_size};
         }}
         .block-chevron {{
             color: {dim_fg};
