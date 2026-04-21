@@ -336,6 +336,7 @@ impl TermView {
             let block_scroll_rc = block_scroll.clone();
             let vte_for_alt = vte.clone();
             let vte_box_rc = vte_box.clone();
+            let pty_for_resize = pty.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
             let config_for_cb = config.clone();
@@ -478,13 +479,38 @@ impl TermView {
 
                             ParserEvent::AltScreenEnter => {
                                 bstate_rc.set(BlockState::AltScreen);
+                                // Hide block view and expand VTE to fill all space
                                 block_scroll_rc.set_visible(false);
+                                block_scroll_rc.set_vexpand(false);
+                                vte_box_rc.set_vexpand(true);
                                 vte_box_rc.set_visible(true);
+
+                                // Resize PTY to match VTE widget size
+                                let pty_resize = pty_for_resize.clone();
+                                let vte_for_resize = vte_for_alt.clone();
+                                glib::idle_add_local_once(move || {
+                                    let width = vte_for_resize.allocated_width() as i64;
+                                    let height = vte_for_resize.allocated_height() as i64;
+                                    if width > 0 && height > 0 {
+                                        let char_width = vte_for_resize.char_width();
+                                        let char_height = vte_for_resize.char_height();
+                                        if char_width > 0 && char_height > 0 {
+                                            let cols = (width / char_width) as u16;
+                                            let rows = (height / char_height) as u16;
+                                            log::debug!("Resizing PTY to {}x{} (widget {}x{}, char {}x{})",
+                                                cols, rows, width, height, char_width, char_height);
+                                            pty_resize.resize(cols, rows);
+                                        }
+                                    }
+                                });
+
                                 vte_for_alt.grab_focus();
                             }
 
                             ParserEvent::AltScreenLeave => {
                                 vte_box_rc.set_visible(false);
+                                vte_box_rc.set_vexpand(false);
+                                block_scroll_rc.set_vexpand(true);
                                 block_scroll_rc.set_visible(true);
                                 bstate_rc.set(BlockState::Idle);
                                 // Reset active block ready for next prompt
