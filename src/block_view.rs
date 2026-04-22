@@ -326,27 +326,31 @@ impl FinishedBlock {
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
+        outer.set_margin_top(8);
+        outer.set_margin_bottom(8);
 
-        // Header row: prompt • command [exit badge]
-        let header = gtk4::Box::new(Orientation::Horizontal, 8);
-        header.add_css_class("block-header");
-        header.set_margin_start(8);
-        header.set_margin_end(8);
-        header.set_margin_top(4);
-        header.set_margin_bottom(4);
+        // Prompt row
+        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        prompt_row.set_margin_start(12);
+        prompt_row.set_margin_top(6);
+        prompt_row.set_margin_bottom(2);
 
         let prompt_label = gtk4::Label::new(Some(prompt));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
+        prompt_label.set_valign(gtk4::Align::Center);
         prompt_label.set_selectable(true);
+        prompt_row.append(&prompt_label);
 
-        let sep = gtk4::Label::new(Some("❯"));
-        sep.add_css_class("block-chevron");
+        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        cmd_row.set_margin_start(12);
+        cmd_row.set_margin_bottom(4);
 
         let cmd_label = gtk4::Label::new(None);
         cmd_label.add_css_class("block-cmd");
         cmd_label.set_xalign(0.0);
         cmd_label.set_hexpand(true);
+        cmd_label.set_valign(gtk4::Align::Center);
         cmd_label.set_selectable(true);
         if cmd.is_empty() {
             cmd_label.set_text("(empty)");
@@ -356,17 +360,17 @@ impl FinishedBlock {
             cmd_label.set_text(cmd);
         }
 
-        header.append(&prompt_label);
-        header.append(&sep);
-        header.append(&cmd_label);
+        cmd_row.append(&cmd_label);
 
         if exit_code != 0 {
             let badge = gtk4::Label::new(Some(&format!(" {exit_code} ")));
             badge.add_css_class("block-exit-bad");
-            header.append(&badge);
+            badge.set_valign(gtk4::Align::Center);
+            cmd_row.append(&badge);
         }
 
-        outer.append(&header);
+        outer.append(&prompt_row);
+        outer.append(&cmd_row);
 
         // Output area (only if there is output)
         if !output.is_empty() {
@@ -409,30 +413,30 @@ impl ActiveBlock {
     fn new() -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
+        widget.set_margin_top(8);
+        widget.set_margin_bottom(8);
 
         // Prompt row
-        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 8);
-        prompt_row.set_margin_start(8);
+        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        prompt_row.set_margin_start(12);
         prompt_row.set_margin_top(6);
         prompt_row.set_margin_bottom(2);
 
         let prompt_label = gtk4::Label::new(Some(""));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
+        prompt_label.set_valign(gtk4::Align::Center);
         prompt_row.append(&prompt_label);
 
-        // Command row
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 8);
-        cmd_row.set_margin_start(8);
+        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        cmd_row.set_margin_start(12);
         cmd_row.set_margin_bottom(4);
 
-        let chevron = gtk4::Label::new(Some("❯"));
-        chevron.add_css_class("block-chevron-active");
         let cmd_label = gtk4::Label::new(Some(""));
         cmd_label.add_css_class("block-cmd-active");
         cmd_label.set_xalign(0.0);
         cmd_label.set_hexpand(true);
-        cmd_row.append(&chevron);
+        cmd_label.set_valign(gtk4::Align::Center);
         cmd_row.append(&cmd_label);
 
         // Live output
@@ -1053,23 +1057,18 @@ fn install_block_css(config: &Config) {
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
+            min-height: 80px;
         }}
         .block-header {{
             background-color: {header_bg};
             border-radius: 5px 5px 0 0;
+            padding-top: 8px;
+            padding-bottom: 8px;
         }}
         .block-prompt {{
             color: {dim_fg};
             font-family: "{font_family}";
             font-size: {font_size};
-        }}
-        .block-chevron {{
-            color: {dim_fg};
-            font-weight: bold;
-        }}
-        .block-chevron-active {{
-            color: {accent};
-            font-weight: bold;
         }}
         .block-cmd {{
             color: {fg_hex};
