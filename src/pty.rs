@@ -194,20 +194,19 @@ impl OwnedPty {
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         glib::idle_add_local(move || {
-            loop {
-                match rx.borrow().try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
-                    }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
-                        }
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+            match rx.borrow().try_recv() {
+                Ok(PtyMsg::Data(data)) => {
+                    callback(data);
+                    glib::ControlFlow::Continue
                 }
+                Ok(PtyMsg::Exit(code)) => {
+                    if let Some(f) = on_exit.take() {
+                        f(code);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }
