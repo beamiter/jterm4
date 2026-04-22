@@ -423,6 +423,13 @@ fn main() -> glib::ExitCode {
         window.connect_close_request(move |_| {
             kill_all_terminal_children(&notebook_for_close_request);
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
+
+            // Explicitly clear all pages to break reference cycles and allow TermView cleanup.
+            // This ensures OwnedPty drops, closing PTY master FD and signaling reader threads.
+            while notebook_for_close_request.n_pages() > 0 {
+                notebook_for_close_request.remove_page(Some(0));
+            }
+
             false.into()
         });
 
