@@ -307,7 +307,6 @@ impl FinishedBlock {
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
-        outer.set_margin_bottom(6);
 
         // Header row: prompt • command [exit badge]
         let header = gtk4::Box::new(Orientation::Horizontal, 8);
@@ -391,7 +390,6 @@ impl ActiveBlock {
     fn new() -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_bottom(2);
 
         // Prompt row
         let prompt_row = gtk4::Box::new(Orientation::Horizontal, 8);
@@ -499,6 +497,7 @@ pub struct TermView {
     cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
     config: Config,
+    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
 }
 
 impl TermView {
@@ -560,6 +559,7 @@ impl TermView {
         let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
+        let finished_blocks_rc: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -577,6 +577,7 @@ impl TermView {
             let exited_cbs = exited_callbacks.clone();
             let config_for_cb = config.clone();
             let parser = Rc::new(RefCell::new(Parser::new()));
+            let finished_blocks_for_cb = finished_blocks_rc.clone();
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -600,6 +601,12 @@ impl TermView {
                                         if !clean.is_empty() {
                                             active_rc.borrow().set_prompt(&clean);
                                         }
+                                        // Auto-scroll to bottom while collecting prompt
+                                        let scroll = block_scroll_rc.clone();
+                                        glib::idle_add_local_once(move || {
+                                            let adj = scroll.vadjustment();
+                                            adj.set_value(adj.upper() - adj.page_size());
+                                        });
                                     }
                                     BlockState::AwaitingCommand => {
                                         // Shell's line editor sends the full line (prompt + input) with each keystroke.
@@ -645,6 +652,13 @@ impl TermView {
                                         active_rc.borrow().set_cmd_markup(&markup);
                                         // Save the raw command for CommandEnd
                                         *cmd_display_raw_rc.borrow_mut() = display.to_string();
+
+                                        // Auto-scroll to bottom while typing command
+                                        let scroll = block_scroll_rc.clone();
+                                        glib::idle_add_local_once(move || {
+                                            let adj = scroll.vadjustment();
+                                            adj.set_value(adj.upper() - adj.page_size());
+                                        });
                                     }
                                     BlockState::CollectingOutput => {
                                         let clean = strip_ansi(&text);
@@ -666,6 +680,15 @@ impl TermView {
                             ParserEvent::PromptStart => {
                                 bstate_rc.set(BlockState::CollectingPrompt);
                                 prompt_buf_rc.borrow_mut().clear();
+                                // Auto-scroll to bottom when new prompt starts - with delay for layout
+                                let scroll = block_scroll_rc.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(10),
+                                    move || {
+                                        let adj = scroll.vadjustment();
+                                        adj.set_value(adj.upper() - adj.page_size());
+                                    },
+                                );
                             }
 
                             ParserEvent::PromptEnd => {
@@ -673,10 +696,28 @@ impl TermView {
                                 cmd_buf_rc.borrow_mut().clear();
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
+                                // Auto-scroll to bottom when prompt ends (ready for command)
+                                let scroll = block_scroll_rc.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(10),
+                                    move || {
+                                        let adj = scroll.vadjustment();
+                                        adj.set_value(adj.upper() - adj.page_size());
+                                    },
+                                );
                             }
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
+                                // Auto-scroll to bottom when command starts executing
+                                let scroll = block_scroll_rc.clone();
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(10),
+                                    move || {
+                                        let adj = scroll.vadjustment();
+                                        adj.set_value(adj.upper() - adj.page_size());
+                                    },
+                                );
                             }
 
                             ParserEvent::CommandEnd(code) => {
@@ -706,17 +747,30 @@ impl TermView {
                                 let active_widget = active_rc.borrow().widget().clone().upcast::<gtk4::Widget>();
                                 finished.widget().insert_before(&block_list_rc, Some(&active_widget));
 
+                                // Track finished blocks and limit history to MAX_VISIBLE_BLOCKS
+                                const MAX_VISIBLE_BLOCKS: usize = 20;
+                                finished_blocks_for_cb.borrow_mut().push(finished.widget().clone());
+
+                                // Remove oldest block if we exceed the limit
+                                if finished_blocks_for_cb.borrow().len() > MAX_VISIBLE_BLOCKS {
+                                    let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
+                                    block_list_rc.remove(&oldest);
+                                }
+
                                 // Reset active block for next command
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
                                 active_rc.borrow().output_buf.set_text("");
 
-                                // Scroll to bottom after layout updates
+                                // Scroll to bottom after layout updates - use timeout to ensure layout is complete
                                 let scroll_for_finished = block_scroll_rc.clone();
-                                glib::idle_add_local_once(move || {
-                                    let adj = scroll_for_finished.vadjustment();
-                                    adj.set_value(adj.upper() - adj.page_size());
-                                });
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(10),
+                                    move || {
+                                        let adj = scroll_for_finished.vadjustment();
+                                        adj.set_value(adj.upper() - adj.page_size());
+                                    },
+                                );
 
                                 bstate_rc.set(BlockState::Idle);
                             }
@@ -871,6 +925,7 @@ impl TermView {
             cwd_callbacks,
             exited_callbacks,
             config: config.clone(),
+            finished_blocks: finished_blocks_rc,
         }
     }
 
@@ -997,16 +1052,15 @@ fn install_block_css(config: &Config) {
     let css = format!(
         r#"
         .block-finished {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
-            border-radius: 6px;
-            margin: 4px 6px;
+            border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 0;
+            margin: 0;
             background-color: {bg_hex};
         }}
         .block-active {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.25);
             border-left: 3px solid {accent};
-            border-radius: 6px;
-            margin: 4px 6px;
+            border-radius: 0;
+            margin: 0;
             background-color: {bg_hex};
         }}
         .block-header {{
