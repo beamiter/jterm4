@@ -1,6 +1,5 @@
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
-use nix::sys::signal::{self, Signal};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::{self, Read as _, Write as _};
@@ -8,6 +7,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::mpsc;
 use gtk4::glib;
+
+use crate::state::terminate_terminal_process;
 
 enum PtyMsg {
     Data(Vec<u8>),
@@ -20,6 +21,12 @@ pub struct OwnedPty {
 }
 
 impl OwnedPty {
+    fn close_master_fd(&self) {
+        if let Ok(mut guard) = self.master.lock() {
+            guard.take();
+        }
+    }
+
     pub fn spawn(
         argv: &[&str],
         cwd: Option<&str>,
@@ -111,7 +118,8 @@ impl OwnedPty {
     }
 
     pub fn kill(&self) {
-        let _ = signal::kill(Pid::from_raw(-self.pid.as_raw()), Signal::SIGHUP);
+        self.close_master_fd();
+        terminate_terminal_process(self.pid.as_raw());
     }
 
     /// Start an async reader: spawns a background thread to read PTY output
@@ -207,12 +215,7 @@ impl OwnedPty {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
-        // Send SIGHUP to process group
-        let _ = signal::kill(Pid::from_raw(-self.pid.as_raw()), Signal::SIGHUP);
-
-        // Close the master FD so reader thread gets EOF
-        if let Ok(mut guard) = self.master.lock() {
-            guard.take();
-        }
+        self.close_master_fd();
+        terminate_terminal_process(self.pid.as_raw());
     }
 }

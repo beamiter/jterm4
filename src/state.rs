@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
+use crate::block_view::TermView;
 use crate::terminal::{collect_terminals, find_first_terminal, terminal_working_directory};
 
 pub(crate) fn tabs_state_file_path() -> PathBuf {
@@ -150,10 +152,78 @@ pub(crate) fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Opti
 
 extern "C" {
     fn tcgetpgrp(fd: std::ffi::c_int) -> std::ffi::c_int;
-    fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
 }
 
-/// Send SIGHUP to a terminal's child process group so the shell exits cleanly.
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let rc = unsafe { nix::libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+
+    matches!(std::io::Error::last_os_error().raw_os_error(), Some(nix::libc::EPERM))
+}
+
+fn signal_pid_and_group(pid: i32, sig: std::ffi::c_int) {
+    if pid <= 0 {
+        return;
+    }
+
+    unsafe {
+        nix::libc::kill(pid, sig);
+        nix::libc::kill(-pid, sig);
+    }
+}
+
+fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while process_exists(pid) {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
+pub(crate) fn terminate_terminal_process(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+
+    signal_pid_and_group(pid, nix::libc::SIGHUP);
+    if wait_for_process_exit(pid, Duration::from_millis(120)) {
+        return;
+    }
+
+    signal_pid_and_group(pid, nix::libc::SIGTERM);
+    if wait_for_process_exit(pid, Duration::from_millis(250)) {
+        return;
+    }
+
+    signal_pid_and_group(pid, nix::libc::SIGKILL);
+    let _ = wait_for_process_exit(pid, Duration::from_millis(150));
+}
+
+pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
+    let term_view = unsafe {
+        widget
+            .data::<std::rc::Rc<TermView>>("term-view")
+            .map(|ptr| ptr.as_ref().clone())
+    };
+
+    if let Some(term_view) = term_view {
+        term_view.kill();
+        return true;
+    }
+
+    false
+}
+
+/// Terminate a terminal child process and its process group before the UI tears down.
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
     let pid: i32 = unsafe {
         match terminal.data::<i32>("child-pid") {
@@ -161,18 +231,16 @@ pub(crate) fn kill_terminal_child(terminal: &Terminal) {
             None => return,
         }
     };
-    if pid > 0 {
-        // Negative PID signals the entire process group
-        unsafe {
-            kill(-pid, 1 /* SIGHUP */);
-        }
-    }
+    terminate_terminal_process(pid);
 }
 
 /// Send SIGHUP to all child process groups across every terminal in the notebook.
 pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     for i in 0..notebook.n_pages() {
         if let Some(page_widget) = notebook.nth_page(Some(i)) {
+            if kill_widget_child_processes(&page_widget) {
+                continue;
+            }
             let mut terms = Vec::new();
             collect_terminals(&page_widget, &mut terms);
             for term in &terms {
