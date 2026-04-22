@@ -28,6 +28,25 @@ use crate::pty::OwnedPty;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+/// Scroll to bottom with retry mechanism to ensure layout is complete
+fn scroll_to_bottom_reliable(scroll: &ScrolledWindow) {
+    let scroll = scroll.clone();
+    // Try multiple times with increasing delays to handle layout updates
+    for delay_ms in [0, 20, 50, 100] {
+        let scroll_clone = scroll.clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(delay_ms),
+            move || {
+                let adj = scroll_clone.vadjustment();
+                let target = adj.upper() - adj.page_size();
+                if adj.value() < target {
+                    adj.set_value(target);
+                }
+            },
+        );
+    }
+}
+
 fn rgba_to_hex(c: &RGBA) -> String {
     format!(
         "#{:02x}{:02x}{:02x}",
@@ -605,11 +624,7 @@ impl TermView {
                                             active_rc.borrow().set_prompt(&clean);
                                         }
                                         // Auto-scroll to bottom while collecting prompt
-                                        let scroll = block_scroll_rc.clone();
-                                        glib::idle_add_local_once(move || {
-                                            let adj = scroll.vadjustment();
-                                            adj.set_value(adj.upper() - adj.page_size());
-                                        });
+                                        scroll_to_bottom_reliable(&block_scroll_rc);
                                     }
                                     BlockState::AwaitingCommand => {
                                         // Shell's line editor sends the full line (prompt + input) with each keystroke.
@@ -657,18 +672,13 @@ impl TermView {
                                         *cmd_display_raw_rc.borrow_mut() = display.to_string();
 
                                         // Auto-scroll to bottom while typing command
-                                        let scroll = block_scroll_rc.clone();
-                                        glib::idle_add_local_once(move || {
-                                            let adj = scroll.vadjustment();
-                                            adj.set_value(adj.upper() - adj.page_size());
-                                        });
+                                        scroll_to_bottom_reliable(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
                                         let clean = strip_ansi(&text);
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
-                                        let adj = block_scroll_rc.vadjustment();
-                                        adj.set_value(adj.upper() - adj.page_size());
+                                        scroll_to_bottom_reliable(&block_scroll_rc);
                                     }
                                     BlockState::AltScreen => {
                                         // Feed raw bytes directly to VTE
@@ -683,15 +693,8 @@ impl TermView {
                             ParserEvent::PromptStart => {
                                 bstate_rc.set(BlockState::CollectingPrompt);
                                 prompt_buf_rc.borrow_mut().clear();
-                                // Auto-scroll to bottom when new prompt starts - with delay for layout
-                                let scroll = block_scroll_rc.clone();
-                                glib::timeout_add_local_once(
-                                    std::time::Duration::from_millis(10),
-                                    move || {
-                                        let adj = scroll.vadjustment();
-                                        adj.set_value(adj.upper() - adj.page_size());
-                                    },
-                                );
+                                // Auto-scroll to bottom when new prompt starts
+                                scroll_to_bottom_reliable(&block_scroll_rc);
                             }
 
                             ParserEvent::PromptEnd => {
@@ -700,27 +703,13 @@ impl TermView {
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
                                 // Auto-scroll to bottom when prompt ends (ready for command)
-                                let scroll = block_scroll_rc.clone();
-                                glib::timeout_add_local_once(
-                                    std::time::Duration::from_millis(10),
-                                    move || {
-                                        let adj = scroll.vadjustment();
-                                        adj.set_value(adj.upper() - adj.page_size());
-                                    },
-                                );
+                                scroll_to_bottom_reliable(&block_scroll_rc);
                             }
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Auto-scroll to bottom when command starts executing
-                                let scroll = block_scroll_rc.clone();
-                                glib::timeout_add_local_once(
-                                    std::time::Duration::from_millis(10),
-                                    move || {
-                                        let adj = scroll.vadjustment();
-                                        adj.set_value(adj.upper() - adj.page_size());
-                                    },
-                                );
+                                scroll_to_bottom_reliable(&block_scroll_rc);
                             }
 
                             ParserEvent::CommandEnd(code) => {
@@ -765,15 +754,8 @@ impl TermView {
                                 active_rc.borrow().set_cmd("");
                                 active_rc.borrow().output_buf.set_text("");
 
-                                // Scroll to bottom after layout updates - use timeout to ensure layout is complete
-                                let scroll_for_finished = block_scroll_rc.clone();
-                                glib::timeout_add_local_once(
-                                    std::time::Duration::from_millis(10),
-                                    move || {
-                                        let adj = scroll_for_finished.vadjustment();
-                                        adj.set_value(adj.upper() - adj.page_size());
-                                    },
-                                );
+                                // Scroll to bottom after layout updates
+                                scroll_to_bottom_reliable(&block_scroll_rc);
 
                                 bstate_rc.set(BlockState::Idle);
                             }
