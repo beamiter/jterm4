@@ -15,7 +15,7 @@ enum PtyMsg {
 }
 
 pub struct OwnedPty {
-    master: OwnedFd,
+    master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     pid: Pid,
 }
 
@@ -61,7 +61,7 @@ impl OwnedPty {
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
                 Ok(OwnedPty {
-                    master,
+                    master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
                     pid: child,
                 })
             }
@@ -69,8 +69,10 @@ impl OwnedPty {
         }
     }
 
-    pub fn master_fd(&self) -> RawFd {
-        self.master.as_raw_fd()
+    pub fn master_fd(&self) -> Option<RawFd> {
+        self.master.lock().ok().and_then(|guard| {
+            guard.as_ref().map(|fd| fd.as_raw_fd())
+        })
     }
 
     pub fn pid(&self) -> Pid {
@@ -82,22 +84,29 @@ impl OwnedPty {
     }
 
     pub fn write_bytes(&self, data: &[u8]) {
-        let fd = self.master.as_raw_fd();
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let _ = file.write_all(data);
-        // Don't close the fd — leak it back out of File
-        std::mem::forget(file);
+        if let Ok(guard) = self.master.lock() {
+            if let Some(fd) = guard.as_ref() {
+                let fd = fd.as_raw_fd();
+                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+                let _ = file.write_all(data);
+                std::mem::forget(file);
+            }
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+        if let Ok(guard) = self.master.lock() {
+            if let Some(fd) = guard.as_ref() {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+                }
+            }
         }
     }
 
@@ -113,7 +122,13 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        let fd = self.master.as_raw_fd();
+        let fd = match self.master.lock().ok().and_then(|guard| {
+            guard.as_ref().map(|fd| fd.as_raw_fd())
+        }) {
+            Some(fd) => fd,
+            None => return,
+        };
+
         let child_pid = self.pid;
         let (tx, rx) = mpsc::channel::<PtyMsg>();
         let rx = std::cell::RefCell::new(rx);
@@ -135,12 +150,38 @@ impl OwnedPty {
                     }
                 }
             }
-            let exit_code = match nix::sys::wait::waitpid(child_pid, None) {
-                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-                _ => 1,
-            };
-            let _ = tx.send(PtyMsg::Exit(exit_code));
+
+            // Wait for the child with timeout using non-blocking checks
+            let max_wait_secs = 5;
+            for _ in 0..(max_wait_secs * 10) {
+                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                        let _ = tx.send(PtyMsg::Exit(code));
+                        return;
+                    }
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                        let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
+                        return;
+                    }
+                    Err(_) | Ok(_) => {
+                        // WNOHANG returns Ok(current status) or Err if not found
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+
+            // Final blocking wait (should be quick if process is responsive to SIGHUP)
+            match nix::sys::wait::waitpid(child_pid, None) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                    let _ = tx.send(PtyMsg::Exit(code));
+                }
+                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                    let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
+                }
+                _ => {
+                    let _ = tx.send(PtyMsg::Exit(1));
+                }
+            }
         });
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
@@ -166,6 +207,12 @@ impl OwnedPty {
 
 impl Drop for OwnedPty {
     fn drop(&mut self) {
-        self.kill();
+        // Send SIGHUP to process group
+        let _ = signal::kill(Pid::from_raw(-self.pid.as_raw()), Signal::SIGHUP);
+
+        // Close the master FD so reader thread gets EOF
+        if let Ok(mut guard) = self.master.lock() {
+            guard.take();
+        }
     }
 }
