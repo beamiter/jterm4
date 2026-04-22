@@ -420,6 +420,7 @@ fn main() -> glib::ExitCode {
         // Save state *before* GTK starts destroying widgets.
         let notebook_for_close_request = notebook.clone();
         let session_ids_for_close = ui.session_ids.clone();
+        let app_for_close = app.clone();
         window.connect_close_request(move |_| {
             kill_all_terminal_children(&notebook_for_close_request);
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
@@ -429,6 +430,9 @@ fn main() -> glib::ExitCode {
             while notebook_for_close_request.n_pages() > 0 {
                 notebook_for_close_request.remove_page(Some(0));
             }
+
+            // Directly quit the application
+            app_for_close.quit();
 
             false.into()
         });
