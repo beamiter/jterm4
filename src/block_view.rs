@@ -330,28 +330,28 @@ impl FinishedBlock {
         outer.set_margin_bottom(8);
 
         // Prompt row
-        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        prompt_row.set_margin_start(12);
-        prompt_row.set_margin_top(6);
-        prompt_row.set_margin_bottom(2);
-
         let prompt_label = gtk4::Label::new(Some(prompt));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
-        prompt_label.set_valign(gtk4::Align::Center);
         prompt_label.set_selectable(true);
-        prompt_row.append(&prompt_label);
+        prompt_label.set_margin_start(12);
+        prompt_label.set_margin_top(6);
+        prompt_label.set_margin_bottom(0);
+        outer.append(&prompt_label);
 
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        cmd_row.set_margin_start(12);
-        cmd_row.set_margin_bottom(4);
+        // Command row with wrap support
+        let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
+        cmd_box.set_margin_start(12);
+        cmd_box.set_margin_bottom(4);
 
         let cmd_label = gtk4::Label::new(None);
         cmd_label.add_css_class("block-cmd");
         cmd_label.set_xalign(0.0);
         cmd_label.set_hexpand(true);
-        cmd_label.set_valign(gtk4::Align::Center);
+        cmd_label.set_valign(gtk4::Align::Start);
         cmd_label.set_selectable(true);
+        cmd_label.set_wrap(true);
+        cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
         if cmd.is_empty() {
             cmd_label.set_text("(empty)");
         } else if let Some(markup) = cmd_markup {
@@ -359,18 +359,16 @@ impl FinishedBlock {
         } else {
             cmd_label.set_text(cmd);
         }
-
-        cmd_row.append(&cmd_label);
+        cmd_box.append(&cmd_label);
 
         if exit_code != 0 {
             let badge = gtk4::Label::new(Some(&format!(" {exit_code} ")));
             badge.add_css_class("block-exit-bad");
-            badge.set_valign(gtk4::Align::Center);
-            cmd_row.append(&badge);
+            badge.set_valign(gtk4::Align::Start);
+            cmd_box.append(&badge);
         }
 
-        outer.append(&prompt_row);
-        outer.append(&cmd_row);
+        outer.append(&cmd_box);
 
         // Output area (only if there is output)
         if !output.is_empty() {
@@ -417,27 +415,26 @@ impl ActiveBlock {
         widget.set_margin_bottom(8);
 
         // Prompt row
-        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        prompt_row.set_margin_start(12);
-        prompt_row.set_margin_top(6);
-        prompt_row.set_margin_bottom(2);
-
         let prompt_label = gtk4::Label::new(Some(""));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
-        prompt_label.set_valign(gtk4::Align::Center);
-        prompt_row.append(&prompt_label);
+        prompt_label.set_margin_start(12);
+        prompt_label.set_margin_top(6);
+        prompt_label.set_margin_bottom(0);
+        widget.append(&prompt_label);
 
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        cmd_row.set_margin_start(12);
-        cmd_row.set_margin_bottom(4);
-
+        // Command row with wrap support
         let cmd_label = gtk4::Label::new(Some(""));
         cmd_label.add_css_class("block-cmd-active");
         cmd_label.set_xalign(0.0);
         cmd_label.set_hexpand(true);
-        cmd_label.set_valign(gtk4::Align::Center);
-        cmd_row.append(&cmd_label);
+        cmd_label.set_valign(gtk4::Align::Start);
+        cmd_label.set_selectable(true);
+        cmd_label.set_wrap(true);
+        cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+        cmd_label.set_margin_start(12);
+        cmd_label.set_margin_bottom(4);
+        widget.append(&cmd_label);
 
         // Live output
         let tv = gtk4::TextView::new();
@@ -451,8 +448,6 @@ impl ActiveBlock {
         tv.add_css_class("block-output");
         let output_buf = tv.buffer();
 
-        widget.append(&prompt_row);
-        widget.append(&cmd_row);
         widget.append(&tv);
 
         ActiveBlock { widget, prompt_label, cmd_label, output_buf }
@@ -1074,12 +1069,14 @@ fn install_block_css(config: &Config) {
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
+            padding: 0;
         }}
         .block-cmd-active {{
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
             font-weight: bold;
+            padding: 0;
         }}
         .block-exit-bad {{
             color: #ff5555;
