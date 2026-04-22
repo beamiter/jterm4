@@ -1,10 +1,12 @@
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
+use std::rc::Rc;
 use std::sync::mpsc;
 use gtk4::glib;
 
@@ -193,20 +195,32 @@ impl OwnedPty {
         });
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
-        glib::idle_add_local(move || {
-            match rx.borrow().try_recv() {
-                Ok(PtyMsg::Data(data)) => {
-                    callback(data);
-                    glib::ControlFlow::Continue
-                }
-                Ok(PtyMsg::Exit(code)) => {
-                    if let Some(f) = on_exit.take() {
-                        f(code);
+
+        // Use timeout instead of idle to limit CPU usage
+        // Process all available data, then yield for 10ms
+        glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+            loop {
+                match rx.borrow().try_recv() {
+                    Ok(PtyMsg::Data(data)) => {
+                        log::debug!("PTY: processing {} bytes", data.len());
+                        callback(data);
                     }
-                    glib::ControlFlow::Break
+                    Ok(PtyMsg::Exit(code)) => {
+                        log::debug!("PTY: exit code {}", code);
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // No more data, will check again in 10ms
+                        return glib::ControlFlow::Continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        log::debug!("PTY: channel disconnected");
+                        return glib::ControlFlow::Break;
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }
