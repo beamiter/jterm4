@@ -510,13 +510,16 @@ impl TermView {
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(true);
+        block_list.set_vexpand(false);  // Don't expand - only take space needed
+        block_list.set_valign(gtk4::Align::Start);  // Align to top
+        block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
         block_scroll.set_hexpand(true);
         block_scroll.set_vexpand(true);
         block_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
         block_scroll.set_child(Some(&block_list));
+        block_scroll.add_css_class("block-scroll");
 
         // Active block always at bottom
         let active = Rc::new(RefCell::new(ActiveBlock::new()));
@@ -1051,6 +1054,12 @@ fn install_block_css(config: &Config) {
 
     let css = format!(
         r#"
+        .block-scroll {{
+            background-color: {bg_hex};
+        }}
+        .block-list {{
+            background-color: {bg_hex};
+        }}
         .block-finished {{
             border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
             border-radius: 0;
