@@ -553,9 +553,80 @@ impl FinishedBlock {
                 output_label.add_css_class("block-output");
                 outer.append(&output_label);
             } else {
-                // Check if output exceeds lazy-load threshold
-                let threshold = _config.lazy_load_threshold as usize;
-                if line_count > threshold {
+                // Check if output exceeds lazy-load or truncation threshold
+                let lazy_threshold = _config.lazy_load_threshold as usize;
+                let truncation_threshold = _config.truncation_threshold_lines as usize;
+
+                if line_count > truncation_threshold {
+                    // Truncate huge outputs: show first 200 + last 100 lines
+                    let lines: Vec<&str> = output.lines().collect();
+                    let first_n = 200.min(line_count / 2);
+                    let last_n = 100.min(line_count / 2);
+
+                    let first_lines = lines.iter().take(first_n).map(|s| *s).collect::<Vec<_>>().join("\n");
+                    let last_lines: Vec<&str> = lines.iter().rev().take(last_n).map(|s| *s).collect();
+                    let last_lines_text = last_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+
+                    let preview = format!("{}\n\n[... {} lines truncated (total: {}) ...]\n\n{}",
+                        first_lines,
+                        line_count - first_n - last_n,
+                        line_count,
+                        last_lines_text);
+
+                    let preview_label = gtk4::Label::new(Some(&preview));
+                    preview_label.set_selectable(true);
+                    preview_label.set_wrap(true);
+                    preview_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                    preview_label.add_css_class("monospace");
+                    preview_label.set_xalign(0.0);
+                    preview_label.set_margin_start(12);
+                    preview_label.set_margin_end(8);
+                    preview_label.set_margin_top(0);
+                    preview_label.set_margin_bottom(2);
+                    preview_label.add_css_class("block-output");
+                    outer.append(&preview_label);
+
+                    // "Show middle" button for truncated content
+                    let show_middle_btn = gtk4::Button::with_label(
+                        &format!("Show middle {} lines", line_count - first_n - last_n)
+                    );
+                    show_middle_btn.add_css_class("flat");
+                    show_middle_btn.add_css_class("block-show-more");
+                    show_middle_btn.set_margin_start(12);
+                    show_middle_btn.set_margin_top(4);
+
+                    let full_output = output.to_string();
+                    let outer_ref = outer.clone();
+                    show_middle_btn.connect_clicked(move |btn| {
+                        // Remove the preview label and button
+                        btn.unparent();
+                        if let Some(child) = outer_ref.first_child() {
+                            if let Some(prev) = child.prev_sibling() {
+                                if let Some(prev_label) = prev.downcast_ref::<gtk4::Label>() {
+                                    if prev_label.has_css_class("block-output") {
+                                        prev_label.unparent();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Insert full output TextView
+                        let tv = gtk4::TextView::new();
+                        tv.set_editable(false);
+                        tv.set_cursor_visible(false);
+                        tv.set_wrap_mode(WrapMode::Char);
+                        tv.set_monospace(true);
+                        tv.set_margin_start(12);
+                        tv.set_margin_end(8);
+                        tv.set_margin_top(0);
+                        tv.set_margin_bottom(2);
+                        tv.add_css_class("block-output");
+                        tv.buffer().set_text(&full_output);
+                        outer_ref.append(&tv);
+                    });
+
+                    outer.append(&show_middle_btn);
+                } else if line_count > lazy_threshold {
                     // Show first 50 lines and last 10 lines with "Show more" button
                     let lines: Vec<&str> = output.lines().collect();
                     let first_50 = lines.iter().take(50).map(|s| *s).collect::<Vec<_>>().join("\n");
@@ -669,6 +740,7 @@ struct ActiveBlock {
     current_batch_ms: Rc<Cell<u32>>,
     config_batch_min: u32,
     config_batch_max: u32,
+    last_flushed_size: Rc<Cell<usize>>,  // Track size of last flushed output for incremental updates
 }
 
 impl ActiveBlock {
@@ -731,6 +803,7 @@ impl ActiveBlock {
             current_batch_ms: Rc::new(Cell::new(initial_batch_ms)),
             config_batch_min: batch_min_ms,
             config_batch_max: batch_max_ms,
+            last_flushed_size: Rc::new(Cell::new(0)),
         }
     }
 
@@ -764,6 +837,7 @@ impl ActiveBlock {
             let current_batch_ms = self.current_batch_ms.clone();
             let min_ms = self.config_batch_min;
             let max_ms = self.config_batch_max;
+            let last_flushed_size = self.last_flushed_size.clone();
 
             let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
@@ -771,8 +845,10 @@ impl ActiveBlock {
                 move || {
                     let text = pending.borrow_mut().drain(..).collect::<String>();
                     if !text.is_empty() {
+                        // Batch insert for better performance
                         let mut end = output_buf.end_iter();
                         output_buf.insert(&mut end, &text);
+                        last_flushed_size.set(last_flushed_size.get() + text.len());
                     }
 
                     // Calculate adaptive batch interval based on throughput
@@ -810,6 +886,7 @@ impl ActiveBlock {
         if !text.is_empty() {
             let mut end = self.output_buf.end_iter();
             self.output_buf.insert(&mut end, &text);
+            self.last_flushed_size.set(self.last_flushed_size.get() + text.len());
         }
         self.flush_pending.set(false);
     }
@@ -849,6 +926,16 @@ struct ViewportState {
     first_visible: usize,
     last_visible: usize,
     total_height: i32,
+}
+
+impl Clone for ViewportState {
+    fn clone(&self) -> Self {
+        Self {
+            first_visible: self.first_visible,
+            last_visible: self.last_visible,
+            total_height: self.total_height,
+        }
+    }
 }
 
 struct WidgetPool {
@@ -892,10 +979,12 @@ pub struct TermView {
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
     config: Config,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
-    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,  // Rendered widgets (will phase out with virtual scrolling)
+    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
     ansi_cache: Rc<RefCell<LruCache<String, String>>>,
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
+    visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
+    search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>,  // Cache search results
 }
 
 impl TermView {
@@ -1339,17 +1428,93 @@ impl TermView {
             config: config.clone(),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
-            ansi_cache,  // Use the cache we created earlier, not a new empty one
+            ansi_cache,
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
                 last_visible: 0,
                 total_height: 0,
             })),
             widget_pool: Rc::new(RefCell::new(WidgetPool::new())),
+            visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Load history if configured
         let _ = term_view.load_history();
+
+        // Initialize viewport and visibility
+        term_view.update_viewport();
+        term_view.update_block_visibility();
+
+        // Wire virtual scrolling: connect scroll signals
+        {
+            let viewport = term_view.viewport.clone();
+            let block_scroll = term_view.block_scroll.clone();
+            let block_data = term_view.block_data.clone();
+            let config = term_view.config.clone();
+            let finished_blocks = term_view.finished_blocks.clone();
+            let visible_indices = term_view.visible_indices.clone();
+
+            let vadjust = block_scroll.vadjustment();
+            vadjust.connect_changed(move |_| {
+                // Update viewport on scroll change
+                let adj = block_scroll.vadjustment();
+                let scroll_top = adj.value() as i32;
+                let viewport_height = adj.page_size() as i32;
+                let margin = (config.virtual_scroll_margin as i32) * viewport_height;
+
+                let visible_top = (scroll_top - margin).max(0);
+                let visible_bottom = scroll_top + viewport_height + margin;
+
+                let block_data_ref = block_data.borrow();
+                let mut y = 0;
+                let mut first = None;
+                let mut last = 0;
+
+                for (i, block) in block_data_ref.iter().enumerate() {
+                    if first.is_none() && y + block.estimated_height > visible_top {
+                        first = Some(i);
+                    }
+                    if y < visible_bottom {
+                        last = i;
+                    }
+                    y += block.estimated_height;
+                }
+
+                let mut vp = viewport.borrow_mut();
+                vp.first_visible = first.unwrap_or(0);
+                vp.last_visible = last;
+                vp.total_height = y;
+                drop(vp);
+
+                // Schedule visibility update on next idle
+                let vp = viewport.clone();
+                let finished = finished_blocks.clone();
+                let visible = visible_indices.clone();
+                glib::idle_add_local_once(move || {
+                    let vp_ref = vp.borrow();
+                    let mut new_visible = std::collections::HashSet::new();
+
+                    for i in vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000) {
+                        new_visible.insert(i);
+                    }
+
+                    let finished_ref = finished.borrow();
+                    let mut visible_ref = visible.borrow_mut();
+
+                    for (i, widget) in finished_ref.iter().enumerate() {
+                        if new_visible.contains(&i) && !visible_ref.contains(&i) {
+                            widget.set_visible(true);
+                        } else if !new_visible.contains(&i) && visible_ref.contains(&i) {
+                            widget.set_visible(false);
+                        }
+                    }
+
+                    *visible_ref = new_visible;
+                });
+            });
+        }
+
         term_view
     }
 
@@ -1433,18 +1598,59 @@ impl TermView {
         vp.total_height = y;
     }
 
+    /// Update block visibility based on viewport: show visible blocks, hide off-screen ones.
+    pub fn update_block_visibility(&self) {
+        let vp = self.viewport.borrow().clone();
+        let mut new_visible = std::collections::HashSet::new();
+
+        // Only show blocks in the visible range
+        for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
+            new_visible.insert(i);
+        }
+
+        let finished = self.finished_blocks.borrow();
+        let mut visible = self.visible_indices.borrow_mut();
+
+        // Update visibility: hide blocks not in new_visible, show blocks in new_visible
+        for (i, widget) in finished.iter().enumerate() {
+            if new_visible.contains(&i) && !visible.contains(&i) {
+                widget.set_visible(true);
+            } else if !new_visible.contains(&i) && visible.contains(&i) {
+                widget.set_visible(false);
+            }
+        }
+
+        *visible = new_visible;
+    }
+
     /// Search blocks for a query string (case-insensitive).
     /// Returns indices of matching blocks.
     pub fn search_blocks(&self, query: &str) -> Vec<usize> {
         let q = query.to_lowercase();
-        self.block_data.borrow().iter().enumerate()
+
+        // Check cache first
+        if let Ok(cache) = self.search_cache.lock() {
+            if let Some(cached) = cache.get(&q) {
+                return cached.clone();
+            }
+        }
+
+        // Perform search
+        let results: Vec<usize> = self.block_data.borrow().iter().enumerate()
             .filter(|(_, b)| {
                 b.prompt.to_lowercase().contains(&q) ||
                 b.cmd.to_lowercase().contains(&q) ||
                 b.output.to_lowercase().contains(&q)
             })
             .map(|(i, _)| i)
-            .collect()
+            .collect();
+
+        // Cache results (ignore lock errors)
+        if let Ok(mut cache) = self.search_cache.lock() {
+            cache.insert(q, results.clone());
+        }
+
+        results
     }
 
     pub fn scroll_to_block(&self, block_index: usize) {

@@ -30,6 +30,7 @@ pub(crate) struct Config {
     pub(crate) output_batch_min_ms: u32,
     pub(crate) output_batch_max_ms: u32,
     pub(crate) lazy_load_threshold: u32,
+    pub(crate) truncation_threshold_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
@@ -219,6 +220,7 @@ struct FileConfig {
     output_batch_min_ms: Option<u32>,
     output_batch_max_ms: Option<u32>,
     lazy_load_threshold: Option<u32>,
+    truncation_threshold_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
@@ -253,6 +255,7 @@ fn load_file_config() -> FileConfig {
         output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
         output_batch_max_ms: table.get("output_batch_max_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
         lazy_load_threshold: table.get("lazy_load_threshold").and_then(|v| v.as_integer()).map(|v| v as u32),
+        truncation_threshold_lines: table.get("truncation_threshold_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
         virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
@@ -319,6 +322,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let lazy_load_threshold = env_u32("JTERM4_LAZY_LINES")
         .or(fc.lazy_load_threshold)
         .unwrap_or(1000);
+    let truncation_threshold_lines = env_u32("JTERM4_TRUNCATION_LINES")
+        .or(fc.truncation_threshold_lines)
+        .unwrap_or(50000);
     let virtual_scroll_margin = env_u32("JTERM4_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
         .unwrap_or(1);
@@ -343,6 +349,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         output_batch_min_ms,
         output_batch_max_ms,
         lazy_load_threshold,
+        truncation_threshold_lines,
         virtual_scroll_margin,
         block_history_path,
         block_history_compress,
