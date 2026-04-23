@@ -17,7 +17,10 @@ use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use gtk4::{glib, Orientation, ScrolledWindow, WrapMode};
 use gtk4::prelude::*;
+use lru::LruCache;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -411,6 +414,18 @@ fn ansi_to_pango_cached(
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
+/// Data for a finished command block (decoupled from widget representation)
+#[derive(Clone)]
+struct BlockData {
+    prompt: String,
+    cmd: String,
+    cmd_markup: Option<String>,
+    output: String,
+    exit_code: i32,
+    estimated_height: i32,
+    line_count: usize,
+}
+
 struct FinishedBlock {
     widget: gtk4::Box,
 }
@@ -581,10 +596,16 @@ struct ActiveBlock {
     output_buf: gtk4::TextBuffer,
     pending_output: Rc<RefCell<String>>,
     flush_pending: Rc<Cell<bool>>,
+    // Adaptive batching state
+    bytes_since_last_flush: Rc<Cell<usize>>,
+    last_flush_time: Rc<Cell<std::time::Instant>>,
+    current_batch_ms: Rc<Cell<u32>>,
+    config_batch_min: u32,
+    config_batch_max: u32,
 }
 
 impl ActiveBlock {
-    fn new() -> Self {
+    fn new(batch_min_ms: u32, batch_max_ms: u32) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         widget.set_margin_top(4);
@@ -629,6 +650,8 @@ impl ActiveBlock {
 
         widget.append(&tv);
 
+        let initial_batch_ms = batch_min_ms;
+
         ActiveBlock {
             widget,
             prompt_label,
@@ -636,6 +659,11 @@ impl ActiveBlock {
             output_buf,
             pending_output: Rc::new(RefCell::new(String::new())),
             flush_pending: Rc::new(Cell::new(false)),
+            bytes_since_last_flush: Rc::new(Cell::new(0)),
+            last_flush_time: Rc::new(Cell::new(std::time::Instant::now())),
+            current_batch_ms: Rc::new(Cell::new(initial_batch_ms)),
+            config_batch_min: batch_min_ms,
+            config_batch_max: batch_max_ms,
         }
     }
 
@@ -652,7 +680,11 @@ impl ActiveBlock {
     }
 
     fn append_output(&self, text: &str) {
+        let text_len = text.len();
         self.pending_output.borrow_mut().push_str(text);
+
+        // Track throughput for adaptive batching
+        self.bytes_since_last_flush.set(self.bytes_since_last_flush.get() + text_len);
 
         // Schedule flush if not already pending
         if !self.flush_pending.get() {
@@ -660,15 +692,46 @@ impl ActiveBlock {
             let pending = self.pending_output.clone();
             let output_buf = self.output_buf.clone();
             let flush_flag = self.flush_pending.clone();
+            let bytes_tracker = self.bytes_since_last_flush.clone();
+            let last_flush_time = self.last_flush_time.clone();
+            let current_batch_ms = self.current_batch_ms.clone();
+            let min_ms = self.config_batch_min;
+            let max_ms = self.config_batch_max;
 
+            let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
-                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(batch_interval as u64),
                 move || {
                     let text = pending.borrow_mut().drain(..).collect::<String>();
                     if !text.is_empty() {
                         let mut end = output_buf.end_iter();
                         output_buf.insert(&mut end, &text);
                     }
+
+                    // Calculate adaptive batch interval based on throughput
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(last_flush_time.get());
+                    let elapsed_ms = elapsed.as_millis().max(1) as u64;
+                    let bytes = bytes_tracker.get();
+
+                    // throughput in bytes/ms
+                    let throughput = bytes as f64 / elapsed_ms as f64;
+
+                    let new_interval = if throughput > 100.0 {
+                        // High throughput (>100KB/s) - batch aggressively
+                        max_ms
+                    } else if throughput < 1.0 {
+                        // Low throughput (<1KB/s) - flush quickly for responsiveness
+                        min_ms
+                    } else {
+                        // Linear interpolation between min and max
+                        let t = (throughput - 1.0) / 99.0;
+                        min_ms + ((max_ms - min_ms) as f64 * t) as u32
+                    };
+
+                    current_batch_ms.set(new_interval);
+                    last_flush_time.set(now);
+                    bytes_tracker.set(0);
                     flush_flag.set(false);
                 },
             );
@@ -729,8 +792,9 @@ pub struct TermView {
     cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
     config: Config,
-    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
-    ansi_cache: Rc<RefCell<std::collections::HashMap<String, String>>>,
+    block_data: Rc<RefCell<VecDeque<BlockData>>>,
+    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,  // Rendered widgets (will phase out with virtual scrolling)
+    ansi_cache: Rc<RefCell<LruCache<String, String>>>,
 }
 
 impl TermView {
@@ -755,7 +819,10 @@ impl TermView {
         block_scroll.add_css_class("block-scroll");
 
         // Active block always at bottom
-        let active = Rc::new(RefCell::new(ActiveBlock::new()));
+        let active = Rc::new(RefCell::new(ActiveBlock::new(
+            config.output_batch_min_ms,
+            config.output_batch_max_ms,
+        )));
         block_list.append(active.borrow().widget());
 
         // VTE fallback for alt-screen mode
@@ -795,8 +862,11 @@ impl TermView {
         let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
+        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> = Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
-        let ansi_cache: Rc<RefCell<std::collections::HashMap<String, String>>> = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
+            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap())
+        ));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -814,6 +884,7 @@ impl TermView {
             let exited_cbs = exited_callbacks.clone();
             let config_for_cb = config.clone();
             let parser = Rc::new(RefCell::new(Parser::new()));
+            let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let scroll_debouncer = ScrollDebouncer::new();
             let ansi_cache_for_cb = ansi_cache.clone();
@@ -884,19 +955,15 @@ impl TermView {
                                         raw_cmd = raw_cmd.trim_start().to_string();
                                         let display = raw_cmd.trim_end_matches('\n').trim_end();
 
-                                        // Use cache for ANSI → Pango conversion
+                                        // Use LRU cache for ANSI → Pango conversion
                                         let markup = {
                                             let mut cache = ansi_cache_for_cb.borrow_mut();
                                             if let Some(cached) = cache.get(display) {
                                                 cached.clone()
                                             } else {
                                                 let result = ansi_to_pango(display, &config_for_cb.palette);
-                                                // LRU eviction: keep cache at 100 entries max
-                                                if cache.len() >= 100 {
-                                                    // Simple eviction: clear oldest half
-                                                    cache.clear();
-                                                }
-                                                cache.insert(display.to_string(), result.clone());
+                                                // LRU automatically evicts least-recently-used entry
+                                                cache.put(display.to_string(), result.clone());
                                                 result
                                             }
                                         };
@@ -968,6 +1035,23 @@ impl TermView {
                                 let output_trimmed = output.trim_end().to_string();
                                 log::debug!("CommandEnd: cmd={:?}, output_len={}, output_empty={}", cmd, output_trimmed.len(), output_trimmed.is_empty());
 
+                                // Create BlockData (logical representation)
+                                let line_count = output_trimmed.lines().count();
+                                let estimated_height = (line_count as i32 * 20).max(60);  // Rough estimate
+
+                                let block_data = BlockData {
+                                    prompt: prompt.clone(),
+                                    cmd: cmd.clone(),
+                                    cmd_markup: if cmd_markup.is_empty() { None } else { Some(cmd_markup.clone()) },
+                                    output: output_trimmed.clone(),
+                                    exit_code: *code,
+                                    estimated_height,
+                                    line_count,
+                                };
+
+                                block_data_for_cb.borrow_mut().push_back(block_data);
+
+                                // Create widget (physical representation)
                                 let finished = FinishedBlock::new(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb,
                                 );
@@ -976,14 +1060,19 @@ impl TermView {
                                 let active_widget = active_rc.borrow().widget().clone().upcast::<gtk4::Widget>();
                                 finished.widget().insert_before(&block_list_rc, Some(&active_widget));
 
-                                // Track finished blocks and limit history to MAX_VISIBLE_BLOCKS
-                                const MAX_VISIBLE_BLOCKS: usize = 50;
+                                // Track finished blocks and limit history
+                                let max_blocks = config_for_cb.max_visible_blocks as usize;
                                 finished_blocks_for_cb.borrow_mut().push(finished.widget().clone());
 
                                 // Remove oldest block if we exceed the limit
-                                if finished_blocks_for_cb.borrow().len() > MAX_VISIBLE_BLOCKS {
+                                if finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
                                     block_list_rc.remove(&oldest);
+                                }
+
+                                // Also evict from block_data if needed
+                                if block_data_for_cb.borrow().len() > max_blocks {
+                                    block_data_for_cb.borrow_mut().pop_front();
                                 }
 
                                 // Reset active block for next command
@@ -1147,8 +1236,9 @@ impl TermView {
             cwd_callbacks,
             exited_callbacks,
             config: config.clone(),
+            block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
-            ansi_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            ansi_cache,  // Use the cache we created earlier, not a new empty one
         }
     }
 
@@ -1199,6 +1289,20 @@ impl TermView {
     /// Apply updated theme colors to the block widgets.
     pub fn apply_theme(&self) {
         install_block_css(&self.config);
+    }
+
+    /// Search blocks for a query string (case-insensitive).
+    /// Returns indices of matching blocks.
+    pub fn search_blocks(&self, query: &str) -> Vec<usize> {
+        let q = query.to_lowercase();
+        self.block_data.borrow().iter().enumerate()
+            .filter(|(_, b)| {
+                b.prompt.to_lowercase().contains(&q) ||
+                b.cmd.to_lowercase().contains(&q) ||
+                b.output.to_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
@@ -1279,12 +1383,14 @@ fn install_block_css(config: &Config) {
         }}
         .block-list {{
             background-color: {bg_hex};
+            contain: style;
         }}
         .block-finished {{
             border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
+            contain: content;
         }}
         .block-active {{
             border-radius: 0;
@@ -1334,6 +1440,7 @@ fn install_block_css(config: &Config) {
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
+            contain: content;
         }}
         "#,
     );

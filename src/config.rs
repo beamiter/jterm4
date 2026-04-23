@@ -24,6 +24,15 @@ pub(crate) struct Config {
     pub(crate) palette: [RGBA; 16],
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
+    // Block view optimizations
+    pub(crate) ansi_cache_capacity: u32,
+    pub(crate) max_visible_blocks: u32,
+    pub(crate) output_batch_min_ms: u32,
+    pub(crate) output_batch_max_ms: u32,
+    pub(crate) lazy_load_threshold: u32,
+    pub(crate) virtual_scroll_margin: u32,
+    pub(crate) block_history_path: Option<String>,
+    pub(crate) block_history_compress: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +213,15 @@ struct FileConfig {
     keybindings: Option<toml::Table>,
     /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
     startup_commands: Option<String>,
+    // Block view optimizations
+    ansi_cache_capacity: Option<u32>,
+    max_visible_blocks: Option<u32>,
+    output_batch_min_ms: Option<u32>,
+    output_batch_max_ms: Option<u32>,
+    lazy_load_threshold: Option<u32>,
+    virtual_scroll_margin: Option<u32>,
+    block_history_path: Option<String>,
+    block_history_compress: Option<bool>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -230,6 +248,14 @@ fn load_file_config() -> FileConfig {
         cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         keybindings: table.get("keybindings").and_then(|v| v.as_table()).cloned(),
         startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
+        max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
+        output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
+        output_batch_max_ms: table.get("output_batch_max_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
+        lazy_load_threshold: table.get("lazy_load_threshold").and_then(|v| v.as_integer()).map(|v| v as u32),
+        virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
+        block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
     }
 }
 
@@ -277,6 +303,29 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or_else(|| fc.cursor_foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
         .unwrap_or(theme.cursor_foreground);
 
+    // Block view optimization settings
+    let ansi_cache_capacity = env_u32("JTERM4_ANSI_CACHE_CAP")
+        .or(fc.ansi_cache_capacity)
+        .unwrap_or(256);
+    let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
+        .or(fc.max_visible_blocks)
+        .unwrap_or(200);
+    let output_batch_min_ms = env_u32("JTERM4_BATCH_MIN")
+        .or(fc.output_batch_min_ms)
+        .unwrap_or(10);
+    let output_batch_max_ms = env_u32("JTERM4_BATCH_MAX")
+        .or(fc.output_batch_max_ms)
+        .unwrap_or(100);
+    let lazy_load_threshold = env_u32("JTERM4_LAZY_LINES")
+        .or(fc.lazy_load_threshold)
+        .unwrap_or(1000);
+    let virtual_scroll_margin = env_u32("JTERM4_VSCROLL_MARGIN")
+        .or(fc.virtual_scroll_margin)
+        .unwrap_or(1);
+    let block_history_path = std::env::var("JTERM4_HISTORY_PATH").ok()
+        .or(fc.block_history_path);
+    let block_history_compress = fc.block_history_compress.unwrap_or(true);
+
     let config = Config {
         window_opacity,
         terminal_scrollback_lines,
@@ -289,6 +338,14 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor_foreground,
         palette: theme.palette,
         startup_commands: fc.startup_commands,
+        ansi_cache_capacity,
+        max_visible_blocks,
+        output_batch_min_ms,
+        output_batch_max_ms,
+        lazy_load_threshold,
+        virtual_scroll_margin,
+        block_history_path,
+        block_history_compress,
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
