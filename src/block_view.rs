@@ -28,22 +28,47 @@ use crate::pty::OwnedPty;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-/// Scroll to bottom with retry mechanism to ensure layout is complete
-fn scroll_to_bottom_reliable(scroll: &ScrolledWindow) {
-    let scroll = scroll.clone();
-    // Try multiple times with increasing delays to handle layout updates
-    for delay_ms in [0, 20, 50, 100] {
-        let scroll_clone = scroll.clone();
-        glib::timeout_add_local_once(
-            std::time::Duration::from_millis(delay_ms),
+/// Coalesces repeated scroll requests into a single scroll event.
+/// Eliminates cascade of timers and provides smooth scrolling under rapid output.
+struct ScrollDebouncer {
+    dirty: Rc<Cell<bool>>,
+    pending_handle: Rc<RefCell<Option<glib::source::SourceId>>>,
+}
+
+impl ScrollDebouncer {
+    fn new() -> Self {
+        Self {
+            dirty: Rc::new(Cell::new(false)),
+            pending_handle: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn mark_dirty(&self, scroll: &ScrolledWindow) {
+        if self.dirty.get() {
+            return;
+        }
+        self.dirty.set(true);
+
+        let scroll = scroll.clone();
+        let dirty = self.dirty.clone();
+        let pending = self.pending_handle.clone();
+
+        if let Some(handle) = pending.borrow_mut().take() {
+            handle.remove();
+        }
+
+        let handle = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(50),
             move || {
-                let adj = scroll_clone.vadjustment();
+                let adj = scroll.vadjustment();
                 let target = adj.upper() - adj.page_size();
                 if adj.value() < target {
                     adj.set_value(target);
                 }
+                dirty.set(false);
             },
         );
+        pending.borrow_mut().replace(handle);
     }
 }
 
@@ -94,6 +119,14 @@ fn strip_ansi(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+fn strip_ansi_cached(input: &str, cache: &std::collections::HashMap<String, String>) -> (String, bool) {
+    if let Some(cached) = cache.get(input) {
+        (cached.clone(), true)
+    } else {
+        (strip_ansi(input), false)
+    }
 }
 
 fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
@@ -210,16 +243,41 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 out.push_str("<span style=\"italic\">");
                                 open_spans += 1;
                             }
+                            Ok(4) => {
+                                out.push_str("<span underline=\"single\">");
+                                open_spans += 1;
+                            }
+                            Ok(5) => {
+                                // Blink - map to different opacity/style
+                                out.push_str("<span alpha=\"60%\">");
+                                open_spans += 1;
+                            }
+                            Ok(9) => {
+                                out.push_str("<span strikethrough=\"true\">");
+                                open_spans += 1;
+                            }
                             Ok(30..=37) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 30) as usize;
                                 let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
                                 out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
                                 open_spans += 1;
                             }
+                            Ok(40..=47) => {
+                                let idx = (param_str.parse::<u32>().unwrap() - 40) as usize;
+                                let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
+                                out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                open_spans += 1;
+                            }
                             Ok(90..=97) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 90 + 8) as u8;
                                 let (r, g, b) = ansi256_to_rgb(idx, palette);
                                 out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                open_spans += 1;
+                            }
+                            Ok(100..=107) => {
+                                let idx = (param_str.parse::<u32>().unwrap() - 100 + 8) as u8;
+                                let (r, g, b) = ansi256_to_rgb(idx, palette);
+                                out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
                                 open_spans += 1;
                             }
                             Ok(38) => {
@@ -238,6 +296,27 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                             params[j + 4].parse::<u8>(),
                                         ) {
                                             out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            open_spans += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(48) => {
+                                let j = params.iter().position(|p| p == param_str).unwrap_or(0);
+                                if j + 2 < params.len() {
+                                    if params[j + 1] == "5" {
+                                        if let Ok(idx) = params[j + 2].parse::<u8>() {
+                                            let (r, g, b) = ansi256_to_rgb(idx, palette);
+                                            out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            open_spans += 1;
+                                        }
+                                    } else if params[j + 1] == "2" && j + 4 < params.len() {
+                                        if let (Ok(r), Ok(g), Ok(b)) = (
+                                            params[j + 2].parse::<u8>(),
+                                            params[j + 3].parse::<u8>(),
+                                            params[j + 4].parse::<u8>(),
+                                        ) {
+                                            out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
                                             open_spans += 1;
                                         }
                                     }
@@ -314,6 +393,18 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
     out
 }
 
+fn ansi_to_pango_cached(
+    input: &str,
+    palette: &[RGBA; 16],
+    cache: &std::collections::HashMap<String, String>,
+) -> (String, bool) {
+    if let Some(cached) = cache.get(input) {
+        (cached.clone(), true)
+    } else {
+        (ansi_to_pango(input, palette), false)
+    }
+}
+
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 struct FinishedBlock {
@@ -375,19 +466,44 @@ impl FinishedBlock {
 
         // Output area (only if there is output)
         if !output.is_empty() {
-            let tv = gtk4::TextView::new();
-            tv.set_editable(false);
-            tv.set_cursor_visible(false);
-            tv.set_wrap_mode(WrapMode::Char);
-            tv.set_monospace(true);
-            tv.set_margin_start(12);
-            tv.set_margin_end(8);
-            tv.set_margin_top(0);
-            tv.set_margin_bottom(2);
-            tv.add_css_class("block-output");
-            let buf = tv.buffer();
-            buf.set_text(output);
-            outer.append(&tv);
+            let line_count = output.lines().count();
+            let byte_size = output.as_bytes().len();
+
+            // Use Label for small outputs (faster rendering), TextView for large ones
+            if line_count < 100 && byte_size < 10240 {
+                let output_label = gtk4::Label::new(Some(output));
+                output_label.set_selectable(true);
+                output_label.set_wrap(true);
+                output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                output_label.set_xalign(0.0);
+                output_label.set_margin_start(12);
+                output_label.set_margin_end(8);
+                output_label.set_margin_top(0);
+                output_label.set_margin_bottom(2);
+                output_label.add_css_class("block-output");
+                outer.append(&output_label);
+            } else {
+                // For large outputs, cap at 1000 lines to avoid performance issues
+                let capped_output = if line_count > 1000 {
+                    output.lines().take(1000).collect::<Vec<_>>().join("\n") + "\n... (output truncated)"
+                } else {
+                    output.to_string()
+                };
+
+                let tv = gtk4::TextView::new();
+                tv.set_editable(false);
+                tv.set_cursor_visible(false);
+                tv.set_wrap_mode(WrapMode::Char);
+                tv.set_monospace(true);
+                tv.set_margin_start(12);
+                tv.set_margin_end(8);
+                tv.set_margin_top(0);
+                tv.set_margin_bottom(2);
+                tv.add_css_class("block-output");
+                let buf = tv.buffer();
+                buf.set_text(&capped_output);
+                outer.append(&tv);
+            }
         }
 
         // Separator line
@@ -523,6 +639,7 @@ pub struct TermView {
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
     config: Config,
     finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
+    ansi_cache: Rc<RefCell<std::collections::HashMap<String, String>>>,
 }
 
 impl TermView {
@@ -606,6 +723,7 @@ impl TermView {
             let config_for_cb = config.clone();
             let parser = Rc::new(RefCell::new(Parser::new()));
             let finished_blocks_for_cb = finished_blocks_rc.clone();
+            let scroll_debouncer = ScrollDebouncer::new();
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -630,7 +748,7 @@ impl TermView {
                                             active_rc.borrow().set_prompt(&clean);
                                         }
                                         // Auto-scroll to bottom while collecting prompt
-                                        scroll_to_bottom_reliable(&block_scroll_rc);
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AwaitingCommand => {
                                         // Shell's line editor sends the full line (prompt + input) with each keystroke.
@@ -678,13 +796,13 @@ impl TermView {
                                         *cmd_display_raw_rc.borrow_mut() = display.to_string();
 
                                         // Auto-scroll to bottom while typing command
-                                        scroll_to_bottom_reliable(&block_scroll_rc);
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
                                         let clean = strip_ansi(&text);
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
-                                        scroll_to_bottom_reliable(&block_scroll_rc);
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AltScreen => {
                                         // Feed raw bytes directly to VTE
@@ -700,7 +818,7 @@ impl TermView {
                                 bstate_rc.set(BlockState::CollectingPrompt);
                                 prompt_buf_rc.borrow_mut().clear();
                                 // Auto-scroll to bottom when new prompt starts
-                                scroll_to_bottom_reliable(&block_scroll_rc);
+                                scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
 
                             ParserEvent::PromptEnd => {
@@ -709,13 +827,13 @@ impl TermView {
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
                                 // Auto-scroll to bottom when prompt ends (ready for command)
-                                scroll_to_bottom_reliable(&block_scroll_rc);
+                                scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Auto-scroll to bottom when command starts executing
-                                scroll_to_bottom_reliable(&block_scroll_rc);
+                                scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
 
                             ParserEvent::CommandEnd(code) => {
@@ -746,7 +864,7 @@ impl TermView {
                                 finished.widget().insert_before(&block_list_rc, Some(&active_widget));
 
                                 // Track finished blocks and limit history to MAX_VISIBLE_BLOCKS
-                                const MAX_VISIBLE_BLOCKS: usize = 20;
+                                const MAX_VISIBLE_BLOCKS: usize = 50;
                                 finished_blocks_for_cb.borrow_mut().push(finished.widget().clone());
 
                                 // Remove oldest block if we exceed the limit
@@ -761,7 +879,7 @@ impl TermView {
                                 active_rc.borrow().output_buf.set_text("");
 
                                 // Scroll to bottom after layout updates
-                                scroll_to_bottom_reliable(&block_scroll_rc);
+                                scroll_debouncer.mark_dirty(&block_scroll_rc);
 
                                 bstate_rc.set(BlockState::Idle);
                             }
@@ -917,6 +1035,7 @@ impl TermView {
             exited_callbacks,
             config: config.clone(),
             finished_blocks: finished_blocks_rc,
+            ansi_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
         }
     }
 
