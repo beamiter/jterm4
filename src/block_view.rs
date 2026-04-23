@@ -977,7 +977,7 @@ pub struct TermView {
     pty: Rc<OwnedPty>,
     cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
-    config: Config,
+    config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
     ansi_cache: Rc<RefCell<LruCache<String, String>>>,
@@ -1072,7 +1072,7 @@ impl TermView {
             let pty_for_resize = pty.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
-            let config_for_cb = config.clone();
+            let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::new()));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
@@ -1151,7 +1151,7 @@ impl TermView {
                                             if let Some(cached) = cache.get(display) {
                                                 cached.clone()
                                             } else {
-                                                let result = ansi_to_pango(display, &config_for_cb.palette);
+                                                let result = ansi_to_pango(display, &config_for_cb.borrow().palette);
                                                 // LRU automatically evicts least-recently-used entry
                                                 cache.put(display.to_string(), result.clone());
                                                 result
@@ -1216,7 +1216,7 @@ impl TermView {
                                 let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
 
                                 let cmd_markup = if !raw_cmd_with_ansi.is_empty() {
-                                    ansi_to_pango(&raw_cmd_with_ansi, &config_for_cb.palette)
+                                    ansi_to_pango(&raw_cmd_with_ansi, &config_for_cb.borrow().palette)
                                 } else {
                                     String::new()
                                 };
@@ -1243,7 +1243,7 @@ impl TermView {
 
                                 // Create widget (physical representation)
                                 let finished = FinishedBlock::new(
-                                    &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb,
+                                    &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb.borrow(),
                                 );
 
                                 // Insert before the active block (which is always last)
@@ -1251,7 +1251,7 @@ impl TermView {
                                 finished.widget().insert_before(&block_list_rc, Some(&active_widget));
 
                                 // Track finished blocks and limit history
-                                let max_blocks = config_for_cb.max_visible_blocks as usize;
+                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                 finished_blocks_for_cb.borrow_mut().push(finished.widget().clone());
 
                                 // Remove oldest block if we exceed the limit
@@ -1502,7 +1502,7 @@ impl TermView {
             pty,
             cwd_callbacks,
             exited_callbacks,
-            config: config.clone(),
+            config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
             ansi_cache,
@@ -1538,7 +1538,7 @@ impl TermView {
                 let adj = block_scroll.vadjustment();
                 let scroll_top = adj.value() as i32;
                 let viewport_height = adj.page_size() as i32;
-                let margin = (config.virtual_scroll_margin as i32) * viewport_height;
+                let margin = (config.borrow().virtual_scroll_margin as i32) * viewport_height;
 
                 let visible_top = (scroll_top - margin).max(0);
                 let visible_bottom = scroll_top + viewport_height + margin;
@@ -1715,7 +1715,23 @@ impl TermView {
 
     /// Apply updated theme colors to the block widgets.
     pub fn apply_theme(&self) {
-        install_block_css(&self.config);
+        install_block_css(&self.config.borrow());
+    }
+
+    /// Update font for VTE terminal and block view CSS.
+    pub fn set_font(&self, font_desc: &FontDescription) {
+        self.vte.set_font(Some(font_desc));
+        // Update config and regenerate CSS with new font
+        self.config.borrow_mut().font_desc = font_desc.to_string();
+        install_block_css(&self.config.borrow());
+    }
+
+    /// Update font scale for VTE terminal and block view CSS.
+    pub fn set_font_scale(&self, scale: f64) {
+        self.vte.set_font_scale(scale);
+        self.config.borrow_mut().default_font_scale = scale;
+        // Regenerate CSS with updated font scale
+        install_block_css(&self.config.borrow());
     }
 
     /// Update virtual scrolling viewport state based on scroll position.
@@ -1723,7 +1739,7 @@ impl TermView {
         let adj = self.block_scroll.vadjustment();
         let scroll_top = adj.value() as i32;
         let viewport_height = adj.page_size() as i32;
-        let margin = (self.config.virtual_scroll_margin as i32) * viewport_height;
+        let margin = (self.config.borrow().virtual_scroll_margin as i32) * viewport_height;
 
         let visible_top = (scroll_top - margin).max(0);
         let visible_bottom = scroll_top + viewport_height + margin;
@@ -1820,7 +1836,7 @@ impl TermView {
 
     /// Save block history to file (if configured).
     pub fn save_history(&self) -> std::io::Result<()> {
-        let path_opt = self.config.block_history_path.as_ref();
+        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
         if path_opt.is_none() {
             return Ok(());
         }
@@ -1838,7 +1854,7 @@ impl TermView {
                 std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
             })?;
 
-            if self.config.block_history_compress {
+            if self.config.borrow().block_history_compress {
                 let compressed = zstd::encode_all(serialized.as_slice(), 3).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
                 })?;
@@ -1859,13 +1875,13 @@ impl TermView {
 
     /// Load block history from file (if configured).
     pub fn load_history(&self) -> std::io::Result<()> {
-        let path_opt = self.config.block_history_path.as_ref();
+        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
         if path_opt.is_none() {
             return Ok(());
         }
 
         let path = path_opt.unwrap();
-        if !std::path::Path::new(path).exists() {
+        if !std::path::Path::new(&path).exists() {
             return Ok(());
         }
 
@@ -1883,7 +1899,7 @@ impl TermView {
             let mut data = vec![0u8; len];
             file.read_exact(&mut data)?;
 
-            let decoded = if self.config.block_history_compress {
+            let decoded = if self.config.borrow().block_history_compress {
                 zstd::decode_all(data.as_slice()).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
                 })?
@@ -1958,17 +1974,21 @@ fn install_block_css(config: &Config) {
     // Parse font description to extract font family and size
     // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Regular 14"
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
-    let (font_family, font_size) = if parts.len() >= 2 {
+    let (font_family, base_size) = if parts.len() >= 2 {
         // Last part is usually the size
         if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
             let family = parts[..parts.len() - 1].join(" ");
-            (family, format!("{}pt", size))
+            (family, size)
         } else {
-            (config.font_desc.clone(), "14pt".to_string())
+            (config.font_desc.clone(), 14)
         }
     } else {
-        (config.font_desc.clone(), "14pt".to_string())
+        (config.font_desc.clone(), 14)
     };
+
+    // Apply font scale to the base size
+    let scaled_size = (base_size as f64 * config.default_font_scale).round() as i32;
+    let font_size = format!("{}pt", scaled_size);
 
     let css = format!(
         r#"

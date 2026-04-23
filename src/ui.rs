@@ -366,6 +366,12 @@ impl UiState {
         self.font_scale.set(new_scale);
         for i in 0..self.notebook.n_pages() {
             if let Some(widget) = self.notebook.nth_page(Some(i)) {
+                // Update TermView if present
+                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
+                    let term_view = unsafe { term_view.as_ref() };
+                    term_view.set_font_scale(new_scale);
+                }
+                // Also update any standalone VTE terminals (for split panes)
                 let mut terms = Vec::new();
                 collect_terminals(&widget, &mut terms);
                 for term in terms {
@@ -427,9 +433,22 @@ impl UiState {
     pub(crate) fn apply_font_all(&self) {
         let config = self.config.borrow();
         let font_desc = FontDescription::from_string(&config.font_desc);
-        self.for_each_terminal(|term| {
-            term.set_font(Some(&font_desc));
-        });
+        drop(config);
+        for i in 0..self.notebook.n_pages() {
+            if let Some(widget) = self.notebook.nth_page(Some(i)) {
+                // Update TermView if present
+                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
+                    let term_view = unsafe { term_view.as_ref() };
+                    term_view.set_font(&font_desc);
+                }
+                // Also update any standalone VTE terminals (for split panes)
+                let mut terms = Vec::new();
+                collect_terminals(&widget, &mut terms);
+                for term in terms {
+                    term.set_font(Some(&font_desc));
+                }
+            }
+        }
     }
 
     pub(crate) fn apply_scrollback_all(&self) {
