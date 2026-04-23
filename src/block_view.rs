@@ -326,8 +326,8 @@ impl FinishedBlock {
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
-        outer.set_margin_top(8);
-        outer.set_margin_bottom(8);
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
 
         // Prompt row
         let prompt_label = gtk4::Label::new(Some(prompt));
@@ -335,14 +335,17 @@ impl FinishedBlock {
         prompt_label.set_xalign(0.0);
         prompt_label.set_selectable(true);
         prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(6);
+        prompt_label.set_margin_top(2);
         prompt_label.set_margin_bottom(0);
+        prompt_label.set_single_line_mode(true);
         outer.append(&prompt_label);
 
         // Command row with wrap support
         let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
         cmd_box.set_margin_start(12);
-        cmd_box.set_margin_bottom(4);
+        cmd_box.set_margin_top(0);
+        cmd_box.set_margin_bottom(0);
+        cmd_box.set_spacing(0);
 
         let cmd_label = gtk4::Label::new(None);
         cmd_label.add_css_class("block-cmd");
@@ -379,7 +382,8 @@ impl FinishedBlock {
             tv.set_monospace(true);
             tv.set_margin_start(12);
             tv.set_margin_end(8);
-            tv.set_margin_bottom(6);
+            tv.set_margin_top(0);
+            tv.set_margin_bottom(2);
             tv.add_css_class("block-output");
             let buf = tv.buffer();
             buf.set_text(output);
@@ -411,16 +415,17 @@ impl ActiveBlock {
     fn new() -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_top(8);
-        widget.set_margin_bottom(8);
+        widget.set_margin_top(4);
+        widget.set_margin_bottom(4);
 
         // Prompt row
         let prompt_label = gtk4::Label::new(Some(""));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
         prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(6);
+        prompt_label.set_margin_top(2);
         prompt_label.set_margin_bottom(0);
+        prompt_label.set_single_line_mode(true);
         widget.append(&prompt_label);
 
         // Command row with wrap support
@@ -433,7 +438,8 @@ impl ActiveBlock {
         cmd_label.set_wrap(true);
         cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
         cmd_label.set_margin_start(12);
-        cmd_label.set_margin_bottom(4);
+        cmd_label.set_margin_top(0);
+        cmd_label.set_margin_bottom(2);
         widget.append(&cmd_label);
 
         // Live output
@@ -444,7 +450,8 @@ impl ActiveBlock {
         tv.set_monospace(true);
         tv.set_margin_start(12);
         tv.set_margin_end(8);
-        tv.set_margin_bottom(6);
+        tv.set_margin_top(0);
+        tv.set_margin_bottom(2);
         tv.add_css_class("block-output");
         let output_buf = tv.buffer();
 
@@ -1048,11 +1055,9 @@ fn install_block_css(config: &Config) {
             background-color: {bg_hex};
         }}
         .block-active {{
-            border-left: 3px solid {accent};
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
-            min-height: 80px;
         }}
         .block-header {{
             background-color: {header_bg};
@@ -1064,12 +1069,16 @@ fn install_block_css(config: &Config) {
             color: {dim_fg};
             font-family: "{font_family}";
             font-size: {font_size};
+            line-height: 1.0;
+            margin: 0;
         }}
         .block-cmd {{
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
             padding: 0;
+            line-height: 1.0;
+            margin: 0;
         }}
         .block-cmd-active {{
             color: {fg_hex};
@@ -1077,6 +1086,10 @@ fn install_block_css(config: &Config) {
             font-size: {font_size};
             font-weight: bold;
             padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            border-left: 3px solid {accent};
+            padding-left: 9px;
         }}
         .block-exit-bad {{
             color: #ff5555;
