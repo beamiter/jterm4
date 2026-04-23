@@ -53,10 +53,12 @@ impl ScrollDebouncer {
         let dirty = self.dirty.clone();
         let pending = self.pending_handle.clone();
 
+        // Cancel existing timer if present (ignore error if already fired)
         if let Some(handle) = pending.borrow_mut().take() {
-            handle.remove();
+            let _ = handle.remove();
         }
 
+        let pending_for_clear = pending.clone();
         let handle = glib::timeout_add_local_once(
             std::time::Duration::from_millis(50),
             move || {
@@ -66,6 +68,8 @@ impl ScrollDebouncer {
                     adj.set_value(target);
                 }
                 dirty.set(false);
+                // Clear the handle after firing to prevent double-remove
+                pending_for_clear.borrow_mut().take();
             },
         );
         pending.borrow_mut().replace(handle);
