@@ -559,8 +559,8 @@ impl FinishedBlock {
                     // Show first 50 lines and last 10 lines with "Show more" button
                     let lines: Vec<&str> = output.lines().collect();
                     let first_50 = lines.iter().take(50).map(|s| *s).collect::<Vec<_>>().join("\n");
-                    let last_10: Vec<&str> = lines.iter().rev().take(10).collect();
-                    let last_10_text = last_10.into_iter().rev().map(|s| *s).collect::<Vec<_>>().join("\n");
+                    let last_10: Vec<&str> = lines.iter().rev().take(10).map(|s| *s).collect();
+                    let last_10_text = last_10.into_iter().rev().collect::<Vec<_>>().join("\n");
 
                     let preview = format!("{}\n\n[... {} lines hidden ...]\n\n{}",
                         first_50,
@@ -570,7 +570,7 @@ impl FinishedBlock {
                     let preview_label = gtk4::Label::new(Some(&preview));
                     preview_label.set_selectable(true);
                     preview_label.set_wrap(true);
-                    preview_label.set_wrap_mode(WrapMode::Char);
+                    preview_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
                     preview_label.add_css_class("monospace");
                     preview_label.set_xalign(0.0);
                     preview_label.set_margin_start(12);
@@ -1323,7 +1323,7 @@ impl TermView {
             root.set_focusable(true);
         }
 
-        TermView {
+        let term_view = TermView {
             root,
             block_scroll,
             block_list,

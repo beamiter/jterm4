@@ -505,8 +505,11 @@ impl UiState {
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
         self.notebook.current_page().and_then(|page_num| {
             self.notebook.nth_page(Some(page_num)).and_then(|widget| {
-                // SAFETY: data() returns a NonNull that we dereference
-                unsafe { widget.data::<Rc<TermView>>("term-view").as_ref() }.cloned()
+                // SAFETY: data() returns a NonNull to data we stored on the widget
+                unsafe {
+                    widget.data::<Rc<TermView>>("term-view")
+                        .map(|ptr| ptr.as_ref().clone())
+                }
             })
         })
     }
