@@ -435,7 +435,7 @@ impl FinishedBlock {
         prompt_label.set_single_line_mode(true);
         outer.append(&prompt_label);
 
-        // Command row with wrap support
+        // Command row with wrap support and collapse button
         let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
         cmd_box.set_margin_start(12);
         cmd_box.set_margin_top(0);
@@ -464,6 +464,56 @@ impl FinishedBlock {
             badge.add_css_class("block-exit-bad");
             badge.set_valign(gtk4::Align::Start);
             cmd_box.append(&badge);
+        }
+
+        // Add collapse button if there's output
+        let has_output = !output.is_empty();
+        if has_output {
+            let collapse_btn = gtk4::Button::from_icon_name("go-down-symbolic");
+            collapse_btn.add_css_class("flat");
+            collapse_btn.set_focus_on_click(false);
+            collapse_btn.set_valign(gtk4::Align::Start);
+            collapse_btn.set_tooltip_text(Some("Collapse output"));
+            cmd_box.append(&collapse_btn);
+
+            // Store collapse state
+            unsafe {
+                outer.set_data("collapsed", false);
+            }
+
+            // Wire collapse button (will connect after output is created)
+            let outer_for_collapse = outer.clone();
+            collapse_btn.connect_clicked(move |btn| {
+                let collapsed = unsafe {
+                    outer_for_collapse.data::<bool>("collapsed")
+                        .map(|ptr| *ptr.as_ref())
+                        .unwrap_or(false)
+                };
+                let new_state = !collapsed;
+
+                // Toggle visibility of all children except first two (prompt + cmd)
+                let mut child_idx = 0;
+                let mut child = outer_for_collapse.first_child();
+                while let Some(c) = child {
+                    if child_idx >= 2 {  // Skip prompt and cmd rows
+                        c.set_visible(!new_state);
+                    }
+                    child = c.next_sibling();
+                    child_idx += 1;
+                }
+
+                unsafe {
+                    outer_for_collapse.set_data("collapsed", new_state);
+                }
+
+                if new_state {
+                    btn.set_icon_name("go-next-symbolic");
+                    btn.set_tooltip_text(Some("Expand output"));
+                } else {
+                    btn.set_icon_name("go-down-symbolic");
+                    btn.set_tooltip_text(Some("Collapse output"));
+                }
+            });
         }
 
         outer.append(&cmd_box);
@@ -529,6 +579,8 @@ struct ActiveBlock {
     prompt_label: gtk4::Label,
     cmd_label: gtk4::Label,
     output_buf: gtk4::TextBuffer,
+    pending_output: Rc<RefCell<String>>,
+    flush_pending: Rc<Cell<bool>>,
 }
 
 impl ActiveBlock {
@@ -577,7 +629,14 @@ impl ActiveBlock {
 
         widget.append(&tv);
 
-        ActiveBlock { widget, prompt_label, cmd_label, output_buf }
+        ActiveBlock {
+            widget,
+            prompt_label,
+            cmd_label,
+            output_buf,
+            pending_output: Rc::new(RefCell::new(String::new())),
+            flush_pending: Rc::new(Cell::new(false)),
+        }
     }
 
     fn set_prompt(&self, text: &str) {
@@ -593,8 +652,36 @@ impl ActiveBlock {
     }
 
     fn append_output(&self, text: &str) {
-        let mut end = self.output_buf.end_iter();
-        self.output_buf.insert(&mut end, text);
+        self.pending_output.borrow_mut().push_str(text);
+
+        // Schedule flush if not already pending
+        if !self.flush_pending.get() {
+            self.flush_pending.set(true);
+            let pending = self.pending_output.clone();
+            let output_buf = self.output_buf.clone();
+            let flush_flag = self.flush_pending.clone();
+
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(50),
+                move || {
+                    let text = pending.borrow_mut().drain(..).collect::<String>();
+                    if !text.is_empty() {
+                        let mut end = output_buf.end_iter();
+                        output_buf.insert(&mut end, &text);
+                    }
+                    flush_flag.set(false);
+                },
+            );
+        }
+    }
+
+    fn flush_output(&self) {
+        let text = self.pending_output.borrow_mut().drain(..).collect::<String>();
+        if !text.is_empty() {
+            let mut end = self.output_buf.end_iter();
+            self.output_buf.insert(&mut end, &text);
+        }
+        self.flush_pending.set(false);
     }
 
     fn output_text(&self) -> String {
@@ -709,6 +796,7 @@ impl TermView {
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
         let finished_blocks_rc: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
+        let ansi_cache: Rc<RefCell<std::collections::HashMap<String, String>>> = Rc::new(RefCell::new(std::collections::HashMap::new()));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -728,6 +816,7 @@ impl TermView {
             let parser = Rc::new(RefCell::new(Parser::new()));
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let scroll_debouncer = ScrollDebouncer::new();
+            let ansi_cache_for_cb = ansi_cache.clone();
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -794,7 +883,24 @@ impl TermView {
 
                                         raw_cmd = raw_cmd.trim_start().to_string();
                                         let display = raw_cmd.trim_end_matches('\n').trim_end();
-                                        let markup = ansi_to_pango(display, &config_for_cb.palette);
+
+                                        // Use cache for ANSI → Pango conversion
+                                        let markup = {
+                                            let mut cache = ansi_cache_for_cb.borrow_mut();
+                                            if let Some(cached) = cache.get(display) {
+                                                cached.clone()
+                                            } else {
+                                                let result = ansi_to_pango(display, &config_for_cb.palette);
+                                                // LRU eviction: keep cache at 100 entries max
+                                                if cache.len() >= 100 {
+                                                    // Simple eviction: clear oldest half
+                                                    cache.clear();
+                                                }
+                                                cache.insert(display.to_string(), result.clone());
+                                                result
+                                            }
+                                        };
+
                                         active_rc.borrow().set_cmd_markup(&markup);
                                         // Save the raw command for CommandEnd
                                         *cmd_display_raw_rc.borrow_mut() = display.to_string();
@@ -841,6 +947,9 @@ impl TermView {
                             }
 
                             ParserEvent::CommandEnd(code) => {
+                                // Flush any pending output first
+                                active_rc.borrow().flush_output();
+
                                 // Freeze the active block into a finished block
                                 let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
 
