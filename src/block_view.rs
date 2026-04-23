@@ -24,6 +24,7 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
+use serde::{Serialize, Deserialize};
 
 use crate::config::Config;
 use crate::parser::{Parser, ParserEvent};
@@ -415,7 +416,7 @@ fn ansi_to_pango_cached(
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 /// Data for a finished command block (decoupled from widget representation)
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct BlockData {
     prompt: String,
     cmd: String,
@@ -552,26 +553,92 @@ impl FinishedBlock {
                 output_label.add_css_class("block-output");
                 outer.append(&output_label);
             } else {
-                // For large outputs, cap at 1000 lines to avoid performance issues
-                let capped_output = if line_count > 1000 {
-                    output.lines().take(1000).collect::<Vec<_>>().join("\n") + "\n... (output truncated)"
-                } else {
-                    output.to_string()
-                };
+                // Check if output exceeds lazy-load threshold
+                let threshold = _config.lazy_load_threshold as usize;
+                if line_count > threshold {
+                    // Show first 50 lines and last 10 lines with "Show more" button
+                    let lines: Vec<&str> = output.lines().collect();
+                    let first_50 = lines.iter().take(50).map(|s| *s).collect::<Vec<_>>().join("\n");
+                    let last_10: Vec<&str> = lines.iter().rev().take(10).collect();
+                    let last_10_text = last_10.into_iter().rev().map(|s| *s).collect::<Vec<_>>().join("\n");
 
-                let tv = gtk4::TextView::new();
-                tv.set_editable(false);
-                tv.set_cursor_visible(false);
-                tv.set_wrap_mode(WrapMode::Char);
-                tv.set_monospace(true);
-                tv.set_margin_start(12);
-                tv.set_margin_end(8);
-                tv.set_margin_top(0);
-                tv.set_margin_bottom(2);
-                tv.add_css_class("block-output");
-                let buf = tv.buffer();
-                buf.set_text(&capped_output);
-                outer.append(&tv);
+                    let preview = format!("{}\n\n[... {} lines hidden ...]\n\n{}",
+                        first_50,
+                        line_count - 60,
+                        last_10_text);
+
+                    let preview_label = gtk4::Label::new(Some(&preview));
+                    preview_label.set_selectable(true);
+                    preview_label.set_wrap(true);
+                    preview_label.set_wrap_mode(WrapMode::Char);
+                    preview_label.set_monospace(true);
+                    preview_label.set_xalign(0.0);
+                    preview_label.set_margin_start(12);
+                    preview_label.set_margin_end(8);
+                    preview_label.set_margin_top(0);
+                    preview_label.set_margin_bottom(2);
+                    preview_label.add_css_class("block-output");
+                    outer.append(&preview_label);
+
+                    // "Show all" button
+                    let show_all_btn = gtk4::Button::with_label(
+                        &format!("Show all {} lines", line_count)
+                    );
+                    show_all_btn.add_css_class("flat");
+                    show_all_btn.add_css_class("block-show-more");
+                    show_all_btn.set_margin_start(12);
+                    show_all_btn.set_margin_top(4);
+
+                    let full_output = output.to_string();
+                    let outer_ref = outer.clone();
+                    show_all_btn.connect_clicked(move |btn| {
+                        // Remove the preview label and button
+                        btn.unparent();
+                        let first_child = outer_ref.first_child();
+                        if let Some(child) = first_child {
+                            if child.downcast_ref::<gtk4::Label>().is_some() {
+                                if let Some(prev) = child.prev_sibling() {
+                                    if let Some(prev_label) = prev.downcast_ref::<gtk4::Label>() {
+                                        if prev_label.has_css_class("block-output") {
+                                            prev_label.unparent();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Insert full output TextView
+                        let tv = gtk4::TextView::new();
+                        tv.set_editable(false);
+                        tv.set_cursor_visible(false);
+                        tv.set_wrap_mode(WrapMode::Char);
+                        tv.set_monospace(true);
+                        tv.set_margin_start(12);
+                        tv.set_margin_end(8);
+                        tv.set_margin_top(0);
+                        tv.set_margin_bottom(2);
+                        tv.add_css_class("block-output");
+                        tv.buffer().set_text(&full_output);
+                        outer_ref.append(&tv);
+                    });
+
+                    outer.append(&show_all_btn);
+                } else {
+                    // For large outputs under threshold, just use TextView
+                    let tv = gtk4::TextView::new();
+                    tv.set_editable(false);
+                    tv.set_cursor_visible(false);
+                    tv.set_wrap_mode(WrapMode::Char);
+                    tv.set_monospace(true);
+                    tv.set_margin_start(12);
+                    tv.set_margin_end(8);
+                    tv.set_margin_top(0);
+                    tv.set_margin_bottom(2);
+                    tv.add_css_class("block-output");
+                    let buf = tv.buffer();
+                    buf.set_text(output);
+                    outer.append(&tv);
+                }
             }
         }
 
@@ -776,6 +843,14 @@ enum BlockState {
     AltScreen,
 }
 
+// ─── Virtual Scrolling ────────────────────────────────────────────────────────
+
+struct ViewportState {
+    first_visible: usize,
+    last_visible: usize,
+    total_height: i32,
+}
+
 // ─── TermView ─────────────────────────────────────────────────────────────────
 
 pub struct TermView {
@@ -795,6 +870,7 @@ pub struct TermView {
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,  // Rendered widgets (will phase out with virtual scrolling)
     ansi_cache: Rc<RefCell<LruCache<String, String>>>,
+    viewport: Rc<RefCell<ViewportState>>,
 }
 
 impl TermView {
@@ -1239,7 +1315,16 @@ impl TermView {
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
             ansi_cache,  // Use the cache we created earlier, not a new empty one
-        }
+            viewport: Rc::new(RefCell::new(ViewportState {
+                first_visible: 0,
+                last_visible: 0,
+                total_height: 0,
+            })),
+        };
+
+        // Load history if configured
+        let _ = term_view.load_history();
+        term_view
     }
 
     /// Root GTK widget to embed in the notebook page.
@@ -1291,6 +1376,37 @@ impl TermView {
         install_block_css(&self.config);
     }
 
+    /// Update virtual scrolling viewport state based on scroll position.
+    pub fn update_viewport(&self) {
+        let adj = self.block_scroll.vadjustment();
+        let scroll_top = adj.value() as i32;
+        let viewport_height = adj.page_size() as i32;
+        let margin = (self.config.virtual_scroll_margin as i32) * viewport_height;
+
+        let visible_top = (scroll_top - margin).max(0);
+        let visible_bottom = scroll_top + viewport_height + margin;
+
+        let block_data = self.block_data.borrow();
+        let mut y = 0;
+        let mut first = None;
+        let mut last = 0;
+
+        for (i, block) in block_data.iter().enumerate() {
+            if first.is_none() && y + block.estimated_height > visible_top {
+                first = Some(i);
+            }
+            if y < visible_bottom {
+                last = i;
+            }
+            y += block.estimated_height;
+        }
+
+        let mut vp = self.viewport.borrow_mut();
+        vp.first_visible = first.unwrap_or(0);
+        vp.last_visible = last;
+        vp.total_height = y;
+    }
+
     /// Search blocks for a query string (case-insensitive).
     /// Returns indices of matching blocks.
     pub fn search_blocks(&self, query: &str) -> Vec<usize> {
@@ -1303,6 +1419,101 @@ impl TermView {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    pub fn scroll_to_block(&self, block_index: usize) {
+        let finished = self.finished_blocks.borrow();
+        if block_index >= finished.len() {
+            return;
+        }
+        if let Some(widget) = finished.get(block_index) {
+            widget.grab_focus();
+            let adj = self.block_scroll.vadjustment();
+            if let Some(value) = widget.compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0)) {
+                adj.set_value(value.y() as f64);
+            }
+        }
+    }
+
+    /// Save block history to file (if configured).
+    pub fn save_history(&self) -> std::io::Result<()> {
+        let path_opt = self.config.block_history_path.as_ref();
+        if path_opt.is_none() {
+            return Ok(());
+        }
+
+        let path = path_opt.unwrap();
+        let blocks = self.block_data.borrow();
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+
+        for block in blocks.iter() {
+            let serialized = bincode::serialize(block).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })?;
+
+            if self.config.block_history_compress {
+                let compressed = zstd::encode_all(serialized.as_slice(), 3).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })?;
+                use std::io::Write;
+                let mut f = file.try_clone()?;
+                f.write_all(&(compressed.len() as u32).to_le_bytes())?;
+                f.write_all(&compressed)?;
+            } else {
+                use std::io::Write;
+                let mut f = file.try_clone()?;
+                f.write_all(&(serialized.len() as u32).to_le_bytes())?;
+                f.write_all(&serialized)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load block history from file (if configured).
+    pub fn load_history(&self) -> std::io::Result<()> {
+        let path_opt = self.config.block_history_path.as_ref();
+        if path_opt.is_none() {
+            return Ok(());
+        }
+
+        let path = path_opt.unwrap();
+        if !std::path::Path::new(path).exists() {
+            return Ok(());
+        }
+
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut blocks = self.block_data.borrow_mut();
+
+        loop {
+            let mut len_bytes = [0u8; 4];
+            if file.read_exact(&mut len_bytes).is_err() {
+                break;
+            }
+
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let mut data = vec![0u8; len];
+            file.read_exact(&mut data)?;
+
+            let decoded = if self.config.block_history_compress {
+                zstd::decode_all(data.as_slice()).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })?
+            } else {
+                data
+            };
+
+            if let Ok(block) = bincode::deserialize::<BlockData>(&decoded) {
+                blocks.push_back(block);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1441,6 +1652,12 @@ fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             contain: content;
+        }}
+        .block-show-more {{
+            color: {accent};
+            margin-start: 12px;
+            margin-top: 4px;
+            margin-bottom: 4px;
         }}
         "#,
     );

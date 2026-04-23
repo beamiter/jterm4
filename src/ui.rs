@@ -502,6 +502,15 @@ impl UiState {
         })
     }
 
+    pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
+        self.notebook.current_page().and_then(|page_num| {
+            self.notebook.nth_page(Some(page_num)).and_then(|widget| {
+                // SAFETY: data() returns a GValue that is safe to access
+                unsafe { widget.data::<Rc<TermView>>("term-view") }
+            })
+        })
+    }
+
     pub(crate) fn toggle_search(&self) {
         let visible = self.search_bar.is_search_mode();
         self.search_bar.set_search_mode(!visible);
@@ -521,6 +530,20 @@ impl UiState {
         if text.is_empty() {
             return;
         }
+
+        // Try block search first (in block mode)
+        if let Some(term_view) = self.current_term_view() {
+            let matches = term_view.search_blocks(&text);
+            if !matches.is_empty() {
+                if let Some(first_match) = matches.first() {
+                    // Scroll to first matching block
+                    term_view.scroll_to_block(*first_match);
+                    return;
+                }
+            }
+        }
+
+        // Fall back to terminal regex search
         if let Some(term) = self.current_terminal() {
             let escaped = glib::Regex::escape_string(&text);
             let regex = vte4::Regex::for_search(&escaped, pcre2_sys::PCRE2_CASELESS);
@@ -1522,7 +1545,9 @@ impl UiState {
         // Connect child-exited to close the tab
         let ui_for_exit = UiState::clone(self);
         let exit_widget = term_view_widget.clone();
+        let term_view_for_exit = term_view.clone();
         term_view.connect_exited(move |_code| {
+            let _ = term_view_for_exit.save_history();
             ui_for_exit.handle_terminal_exited(&exit_widget);
         });
 
