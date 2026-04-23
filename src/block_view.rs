@@ -1340,8 +1340,8 @@ impl TermView {
         // ── Keyboard input → PTY ──────────────────────────────────────────
         {
             let pty_for_key = pty.clone();
-            let vte_box_for_key = vte_box.clone();
-            let bstate_for_key = bstate.clone();
+            let vte_for_key = vte.clone();
+            let root_for_key = root.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -1351,6 +1351,83 @@ impl TermView {
                 // Main app's key_controller on the window (also Capture phase) runs first
                 // and will intercept keybindings before we get here.
                 let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+                let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+
+                log::debug!("KEY: keyval={:?}, ctrl={}, shift={}, alt={}", keyval, ctrl, shift, alt);
+
+                // Handle Ctrl+Shift+C (copy) and Ctrl+Shift+V (paste)
+                if ctrl && shift {
+                    match keyval {
+                        v if v == gtk4::gdk::Key::c || v == gtk4::gdk::Key::C => {
+                            log::warn!(">>> COPY: Ctrl+Shift+C pressed");
+                            // Copy selected text to clipboard
+                            // First try VTE (for alt-screen mode)
+                            if let Some(text) = vte_for_key.text_selected(vte4::Format::Text) {
+                                log::warn!(">>> Copy: got {} chars from VTE", text.len());
+                                let clipboard = vte_for_key.clipboard();
+                                clipboard.set_text(&text);
+                                log::warn!(">>> Copy: set VTE text to clipboard");
+                            } else {
+                                log::warn!(">>> Copy: no text in VTE, trying PRIMARY");
+                                // Fall back to PRIMARY clipboard (selected text in labels)
+                                let display = root_for_key.display();
+                                log::warn!(">>> Copy: got display");
+                                let root_clone = root_for_key.clone();
+                                let clipboard = display.clipboard();
+                                log::warn!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
+                                clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
+                                    log::warn!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+                                    match result {
+                                        Ok(text_opt) => {
+                                            if let Some(text_str) = text_opt {
+                                                log::warn!(">>> Copy: got {} chars from PRIMARY", text_str.len());
+                                                // Copy to regular clipboard too
+                                                let display2 = root_clone.display();
+                                                let cb = display2.clipboard();
+                                                cb.set_text(&text_str);
+                                                log::warn!(">>> Copy: copied to regular clipboard");
+                                            } else {
+                                                log::warn!(">>> Copy: PRIMARY is None");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!(">>> Copy: error reading PRIMARY: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                        v if v == gtk4::gdk::Key::v || v == gtk4::gdk::Key::V => {
+                            log::warn!(">>> PASTE: Ctrl+Shift+V pressed");
+                            // Paste: read clipboard and write to PTY
+                            let clipboard = vte_for_key.clipboard();
+                            let pty_for_paste = pty_for_key.clone();
+                            log::warn!(">>> Paste: got clipboard, calling read_text_async");
+                            clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+                                log::warn!(">>> Paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+                                match result {
+                                    Ok(text_opt) => {
+                                        if let Some(text_str) = text_opt {
+                                            log::warn!(">>> Paste: got {} chars from clipboard", text_str.len());
+                                            pty_for_paste.write_bytes(text_str.as_bytes());
+                                            log::warn!(">>> Paste: wrote {} bytes to PTY", text_str.len());
+                                        } else {
+                                            log::warn!(">>> Paste: clipboard is None");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!(">>> Paste: error: {}", e);
+                                    }
+                                }
+                            });
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
+
                 let bytes: Option<Vec<u8>> = match keyval {
                     v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
                         Some(b"\r".to_vec())
@@ -1552,6 +1629,80 @@ impl TermView {
         } else {
             self.root.grab_focus();
         }
+    }
+
+    /// Copy selected text to clipboard.
+    /// In block mode: tries to copy from GTK's selection (PRIMARY clipboard).
+    /// In alt-screen mode: copies from VTE terminal.
+    pub fn copy_to_clipboard(&self) {
+        log::warn!(">>> TermView::copy_to_clipboard called");
+        // First try VTE (for alt-screen mode)
+        let vte_text = self.vte.text_selected(vte4::Format::Text);
+        let has_vte_text = vte_text.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+
+        if has_vte_text {
+            let text = vte_text.unwrap();
+            log::warn!(">>> TermView copy: got {} chars from VTE", text.len());
+            let clipboard = self.vte.clipboard();
+            clipboard.set_text(&text);
+            log::warn!(">>> TermView copy: set VTE text to clipboard");
+        } else {
+            log::warn!(">>> TermView copy: VTE text empty or None, trying PRIMARY");
+            // Fall back to PRIMARY clipboard (selected text in labels)
+            let display = self.root.display();
+            let root_clone = self.root.clone();
+            let primary = display.primary_clipboard();
+            log::warn!(">>> TermView copy: got PRIMARY clipboard, calling read_text_async");
+            primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
+                log::warn!(">>> TermView copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| (s.len(), s.as_str()))));
+                match result {
+                    Ok(text_opt) => {
+                        if let Some(text_str) = text_opt {
+                            if !text_str.is_empty() {
+                                log::warn!(">>> TermView copy: got {} chars from PRIMARY: {:?}", text_str.len(), &text_str[..text_str.len().min(50)]);
+                                // Copy to regular clipboard (CLIPBOARD)
+                                let display2 = root_clone.display();
+                                let cb = display2.clipboard();
+                                cb.set_text(&text_str);
+                                log::warn!(">>> TermView copy: copied to CLIPBOARD");
+                            } else {
+                                log::warn!(">>> TermView copy: PRIMARY text is empty");
+                            }
+                        } else {
+                            log::warn!(">>> TermView copy: PRIMARY is None - no text selected");
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(">>> TermView copy: error reading PRIMARY: {}", e);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Paste from clipboard to PTY.
+    pub fn paste_from_clipboard(&self) {
+        log::warn!(">>> TermView::paste_from_clipboard called");
+        let clipboard = self.vte.clipboard();
+        let pty = self.pty.clone();
+        log::warn!(">>> TermView paste: got clipboard, calling read_text_async");
+        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+            log::warn!(">>> TermView paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+            match result {
+                Ok(text_opt) => {
+                    if let Some(text_str) = text_opt {
+                        log::warn!(">>> TermView paste: got {} chars from clipboard", text_str.len());
+                        pty.write_bytes(text_str.as_bytes());
+                        log::warn!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
+                    } else {
+                        log::warn!(">>> TermView paste: clipboard is None");
+                    }
+                }
+                Err(e) => {
+                    log::error!(">>> TermView paste: error: {}", e);
+                }
+            }
+        });
     }
 
     pub fn connect_cwd_changed<F: Fn(&str) + 'static>(&self, f: F) {

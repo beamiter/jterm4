@@ -81,15 +81,27 @@ impl UiState {
                 self.close_focused_pane_or_tab();
             }
             Action::Copy => {
-                log::debug!("Copy");
-                if let Some(ref term) = current_terminal {
-                    term.copy_clipboard_format(Format::Text);
+                log::warn!(">>> UI Action::Copy triggered");
+                if let Some(term_view) = self.current_term_view() {
+                    log::warn!(">>> UI Copy: calling term_view.copy_to_clipboard");
+                    term_view.copy_to_clipboard();
+                } else {
+                    log::warn!(">>> UI Copy: no current term_view, falling back to VTE");
+                    if let Some(ref term) = current_terminal {
+                        term.copy_clipboard_format(Format::Text);
+                    }
                 }
             }
             Action::Paste => {
-                log::debug!("Paste");
-                if let Some(ref term) = current_terminal {
-                    term.paste_clipboard();
+                log::warn!(">>> UI Action::Paste triggered");
+                if let Some(term_view) = self.current_term_view() {
+                    log::warn!(">>> UI Paste: calling term_view.paste_from_clipboard");
+                    term_view.paste_from_clipboard();
+                } else {
+                    log::warn!(">>> UI Paste: no current term_view, falling back to VTE");
+                    if let Some(ref term) = current_terminal {
+                        term.paste_clipboard();
+                    }
                 }
             }
             Action::FontIncrease => {
