@@ -571,7 +571,7 @@ impl FinishedBlock {
                     preview_label.set_selectable(true);
                     preview_label.set_wrap(true);
                     preview_label.set_wrap_mode(WrapMode::Char);
-                    preview_label.set_monospace(true);
+                    preview_label.add_css_class("monospace");
                     preview_label.set_xalign(0.0);
                     preview_label.set_margin_start(12);
                     preview_label.set_margin_end(8);
@@ -851,6 +851,30 @@ struct ViewportState {
     total_height: i32,
 }
 
+struct WidgetPool {
+    available: Vec<gtk4::Box>,
+    max_pool_size: usize,
+}
+
+impl WidgetPool {
+    fn new() -> Self {
+        Self {
+            available: Vec::new(),
+            max_pool_size: 20,
+        }
+    }
+
+    fn acquire(&mut self) -> Option<gtk4::Box> {
+        self.available.pop()
+    }
+
+    fn release(&mut self, widget: gtk4::Box) {
+        if self.available.len() < self.max_pool_size {
+            self.available.push(widget);
+        }
+    }
+}
+
 // ─── TermView ─────────────────────────────────────────────────────────────────
 
 pub struct TermView {
@@ -871,6 +895,7 @@ pub struct TermView {
     finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,  // Rendered widgets (will phase out with virtual scrolling)
     ansi_cache: Rc<RefCell<LruCache<String, String>>>,
     viewport: Rc<RefCell<ViewportState>>,
+    widget_pool: Rc<RefCell<WidgetPool>>,
 }
 
 impl TermView {
@@ -1320,6 +1345,7 @@ impl TermView {
                 last_visible: 0,
                 total_height: 0,
             })),
+            widget_pool: Rc::new(RefCell::new(WidgetPool::new())),
         };
 
         // Load history if configured
