@@ -460,6 +460,8 @@ struct FinishedBlock {
 
 impl FinishedBlock {
     fn new(prompt: &str, cmd: &str, cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
+        // Trim leading newlines from output to avoid visual gap between command and output
+        let output = output.trim_start_matches('\n');
 
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
