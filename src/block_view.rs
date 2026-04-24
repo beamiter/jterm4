@@ -93,20 +93,43 @@ fn dim_rgba(c: &RGBA, alpha: f32) -> RGBA {
     RGBA::new(c.red(), c.green(), c.blue(), alpha)
 }
 
-fn strip_ansi(input: &str) -> String {
+fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+    let mut should_clear = false;
+
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'[' => {
-                    // CSI sequence: skip until final byte 0x40..0x7e
+                    // CSI sequence: collect params and final byte
                     i += 2;
+                    let mut params = Vec::new();
                     while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        params.push(bytes[i]);
                         i += 1;
                     }
-                    if i < bytes.len() { i += 1; }
+                    if i < bytes.len() {
+                        let final_byte = bytes[i];
+                        i += 1;
+
+                        // Detect clear-screen sequences
+                        match final_byte {
+                            b'J' => {
+                                // CSI J, CSI 1J, CSI 2J — any erase in display
+                                should_clear = true;
+                            }
+                            b'H' | b'f' => {
+                                // CSI H or CSI f — cursor movement to position
+                                // If no params or params = "1;1", it's home position (clear-like behavior)
+                                if params.is_empty() || params == b"" || params == b"1;1" {
+                                    should_clear = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 b']' => {
                     // OSC sequence: skip until BEL or ST
@@ -126,7 +149,11 @@ fn strip_ansi(input: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).to_string()
+    (String::from_utf8_lossy(&out).to_string(), should_clear)
+}
+
+fn strip_ansi(input: &str) -> String {
+    strip_ansi_with_clear_detect(input).0
 }
 
 fn strip_ansi_cached(input: &str, cache: &std::collections::HashMap<String, String>) -> (String, bool) {
@@ -1166,7 +1193,11 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
-                                        let clean = strip_ansi(&text);
+                                        let (clean, should_clear) = strip_ansi_with_clear_detect(&text);
+                                        if should_clear {
+                                            // Clear-screen sequence detected; clear buffer before appending
+                                            active_rc.borrow().output_buf.set_text("");
+                                        }
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
