@@ -464,8 +464,8 @@ impl FinishedBlock {
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
+        outer.set_margin_top(2);
+        outer.set_margin_bottom(0);
 
         // Prompt row
         let prompt_label = gtk4::Label::new(Some(prompt));
@@ -566,17 +566,18 @@ impl FinishedBlock {
             let line_count = output.lines().count();
             let byte_size = output.as_bytes().len();
 
-            // Use Label for small outputs (faster rendering), TextView for large ones
+            // Use Label for small outputs (faster rendering)
             if line_count < 100 && byte_size < 10240 {
                 let output_label = gtk4::Label::new(Some(output));
                 output_label.set_selectable(true);
                 output_label.set_wrap(true);
                 output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                output_label.add_css_class("monospace");
                 output_label.set_xalign(0.0);
                 output_label.set_margin_start(12);
                 output_label.set_margin_end(8);
                 output_label.set_margin_top(0);
-                output_label.set_margin_bottom(2);
+                output_label.set_margin_bottom(0);
                 output_label.add_css_class("block-output");
                 outer.append(&output_label);
             } else {
@@ -609,7 +610,7 @@ impl FinishedBlock {
                     preview_label.set_margin_start(12);
                     preview_label.set_margin_end(8);
                     preview_label.set_margin_top(0);
-                    preview_label.set_margin_bottom(2);
+                    preview_label.set_margin_bottom(0);
                     preview_label.add_css_class("block-output");
                     outer.append(&preview_label);
 
@@ -637,19 +638,19 @@ impl FinishedBlock {
                             }
                         }
 
-                        // Insert full output TextView
-                        let tv = gtk4::TextView::new();
-                        tv.set_editable(false);
-                        tv.set_cursor_visible(false);
-                        tv.set_wrap_mode(WrapMode::Char);
-                        tv.set_monospace(true);
-                        tv.set_margin_start(12);
-                        tv.set_margin_end(8);
-                        tv.set_margin_top(0);
-                        tv.set_margin_bottom(2);
-                        tv.add_css_class("block-output");
-                        tv.buffer().set_text(&full_output);
-                        outer_ref.append(&tv);
+                        // Insert full output Label
+                        let output_label = gtk4::Label::new(Some(&full_output));
+                        output_label.set_selectable(true);
+                        output_label.set_wrap(true);
+                        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                        output_label.add_css_class("monospace");
+                        output_label.set_xalign(0.0);
+                        output_label.set_margin_start(12);
+                        output_label.set_margin_end(8);
+                        output_label.set_margin_top(0);
+                        output_label.set_margin_bottom(0);
+                        output_label.add_css_class("block-output");
+                        outer_ref.append(&output_label);
                     });
 
                     outer.append(&show_middle_btn);
@@ -674,7 +675,7 @@ impl FinishedBlock {
                     preview_label.set_margin_start(12);
                     preview_label.set_margin_end(8);
                     preview_label.set_margin_top(0);
-                    preview_label.set_margin_bottom(2);
+                    preview_label.set_margin_bottom(0);
                     preview_label.add_css_class("block-output");
                     outer.append(&preview_label);
 
@@ -705,37 +706,36 @@ impl FinishedBlock {
                             }
                         }
 
-                        // Insert full output TextView
-                        let tv = gtk4::TextView::new();
-                        tv.set_editable(false);
-                        tv.set_cursor_visible(false);
-                        tv.set_wrap_mode(WrapMode::Char);
-                        tv.set_monospace(true);
-                        tv.set_margin_start(12);
-                        tv.set_margin_end(8);
-                        tv.set_margin_top(0);
-                        tv.set_margin_bottom(2);
-                        tv.add_css_class("block-output");
-                        tv.buffer().set_text(&full_output);
-                        outer_ref.append(&tv);
+                        // Insert full output Label
+                        let output_label = gtk4::Label::new(Some(&full_output));
+                        output_label.set_selectable(true);
+                        output_label.set_wrap(true);
+                        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                        output_label.add_css_class("monospace");
+                        output_label.set_xalign(0.0);
+                        output_label.set_margin_start(12);
+                        output_label.set_margin_end(8);
+                        output_label.set_margin_top(0);
+                        output_label.set_margin_bottom(0);
+                        output_label.add_css_class("block-output");
+                        outer_ref.append(&output_label);
                     });
 
                     outer.append(&show_all_btn);
                 } else {
-                    // For large outputs under threshold, just use TextView
-                    let tv = gtk4::TextView::new();
-                    tv.set_editable(false);
-                    tv.set_cursor_visible(false);
-                    tv.set_wrap_mode(WrapMode::Char);
-                    tv.set_monospace(true);
-                    tv.set_margin_start(12);
-                    tv.set_margin_end(8);
-                    tv.set_margin_top(0);
-                    tv.set_margin_bottom(2);
-                    tv.add_css_class("block-output");
-                    let buf = tv.buffer();
-                    buf.set_text(output);
-                    outer.append(&tv);
+                    // For large outputs under threshold, use Label
+                    let output_label = gtk4::Label::new(Some(output));
+                    output_label.set_selectable(true);
+                    output_label.set_wrap(true);
+                    output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+                    output_label.add_css_class("monospace");
+                    output_label.set_xalign(0.0);
+                    output_label.set_margin_start(12);
+                    output_label.set_margin_end(8);
+                    output_label.set_margin_top(0);
+                    output_label.set_margin_bottom(0);
+                    output_label.add_css_class("block-output");
+                    outer.append(&output_label);
                 }
             }
         }
@@ -758,8 +758,7 @@ struct ActiveBlock {
     widget: gtk4::Box,
     prompt_label: gtk4::Label,
     cmd_label: gtk4::Label,
-    output_buf: gtk4::TextBuffer,
-    output_view: gtk4::TextView,
+    output_label: gtk4::Label,
     cursor_area: gtk4::DrawingArea,
     pending_output: Rc<RefCell<String>>,
     flush_pending: Rc<Cell<bool>>,
@@ -779,8 +778,8 @@ impl ActiveBlock {
     fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_top(4);
-        widget.set_margin_bottom(4);
+        widget.set_margin_top(2);
+        widget.set_margin_bottom(0);
 
         // Prompt row
         let prompt_label = gtk4::Label::new(Some(""));
@@ -792,7 +791,7 @@ impl ActiveBlock {
         prompt_label.set_single_line_mode(true);
         widget.append(&prompt_label);
 
-        // Command row with wrap support
+        // Command row with cursor overlay
         let cmd_label = gtk4::Label::new(Some(""));
         cmd_label.add_css_class("block-cmd-active");
         cmd_label.set_xalign(0.0);
@@ -803,34 +802,50 @@ impl ActiveBlock {
         cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
         cmd_label.set_margin_start(12);
         cmd_label.set_margin_top(0);
-        cmd_label.set_margin_bottom(2);
-        widget.append(&cmd_label);
-
-        // Live output with cursor overlay
-        let tv = gtk4::TextView::new();
-        tv.set_editable(false);
-        tv.set_cursor_visible(false);
-        tv.set_wrap_mode(WrapMode::Char);
-        tv.set_monospace(true);
-        tv.set_margin_start(12);
-        tv.set_margin_end(8);
-        tv.set_margin_top(0);
-        tv.set_margin_bottom(2);
-        tv.add_css_class("block-output");
-        let output_buf = tv.buffer();
+        cmd_label.set_margin_bottom(0);
 
         // Create cursor drawing area
         let cursor_area = gtk4::DrawingArea::new();
-        cursor_area.set_hexpand(true);
-        cursor_area.set_vexpand(true);
-        cursor_area.set_can_target(false);  // Allow clicks to pass through
+        let cursor_color = config.cursor.clone();
+        let font_desc = FontDescription::from_string(&config.font_desc);
+        let size = font_desc.size();
+        let cursor_width = if size > 0 {
+            ((size / 1024) as f64 * 0.6).max(8.0) as i32
+        } else {
+            8
+        };
+        let cursor_height = if size > 0 {
+            (size / 1024) as i32
+        } else {
+            14
+        };
+        cursor_area.set_hexpand(false);
+        cursor_area.set_vexpand(false);
+        cursor_area.set_halign(gtk4::Align::Start);
+        cursor_area.set_valign(gtk4::Align::Start);
+        cursor_area.set_can_target(false);
+        cursor_area.set_size_request(cursor_width, cursor_height);
 
-        // Overlay to stack cursor on top of TextView
-        let overlay = gtk4::Overlay::new();
-        overlay.set_child(Some(&tv));
-        overlay.add_overlay(&cursor_area);
+        // Use Overlay to stack cursor on top of cmd_label
+        let cmd_overlay = gtk4::Overlay::new();
+        cmd_overlay.set_child(Some(&cmd_label));
+        cmd_overlay.add_overlay(&cursor_area);
+        widget.append(&cmd_overlay);
 
-        widget.append(&overlay);
+        // Live output - use Label instead of TextView
+        let output_label = gtk4::Label::new(Some(""));
+        output_label.set_selectable(true);
+        output_label.set_wrap(true);
+        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+        output_label.add_css_class("monospace");
+        output_label.set_xalign(0.0);
+        output_label.set_margin_start(12);
+        output_label.set_margin_end(8);
+        output_label.set_margin_top(0);
+        output_label.set_margin_bottom(0);
+        output_label.add_css_class("block-output");
+
+        widget.append(&output_label);
 
         let initial_batch_ms = batch_min_ms;
 
@@ -850,47 +865,29 @@ impl ActiveBlock {
         );
         cursor_blink_handle.borrow_mut().replace(blink_handle);
 
-        // Custom draw handler for cursor
+        // Custom draw handler for cursor - position at end of cmd_label text
         let cursor_visible_for_draw = cursor_visible.clone();
-        let output_buf_for_draw = output_buf.clone();
-        let tv_for_draw = tv.clone();
-        let cursor_color = config.cursor.clone();
-        let font_desc = FontDescription::from_string(&config.font_desc);
-        let size = font_desc.size();
-        let cursor_width = if size > 0 {
-            // Pango size is in points * PANGO_SCALE (1024)
-            (size / 1024) as f64 * 0.6  // Approximate character width
-        } else {
-            8.0
-        };
-
+        let cmd_label_for_draw = cmd_label.clone();
         cursor_area.set_draw_func(move |_area, cr, _width, _height| {
             if !cursor_visible_for_draw.get() {
                 return;
             }
 
-            // Get end iterator position
-            let end_iter = output_buf_for_draw.end_iter();
-            let rect = tv_for_draw.iter_location(&end_iter);
+            // Get the layout to measure text width
+            let layout = cmd_label_for_draw.layout();
+            let (text_width, text_height) = layout.pixel_size();
 
-            // Convert TextView coordinates to window coordinates
-            let (win_x, win_y) = tv_for_draw.buffer_to_window_coords(
-                gtk4::TextWindowType::Widget,
-                rect.x(),
-                rect.y(),
-            );
-
-            // Draw a block cursor with the configured color
+            // Draw cursor at the end of text
             cr.set_source_rgb(
                 cursor_color.red() as f64,
                 cursor_color.green() as f64,
                 cursor_color.blue() as f64,
             );
             let _ = cr.rectangle(
-                (win_x + 12) as f64,  // Account for margin_start
-                win_y as f64,
-                cursor_width,
-                rect.height() as f64,
+                text_width as f64,
+                0.0,
+                cursor_width as f64,
+                (text_height as i32).min(cursor_height) as f64,
             );
             let _ = cr.fill();
         });
@@ -899,8 +896,7 @@ impl ActiveBlock {
             widget,
             prompt_label,
             cmd_label,
-            output_buf,
-            output_view: tv,
+            output_label: output_label.clone(),
             cursor_area: cursor_area.clone(),
             pending_output: Rc::new(RefCell::new(String::new())),
             flush_pending: Rc::new(Cell::new(false)),
@@ -921,10 +917,12 @@ impl ActiveBlock {
 
     fn set_cmd(&self, text: &str) {
         self.cmd_label.set_text(text);
+        self.cursor_area.queue_draw();  // Redraw cursor at new position
     }
 
     fn set_cmd_markup(&self, markup: &str) {
         self.cmd_label.set_markup(markup);
+        self.cursor_area.queue_draw();  // Redraw cursor at new position
     }
 
     fn append_output(&self, text: &str) {
@@ -938,7 +936,7 @@ impl ActiveBlock {
         if !self.flush_pending.get() {
             self.flush_pending.set(true);
             let pending = self.pending_output.clone();
-            let output_buf = self.output_buf.clone();
+            let output_label = self.output_label.clone();
             let flush_flag = self.flush_pending.clone();
             let bytes_tracker = self.bytes_since_last_flush.clone();
             let last_flush_time = self.last_flush_time.clone();
@@ -952,12 +950,13 @@ impl ActiveBlock {
             glib::timeout_add_local_once(
                 std::time::Duration::from_millis(batch_interval as u64),
                 move || {
-                    let text = pending.borrow_mut().drain(..).collect::<String>();
-                    if !text.is_empty() {
-                        // Batch insert for better performance
-                        let mut end = output_buf.end_iter();
-                        output_buf.insert(&mut end, &text);
-                        last_flushed_size.set(last_flushed_size.get() + text.len());
+                    let new_text = pending.borrow_mut().drain(..).collect::<String>();
+                    if !new_text.is_empty() {
+                        // Append to existing text
+                        let current_text = output_label.text();
+                        let updated_text = format!("{}{}", current_text, new_text);
+                        output_label.set_text(&updated_text);
+                        last_flushed_size.set(last_flushed_size.get() + new_text.len());
                         // Trigger cursor redraw
                         cursor_area.queue_draw();
                     }
@@ -993,21 +992,18 @@ impl ActiveBlock {
     }
 
     fn flush_output(&self) {
-        let text = self.pending_output.borrow_mut().drain(..).collect::<String>();
-        if !text.is_empty() {
-            let mut end = self.output_buf.end_iter();
-            self.output_buf.insert(&mut end, &text);
-            self.last_flushed_size.set(self.last_flushed_size.get() + text.len());
+        let new_text = self.pending_output.borrow_mut().drain(..).collect::<String>();
+        if !new_text.is_empty() {
+            let current_text = self.output_label.text();
+            let updated_text = format!("{}{}", current_text, new_text);
+            self.output_label.set_text(&updated_text);
+            self.last_flushed_size.set(self.last_flushed_size.get() + new_text.len());
         }
         self.flush_pending.set(false);
     }
 
     fn output_text(&self) -> String {
-        self.output_buf.text(
-            &self.output_buf.start_iter(),
-            &self.output_buf.end_iter(),
-            false,
-        ).to_string()
+        self.output_label.text().to_string()
     }
 
     fn widget(&self) -> &gtk4::Box {
@@ -1290,7 +1286,7 @@ impl TermView {
                                         let (clean, should_clear) = strip_ansi_with_clear_detect(&text);
                                         if should_clear {
                                             // Clear-screen sequence detected; clear buffer before appending
-                                            active_rc.borrow().output_buf.set_text("");
+                                            active_rc.borrow().output_label.set_text("");
                                         }
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
@@ -1325,7 +1321,7 @@ impl TermView {
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Clear output buffer for new command (replace old output)
-                                active_rc.borrow().output_buf.set_text("");
+                                active_rc.borrow().output_label.set_text("");
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
@@ -1395,7 +1391,7 @@ impl TermView {
                                 // Reset active block for next command
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
-                                active_rc.borrow().output_buf.set_text("");
+                                active_rc.borrow().output_label.set_text("");
 
                                 // Scroll to bottom after layout updates
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
