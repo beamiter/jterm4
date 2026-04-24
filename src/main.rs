@@ -148,7 +148,7 @@ fn main() -> glib::ExitCode {
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
-            ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; overflow: hidden; }
+            ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; }
              .tab-strip-btn:checked { font-weight: bold; border-left: 3px solid currentColor; border-radius: 0; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .sidebar-box { min-width: 140px; padding: 2px 4px; }

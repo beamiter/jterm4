@@ -460,8 +460,7 @@ struct FinishedBlock {
 
 impl FinishedBlock {
     fn new(prompt: &str, cmd: &str, cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
-        // Trim leading newlines from output to avoid visual gap between command and output
-        let output = output.trim_start_matches('\n');
+        // Output is already trimmed by caller, but be defensive
 
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
@@ -484,8 +483,11 @@ impl FinishedBlock {
         let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
         cmd_box.set_margin_start(12);
         cmd_box.set_margin_top(0);
-        cmd_box.set_margin_bottom(0);
+        cmd_box.set_margin_bottom(0);  // No negative margin needed now
         cmd_box.set_spacing(0);
+        cmd_box.set_can_focus(false);
+        cmd_box.set_can_target(false);
+        cmd_box.set_focusable(false);
 
         let cmd_label = gtk4::Label::new(None);
         cmd_label.add_css_class("block-cmd");
@@ -495,12 +497,22 @@ impl FinishedBlock {
         cmd_label.set_selectable(true);
         cmd_label.set_wrap(true);
         cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-        if cmd.is_empty() {
-            cmd_label.set_text("(empty)");
-        } else if let Some(markup) = cmd_markup {
-            cmd_label.set_markup(markup);
+
+        // Combine cmd and output in one label to avoid spacing issues
+        let combined_text = if output.is_empty() {
+            if cmd.is_empty() {
+                "(empty)".to_string()
+            } else {
+                cmd.to_string()
+            }
         } else {
-            cmd_label.set_text(cmd);
+            format!("{}\n{}", cmd, output)
+        };
+
+        if cmd_markup.is_some() && output.is_empty() {
+            cmd_label.set_markup(cmd_markup.unwrap());
+        } else {
+            cmd_label.set_text(&combined_text);
         }
         cmd_box.append(&cmd_label);
 
@@ -564,7 +576,8 @@ impl FinishedBlock {
         outer.append(&cmd_box);
 
         // Output area (only if there is output)
-        if !output.is_empty() {
+        // NOTE: Output is now combined with cmd in cmd_label, so skip creating separate output widget
+        if false && !output.is_empty() {
             let line_count = output.lines().count();
             let byte_size = output.as_bytes().len();
 
@@ -576,9 +589,16 @@ impl FinishedBlock {
                 output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
                 output_label.add_css_class("monospace");
                 output_label.set_xalign(0.0);
+                output_label.set_yalign(0.0);
+                output_label.set_valign(gtk4::Align::Start);
+                output_label.set_vexpand(false);
+                output_label.set_size_request(-1, 0);  // Force minimum height to 0
+                output_label.set_can_focus(false);
+                output_label.set_can_target(false);
+                output_label.set_focusable(false);
                 output_label.set_margin_start(12);
                 output_label.set_margin_end(8);
-                output_label.set_margin_top(0);
+                output_label.set_margin_top(-24);  // Even larger negative margin
                 output_label.set_margin_bottom(0);
                 output_label.add_css_class("block-output");
                 outer.append(&output_label);
@@ -611,7 +631,7 @@ impl FinishedBlock {
                     preview_label.set_xalign(0.0);
                     preview_label.set_margin_start(12);
                     preview_label.set_margin_end(8);
-                    preview_label.set_margin_top(0);
+                    preview_label.set_margin_top(-24);
                     preview_label.set_margin_bottom(0);
                     preview_label.add_css_class("block-output");
                     outer.append(&preview_label);
@@ -649,7 +669,7 @@ impl FinishedBlock {
                         output_label.set_xalign(0.0);
                         output_label.set_margin_start(12);
                         output_label.set_margin_end(8);
-                        output_label.set_margin_top(0);
+                        output_label.set_margin_top(-24);
                         output_label.set_margin_bottom(0);
                         output_label.add_css_class("block-output");
                         outer_ref.append(&output_label);
@@ -676,7 +696,7 @@ impl FinishedBlock {
                     preview_label.set_xalign(0.0);
                     preview_label.set_margin_start(12);
                     preview_label.set_margin_end(8);
-                    preview_label.set_margin_top(0);
+                    preview_label.set_margin_top(-24);
                     preview_label.set_margin_bottom(0);
                     preview_label.add_css_class("block-output");
                     outer.append(&preview_label);
@@ -717,7 +737,7 @@ impl FinishedBlock {
                         output_label.set_xalign(0.0);
                         output_label.set_margin_start(12);
                         output_label.set_margin_end(8);
-                        output_label.set_margin_top(0);
+                        output_label.set_margin_top(-24);
                         output_label.set_margin_bottom(0);
                         output_label.add_css_class("block-output");
                         outer_ref.append(&output_label);
@@ -734,7 +754,7 @@ impl FinishedBlock {
                     output_label.set_xalign(0.0);
                     output_label.set_margin_start(12);
                     output_label.set_margin_end(8);
-                    output_label.set_margin_top(0);
+                    output_label.set_margin_top(-4);
                     output_label.set_margin_bottom(0);
                     output_label.add_css_class("block-output");
                     outer.append(&output_label);
@@ -843,7 +863,7 @@ impl ActiveBlock {
         output_label.set_xalign(0.0);
         output_label.set_margin_start(12);
         output_label.set_margin_end(8);
-        output_label.set_margin_top(0);
+        output_label.set_margin_top(0);  // ActiveBlock doesn't need negative margin
         output_label.set_margin_bottom(0);
         output_label.add_css_class("block-output");
 
@@ -956,9 +976,18 @@ impl ActiveBlock {
                     if !new_text.is_empty() {
                         // Append to existing text
                         let current_text = output_label.text();
-                        let updated_text = format!("{}{}", current_text, new_text);
+                        let trimmed_new = if current_text.is_empty() {
+                            // First output: trim leading whitespace
+                            let trimmed = new_text.trim_start().to_string();
+                            log::debug!("First output trim: orig_len={}, trimmed_len={}, starts_with_newline={}",
+                                new_text.len(), trimmed.len(), new_text.starts_with('\n'));
+                            trimmed
+                        } else {
+                            new_text
+                        };
+                        let updated_text = format!("{}{}", current_text, trimmed_new);
                         output_label.set_text(&updated_text);
-                        last_flushed_size.set(last_flushed_size.get() + new_text.len());
+                        last_flushed_size.set(last_flushed_size.get() + trimmed_new.len());
                         // Trigger cursor redraw
                         cursor_area.queue_draw();
                     }
@@ -1347,8 +1376,11 @@ impl TermView {
                                 };
 
                                 let output = active_rc.borrow().output_text();
-                                let output_trimmed = output.trim_end().to_string();
-                                log::debug!("CommandEnd: cmd={:?}, output_len={}, output_empty={}", cmd, output_trimmed.len(), output_trimmed.is_empty());
+                                let output_trimmed = output.trim().to_string();
+                                let preview = output.chars().take(20).collect::<String>();
+                                let bytes_preview: Vec<u8> = output.bytes().take(10).collect();
+                                log::debug!("CommandEnd: cmd={:?}, output_len_before={}, output_len_after={}, starts_with_newline={}, first_20_chars={:?}, first_10_bytes={:?}",
+                                    cmd, output.len(), output_trimmed.len(), output.starts_with('\n'), preview, bytes_preview);
 
                                 // Create BlockData (logical representation)
                                 let line_count = output_trimmed.lines().count();
@@ -2122,14 +2154,13 @@ fn install_block_css(config: &Config) {
         }}
         .block-list {{
             background-color: {bg_hex};
-            contain: style;
         }}
         .block-finished {{
             border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
-            contain: content;
+            min-height: 0;
         }}
         .block-active {{
             border-radius: 0;
@@ -2156,6 +2187,7 @@ fn install_block_css(config: &Config) {
             padding: 0;
             line-height: 1.0;
             margin: 0;
+            min-height: 0;
         }}
         .block-cmd-active {{
             color: {fg_hex};
@@ -2179,11 +2211,14 @@ fn install_block_css(config: &Config) {
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
-            contain: content;
+            min-height: 0;
+            line-height: 1.0;
+            padding: 0;
+            margin: 0;
         }}
         .block-show-more {{
             color: {accent};
-            margin-start: 12px;
+            margin-left: 12px;
             margin-top: 4px;
             margin-bottom: 4px;
         }}
