@@ -15,7 +15,7 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, Orientation, ScrolledWindow, WrapMode, Overlay};
+use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, WrapMode, Overlay};
 use gtk4::prelude::*;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -594,7 +594,7 @@ impl FinishedBlock {
                 output_label.set_vexpand(false);
                 output_label.set_size_request(-1, 0);  // Force minimum height to 0
                 output_label.set_can_focus(false);
-                output_label.set_can_target(false);
+                // Keep can_target enabled for double-click word selection
                 output_label.set_focusable(false);
                 output_label.set_margin_start(12);
                 output_label.set_margin_end(8);
@@ -1644,6 +1644,151 @@ impl TermView {
             });
             root.add_controller(key_ctrl);
             root.set_focusable(true);
+        }
+
+        // ── Double-click to select word ──────────────────────────────────
+        {
+            let click_ctrl = GestureClick::new();
+            click_ctrl.set_button(1); // Left button
+
+            let root_for_click = root.clone();
+            click_ctrl.connect_pressed(move |_gesture, n_press, x, y| {
+                log::warn!(">>> Click detected: n_press={}, x={}, y={}", n_press, x, y);
+                if n_press != 2 {
+                    return; // Only handle double-click
+                }
+
+                log::warn!(">>> Double-click at ({}, {})", x, y);
+
+                // Find the widget at the click position
+                let widget = root_for_click.pick(x, y, gtk4::PickFlags::DEFAULT);
+                let Some(widget) = widget else {
+                    log::warn!(">>> No widget found at click position");
+                    return;
+                };
+
+                log::warn!(">>> Found widget: {:?}", widget.widget_name());
+
+                // Recursively find a Label widget that contains the click position
+                fn find_label_at_position(widget: &gtk4::Widget, x: f64, y: f64) -> Option<Label> {
+                    // Try to downcast to Label
+                    if let Ok(label) = widget.clone().downcast::<Label>() {
+                        // Check if the label's bounds contain the click position
+                        let alloc = label.allocation();
+                        if x >= alloc.x() as f64
+                            && x <= (alloc.x() + alloc.width()) as f64
+                            && y >= alloc.y() as f64
+                            && y <= (alloc.y() + alloc.height()) as f64
+                        {
+                            return Some(label);
+                        }
+                    }
+
+                    // If it's a Box, check its children
+                    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
+                        let mut child = bx.first_child();
+                        while let Some(c) = child {
+                            if let Some(label) = find_label_at_position(&c, x, y) {
+                                return Some(label);
+                            }
+                            child = c.next_sibling();
+                        }
+                    }
+
+                    None
+                }
+
+                let Some(label) = find_label_at_position(&widget, x, y) else {
+                    log::warn!(">>> No Label found at click position");
+                    return;
+                };
+
+                log::warn!(">>> Found Label at position");
+
+                // Get label text
+                let text = label.text();
+                log::warn!(">>> Label text: '{}'", text);
+                if text.is_empty() {
+                    log::warn!(">>> Label text is empty");
+                    return;
+                }
+
+                // Get click position relative to the label
+                let label_alloc = label.allocation();
+                let label_x = x - label_alloc.x() as f64;
+                let label_y = y - label_alloc.y() as f64;
+
+                // Find character at click position using Pango layout
+                let layout = label.layout();
+                let (inside, index, _trailing) = layout.xy_to_index(
+                    (label_x * gtk4::pango::SCALE as f64) as i32,
+                    (label_y * gtk4::pango::SCALE as f64) as i32,
+                );
+
+                if !inside {
+                    log::debug!("Click outside label text bounds");
+                    return;
+                }
+
+                // Find word boundaries around the clicked position
+                let text_str = text.as_str();
+                let byte_index = index as usize;
+
+                // Find start of word (go backward until whitespace or start)
+                let mut start = byte_index;
+                while start > 0 {
+                    let prev_char = text_str[..start].chars().last();
+                    if let Some(c) = prev_char {
+                        if c.is_whitespace() {
+                            break;
+                        }
+                        start = text_str[..start].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Find end of word (go forward until whitespace or end)
+                let mut end = byte_index;
+                while end < text_str.len() {
+                    if let Some(c) = text_str[end..].chars().next() {
+                        if c.is_whitespace() {
+                            break;
+                        }
+                        end += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+
+                // Extract the word
+                let word = &text_str[start..end];
+                if word.is_empty() {
+                    log::warn!(">>> No word found at click position");
+                    return;
+                }
+
+                log::warn!(">>> Selected word: '{}' (start={}, end={})", word, start, end);
+
+                // Copy to both PRIMARY and CLIPBOARD
+                let display = label.display();
+                let primary = display.primary_clipboard();
+                primary.set_text(word);
+                log::warn!(">>> Copied to PRIMARY clipboard");
+
+                let clipboard = display.clipboard();
+                clipboard.set_text(word);
+                log::warn!(">>> Copied to CLIPBOARD");
+
+                // Select the text in the label (visual feedback)
+                let start_pos = text_str[..start].chars().count() as i32;
+                let end_pos = text_str[..end].chars().count() as i32;
+                log::warn!(">>> Calling select_region({}, {})", start_pos, end_pos);
+                label.select_region(start_pos, end_pos);
+                log::warn!(">>> select_region called");
+            });
+
+            root.add_controller(click_ctrl);
         }
 
         let term_view = TermView {

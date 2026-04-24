@@ -37,7 +37,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
         .bold_is_bright(true)
         .input_enabled(true)
         .scrollback_lines(config.terminal_scrollback_lines)
-        .cursor_blink_mode(CursorBlinkMode::Off)
+        .cursor_blink_mode(CursorBlinkMode::System)
         .cursor_shape(CursorShape::Block)
         .font_scale(font_scale)
         .opacity(1.0)

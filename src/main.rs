@@ -22,7 +22,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use config::{load_config, config_file_path, choose_shell_argv};
-use keybindings::{KeyCombo, normalize_key};
+use keybindings::{Action, KeyCombo, normalize_key};
 use state::{load_tabs_state, save_tabs_state, kill_all_terminal_children};
 use terminal::{terminal_working_directory, find_first_terminal, looks_like_legacy_default_title};
 use ui::UiState;
@@ -326,8 +326,24 @@ fn main() -> glib::ExitCode {
             };
 
             if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
-                ui_clone.execute_action(action);
-                return true.into();
+                // For Copy/Paste in block mode, let the event propagate to block_view's handler
+                // so that text selection in block mode works correctly
+                match action {
+                    Action::Copy | Action::Paste => {
+                        // Check if current tab is using block mode (TermView)
+                        if ui_clone.current_term_view().is_some() {
+                            // Block mode: let event propagate to block_view's key handler
+                            return false.into();
+                        }
+                        // Legacy VTE: handle at window level
+                        ui_clone.execute_action(action);
+                        return true.into();
+                    }
+                    _ => {
+                        ui_clone.execute_action(action);
+                        return true.into();
+                    }
+                }
             }
 
             false.into()
