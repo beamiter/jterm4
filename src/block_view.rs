@@ -1199,6 +1199,8 @@ impl TermView {
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
+                                // Clear output buffer for new command (replace old output)
+                                active_rc.borrow().output_buf.set_text("");
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
