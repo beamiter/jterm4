@@ -15,7 +15,7 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, Orientation, ScrolledWindow, WrapMode};
+use gtk4::{glib, Orientation, ScrolledWindow, WrapMode, Overlay};
 use gtk4::prelude::*;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -759,6 +759,8 @@ struct ActiveBlock {
     prompt_label: gtk4::Label,
     cmd_label: gtk4::Label,
     output_buf: gtk4::TextBuffer,
+    output_view: gtk4::TextView,
+    cursor_area: gtk4::DrawingArea,
     pending_output: Rc<RefCell<String>>,
     flush_pending: Rc<Cell<bool>>,
     // Adaptive batching state
@@ -768,10 +770,13 @@ struct ActiveBlock {
     config_batch_min: u32,
     config_batch_max: u32,
     last_flushed_size: Rc<Cell<usize>>,  // Track size of last flushed output for incremental updates
+    // Cursor blinking
+    cursor_visible: Rc<Cell<bool>>,
+    cursor_blink_handle: Rc<RefCell<Option<glib::source::SourceId>>>,
 }
 
 impl ActiveBlock {
-    fn new(batch_min_ms: u32, batch_max_ms: u32) -> Self {
+    fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         widget.set_margin_top(4);
@@ -801,7 +806,7 @@ impl ActiveBlock {
         cmd_label.set_margin_bottom(2);
         widget.append(&cmd_label);
 
-        // Live output
+        // Live output with cursor overlay
         let tv = gtk4::TextView::new();
         tv.set_editable(false);
         tv.set_cursor_visible(false);
@@ -814,15 +819,89 @@ impl ActiveBlock {
         tv.add_css_class("block-output");
         let output_buf = tv.buffer();
 
-        widget.append(&tv);
+        // Create cursor drawing area
+        let cursor_area = gtk4::DrawingArea::new();
+        cursor_area.set_hexpand(true);
+        cursor_area.set_vexpand(true);
+        cursor_area.set_can_target(false);  // Allow clicks to pass through
+
+        // Overlay to stack cursor on top of TextView
+        let overlay = gtk4::Overlay::new();
+        overlay.set_child(Some(&tv));
+        overlay.add_overlay(&cursor_area);
+
+        widget.append(&overlay);
 
         let initial_batch_ms = batch_min_ms;
+
+        let cursor_visible = Rc::new(Cell::new(true));
+        let cursor_blink_handle = Rc::new(RefCell::new(None));
+
+        // Start cursor blinking
+        let cursor_area_for_blink = cursor_area.clone();
+        let cursor_visible_clone = cursor_visible.clone();
+        let blink_handle = glib::timeout_add_local(
+            std::time::Duration::from_millis(500),
+            move || {
+                cursor_visible_clone.set(!cursor_visible_clone.get());
+                cursor_area_for_blink.queue_draw();
+                glib::ControlFlow::Continue
+            },
+        );
+        cursor_blink_handle.borrow_mut().replace(blink_handle);
+
+        // Custom draw handler for cursor
+        let cursor_visible_for_draw = cursor_visible.clone();
+        let output_buf_for_draw = output_buf.clone();
+        let tv_for_draw = tv.clone();
+        let cursor_color = config.cursor.clone();
+        let font_desc = FontDescription::from_string(&config.font_desc);
+        let size = font_desc.size();
+        let cursor_width = if size > 0 {
+            // Pango size is in points * PANGO_SCALE (1024)
+            (size / 1024) as f64 * 0.6  // Approximate character width
+        } else {
+            8.0
+        };
+
+        cursor_area.set_draw_func(move |_area, cr, _width, _height| {
+            if !cursor_visible_for_draw.get() {
+                return;
+            }
+
+            // Get end iterator position
+            let end_iter = output_buf_for_draw.end_iter();
+            let rect = tv_for_draw.iter_location(&end_iter);
+
+            // Convert TextView coordinates to window coordinates
+            let (win_x, win_y) = tv_for_draw.buffer_to_window_coords(
+                gtk4::TextWindowType::Widget,
+                rect.x(),
+                rect.y(),
+            );
+
+            // Draw a block cursor with the configured color
+            cr.set_source_rgb(
+                cursor_color.red() as f64,
+                cursor_color.green() as f64,
+                cursor_color.blue() as f64,
+            );
+            let _ = cr.rectangle(
+                (win_x + 12) as f64,  // Account for margin_start
+                win_y as f64,
+                cursor_width,
+                rect.height() as f64,
+            );
+            let _ = cr.fill();
+        });
 
         ActiveBlock {
             widget,
             prompt_label,
             cmd_label,
             output_buf,
+            output_view: tv,
+            cursor_area: cursor_area.clone(),
             pending_output: Rc::new(RefCell::new(String::new())),
             flush_pending: Rc::new(Cell::new(false)),
             bytes_since_last_flush: Rc::new(Cell::new(0)),
@@ -831,6 +910,8 @@ impl ActiveBlock {
             config_batch_min: batch_min_ms,
             config_batch_max: batch_max_ms,
             last_flushed_size: Rc::new(Cell::new(0)),
+            cursor_visible,
+            cursor_blink_handle,
         }
     }
 
@@ -865,6 +946,7 @@ impl ActiveBlock {
             let min_ms = self.config_batch_min;
             let max_ms = self.config_batch_max;
             let last_flushed_size = self.last_flushed_size.clone();
+            let cursor_area = self.cursor_area.clone();
 
             let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
@@ -876,6 +958,8 @@ impl ActiveBlock {
                         let mut end = output_buf.end_iter();
                         output_buf.insert(&mut end, &text);
                         last_flushed_size.set(last_flushed_size.get() + text.len());
+                        // Trigger cursor redraw
+                        cursor_area.queue_draw();
                     }
 
                     // Calculate adaptive batch interval based on throughput
@@ -928,6 +1012,15 @@ impl ActiveBlock {
 
     fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+}
+
+impl Drop for ActiveBlock {
+    fn drop(&mut self) {
+        // Stop cursor blinking when the block is dropped
+        if let Some(handle) = self.cursor_blink_handle.borrow_mut().take() {
+            handle.remove();
+        }
     }
 }
 
@@ -1039,6 +1132,7 @@ impl TermView {
         let active = Rc::new(RefCell::new(ActiveBlock::new(
             config.output_batch_min_ms,
             config.output_batch_max_ms,
+            config,
         )));
         block_list.append(active.borrow().widget());
 
