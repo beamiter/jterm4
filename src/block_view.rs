@@ -15,7 +15,7 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, WrapMode, Overlay};
+use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion};
 use gtk4::prelude::*;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -749,7 +749,8 @@ impl ActiveBlock {
         widget.set_margin_top(2);
         widget.set_margin_bottom(0);
         widget.set_can_focus(false);   // Don't steal focus from labels
-        widget.set_can_target(true);   // But allow event propagation
+        widget.set_can_target(false);  // Let events pass through to children
+        widget.set_focusable(false);   // Prevent any focus interception
 
         // Prompt label
         let prompt_label = gtk4::Label::new(Some(""));
@@ -779,7 +780,34 @@ impl ActiveBlock {
         content_label.set_margin_end(8);
         content_label.set_margin_top(0);
         content_label.set_margin_bottom(0);
+
+        // Debug: Add motion controller to track mouse events
+        let motion_ctrl = gtk4::EventControllerMotion::new();
+        motion_ctrl.connect_enter(|_, _, _| {
+            log::warn!("[ActiveBlock content_label] Mouse ENTER");
+        });
+        motion_ctrl.connect_leave(|_| {
+            log::warn!("[ActiveBlock content_label] Mouse LEAVE");
+        });
+        content_label.add_controller(motion_ctrl);
+
+        // Debug: Add gesture to track clicks
+        let click_debug = GestureClick::new();
+        click_debug.set_button(0);  // All buttons
+        click_debug.connect_pressed(|_, n_press, x, y| {
+            log::warn!("[ActiveBlock content_label] Click detected: n_press={}, x={}, y={}", n_press, x, y);
+        });
+        content_label.add_controller(click_debug);
+
         widget.append(&content_label);
+
+        // Debug: Print widget properties
+        log::warn!("[ActiveBlock] content_label properties:");
+        log::warn!("  - selectable: {}", content_label.is_selectable());
+        log::warn!("  - can_target: {}", content_label.can_target());
+        log::warn!("  - can_focus: {}", content_label.can_focus());
+        log::warn!("  - focusable: {}", content_label.is_focusable());
+        log::warn!("  - sensitive: {}", content_label.is_sensitive());
 
         ActiveBlock {
             widget,
