@@ -779,10 +779,9 @@ impl FinishedBlock {
 struct ActiveBlock {
     widget: gtk4::Box,
     prompt_label: gtk4::Label,
-    cmd_label: gtk4::Label,
-    output_label: gtk4::Label,
-    cursor_area: gtk4::DrawingArea,
+    content_label: gtk4::Label,  // Combined cmd + output in one label
     pending_output: Rc<RefCell<String>>,
+    pending_cmd: Rc<RefCell<String>>,  // Track cmd text separately
     flush_pending: Rc<Cell<bool>>,
     // Adaptive batching state
     bytes_since_last_flush: Rc<Cell<usize>>,
@@ -790,151 +789,55 @@ struct ActiveBlock {
     current_batch_ms: Rc<Cell<u32>>,
     config_batch_min: u32,
     config_batch_max: u32,
-    last_flushed_size: Rc<Cell<usize>>,  // Track size of last flushed output for incremental updates
-    // Cursor blinking
-    cursor_visible: Rc<Cell<bool>>,
-    cursor_blink_handle: Rc<RefCell<Option<glib::source::SourceId>>>,
+    last_flushed_size: Rc<Cell<usize>>,
 }
 
 impl ActiveBlock {
-    fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
+    fn new(batch_min_ms: u32, batch_max_ms: u32, _config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         widget.set_margin_top(2);
         widget.set_margin_bottom(0);
 
-        // Prompt row
+        // Prompt label
         let prompt_label = gtk4::Label::new(Some(""));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
+        prompt_label.set_selectable(true);
         prompt_label.set_margin_start(12);
         prompt_label.set_margin_top(2);
         prompt_label.set_margin_bottom(0);
         prompt_label.set_single_line_mode(true);
         widget.append(&prompt_label);
 
-        // Command row with cursor overlay
-        let cmd_label = gtk4::Label::new(Some(""));
-        cmd_label.add_css_class("block-cmd-active");
-        cmd_label.set_xalign(0.0);
-        cmd_label.set_hexpand(true);
-        cmd_label.set_valign(gtk4::Align::Start);
-        cmd_label.set_selectable(true);
-        cmd_label.set_wrap(true);
-        cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-        cmd_label.set_margin_start(12);
-        cmd_label.set_margin_top(0);
-        cmd_label.set_margin_bottom(0);
-
-        // Create cursor drawing area
-        let cursor_area = gtk4::DrawingArea::new();
-        let cursor_color = config.cursor.clone();
-        let font_desc = FontDescription::from_string(&config.font_desc);
-        let size = font_desc.size();
-        let cursor_width = if size > 0 {
-            ((size / 1024) as f64 * 0.6).max(8.0) as i32
-        } else {
-            8
-        };
-        let cursor_height = if size > 0 {
-            (size / 1024) as i32
-        } else {
-            14
-        };
-        cursor_area.set_hexpand(false);
-        cursor_area.set_vexpand(false);
-        cursor_area.set_halign(gtk4::Align::Start);
-        cursor_area.set_valign(gtk4::Align::Start);
-        cursor_area.set_can_target(false);
-        cursor_area.set_can_focus(false);
-        cursor_area.set_focusable(false);
-        cursor_area.set_size_request(cursor_width, cursor_height);
-
-        // Use a regular Box instead of Overlay to avoid interfering with Label's event handling
-        // Stack cursor area next to cmd_label in a horizontal box
-        let cmd_box = gtk4::Box::new(Orientation::Horizontal, 0);
-        cmd_box.set_hexpand(true);
-        cmd_box.set_valign(gtk4::Align::Start);
-        cmd_box.append(&cmd_label);
-        cmd_box.append(&cursor_area);
-        widget.append(&cmd_box);
-
-        // Live output - use Label instead of TextView
-        let output_label = gtk4::Label::new(Some(""));
-        output_label.set_selectable(true);
-        output_label.set_wrap(true);
-        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-        output_label.add_css_class("monospace");
-        output_label.set_xalign(0.0);
-        output_label.set_margin_start(12);
-        output_label.set_margin_end(8);
-        output_label.set_margin_top(0);  // ActiveBlock doesn't need negative margin
-        output_label.set_margin_bottom(0);
-        output_label.add_css_class("block-output");
-
-        widget.append(&output_label);
-
-        let initial_batch_ms = batch_min_ms;
-
-        let cursor_visible = Rc::new(Cell::new(true));
-        let cursor_blink_handle = Rc::new(RefCell::new(None));
-
-        // Start cursor blinking
-        let cursor_area_for_blink = cursor_area.clone();
-        let cursor_visible_clone = cursor_visible.clone();
-        let blink_handle = glib::timeout_add_local(
-            std::time::Duration::from_millis(500),
-            move || {
-                cursor_visible_clone.set(!cursor_visible_clone.get());
-                cursor_area_for_blink.queue_draw();
-                glib::ControlFlow::Continue
-            },
-        );
-        cursor_blink_handle.borrow_mut().replace(blink_handle);
-
-        // Custom draw handler for cursor - position at end of cmd_label text
-        let cursor_visible_for_draw = cursor_visible.clone();
-        let cmd_label_for_draw = cmd_label.clone();
-        cursor_area.set_draw_func(move |_area, cr, _width, _height| {
-            if !cursor_visible_for_draw.get() {
-                return;
-            }
-
-            // Get the layout to measure text width
-            let layout = cmd_label_for_draw.layout();
-            let (text_width, text_height) = layout.pixel_size();
-
-            // Draw cursor at the end of text
-            cr.set_source_rgb(
-                cursor_color.red() as f64,
-                cursor_color.green() as f64,
-                cursor_color.blue() as f64,
-            );
-            let _ = cr.rectangle(
-                text_width as f64,
-                0.0,
-                cursor_width as f64,
-                (text_height as i32).min(cursor_height) as f64,
-            );
-            let _ = cr.fill();
-        });
+        // Content label (cmd + output combined)
+        let content_label = gtk4::Label::new(Some(""));
+        content_label.add_css_class("block-cmd-active");
+        content_label.set_xalign(0.0);
+        content_label.set_hexpand(true);
+        content_label.set_valign(gtk4::Align::Start);
+        content_label.set_selectable(true);
+        content_label.set_wrap(true);
+        content_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+        content_label.set_margin_start(12);
+        content_label.set_margin_end(8);
+        content_label.set_margin_top(0);
+        content_label.set_margin_bottom(0);
+        widget.append(&content_label);
 
         ActiveBlock {
             widget,
             prompt_label,
-            cmd_label,
-            output_label: output_label.clone(),
-            cursor_area: cursor_area.clone(),
+            content_label,
             pending_output: Rc::new(RefCell::new(String::new())),
+            pending_cmd: Rc::new(RefCell::new(String::new())),
             flush_pending: Rc::new(Cell::new(false)),
             bytes_since_last_flush: Rc::new(Cell::new(0)),
             last_flush_time: Rc::new(Cell::new(std::time::Instant::now())),
-            current_batch_ms: Rc::new(Cell::new(initial_batch_ms)),
+            current_batch_ms: Rc::new(Cell::new(batch_min_ms)),
             config_batch_min: batch_min_ms,
             config_batch_max: batch_max_ms,
             last_flushed_size: Rc::new(Cell::new(0)),
-            cursor_visible,
-            cursor_blink_handle,
         }
     }
 
@@ -943,13 +846,35 @@ impl ActiveBlock {
     }
 
     fn set_cmd(&self, text: &str) {
-        self.cmd_label.set_text(text);
-        self.cursor_area.queue_draw();  // Redraw cursor at new position
+        *self.pending_cmd.borrow_mut() = text.to_string();
+        self.update_content_label();
     }
 
     fn set_cmd_markup(&self, markup: &str) {
-        self.cmd_label.set_markup(markup);
-        self.cursor_area.queue_draw();  // Redraw cursor at new position
+        // For markup, we store plain text in pending_cmd and use markup on label
+        *self.pending_cmd.borrow_mut() = markup.to_string();
+        // Directly set markup on content_label
+        let output = self.pending_output.borrow();
+        if output.is_empty() {
+            self.content_label.set_markup(markup);
+        } else {
+            // Combine markup cmd with plain output
+            let combined = format!("{}\n{}", markup, output);
+            self.content_label.set_markup(&combined);
+        }
+    }
+
+    // Helper to update content_label with cmd + output
+    fn update_content_label(&self) {
+        let cmd = self.pending_cmd.borrow();
+        let output = self.pending_output.borrow();
+
+        if output.is_empty() {
+            self.content_label.set_text(&cmd);
+        } else {
+            let combined = format!("{}\n{}", cmd, output);
+            self.content_label.set_text(&combined);
+        }
     }
 
     fn append_output(&self, text: &str) {
@@ -962,8 +887,9 @@ impl ActiveBlock {
         // Schedule flush if not already pending
         if !self.flush_pending.get() {
             self.flush_pending.set(true);
-            let pending = self.pending_output.clone();
-            let output_label = self.output_label.clone();
+            let pending_cmd = self.pending_cmd.clone();
+            let pending_output = self.pending_output.clone();
+            let content_label = self.content_label.clone();
             let flush_flag = self.flush_pending.clone();
             let bytes_tracker = self.bytes_since_last_flush.clone();
             let last_flush_time = self.last_flush_time.clone();
@@ -971,31 +897,24 @@ impl ActiveBlock {
             let min_ms = self.config_batch_min;
             let max_ms = self.config_batch_max;
             let last_flushed_size = self.last_flushed_size.clone();
-            let cursor_area = self.cursor_area.clone();
 
             let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
                 std::time::Duration::from_millis(batch_interval as u64),
                 move || {
-                    let new_text = pending.borrow_mut().drain(..).collect::<String>();
-                    if !new_text.is_empty() {
-                        // Append to existing text
-                        let current_text = output_label.text();
-                        let trimmed_new = if current_text.is_empty() {
-                            // First output: trim leading whitespace
-                            let trimmed = new_text.trim_start().to_string();
-                            log::debug!("First output trim: orig_len={}, trimmed_len={}, starts_with_newline={}",
-                                new_text.len(), trimmed.len(), new_text.starts_with('\n'));
-                            trimmed
-                        } else {
-                            new_text
-                        };
-                        let updated_text = format!("{}{}", current_text, trimmed_new);
-                        output_label.set_text(&updated_text);
-                        last_flushed_size.set(last_flushed_size.get() + trimmed_new.len());
-                        // Trigger cursor redraw
-                        cursor_area.queue_draw();
+                    // Get current cmd and output
+                    let cmd = pending_cmd.borrow();
+                    let output = pending_output.borrow();
+
+                    // Combine and display
+                    if output.is_empty() {
+                        content_label.set_text(&cmd);
+                    } else {
+                        let combined = format!("{}\n{}", cmd, output);
+                        content_label.set_text(&combined);
                     }
+
+                    last_flushed_size.set(output.len());
 
                     // Calculate adaptive batch interval based on throughput
                     let now = std::time::Instant::now();
@@ -1028,31 +947,24 @@ impl ActiveBlock {
     }
 
     fn flush_output(&self) {
-        let new_text = self.pending_output.borrow_mut().drain(..).collect::<String>();
-        if !new_text.is_empty() {
-            let current_text = self.output_label.text();
-            let updated_text = format!("{}{}", current_text, new_text);
-            self.output_label.set_text(&updated_text);
-            self.last_flushed_size.set(self.last_flushed_size.get() + new_text.len());
+        let cmd = self.pending_cmd.borrow();
+        let output = self.pending_output.borrow();
+
+        if output.is_empty() {
+            self.content_label.set_text(&cmd);
+        } else {
+            let combined = format!("{}\n{}", cmd, output);
+            self.content_label.set_text(&combined);
         }
-        self.flush_pending.set(false);
+        self.last_flushed_size.set(output.len());
     }
 
     fn output_text(&self) -> String {
-        self.output_label.text().to_string()
+        self.pending_output.borrow().clone()
     }
 
     fn widget(&self) -> &gtk4::Box {
         &self.widget
-    }
-}
-
-impl Drop for ActiveBlock {
-    fn drop(&mut self) {
-        // Stop cursor blinking when the block is dropped
-        if let Some(handle) = self.cursor_blink_handle.borrow_mut().take() {
-            handle.remove();
-        }
     }
 }
 
@@ -1321,8 +1233,9 @@ impl TermView {
                                     BlockState::CollectingOutput => {
                                         let (clean, should_clear) = strip_ansi_with_clear_detect(&text);
                                         if should_clear {
-                                            // Clear-screen sequence detected; clear buffer before appending
-                                            active_rc.borrow().output_label.set_text("");
+                                            // Clear-screen sequence detected; clear output buffer
+                                            active_rc.borrow().pending_output.borrow_mut().clear();
+                                            active_rc.borrow().update_content_label();
                                         }
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
@@ -1356,8 +1269,9 @@ impl TermView {
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
-                                // Clear output buffer for new command (replace old output)
-                                active_rc.borrow().output_label.set_text("");
+                                // Clear output buffer for new command
+                                active_rc.borrow().pending_output.borrow_mut().clear();
+                                active_rc.borrow().update_content_label();
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
@@ -1430,7 +1344,8 @@ impl TermView {
                                 // Reset active block for next command
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
-                                active_rc.borrow().output_label.set_text("");
+                                active_rc.borrow().pending_output.borrow_mut().clear();
+                                active_rc.borrow().update_content_label();
 
                                 // Scroll to bottom after layout updates
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
