@@ -523,56 +523,6 @@ impl FinishedBlock {
             cmd_box.append(&badge);
         }
 
-        // Add collapse button if there's output
-        let has_output = !output.is_empty();
-        if has_output {
-            let collapse_btn = gtk4::Button::from_icon_name("go-down-symbolic");
-            collapse_btn.add_css_class("flat");
-            collapse_btn.set_focus_on_click(false);
-            collapse_btn.set_valign(gtk4::Align::Start);
-            collapse_btn.set_tooltip_text(Some("Collapse output"));
-            cmd_box.append(&collapse_btn);
-
-            // Store collapse state
-            unsafe {
-                outer.set_data("collapsed", false);
-            }
-
-            // Wire collapse button (will connect after output is created)
-            let outer_for_collapse = outer.clone();
-            collapse_btn.connect_clicked(move |btn| {
-                let collapsed = unsafe {
-                    outer_for_collapse.data::<bool>("collapsed")
-                        .map(|ptr| *ptr.as_ref())
-                        .unwrap_or(false)
-                };
-                let new_state = !collapsed;
-
-                // Toggle visibility of all children except first two (prompt + cmd)
-                let mut child_idx = 0;
-                let mut child = outer_for_collapse.first_child();
-                while let Some(c) = child {
-                    if child_idx >= 2 {  // Skip prompt and cmd rows
-                        c.set_visible(!new_state);
-                    }
-                    child = c.next_sibling();
-                    child_idx += 1;
-                }
-
-                unsafe {
-                    outer_for_collapse.set_data("collapsed", new_state);
-                }
-
-                if new_state {
-                    btn.set_icon_name("go-next-symbolic");
-                    btn.set_tooltip_text(Some("Expand output"));
-                } else {
-                    btn.set_icon_name("go-down-symbolic");
-                    btn.set_tooltip_text(Some("Collapse output"));
-                }
-            });
-        }
-
         outer.append(&cmd_box);
 
         // Output area (only if there is output)
