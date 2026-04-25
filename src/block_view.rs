@@ -804,6 +804,8 @@ impl ActiveBlock {
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
         prompt_label.set_selectable(true);
+        prompt_label.set_can_target(true);  // Ensure it can receive mouse events
+        prompt_label.set_can_focus(true);   // Ensure it can receive focus
         prompt_label.set_margin_start(12);
         prompt_label.set_margin_top(2);
         prompt_label.set_margin_bottom(0);
@@ -817,6 +819,8 @@ impl ActiveBlock {
         content_label.set_hexpand(true);
         content_label.set_valign(gtk4::Align::Start);
         content_label.set_selectable(true);
+        content_label.set_can_target(true);  // Ensure it can receive mouse events
+        content_label.set_can_focus(true);   // Ensure it can receive focus
         content_label.set_wrap(true);
         content_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
         content_label.set_margin_start(12);
