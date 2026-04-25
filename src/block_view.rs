@@ -748,6 +748,8 @@ impl ActiveBlock {
         widget.add_css_class("block-active");
         widget.set_margin_top(2);
         widget.set_margin_bottom(0);
+        widget.set_can_focus(false);   // Don't steal focus from labels
+        widget.set_can_target(true);   // But allow event propagation
 
         // Prompt label
         let prompt_label = gtk4::Label::new(Some(""));
