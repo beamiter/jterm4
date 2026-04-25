@@ -846,13 +846,18 @@ impl ActiveBlock {
         cursor_area.set_halign(gtk4::Align::Start);
         cursor_area.set_valign(gtk4::Align::Start);
         cursor_area.set_can_target(false);
+        cursor_area.set_can_focus(false);
+        cursor_area.set_focusable(false);
         cursor_area.set_size_request(cursor_width, cursor_height);
 
-        // Use Overlay to stack cursor on top of cmd_label
-        let cmd_overlay = gtk4::Overlay::new();
-        cmd_overlay.set_child(Some(&cmd_label));
-        cmd_overlay.add_overlay(&cursor_area);
-        widget.append(&cmd_overlay);
+        // Use a regular Box instead of Overlay to avoid interfering with Label's event handling
+        // Stack cursor area next to cmd_label in a horizontal box
+        let cmd_box = gtk4::Box::new(Orientation::Horizontal, 0);
+        cmd_box.set_hexpand(true);
+        cmd_box.set_valign(gtk4::Align::Start);
+        cmd_box.append(&cmd_label);
+        cmd_box.append(&cursor_area);
+        widget.append(&cmd_box);
 
         // Live output - use Label instead of TextView
         let output_label = gtk4::Label::new(Some(""));
