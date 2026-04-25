@@ -1547,7 +1547,8 @@ impl TermView {
                 }
             });
             root.add_controller(key_ctrl);
-            root.set_focusable(true);
+            // Don't set root as focusable - it prevents child labels from being selectable
+            // root.set_focusable(true);
         }
 
         let term_view = TermView {
