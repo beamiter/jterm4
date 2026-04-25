@@ -456,10 +456,22 @@ struct BlockData {
 
 struct FinishedBlock {
     widget: gtk4::Box,
+    content_view: gtk4::TextView,
+    content_buffer: gtk4::TextBuffer,
+}
+
+impl Clone for FinishedBlock {
+    fn clone(&self) -> Self {
+        Self {
+            widget: self.widget.clone(),
+            content_view: self.content_view.clone(),
+            content_buffer: self.content_buffer.clone(),
+        }
+    }
 }
 
 impl FinishedBlock {
-    fn new(prompt: &str, cmd: &str, cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
+    fn new(prompt: &str, cmd: &str, _cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
         // Output is already trimmed by caller, but be defensive
 
         // Outer frame
@@ -479,26 +491,48 @@ impl FinishedBlock {
         prompt_label.set_single_line_mode(true);
         outer.append(&prompt_label);
 
-        // Command row with wrap support and collapse button
+        // Command + output content row using TextView
         let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
-        cmd_box.set_margin_start(12);
+        cmd_box.set_margin_start(0);  // TextView has its own left margin
         cmd_box.set_margin_top(0);
-        cmd_box.set_margin_bottom(0);  // No negative margin needed now
+        cmd_box.set_margin_bottom(0);
         cmd_box.set_spacing(0);
         cmd_box.set_can_focus(false);
-        cmd_box.set_can_target(false);
         cmd_box.set_focusable(false);
+        // Don't set can_target(false) - need to allow mouse events for TextView selection
 
-        let cmd_label = gtk4::Label::new(None);
-        cmd_label.add_css_class("block-cmd");
-        cmd_label.set_xalign(0.0);
-        cmd_label.set_hexpand(true);
-        cmd_label.set_valign(gtk4::Align::Start);
-        cmd_label.set_selectable(true);
-        cmd_label.set_wrap(true);
-        cmd_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
+        // Create TextView + TextBuffer for content
+        let content_buffer = gtk4::TextBuffer::new(None);
+        let content_view = gtk4::TextView::with_buffer(&content_buffer);
 
-        // Combine cmd and output in one label to avoid spacing issues
+        // Basic styling
+        content_view.add_css_class("block-cmd-finished");
+        content_view.set_wrap_mode(gtk4::WrapMode::Char);
+        content_view.set_monospace(true);
+
+        // Margins (matching the previous cmd_label)
+        content_view.set_left_margin(12);
+        content_view.set_right_margin(8);
+        content_view.set_top_margin(0);
+        content_view.set_bottom_margin(0);
+
+        // Layout
+        content_view.set_hexpand(true);
+        content_view.set_vexpand(false);
+        content_view.set_valign(gtk4::Align::Start);
+
+        // Non-editable
+        content_view.set_editable(false);
+        content_view.set_cursor_visible(false);
+        content_view.set_accepts_tab(false);  // Don't capture Tab key
+
+        // Focus management - allow focus for text selection
+        // Non-editable TextView won't capture keyboard input
+        content_view.set_can_focus(true);
+        content_view.set_focusable(true);
+        content_view.set_can_target(true);
+
+        // Combine cmd and output text
         let combined_text = if output.is_empty() {
             if cmd.is_empty() {
                 "(empty)".to_string()
@@ -509,13 +543,10 @@ impl FinishedBlock {
             format!("{}\n{}", cmd, output)
         };
 
-        if cmd_markup.is_some() && output.is_empty() {
-            cmd_label.set_markup(cmd_markup.unwrap());
-        } else {
-            cmd_label.set_text(&combined_text);
-        }
-        cmd_box.append(&cmd_label);
+        content_buffer.set_text(&combined_text);
+        cmd_box.append(&content_view);
 
+        // Exit code badge
         if exit_code != 0 {
             let badge = gtk4::Label::new(Some(&format!(" {exit_code} ")));
             badge.add_css_class("block-exit-bad");
@@ -525,198 +556,15 @@ impl FinishedBlock {
 
         outer.append(&cmd_box);
 
-        // Output area (only if there is output)
-        // NOTE: Output is now combined with cmd in cmd_label, so skip creating separate output widget
-        if false && !output.is_empty() {
-            let line_count = output.lines().count();
-            let byte_size = output.as_bytes().len();
-
-            // Use Label for small outputs (faster rendering)
-            if line_count < 100 && byte_size < 10240 {
-                let output_label = gtk4::Label::new(Some(output));
-                output_label.set_selectable(true);
-                output_label.set_wrap(true);
-                output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                output_label.add_css_class("monospace");
-                output_label.set_xalign(0.0);
-                output_label.set_yalign(0.0);
-                output_label.set_valign(gtk4::Align::Start);
-                output_label.set_vexpand(false);
-                output_label.set_size_request(-1, 0);  // Force minimum height to 0
-                output_label.set_can_focus(false);
-                // Keep can_target enabled for double-click word selection
-                output_label.set_focusable(false);
-                output_label.set_margin_start(12);
-                output_label.set_margin_end(8);
-                output_label.set_margin_top(-24);  // Even larger negative margin
-                output_label.set_margin_bottom(0);
-                output_label.add_css_class("block-output");
-                outer.append(&output_label);
-            } else {
-                // Check if output exceeds lazy-load or truncation threshold
-                let lazy_threshold = _config.lazy_load_threshold as usize;
-                let truncation_threshold = _config.truncation_threshold_lines as usize;
-
-                if line_count > truncation_threshold {
-                    // Truncate huge outputs: show first 200 + last 100 lines
-                    let lines: Vec<&str> = output.lines().collect();
-                    let first_n = 200.min(line_count / 2);
-                    let last_n = 100.min(line_count / 2);
-
-                    let first_lines = lines.iter().take(first_n).map(|s| *s).collect::<Vec<_>>().join("\n");
-                    let last_lines: Vec<&str> = lines.iter().rev().take(last_n).map(|s| *s).collect();
-                    let last_lines_text = last_lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-
-                    let preview = format!("{}\n\n[... {} lines truncated (total: {}) ...]\n\n{}",
-                        first_lines,
-                        line_count - first_n - last_n,
-                        line_count,
-                        last_lines_text);
-
-                    let preview_label = gtk4::Label::new(Some(&preview));
-                    preview_label.set_selectable(true);
-                    preview_label.set_wrap(true);
-                    preview_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                    preview_label.add_css_class("monospace");
-                    preview_label.set_xalign(0.0);
-                    preview_label.set_margin_start(12);
-                    preview_label.set_margin_end(8);
-                    preview_label.set_margin_top(-24);
-                    preview_label.set_margin_bottom(0);
-                    preview_label.add_css_class("block-output");
-                    outer.append(&preview_label);
-
-                    // "Show middle" button for truncated content
-                    let show_middle_btn = gtk4::Button::with_label(
-                        &format!("Show middle {} lines", line_count - first_n - last_n)
-                    );
-                    show_middle_btn.add_css_class("flat");
-                    show_middle_btn.add_css_class("block-show-more");
-                    show_middle_btn.set_margin_start(12);
-                    show_middle_btn.set_margin_top(4);
-
-                    let full_output = output.to_string();
-                    let outer_ref = outer.clone();
-                    show_middle_btn.connect_clicked(move |btn| {
-                        // Remove the preview label and button
-                        btn.unparent();
-                        if let Some(child) = outer_ref.first_child() {
-                            if let Some(prev) = child.prev_sibling() {
-                                if let Some(prev_label) = prev.downcast_ref::<gtk4::Label>() {
-                                    if prev_label.has_css_class("block-output") {
-                                        prev_label.unparent();
-                                    }
-                                }
-                            }
-                        }
-
-                        // Insert full output Label
-                        let output_label = gtk4::Label::new(Some(&full_output));
-                        output_label.set_selectable(true);
-                        output_label.set_wrap(true);
-                        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                        output_label.add_css_class("monospace");
-                        output_label.set_xalign(0.0);
-                        output_label.set_margin_start(12);
-                        output_label.set_margin_end(8);
-                        output_label.set_margin_top(-24);
-                        output_label.set_margin_bottom(0);
-                        output_label.add_css_class("block-output");
-                        outer_ref.append(&output_label);
-                    });
-
-                    outer.append(&show_middle_btn);
-                } else if line_count > lazy_threshold {
-                    // Show first 50 lines and last 10 lines with "Show more" button
-                    let lines: Vec<&str> = output.lines().collect();
-                    let first_50 = lines.iter().take(50).map(|s| *s).collect::<Vec<_>>().join("\n");
-                    let last_10: Vec<&str> = lines.iter().rev().take(10).map(|s| *s).collect();
-                    let last_10_text = last_10.into_iter().rev().collect::<Vec<_>>().join("\n");
-
-                    let preview = format!("{}\n\n[... {} lines hidden ...]\n\n{}",
-                        first_50,
-                        line_count - 60,
-                        last_10_text);
-
-                    let preview_label = gtk4::Label::new(Some(&preview));
-                    preview_label.set_selectable(true);
-                    preview_label.set_wrap(true);
-                    preview_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                    preview_label.add_css_class("monospace");
-                    preview_label.set_xalign(0.0);
-                    preview_label.set_margin_start(12);
-                    preview_label.set_margin_end(8);
-                    preview_label.set_margin_top(-24);
-                    preview_label.set_margin_bottom(0);
-                    preview_label.add_css_class("block-output");
-                    outer.append(&preview_label);
-
-                    // "Show all" button
-                    let show_all_btn = gtk4::Button::with_label(
-                        &format!("Show all {} lines", line_count)
-                    );
-                    show_all_btn.add_css_class("flat");
-                    show_all_btn.add_css_class("block-show-more");
-                    show_all_btn.set_margin_start(12);
-                    show_all_btn.set_margin_top(4);
-
-                    let full_output = output.to_string();
-                    let outer_ref = outer.clone();
-                    show_all_btn.connect_clicked(move |btn| {
-                        // Remove the preview label and button
-                        btn.unparent();
-                        let first_child = outer_ref.first_child();
-                        if let Some(child) = first_child {
-                            if child.downcast_ref::<gtk4::Label>().is_some() {
-                                if let Some(prev) = child.prev_sibling() {
-                                    if let Some(prev_label) = prev.downcast_ref::<gtk4::Label>() {
-                                        if prev_label.has_css_class("block-output") {
-                                            prev_label.unparent();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Insert full output Label
-                        let output_label = gtk4::Label::new(Some(&full_output));
-                        output_label.set_selectable(true);
-                        output_label.set_wrap(true);
-                        output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                        output_label.add_css_class("monospace");
-                        output_label.set_xalign(0.0);
-                        output_label.set_margin_start(12);
-                        output_label.set_margin_end(8);
-                        output_label.set_margin_top(-24);
-                        output_label.set_margin_bottom(0);
-                        output_label.add_css_class("block-output");
-                        outer_ref.append(&output_label);
-                    });
-
-                    outer.append(&show_all_btn);
-                } else {
-                    // For large outputs under threshold, use Label
-                    let output_label = gtk4::Label::new(Some(output));
-                    output_label.set_selectable(true);
-                    output_label.set_wrap(true);
-                    output_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-                    output_label.add_css_class("monospace");
-                    output_label.set_xalign(0.0);
-                    output_label.set_margin_start(12);
-                    output_label.set_margin_end(8);
-                    output_label.set_margin_top(-4);
-                    output_label.set_margin_bottom(0);
-                    output_label.add_css_class("block-output");
-                    outer.append(&output_label);
-                }
-            }
-        }
-
         // Separator line
         let sep_box = gtk4::Separator::new(Orientation::Horizontal);
         outer.append(&sep_box);
 
-        FinishedBlock { widget: outer }
+        FinishedBlock {
+            widget: outer,
+            content_view,
+            content_buffer,
+        }
     }
 
     fn widget(&self) -> &gtk4::Box {
@@ -809,9 +657,15 @@ impl ActiveBlock {
     }
 
     fn set_cmd_markup(&self, markup: &str) {
-        // For markup with TextView, we need to strip markup tags or convert to plain text
-        // For now, just store and display as plain text
-        *self.pending_cmd.borrow_mut() = markup.to_string();
+        // TextView with TextBuffer doesn't support Pango markup directly
+        // Parse markup to extract plain text
+        let plain_text = if let Ok((_, text, _)) = gtk4::pango::parse_markup(markup, '\0') {
+            text.to_string()
+        } else {
+            // Fallback: strip ANSI if parsing fails
+            strip_ansi(markup)
+        };
+        *self.pending_cmd.borrow_mut() = plain_text;
         self.update_content_view();
     }
 
@@ -994,7 +848,7 @@ pub struct TermView {
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
-    finished_blocks: Rc<RefCell<Vec<gtk4::Box>>>,
+    finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
     ansi_cache: Rc<RefCell<LruCache<String, String>>>,
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
@@ -1069,7 +923,7 @@ impl TermView {
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> = Rc::new(RefCell::new(VecDeque::new()));
-        let finished_blocks_rc: Rc<RefCell<Vec<gtk4::Box>>> = Rc::new(RefCell::new(Vec::new()));
+        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
         let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
             LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap())
         ));
@@ -1279,12 +1133,12 @@ impl TermView {
 
                                 // Track finished blocks and limit history
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
-                                finished_blocks_for_cb.borrow_mut().push(finished.widget().clone());
+                                finished_blocks_for_cb.borrow_mut().push(finished.clone());
 
                                 // Remove oldest block if we exceed the limit
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                    block_list_rc.remove(&oldest);
+                                    block_list_rc.remove(oldest.widget());
                                 }
 
                                 // Also evict from block_data if needed
@@ -1608,11 +1462,11 @@ impl TermView {
                     let finished_ref = finished.borrow();
                     let mut visible_ref = visible.borrow_mut();
 
-                    for (i, widget) in finished_ref.iter().enumerate() {
+                    for (i, block) in finished_ref.iter().enumerate() {
                         if new_visible.contains(&i) && !visible_ref.contains(&i) {
-                            widget.set_visible(true);
+                            block.widget().set_visible(true);
                         } else if !new_visible.contains(&i) && visible_ref.contains(&i) {
-                            widget.set_visible(false);
+                            block.widget().set_visible(false);
                         }
                     }
 
@@ -1808,11 +1662,11 @@ impl TermView {
         let mut visible = self.visible_indices.borrow_mut();
 
         // Update visibility: hide blocks not in new_visible, show blocks in new_visible
-        for (i, widget) in finished.iter().enumerate() {
+        for (i, block) in finished.iter().enumerate() {
             if new_visible.contains(&i) && !visible.contains(&i) {
-                widget.set_visible(true);
+                block.widget().set_visible(true);
             } else if !new_visible.contains(&i) && visible.contains(&i) {
-                widget.set_visible(false);
+                block.widget().set_visible(false);
             }
         }
 
@@ -1854,10 +1708,10 @@ impl TermView {
         if block_index >= finished.len() {
             return;
         }
-        if let Some(widget) = finished.get(block_index) {
-            widget.grab_focus();
+        if let Some(block) = finished.get(block_index) {
+            block.widget().grab_focus();
             let adj = self.block_scroll.vadjustment();
-            if let Some(value) = widget.compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0)) {
+            if let Some(value) = block.widget().compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0)) {
                 adj.set_value(value.y() as f64);
             }
         }
@@ -2071,6 +1925,19 @@ fn install_block_css(config: &Config) {
             margin: 0;
             border-left: 3px solid {accent};
             padding-left: 9px;
+        }}
+        .block-cmd-finished {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+        }}
+        .block-cmd-finished text {{
+            background-color: {bg_hex};
         }}
         .block-exit-bad {{
             color: #ff5555;
