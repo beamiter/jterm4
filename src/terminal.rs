@@ -347,19 +347,29 @@ pub(crate) fn looks_like_legacy_default_title(title: &str) -> bool {
 }
 
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
+    // Use a click gesture in Capture phase to intercept Ctrl+Click before VTE sees it
+    // For normal clicks, let them pass through to VTE for text selection
     let click_controller = GestureClick::new();
-    click_controller.set_button(0);
+    click_controller.set_button(GDK_BUTTON_PRIMARY as u32);
+    click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let terminal_clone = terminal.clone();
 
     click_controller.connect_pressed(move |controller, n_press, x, y| {
-        if n_press == 1 && controller.current_button() == GDK_BUTTON_PRIMARY as u32 {
+        // Only intercept single Ctrl+Click on hyperlinks
+        // Let all other clicks pass through to VTE for selection
+        if n_press == 1 {
             let state = controller.current_event_state();
             if state.contains(ModifierType::CONTROL_MASK) {
                 if let Some(uri) = terminal_clone.check_match_at(x, y).0 {
                     open_uri(&uri);
+                    // Claim this event to prevent VTE from processing it
+                    controller.set_state(gtk4::EventSequenceState::Claimed);
+                    return;
                 }
             }
         }
+        // Explicitly deny to pass event to VTE for text selection
+        controller.set_state(gtk4::EventSequenceState::Denied);
     });
 
     terminal.add_controller(click_controller);
