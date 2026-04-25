@@ -15,7 +15,7 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion};
+use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion, TextView, TextBuffer};
 use gtk4::prelude::*;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -729,9 +729,10 @@ impl FinishedBlock {
 struct ActiveBlock {
     widget: gtk4::Box,
     prompt_label: gtk4::Label,
-    content_label: gtk4::Label,  // Combined cmd + output in one label
+    content_view: gtk4::TextView,  // TextView for cmd + output
+    content_buffer: gtk4::TextBuffer,
     pending_output: Rc<RefCell<String>>,
-    pending_cmd: Rc<RefCell<String>>,  // Track cmd text separately
+    pending_cmd: Rc<RefCell<String>>,
     flush_pending: Rc<Cell<bool>>,
     // Adaptive batching state
     bytes_since_last_flush: Rc<Cell<usize>>,
@@ -765,54 +766,27 @@ impl ActiveBlock {
         prompt_label.set_single_line_mode(true);
         widget.append(&prompt_label);
 
-        // Content label (cmd + output combined)
-        let content_label = gtk4::Label::new(Some(""));
-        content_label.add_css_class("block-cmd-active");
-        content_label.set_xalign(0.0);
-        content_label.set_hexpand(true);
-        content_label.set_valign(gtk4::Align::Start);
-        content_label.set_selectable(true);
-        content_label.set_can_target(true);  // Ensure it can receive mouse events
-        content_label.set_can_focus(true);   // Ensure it can receive focus
-        content_label.set_wrap(true);
-        content_label.set_wrap_mode(gtk4::pango::WrapMode::Char);
-        content_label.set_margin_start(12);
-        content_label.set_margin_end(8);
-        content_label.set_margin_top(0);
-        content_label.set_margin_bottom(0);
-
-        // Debug: Add motion controller to track mouse events
-        let motion_ctrl = gtk4::EventControllerMotion::new();
-        motion_ctrl.connect_enter(|_, _, _| {
-            log::warn!("[ActiveBlock content_label] Mouse ENTER");
-        });
-        motion_ctrl.connect_leave(|_| {
-            log::warn!("[ActiveBlock content_label] Mouse LEAVE");
-        });
-        content_label.add_controller(motion_ctrl);
-
-        // Debug: Add gesture to track clicks
-        let click_debug = GestureClick::new();
-        click_debug.set_button(0);  // All buttons
-        click_debug.connect_pressed(|_, n_press, x, y| {
-            log::warn!("[ActiveBlock content_label] Click detected: n_press={}, x={}, y={}", n_press, x, y);
-        });
-        content_label.add_controller(click_debug);
-
-        widget.append(&content_label);
-
-        // Debug: Print widget properties
-        log::warn!("[ActiveBlock] content_label properties:");
-        log::warn!("  - selectable: {}", content_label.is_selectable());
-        log::warn!("  - can_target: {}", content_label.can_target());
-        log::warn!("  - can_focus: {}", content_label.can_focus());
-        log::warn!("  - focusable: {}", content_label.is_focusable());
-        log::warn!("  - sensitive: {}", content_label.is_sensitive());
+        // Content view (TextView for cmd + output combined)
+        let content_buffer = TextBuffer::new(None);
+        let content_view = TextView::with_buffer(&content_buffer);
+        content_view.add_css_class("block-cmd-active");
+        content_view.set_hexpand(true);
+        content_view.set_vexpand(false);
+        content_view.set_editable(false);
+        content_view.set_cursor_visible(false);
+        content_view.set_wrap_mode(gtk4::WrapMode::Char);
+        content_view.set_left_margin(12);
+        content_view.set_right_margin(8);
+        content_view.set_top_margin(0);
+        content_view.set_bottom_margin(0);
+        content_view.set_monospace(true);
+        widget.append(&content_view);
 
         ActiveBlock {
             widget,
             prompt_label,
-            content_label,
+            content_view,
+            content_buffer,
             pending_output: Rc::new(RefCell::new(String::new())),
             pending_cmd: Rc::new(RefCell::new(String::new())),
             flush_pending: Rc::new(Cell::new(false)),
@@ -831,34 +805,27 @@ impl ActiveBlock {
 
     fn set_cmd(&self, text: &str) {
         *self.pending_cmd.borrow_mut() = text.to_string();
-        self.update_content_label();
+        self.update_content_view();
     }
 
     fn set_cmd_markup(&self, markup: &str) {
-        // For markup, we store plain text in pending_cmd and use markup on label
+        // For markup with TextView, we need to strip markup tags or convert to plain text
+        // For now, just store and display as plain text
         *self.pending_cmd.borrow_mut() = markup.to_string();
-        // Directly set markup on content_label
-        let output = self.pending_output.borrow();
-        if output.is_empty() {
-            self.content_label.set_markup(markup);
-        } else {
-            // Combine markup cmd with plain output
-            let combined = format!("{}\n{}", markup, output);
-            self.content_label.set_markup(&combined);
-        }
+        self.update_content_view();
     }
 
-    // Helper to update content_label with cmd + output
-    fn update_content_label(&self) {
+    // Helper to update content_view with cmd + output
+    fn update_content_view(&self) {
         let cmd = self.pending_cmd.borrow();
         let output = self.pending_output.borrow();
 
-        if output.is_empty() {
-            self.content_label.set_text(&cmd);
+        let text = if output.is_empty() {
+            cmd.to_string()
         } else {
-            let combined = format!("{}\n{}", cmd, output);
-            self.content_label.set_text(&combined);
-        }
+            format!("{}\n{}", cmd, output)
+        };
+        self.content_buffer.set_text(&text);
     }
 
     fn append_output(&self, text: &str) {
@@ -873,7 +840,7 @@ impl ActiveBlock {
             self.flush_pending.set(true);
             let pending_cmd = self.pending_cmd.clone();
             let pending_output = self.pending_output.clone();
-            let content_label = self.content_label.clone();
+            let content_buffer = self.content_buffer.clone();
             let flush_flag = self.flush_pending.clone();
             let bytes_tracker = self.bytes_since_last_flush.clone();
             let last_flush_time = self.last_flush_time.clone();
@@ -890,13 +857,13 @@ impl ActiveBlock {
                     let cmd = pending_cmd.borrow();
                     let output = pending_output.borrow();
 
-                    // Combine and display
-                    if output.is_empty() {
-                        content_label.set_text(&cmd);
+                    // Combine and display in TextBuffer
+                    let text = if output.is_empty() {
+                        cmd.to_string()
                     } else {
-                        let combined = format!("{}\n{}", cmd, output);
-                        content_label.set_text(&combined);
-                    }
+                        format!("{}\n{}", cmd, output)
+                    };
+                    content_buffer.set_text(&text);
 
                     last_flushed_size.set(output.len());
 
@@ -934,12 +901,12 @@ impl ActiveBlock {
         let cmd = self.pending_cmd.borrow();
         let output = self.pending_output.borrow();
 
-        if output.is_empty() {
-            self.content_label.set_text(&cmd);
+        let text = if output.is_empty() {
+            cmd.to_string()
         } else {
-            let combined = format!("{}\n{}", cmd, output);
-            self.content_label.set_text(&combined);
-        }
+            format!("{}\n{}", cmd, output)
+        };
+        self.content_buffer.set_text(&text);
         self.last_flushed_size.set(output.len());
     }
 
@@ -1219,7 +1186,7 @@ impl TermView {
                                         if should_clear {
                                             // Clear-screen sequence detected; clear output buffer
                                             active_rc.borrow().pending_output.borrow_mut().clear();
-                                            active_rc.borrow().update_content_label();
+                                            active_rc.borrow().update_content_view();
                                         }
                                         active_rc.borrow().append_output(&clean);
                                         // Auto-scroll to bottom
@@ -1255,7 +1222,7 @@ impl TermView {
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Clear output buffer for new command
                                 active_rc.borrow().pending_output.borrow_mut().clear();
-                                active_rc.borrow().update_content_label();
+                                active_rc.borrow().update_content_view();
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
@@ -1329,7 +1296,7 @@ impl TermView {
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
                                 active_rc.borrow().pending_output.borrow_mut().clear();
-                                active_rc.borrow().update_content_label();
+                                active_rc.borrow().update_content_view();
 
                                 // Scroll to bottom after layout updates
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
