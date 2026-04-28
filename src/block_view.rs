@@ -1247,37 +1247,41 @@ impl TermView {
                             // First try VTE (for alt-screen mode)
                             if let Some(text) = vte_for_key.text_selected(vte4::Format::Text) {
                                 log::warn!(">>> Copy: got {} chars from VTE", text.len());
-                                let clipboard = vte_for_key.clipboard();
-                                clipboard.set_text(&text);
-                                log::warn!(">>> Copy: set VTE text to clipboard");
-                            } else {
-                                log::warn!(">>> Copy: no text in VTE, trying PRIMARY");
-                                // Fall back to PRIMARY clipboard (selected text in labels)
-                                let display = root_for_key.display();
-                                log::warn!(">>> Copy: got display");
-                                let root_clone = root_for_key.clone();
-                                let clipboard = display.clipboard();
-                                log::warn!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
-                                clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
-                                    log::warn!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
-                                    match result {
-                                        Ok(text_opt) => {
-                                            if let Some(text_str) = text_opt {
-                                                log::warn!(">>> Copy: got {} chars from PRIMARY", text_str.len());
-                                                // Copy to regular clipboard too
-                                                let display2 = root_clone.display();
-                                                let cb = display2.clipboard();
-                                                cb.set_text(&text_str);
-                                                log::warn!(">>> Copy: copied to regular clipboard");
-                                            } else {
-                                                log::warn!(">>> Copy: PRIMARY is None");
+                                if !text.is_empty() {
+                                    let clipboard = vte_for_key.clipboard();
+                                    clipboard.set_text(&text);
+                                    log::warn!(">>> Copy: set VTE text to clipboard");
+                                } else {
+                                    log::warn!(">>> Copy: VTE text empty, trying PRIMARY");
+                                    // Fall back to PRIMARY clipboard (selected text in labels)
+                                    let display = root_for_key.display();
+                                    let primary = display.primary_clipboard();
+                                    log::warn!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
+                                    let clipboard = display.clipboard();
+                                    primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
+                                        log::warn!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+                                        match result {
+                                            Ok(text_opt) => {
+                                                if let Some(text_str) = text_opt {
+                                                    if !text_str.is_empty() {
+                                                        log::warn!(">>> Copy: got {} chars from PRIMARY", text_str.len());
+                                                        clipboard.set_text(&text_str);
+                                                        log::warn!(">>> Copy: copied to regular clipboard");
+                                                    } else {
+                                                        log::warn!(">>> Copy: PRIMARY is empty");
+                                                    }
+                                                } else {
+                                                    log::warn!(">>> Copy: PRIMARY is None");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::warn!(">>> Copy: error reading PRIMARY: {}", e);
                                             }
                                         }
-                                        Err(e) => {
-                                            log::warn!(">>> Copy: error reading PRIMARY: {}", e);
-                                        }
-                                    }
-                                });
+                                    });
+                                }
+                            } else {
+                                log::warn!(">>> Copy: VTE returned None");
                             }
                             return glib::Propagation::Stop;
                         }
