@@ -15,16 +15,16 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, EventControllerKey, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion, Settings, TextView, TextBuffer};
 use gtk4::prelude::*;
+use gtk4::{glib, EventControllerKey, Orientation, ScrolledWindow, TextBuffer, TextView};
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
-use serde::{Serialize, Deserialize};
 
 use crate::config::Config;
 use crate::parser::{Parser, ParserEvent};
@@ -63,9 +63,8 @@ impl ScrollDebouncer {
         }
 
         let pending_for_clear = pending.clone();
-        let handle = glib::timeout_add_local_once(
-            std::time::Duration::from_millis(50),
-            move || {
+        let handle =
+            glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
                 let adj = scroll.vadjustment();
                 let target = adj.upper() - adj.page_size();
                 if adj.value() < target {
@@ -74,8 +73,7 @@ impl ScrollDebouncer {
                 dirty.set(false);
                 // Clear the handle after firing to prevent double-remove
                 pending_for_clear.borrow_mut().take();
-            },
-        );
+            });
         pending.borrow_mut().replace(handle);
     }
 }
@@ -137,7 +135,9 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                     while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
                         i += 1;
                     }
-                    if i < bytes.len() && bytes[i] == 0x07 { i += 1; }
+                    if i < bytes.len() && bytes[i] == 0x07 {
+                        i += 1;
+                    }
                 }
                 _ => {
                     // Other ESC sequence: skip ESC + one byte
@@ -156,7 +156,10 @@ fn strip_ansi(input: &str) -> String {
     strip_ansi_with_clear_detect(input).0
 }
 
-fn strip_ansi_cached(input: &str, cache: &std::collections::HashMap<String, String>) -> (String, bool) {
+fn strip_ansi_cached(
+    input: &str,
+    cache: &std::collections::HashMap<String, String>,
+) -> (String, bool) {
     if let Some(cached) = cache.get(input) {
         (cached.clone(), true)
     } else {
@@ -199,14 +202,18 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
                     while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
                         i += 1;
                     }
-                    if i < bytes.len() { i += 1; }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
                 }
                 b']' => {
                     i += 2;
                     while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
                         i += 1;
                     }
-                    if i < bytes.len() && bytes[i] == 0x07 { i += 1; }
+                    if i < bytes.len() && bytes[i] == 0x07 {
+                        i += 1;
+                    }
                 }
                 _ => {
                     i += 2;
@@ -225,23 +232,28 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
                 1
             };
             i += ch_len;
-            if count > 0 { count -= 1; }
+            if count > 0 {
+                count -= 1;
+            }
         }
     }
     input[i..].to_string()
 }
 
-fn separate_input_and_suggestion(input: &str) -> (String, String) {
-    let mut user_input = String::new();
-    let mut suggestion = String::new();
+fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, String) {
+    struct Cell {
+        text: String,
+        in_dim: bool,
+    }
+
+    let mut cells: Vec<Cell> = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
     let mut in_dim = false;
+    let mut cursor = 0usize;
 
     while i < bytes.len() {
-        // Check for ANSI escape sequence
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            let seq_start = i;
             i += 2;
             let mut params = Vec::new();
 
@@ -256,48 +268,249 @@ fn separate_input_and_suggestion(input: &str) -> (String, String) {
                 i += 1;
             }
 
-            if i < bytes.len() && bytes[i] == b'm' {
+            if i < bytes.len() {
+                let final_byte = bytes[i];
                 i += 1;
-                // Check if this is a dim command (code 2)
-                if params.iter().any(|p| p == "2") {
-                    in_dim = true;
-                } else if params.is_empty() || params[0] == "0" {
-                    // Reset code
-                    in_dim = false;
+
+                match final_byte {
+                    b'm' => {
+                        if params.is_empty() || params.iter().any(|p| p.is_empty()) {
+                            in_dim = false;
+                        }
+
+                        for param in &params {
+                            match param.as_str() {
+                                "0" | "22" => in_dim = false,
+                                "2" => in_dim = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    b'D' => {
+                        let count = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = cursor.saturating_sub(count);
+                    }
+                    b'C' => {
+                        let count = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = (cursor + count).min(cells.len());
+                    }
+                    b'G' => {
+                        let col = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = if column_offset == 0 {
+                            col.saturating_sub(1)
+                        } else {
+                            col.saturating_sub(column_offset)
+                        }
+                        .min(cells.len());
+                    }
+                    b'K' => {
+                        let mode = params.first().map(String::as_str).unwrap_or("0");
+                        match mode {
+                            "" | "0" => cells.truncate(cursor),
+                            "1" => {
+                                cells.drain(..cursor);
+                                cursor = 0;
+                            }
+                            "2" => {
+                                cells.clear();
+                                cursor = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
-
-            // Add ANSI sequence to appropriate buffer
-            let seq = String::from_utf8_lossy(&bytes[seq_start..i]);
-            if in_dim {
-                suggestion.push_str(&seq);
-            } else {
-                user_input.push_str(&seq);
-            }
+        } else if bytes[i] == b'\r' {
+            cursor = 0;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            cursor = cursor.saturating_sub(1);
+            i += 1;
         } else {
-            // Regular character
             let ch_start = i;
-            if bytes[i] < 0x80 {
-                i += 1;
-            } else {
-                while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1;
-                }
-            }
+            i += input[i..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
 
-            let ch = String::from_utf8_lossy(&bytes[ch_start..i]);
-            if in_dim {
-                suggestion.push_str(&ch);
+            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            if cursor < cells.len() {
+                cells[cursor] = Cell { text: ch, in_dim };
             } else {
-                user_input.push_str(&ch);
+                cells.push(Cell { text: ch, in_dim });
             }
+            cursor += 1;
+        }
+    }
+
+    let cursor_split = cursor.min(cells.len());
+    let dim_split = cells
+        .iter()
+        .position(|cell| cell.in_dim)
+        .unwrap_or(cells.len());
+    let split = cursor_split.min(dim_split);
+
+    let mut user_input = String::new();
+    let mut suggestion = String::new();
+
+    for (idx, cell) in cells.into_iter().enumerate() {
+        if idx < split {
+            user_input.push_str(&cell.text);
+        } else {
+            suggestion.push_str(&cell.text);
         }
     }
 
     (user_input, suggestion)
+}
+
+fn command_line_plain_text(input: &str) -> String {
+    let mut cells: Vec<String> = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut cursor = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            let mut params = Vec::new();
+
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                if bytes[i] == b';' {
+                    params.push(String::new());
+                } else if let Some(last) = params.last_mut() {
+                    last.push(bytes[i] as char);
+                } else {
+                    params.push(String::from(bytes[i] as char));
+                }
+                i += 1;
+            }
+
+            if i < bytes.len() {
+                let final_byte = bytes[i];
+                i += 1;
+
+                match final_byte {
+                    b'D' => {
+                        let count = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = cursor.saturating_sub(count);
+                    }
+                    b'C' => {
+                        let count = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = (cursor + count).min(cells.len());
+                    }
+                    b'G' => {
+                        let col = params
+                            .first()
+                            .and_then(|param| param.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        cursor = col.saturating_sub(1).min(cells.len());
+                    }
+                    b'K' => {
+                        let mode = params.first().map(String::as_str).unwrap_or("0");
+                        match mode {
+                            "" | "0" => cells.truncate(cursor),
+                            "1" => {
+                                cells.drain(..cursor);
+                                cursor = 0;
+                            }
+                            "2" => {
+                                cells.clear();
+                                cursor = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if bytes[i] == b'\r' {
+            cursor = 0;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            cursor = cursor.saturating_sub(1);
+            i += 1;
+        } else {
+            let ch_start = i;
+            i += input[i..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
+
+            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            if cursor < cells.len() {
+                cells[cursor] = ch;
+            } else {
+                cells.push(ch);
+            }
+            cursor += 1;
+        }
+    }
+
+    cells.concat()
+}
+
+fn plain_text_from_ansi(input: &str) -> String {
+    command_line_plain_text(input)
+}
+
+fn set_active_buffer_text(
+    buffer: &TextBuffer,
+    cmd: &str,
+    suggestion: &str,
+    output: &str,
+    cursor_visible: bool,
+) {
+    let cursor_char = if output.is_empty() {
+        if cursor_visible { "█" } else { " " }
+    } else {
+        ""
+    };
+    let text = if output.is_empty() {
+        format!("{}{}{}", cmd, cursor_char, suggestion)
+    } else {
+        format!("{}{}\n{}", cmd, cursor_char, output)
+    };
+
+    buffer.set_text(&text);
+
+    if suggestion.is_empty() || !output.is_empty() {
+        return;
+    }
+
+    let tag_table = buffer.tag_table();
+    if tag_table.lookup("suggestion").is_none() {
+        let tag = gtk4::TextTag::new(Some("suggestion"));
+        tag.set_property("style", gtk4::pango::Style::Italic);
+        tag.set_property("foreground-rgba", &RGBA::new(0.5, 0.5, 0.5, 0.7));
+        tag_table.add(&tag);
+    }
+
+    if let Some(tag) = tag_table.lookup("suggestion") {
+        let start_pos = cmd.chars().count() + cursor_char.chars().count();
+        let end_pos = start_pos + suggestion.chars().count();
+        let start_iter = buffer.iter_at_offset(start_pos as i32);
+        let end_iter = buffer.iter_at_offset(end_pos as i32);
+        buffer.apply_tag(&tag, &start_iter, &end_iter);
+    }
 }
 
 fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
@@ -331,7 +544,9 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                     }
 
                     for param_str in &params {
-                        if param_str.is_empty() { continue; }
+                        if param_str.is_empty() {
+                            continue;
+                        }
                         match param_str.parse::<u32>() {
                             Ok(0) => {
                                 while open_spans > 0 {
@@ -368,25 +583,37 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                             Ok(30..=37) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 30) as usize;
                                 let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
-                                out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                out.push_str(&format!(
+                                    "<span foreground=\"#{:02x}{:02x}{:02x}\">",
+                                    r, g, b
+                                ));
                                 open_spans += 1;
                             }
                             Ok(40..=47) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 40) as usize;
                                 let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
-                                out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                out.push_str(&format!(
+                                    "<span background=\"#{:02x}{:02x}{:02x}\">",
+                                    r, g, b
+                                ));
                                 open_spans += 1;
                             }
                             Ok(90..=97) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 90 + 8) as u8;
                                 let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                out.push_str(&format!(
+                                    "<span foreground=\"#{:02x}{:02x}{:02x}\">",
+                                    r, g, b
+                                ));
                                 open_spans += 1;
                             }
                             Ok(100..=107) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 100 + 8) as u8;
                                 let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                out.push_str(&format!(
+                                    "<span background=\"#{:02x}{:02x}{:02x}\">",
+                                    r, g, b
+                                ));
                                 open_spans += 1;
                             }
                             Ok(38) => {
@@ -395,7 +622,10 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                     if params[j + 1] == "5" {
                                         if let Ok(idx) = params[j + 2].parse::<u8>() {
                                             let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                            out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            out.push_str(&format!(
+                                                "<span foreground=\"#{:02x}{:02x}{:02x}\">",
+                                                r, g, b
+                                            ));
                                             open_spans += 1;
                                         }
                                     } else if params[j + 1] == "2" && j + 4 < params.len() {
@@ -404,7 +634,10 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                             params[j + 3].parse::<u8>(),
                                             params[j + 4].parse::<u8>(),
                                         ) {
-                                            out.push_str(&format!("<span foreground=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            out.push_str(&format!(
+                                                "<span foreground=\"#{:02x}{:02x}{:02x}\">",
+                                                r, g, b
+                                            ));
                                             open_spans += 1;
                                         }
                                     }
@@ -416,7 +649,10 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                     if params[j + 1] == "5" {
                                         if let Ok(idx) = params[j + 2].parse::<u8>() {
                                             let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                            out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            out.push_str(&format!(
+                                                "<span background=\"#{:02x}{:02x}{:02x}\">",
+                                                r, g, b
+                                            ));
                                             open_spans += 1;
                                         }
                                     } else if params[j + 1] == "2" && j + 4 < params.len() {
@@ -425,7 +661,10 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                             params[j + 3].parse::<u8>(),
                                             params[j + 4].parse::<u8>(),
                                         ) {
-                                            out.push_str(&format!("<span background=\"#{:02x}{:02x}{:02x}\">", r, g, b));
+                                            out.push_str(&format!(
+                                                "<span background=\"#{:02x}{:02x}{:02x}\">",
+                                                r, g, b
+                                            ));
                                             open_spans += 1;
                                         }
                                     }
@@ -545,7 +784,14 @@ impl Clone for FinishedBlock {
 }
 
 impl FinishedBlock {
-    fn new(prompt: &str, cmd: &str, _cmd_markup: Option<&str>, output: &str, exit_code: i32, _config: &Config) -> Self {
+    fn new(
+        prompt: &str,
+        cmd: &str,
+        _cmd_markup: Option<&str>,
+        output: &str,
+        exit_code: i32,
+        _config: &Config,
+    ) -> Self {
         // Output is already trimmed by caller, but be defensive
 
         // Outer frame
@@ -567,7 +813,7 @@ impl FinishedBlock {
 
         // Command + output content row using TextView
         let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
-        cmd_box.set_margin_start(0);  // TextView has its own left margin
+        cmd_box.set_margin_start(0); // TextView has its own left margin
         cmd_box.set_margin_top(0);
         cmd_box.set_margin_bottom(0);
         cmd_box.set_spacing(0);
@@ -598,7 +844,7 @@ impl FinishedBlock {
         // Non-editable
         content_view.set_editable(false);
         content_view.set_cursor_visible(false);
-        content_view.set_accepts_tab(false);  // Don't capture Tab key
+        content_view.set_accepts_tab(false); // Don't capture Tab key
 
         // Focus management - allow focus for text selection
         // Non-editable TextView won't capture keyboard input
@@ -651,10 +897,11 @@ impl FinishedBlock {
 struct ActiveBlock {
     widget: gtk4::Box,
     prompt_label: gtk4::Label,
-    content_view: gtk4::TextView,  // TextView for cmd + output
+    content_view: gtk4::TextView, // TextView for cmd + output
     content_buffer: gtk4::TextBuffer,
     pending_output: Rc<RefCell<String>>,
-    pending_cmd: Rc<RefCell<String>>,
+    pending_cmd: Rc<RefCell<String>>,        // User input only
+    pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
     flush_pending: Rc<Cell<bool>>,
     // Adaptive batching state
     bytes_since_last_flush: Rc<Cell<usize>>,
@@ -663,7 +910,7 @@ struct ActiveBlock {
     config_batch_min: u32,
     config_batch_max: u32,
     last_flushed_size: Rc<Cell<usize>>,
-    cursor_visible: Rc<Cell<bool>>,  // For blinking cursor animation
+    cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
 }
 
 impl ActiveBlock {
@@ -672,17 +919,17 @@ impl ActiveBlock {
         widget.add_css_class("block-active");
         widget.set_margin_top(2);
         widget.set_margin_bottom(0);
-        widget.set_can_focus(false);   // Don't steal focus from labels
-        widget.set_can_target(false);  // Let events pass through to children
-        widget.set_focusable(false);   // Prevent any focus interception
+        widget.set_can_focus(false); // Don't steal focus from labels
+        widget.set_can_target(false); // Let events pass through to children
+        widget.set_focusable(false); // Prevent any focus interception
 
         // Prompt label
         let prompt_label = gtk4::Label::new(Some(""));
         prompt_label.add_css_class("block-prompt");
         prompt_label.set_xalign(0.0);
         prompt_label.set_selectable(true);
-        prompt_label.set_can_target(true);  // Ensure it can receive mouse events
-        prompt_label.set_can_focus(true);   // Ensure it can receive focus
+        prompt_label.set_can_target(true); // Ensure it can receive mouse events
+        prompt_label.set_can_focus(true); // Ensure it can receive focus
         prompt_label.set_margin_start(12);
         prompt_label.set_margin_top(2);
         prompt_label.set_margin_bottom(0);
@@ -695,7 +942,7 @@ impl ActiveBlock {
         content_view.add_css_class("block-cmd-active");
         content_view.set_hexpand(true);
         content_view.set_vexpand(false);
-        content_view.set_editable(true);  // Enable editing to show blinking cursor
+        content_view.set_editable(true); // Enable editing to show blinking cursor
         content_view.set_cursor_visible(true);
         content_view.set_can_focus(true);
         content_view.set_focusable(true);
@@ -703,13 +950,13 @@ impl ActiveBlock {
         // Ensure GTK cursor blink is enabled
         if let Some(settings) = gtk4::Settings::default() {
             settings.set_property("gtk-cursor-blink", true);
-            settings.set_property("gtk-cursor-blink-time", 1200i32);  // 1200ms blink cycle
+            settings.set_property("gtk-cursor-blink-time", 1200i32); // 1200ms blink cycle
         }
 
         // Block keyboard input to keep it read-only while showing cursor
         let key_controller = EventControllerKey::new();
         key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
-            glib::Propagation::Stop  // Block all keyboard input
+            glib::Propagation::Stop // Block all keyboard input
         });
         content_view.add_controller(key_controller);
         content_view.set_wrap_mode(gtk4::WrapMode::Char);
@@ -732,12 +979,14 @@ impl ActiveBlock {
 
         let cursor_visible = Rc::new(Cell::new(true));
         let pending_cmd = Rc::new(RefCell::new(String::new()));
+        let pending_suggestion = Rc::new(RefCell::new(String::new()));
         let pending_output = Rc::new(RefCell::new(String::new()));
 
         // Start cursor blink animation
         let cursor_visible_clone = cursor_visible.clone();
         let content_buffer_clone = content_buffer.clone();
         let pending_cmd_clone = pending_cmd.clone();
+        let pending_suggestion_clone = pending_suggestion.clone();
         let pending_output_clone = pending_output.clone();
 
         glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
@@ -746,15 +995,22 @@ impl ActiveBlock {
 
             // Update display
             let cmd = pending_cmd_clone.borrow();
+            let suggestion = pending_suggestion_clone.borrow();
             let output = pending_output_clone.borrow();
-            let cursor_char = if cursor_visible_clone.get() { "█" } else { "" };
+            log::debug!(
+                "cursor_blink_timer: cmd={:?}, suggestion={:?}, cursor_visible={}",
+                cmd,
+                suggestion,
+                cursor_visible_clone.get()
+            );
 
-            let text = if output.is_empty() {
-                format!("{}{}", cmd, cursor_char)
-            } else {
-                format!("{}\n{}", cmd, output)
-            };
-            content_buffer_clone.set_text(&text);
+            set_active_buffer_text(
+                &content_buffer_clone,
+                &cmd,
+                &suggestion,
+                &output,
+                cursor_visible_clone.get(),
+            );
 
             glib::ControlFlow::Continue
         });
@@ -766,6 +1022,7 @@ impl ActiveBlock {
             content_buffer,
             pending_output,
             pending_cmd,
+            pending_suggestion,
             flush_pending: Rc::new(Cell::new(false)),
             bytes_since_last_flush: Rc::new(Cell::new(0)),
             last_flush_time: Rc::new(Cell::new(std::time::Instant::now())),
@@ -782,35 +1039,46 @@ impl ActiveBlock {
     }
 
     fn set_cmd(&self, text: &str) {
+        log::debug!("set_cmd: text={:?}", text);
         *self.pending_cmd.borrow_mut() = text.to_string();
+        *self.pending_suggestion.borrow_mut() = String::new(); // Clear suggestion when user types
         self.update_content_view();
     }
 
-    fn set_cmd_markup(&self, markup: &str) {
-        // TextView with TextBuffer doesn't support Pango markup directly
-        // Parse markup to extract plain text
-        let plain_text = if let Ok((_, text, _)) = gtk4::pango::parse_markup(markup, '\0') {
-            text.to_string()
-        } else {
-            // Fallback: strip ANSI if parsing fails
-            strip_ansi(markup)
-        };
-        *self.pending_cmd.borrow_mut() = plain_text;
+    fn set_cmd_parts(&self, user_part: &str, suggestion_part: &str) {
+        let user_plain = plain_text_from_ansi(user_part);
+        let suggestion_plain = plain_text_from_ansi(suggestion_part);
+
+        log::debug!(
+            "set_cmd_parts: user={:?}, suggestion={:?}",
+            user_plain,
+            suggestion_plain
+        );
+
+        *self.pending_cmd.borrow_mut() = user_plain;
+        *self.pending_suggestion.borrow_mut() = suggestion_plain;
         self.update_content_view();
     }
 
     // Helper to update content_view with cmd + output
     fn update_content_view(&self) {
         let cmd = self.pending_cmd.borrow();
+        let suggestion = self.pending_suggestion.borrow();
         let output = self.pending_output.borrow();
-        let cursor_char = if self.cursor_visible.get() { "█" } else { "" };
+        log::debug!(
+            "update_content_view: cmd={:?}, suggestion={:?}, cursor_visible={}",
+            cmd,
+            suggestion,
+            self.cursor_visible.get()
+        );
 
-        let text = if output.is_empty() {
-            format!("{}{}", cmd, cursor_char)
-        } else {
-            format!("{}\n{}", cmd, output)
-        };
-        self.content_buffer.set_text(&text);
+        set_active_buffer_text(
+            &self.content_buffer,
+            &cmd,
+            &suggestion,
+            &output,
+            self.cursor_visible.get(),
+        );
     }
 
     fn append_output(&self, text: &str) {
@@ -818,7 +1086,8 @@ impl ActiveBlock {
         self.pending_output.borrow_mut().push_str(text);
 
         // Track throughput for adaptive batching
-        self.bytes_since_last_flush.set(self.bytes_since_last_flush.get() + text_len);
+        self.bytes_since_last_flush
+            .set(self.bytes_since_last_flush.get() + text_len);
 
         // Schedule flush if not already pending
         if !self.flush_pending.get() {
@@ -994,7 +1263,7 @@ pub struct TermView {
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
-    search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>,  // Cache search results
+    search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>, // Cache search results
 }
 
 impl TermView {
@@ -1007,8 +1276,8 @@ impl TermView {
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(false);  // Don't expand - only take space needed
-        block_list.set_valign(gtk4::Align::Start);  // Align to top
+        block_list.set_vexpand(false); // Don't expand - only take space needed
+        block_list.set_valign(gtk4::Align::Start); // Align to top
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
@@ -1028,10 +1297,7 @@ impl TermView {
 
         // VTE fallback for alt-screen mode
         let vte = build_vte(config);
-        let vte_scrollbar = gtk4::Scrollbar::new(
-            Orientation::Vertical,
-            vte.vadjustment().as_ref(),
-        );
+        let vte_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, vte.vadjustment().as_ref());
         let vte_box = gtk4::Box::new(Orientation::Horizontal, 0);
         vte_box.set_hexpand(true);
         vte_box.set_vexpand(true);
@@ -1044,9 +1310,7 @@ impl TermView {
 
         // ── PTY ───────────────────────────────────────────────────────────
         let argv: Vec<&str> = shell_argv.iter().map(|s| s.as_str()).collect();
-        let pty = Rc::new(
-            OwnedPty::spawn(&argv, cwd, &[]).expect("PTY spawn failed"),
-        );
+        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &[]).expect("PTY spawn failed"));
 
         // Store child PID on VTE widget so kill_all_terminal_children can find it
         unsafe {
@@ -1061,12 +1325,18 @@ impl TermView {
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cmd_display_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let last_nonempty_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let last_nonempty_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let executing_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
-        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> = Rc::new(RefCell::new(VecDeque::new()));
+        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
         let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
-            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap())
+            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
         ));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
@@ -1076,6 +1346,11 @@ impl TermView {
             let prompt_buf_rc = prompt_buf.clone();
             let cmd_buf_rc = cmd_buf.clone();
             let cmd_display_raw_rc = cmd_display_raw.clone();
+            let cmd_display_markup_rc = cmd_display_markup.clone();
+            let last_nonempty_cmd_raw_rc = last_nonempty_cmd_raw.clone();
+            let last_nonempty_cmd_markup_rc = last_nonempty_cmd_markup.clone();
+            let executing_cmd_raw_rc = executing_cmd_raw.clone();
+            let executing_cmd_markup_rc = executing_cmd_markup.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
             let vte_for_alt = vte.clone();
@@ -1139,39 +1414,56 @@ impl TermView {
                                         // Skip the prompt visible characters to get to the command
                                         // Use character count, not byte length (important for UTF-8 chars like ❯)
                                         let prompt_char_count = prompt_clean.chars().count();
-                                        let mut raw_cmd = if !prompt_clean.is_empty() {
+                                        let (mut raw_cmd, mut command_column_offset) = if !prompt_clean.is_empty() {
                                             if let Some(_after_prompt) = current_stripped.strip_prefix(prompt_clean) {
                                                 // Calculate visible chars to skip in raw text
-                                                skip_ansi_visible_chars(&current_raw_buf, prompt_char_count)
+                                                (
+                                                    skip_ansi_visible_chars(&current_raw_buf, prompt_char_count),
+                                                    prompt_char_count,
+                                                )
                                             } else if let Some(pos) = current_stripped.find(prompt_clean) {
                                                 let pos_chars = current_stripped[..pos].chars().count();
-                                                skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count)
+                                                (
+                                                    skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count),
+                                                    pos_chars + prompt_char_count,
+                                                )
                                             } else {
-                                                current_raw_buf.clone()
+                                                (current_raw_buf.clone(), 0)
                                             }
                                         } else {
-                                            current_raw_buf.clone()
+                                            (current_raw_buf.clone(), 0)
                                         };
 
+                                        command_column_offset += strip_ansi(&raw_cmd)
+                                            .chars()
+                                            .take_while(|ch| ch.is_whitespace() && *ch != '\n')
+                                            .count();
                                         raw_cmd = raw_cmd.trim_start().to_string();
                                         let display = raw_cmd.trim_end_matches('\n').trim_end();
 
+                                        let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
+
                                         // Use LRU cache for ANSI → Pango conversion
-                                        let markup = {
+                                        let user_markup = {
                                             let mut cache = ansi_cache_for_cb.borrow_mut();
-                                            if let Some(cached) = cache.get(display) {
+                                            if let Some(cached) = cache.get(&user_raw) {
                                                 cached.clone()
                                             } else {
-                                                let result = ansi_to_pango(display, &config_for_cb.borrow().palette);
+                                                let result = ansi_to_pango(&user_raw, &config_for_cb.borrow().palette);
                                                 // LRU automatically evicts least-recently-used entry
-                                                cache.put(display.to_string(), result.clone());
+                                                cache.put(user_raw.clone(), result.clone());
                                                 result
                                             }
                                         };
 
-                                        active_rc.borrow().set_cmd_markup(&markup);
-                                        // Save the raw command for CommandEnd
-                                        *cmd_display_raw_rc.borrow_mut() = display.to_string();
+                                        active_rc.borrow().set_cmd_parts(&user_raw, &suggestion_raw);
+                                        if !strip_ansi(&user_raw).trim().is_empty() {
+                                            *last_nonempty_cmd_raw_rc.borrow_mut() = user_raw.clone();
+                                            *last_nonempty_cmd_markup_rc.borrow_mut() = user_markup.clone();
+                                        }
+                                        // Save only the user-entered command for CommandEnd.
+                                        *cmd_display_raw_rc.borrow_mut() = user_raw;
+                                        *cmd_display_markup_rc.borrow_mut() = user_markup;
 
                                         // Auto-scroll to bottom while typing command
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -1208,6 +1500,7 @@ impl TermView {
                                 bstate_rc.set(BlockState::AwaitingCommand);
                                 cmd_buf_rc.borrow_mut().clear();
                                 cmd_display_raw_rc.borrow_mut().clear();
+                                cmd_display_markup_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
                                 // Auto-scroll to bottom when prompt ends (ready for command)
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -1215,7 +1508,20 @@ impl TermView {
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
+                                let raw_cmd = cmd_display_raw_rc.borrow().clone();
+                                if !raw_cmd.trim().is_empty() {
+                                    *executing_cmd_raw_rc.borrow_mut() = raw_cmd;
+                                    *executing_cmd_markup_rc.borrow_mut() = cmd_display_markup_rc.borrow().clone();
+                                } else if !last_nonempty_cmd_raw_rc.borrow().trim().is_empty() {
+                                    *executing_cmd_raw_rc.borrow_mut() = last_nonempty_cmd_raw_rc.borrow().clone();
+                                    *executing_cmd_markup_rc.borrow_mut() = last_nonempty_cmd_markup_rc.borrow().clone();
+                                } else {
+                                    let active_cmd = active_rc.borrow().pending_cmd.borrow().clone();
+                                    *executing_cmd_raw_rc.borrow_mut() = active_cmd.clone();
+                                    *executing_cmd_markup_rc.borrow_mut() = ansi_to_pango(&active_cmd, &config_for_cb.borrow().palette);
+                                }
                                 // Clear output buffer for new command
+                                active_rc.borrow().pending_suggestion.borrow_mut().clear();
                                 active_rc.borrow().pending_output.borrow_mut().clear();
                                 active_rc.borrow().update_content_view();
                                 // Auto-scroll to bottom when command starts executing
@@ -1231,14 +1537,15 @@ impl TermView {
 
                                 // Use the last displayed command (saved in AwaitingCommand)
                                 // This avoids issues when the shell redraws with just the prompt after Enter
-                                let raw_cmd_with_ansi = cmd_display_raw_rc.borrow().clone();
+                                let mut raw_cmd_with_ansi = executing_cmd_raw_rc.borrow().clone();
+                                let mut cmd_markup = executing_cmd_markup_rc.borrow().clone();
+                                if raw_cmd_with_ansi.trim().is_empty()
+                                    && !last_nonempty_cmd_raw_rc.borrow().trim().is_empty()
+                                {
+                                    raw_cmd_with_ansi = last_nonempty_cmd_raw_rc.borrow().clone();
+                                    cmd_markup = last_nonempty_cmd_markup_rc.borrow().clone();
+                                }
                                 let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
-
-                                let cmd_markup = if !raw_cmd_with_ansi.is_empty() {
-                                    ansi_to_pango(&raw_cmd_with_ansi, &config_for_cb.borrow().palette)
-                                } else {
-                                    String::new()
-                                };
 
                                 let output = active_rc.borrow().output_text();
                                 let output_trimmed = output.trim().to_string();
@@ -1292,6 +1599,11 @@ impl TermView {
                                 active_rc.borrow().set_cmd("");
                                 active_rc.borrow().pending_output.borrow_mut().clear();
                                 active_rc.borrow().update_content_view();
+
+                                executing_cmd_raw_rc.borrow_mut().clear();
+                                executing_cmd_markup_rc.borrow_mut().clear();
+                                last_nonempty_cmd_raw_rc.borrow_mut().clear();
+                                last_nonempty_cmd_markup_rc.borrow_mut().clear();
 
                                 // Scroll to bottom after layout updates
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -1602,7 +1914,9 @@ impl TermView {
                     let vp_ref = vp.borrow();
                     let mut new_visible = std::collections::HashSet::new();
 
-                    for i in vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000) {
+                    for i in
+                        vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000)
+                    {
                         new_visible.insert(i);
                     }
 
@@ -1686,30 +2000,42 @@ impl TermView {
             let root_clone = self.root.clone();
             let primary = display.primary_clipboard();
             log::warn!(">>> TermView copy: got PRIMARY clipboard, calling read_text_async");
-            primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
-                log::warn!(">>> TermView copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| (s.len(), s.as_str()))));
-                match result {
-                    Ok(text_opt) => {
-                        if let Some(text_str) = text_opt {
-                            if !text_str.is_empty() {
-                                log::warn!(">>> TermView copy: got {} chars from PRIMARY: {:?}", text_str.len(), &text_str[..text_str.len().min(50)]);
-                                // Copy to regular clipboard (CLIPBOARD)
-                                let display2 = root_clone.display();
-                                let cb = display2.clipboard();
-                                cb.set_text(&text_str);
-                                log::warn!(">>> TermView copy: copied to CLIPBOARD");
+            primary.read_text_async(
+                None::<&gtk4::gio::Cancellable>,
+                move |result: Result<Option<gtk4::glib::GString>, _>| {
+                    log::warn!(
+                        ">>> TermView copy callback: result={:?}",
+                        result
+                            .as_ref()
+                            .map(|opt| opt.as_ref().map(|s| (s.len(), s.as_str())))
+                    );
+                    match result {
+                        Ok(text_opt) => {
+                            if let Some(text_str) = text_opt {
+                                if !text_str.is_empty() {
+                                    log::warn!(
+                                        ">>> TermView copy: got {} chars from PRIMARY: {:?}",
+                                        text_str.len(),
+                                        &text_str[..text_str.len().min(50)]
+                                    );
+                                    // Copy to regular clipboard (CLIPBOARD)
+                                    let display2 = root_clone.display();
+                                    let cb = display2.clipboard();
+                                    cb.set_text(&text_str);
+                                    log::warn!(">>> TermView copy: copied to CLIPBOARD");
+                                } else {
+                                    log::warn!(">>> TermView copy: PRIMARY text is empty");
+                                }
                             } else {
-                                log::warn!(">>> TermView copy: PRIMARY text is empty");
+                                log::warn!(">>> TermView copy: PRIMARY is None - no text selected");
                             }
-                        } else {
-                            log::warn!(">>> TermView copy: PRIMARY is None - no text selected");
+                        }
+                        Err(e) => {
+                            log::warn!(">>> TermView copy: error reading PRIMARY: {}", e);
                         }
                     }
-                    Err(e) => {
-                        log::warn!(">>> TermView copy: error reading PRIMARY: {}", e);
-                    }
-                }
-            });
+                },
+            );
         }
     }
 
@@ -1720,11 +2046,17 @@ impl TermView {
         let pty = self.pty.clone();
         log::warn!(">>> TermView paste: got clipboard, calling read_text_async");
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-            log::warn!(">>> TermView paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+            log::warn!(
+                ">>> TermView paste callback: result={:?}",
+                result.as_ref().map(|opt| opt.as_ref().map(|s| s.len()))
+            );
             match result {
                 Ok(text_opt) => {
                     if let Some(text_str) = text_opt {
-                        log::warn!(">>> TermView paste: got {} chars from clipboard", text_str.len());
+                        log::warn!(
+                            ">>> TermView paste: got {} chars from clipboard",
+                            text_str.len()
+                        );
                         pty.write_bytes(text_str.as_bytes());
                         log::warn!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
                     } else {
@@ -1836,11 +2168,15 @@ impl TermView {
         }
 
         // Perform search
-        let results: Vec<usize> = self.block_data.borrow().iter().enumerate()
+        let results: Vec<usize> = self
+            .block_data
+            .borrow()
+            .iter()
+            .enumerate()
             .filter(|(_, b)| {
-                b.prompt.to_lowercase().contains(&q) ||
-                b.cmd.to_lowercase().contains(&q) ||
-                b.output.to_lowercase().contains(&q)
+                b.prompt.to_lowercase().contains(&q)
+                    || b.cmd.to_lowercase().contains(&q)
+                    || b.output.to_lowercase().contains(&q)
             })
             .map(|(i, _)| i)
             .collect();
@@ -1861,7 +2197,10 @@ impl TermView {
         if let Some(block) = finished.get(block_index) {
             block.widget().grab_focus();
             let adj = self.block_scroll.vadjustment();
-            if let Some(value) = block.widget().compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0)) {
+            if let Some(value) = block
+                .widget()
+                .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+            {
                 adj.set_value(value.y() as f64);
             }
         }
@@ -1883,14 +2222,12 @@ impl TermView {
             .open(path)?;
 
         for block in blocks.iter() {
-            let serialized = bincode::serialize(block).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-            })?;
+            let serialized = bincode::serialize(block)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             if self.config.borrow().block_history_compress {
-                let compressed = zstd::encode_all(serialized.as_slice(), 3).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?;
+                let compressed = zstd::encode_all(serialized.as_slice(), 3)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 use std::io::Write;
                 let mut f = file.try_clone()?;
                 f.write_all(&(compressed.len() as u32).to_le_bytes())?;
@@ -1933,9 +2270,8 @@ impl TermView {
             file.read_exact(&mut data)?;
 
             let decoded = if self.config.borrow().block_history_compress {
-                zstd::decode_all(data.as_slice()).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?
+                zstd::decode_all(data.as_slice())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
             } else {
                 data
             };
@@ -1969,7 +2305,11 @@ fn build_vte(config: &Config) -> Terminal {
         .build();
     terminal.set_mouse_autohide(true);
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-    terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
     let font_desc = FontDescription::from_string(&config.font_desc);
