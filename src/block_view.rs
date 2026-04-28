@@ -231,6 +231,75 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
     input[i..].to_string()
 }
 
+fn separate_input_and_suggestion(input: &str) -> (String, String) {
+    let mut user_input = String::new();
+    let mut suggestion = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut in_dim = false;
+
+    while i < bytes.len() {
+        // Check for ANSI escape sequence
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let seq_start = i;
+            i += 2;
+            let mut params = Vec::new();
+
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                if bytes[i] == b';' {
+                    params.push(String::new());
+                } else if let Some(last) = params.last_mut() {
+                    last.push(bytes[i] as char);
+                } else {
+                    params.push(String::from(bytes[i] as char));
+                }
+                i += 1;
+            }
+
+            if i < bytes.len() && bytes[i] == b'm' {
+                i += 1;
+                // Check if this is a dim command (code 2)
+                if params.iter().any(|p| p == "2") {
+                    in_dim = true;
+                } else if params.is_empty() || params[0] == "0" {
+                    // Reset code
+                    in_dim = false;
+                }
+            }
+
+            // Add ANSI sequence to appropriate buffer
+            let seq = String::from_utf8_lossy(&bytes[seq_start..i]);
+            if in_dim {
+                suggestion.push_str(&seq);
+            } else {
+                user_input.push_str(&seq);
+            }
+        } else {
+            // Regular character
+            let ch_start = i;
+            if bytes[i] < 0x80 {
+                i += 1;
+            } else {
+                while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+
+            let ch = String::from_utf8_lossy(&bytes[ch_start..i]);
+            if in_dim {
+                suggestion.push_str(&ch);
+            } else {
+                user_input.push_str(&ch);
+            }
+        }
+    }
+
+    (user_input, suggestion)
+}
+
 fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
     let bytes = input.as_bytes();
     let mut out = String::new();
@@ -272,6 +341,11 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                             }
                             Ok(1) => {
                                 out.push_str("<span weight=\"bold\">");
+                                open_spans += 1;
+                            }
+                            Ok(2) => {
+                                // Dim - used for shell suggestions/hints, show in italic with reduced opacity
+                                out.push_str("<span style=\"italic\" alpha=\"65%\">");
                                 open_spans += 1;
                             }
                             Ok(3) => {
