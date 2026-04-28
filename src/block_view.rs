@@ -15,7 +15,7 @@
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion, TextView, TextBuffer};
+use gtk4::{glib, EventControllerKey, GestureClick, Label, Orientation, ScrolledWindow, EventControllerMotion, Settings, TextView, TextBuffer};
 use gtk4::prelude::*;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -589,6 +589,7 @@ struct ActiveBlock {
     config_batch_min: u32,
     config_batch_max: u32,
     last_flushed_size: Rc<Cell<usize>>,
+    cursor_visible: Rc<Cell<bool>>,  // For blinking cursor animation
 }
 
 impl ActiveBlock {
@@ -620,8 +621,23 @@ impl ActiveBlock {
         content_view.add_css_class("block-cmd-active");
         content_view.set_hexpand(true);
         content_view.set_vexpand(false);
-        content_view.set_editable(false);
-        content_view.set_cursor_visible(false);
+        content_view.set_editable(true);  // Enable editing to show blinking cursor
+        content_view.set_cursor_visible(true);
+        content_view.set_can_focus(true);
+        content_view.set_focusable(true);
+
+        // Ensure GTK cursor blink is enabled
+        if let Some(settings) = gtk4::Settings::default() {
+            settings.set_property("gtk-cursor-blink", true);
+            settings.set_property("gtk-cursor-blink-time", 1200i32);  // 1200ms blink cycle
+        }
+
+        // Block keyboard input to keep it read-only while showing cursor
+        let key_controller = EventControllerKey::new();
+        key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
+            glib::Propagation::Stop  // Block all keyboard input
+        });
+        content_view.add_controller(key_controller);
         content_view.set_wrap_mode(gtk4::WrapMode::Char);
         content_view.set_left_margin(12);
         content_view.set_right_margin(8);
@@ -630,13 +646,52 @@ impl ActiveBlock {
         content_view.set_monospace(true);
         widget.append(&content_view);
 
+        // Place cursor at the beginning of the buffer and grab focus for cursor blinking
+        let start_iter = content_buffer.start_iter();
+        content_buffer.place_cursor(&start_iter);
+
+        // Schedule focus grab after widget is realized
+        let content_view_clone = content_view.clone();
+        content_view.connect_realize(move |_| {
+            content_view_clone.grab_focus();
+        });
+
+        let cursor_visible = Rc::new(Cell::new(true));
+        let pending_cmd = Rc::new(RefCell::new(String::new()));
+        let pending_output = Rc::new(RefCell::new(String::new()));
+
+        // Start cursor blink animation
+        let cursor_visible_clone = cursor_visible.clone();
+        let content_buffer_clone = content_buffer.clone();
+        let pending_cmd_clone = pending_cmd.clone();
+        let pending_output_clone = pending_output.clone();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
+            // Toggle cursor visibility
+            cursor_visible_clone.set(!cursor_visible_clone.get());
+
+            // Update display
+            let cmd = pending_cmd_clone.borrow();
+            let output = pending_output_clone.borrow();
+            let cursor_char = if cursor_visible_clone.get() { "█" } else { "" };
+
+            let text = if output.is_empty() {
+                format!("{}{}", cmd, cursor_char)
+            } else {
+                format!("{}\n{}", cmd, output)
+            };
+            content_buffer_clone.set_text(&text);
+
+            glib::ControlFlow::Continue
+        });
+
         ActiveBlock {
             widget,
             prompt_label,
             content_view,
             content_buffer,
-            pending_output: Rc::new(RefCell::new(String::new())),
-            pending_cmd: Rc::new(RefCell::new(String::new())),
+            pending_output,
+            pending_cmd,
             flush_pending: Rc::new(Cell::new(false)),
             bytes_since_last_flush: Rc::new(Cell::new(0)),
             last_flush_time: Rc::new(Cell::new(std::time::Instant::now())),
@@ -644,6 +699,7 @@ impl ActiveBlock {
             config_batch_min: batch_min_ms,
             config_batch_max: batch_max_ms,
             last_flushed_size: Rc::new(Cell::new(0)),
+            cursor_visible,
         }
     }
 
@@ -673,9 +729,10 @@ impl ActiveBlock {
     fn update_content_view(&self) {
         let cmd = self.pending_cmd.borrow();
         let output = self.pending_output.borrow();
+        let cursor_char = if self.cursor_visible.get() { "█" } else { "" };
 
         let text = if output.is_empty() {
-            cmd.to_string()
+            format!("{}{}", cmd, cursor_char)
         } else {
             format!("{}\n{}", cmd, output)
         };
@@ -718,6 +775,9 @@ impl ActiveBlock {
                         format!("{}\n{}", cmd, output)
                     };
                     content_buffer.set_text(&text);
+                    // Move cursor to end for blinking cursor
+                    let end_iter = content_buffer.end_iter();
+                    content_buffer.place_cursor(&end_iter);
 
                     last_flushed_size.set(output.len());
 
@@ -761,6 +821,9 @@ impl ActiveBlock {
             format!("{}\n{}", cmd, output)
         };
         self.content_buffer.set_text(&text);
+        // Move cursor to end for blinking cursor
+        let end_iter = self.content_buffer.end_iter();
+        self.content_buffer.place_cursor(&end_iter);
         self.last_flushed_size.set(output.len());
     }
 
@@ -770,6 +833,10 @@ impl ActiveBlock {
 
     fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    fn grab_focus(&self) {
+        self.content_view.grab_focus();
     }
 }
 
@@ -1203,6 +1270,8 @@ impl TermView {
                                 // Reset active block ready for next prompt
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
+                                // Give focus to active block's TextView
+                                active_rc.borrow().content_view.grab_focus();
                             }
                         }
                     }
@@ -1478,6 +1547,9 @@ impl TermView {
                 });
             });
         }
+
+        // Give initial focus to ActiveBlock's TextView for cursor blinking
+        term_view.active.borrow().content_view.grab_focus();
 
         term_view
     }
@@ -1923,12 +1995,23 @@ fn install_block_css(config: &Config) {
             color: {fg_hex};
             font-family: "{font_family}";
             font-size: {font_size};
-            font-weight: bold;
             padding: 0;
             line-height: 1.0;
             margin: 0;
-            border-left: 3px solid {accent};
-            padding-left: 9px;
+            min-height: 0;
+            background-color: {bg_hex};
+            caret-color: {fg_hex};
+        }}
+        .block-cmd-active text {{
+            background-color: {bg_hex};
+            caret-color: {fg_hex};
+        }}
+        @keyframes blink {{
+            0%, 49% {{ opacity: 1; }}
+            50%, 100% {{ opacity: 0; }}
+        }}
+        .block-cmd-active text selection {{
+            background-color: transparent;
         }}
         .block-cmd-finished {{
             color: {fg_hex};
