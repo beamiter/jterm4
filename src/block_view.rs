@@ -1861,6 +1861,24 @@ impl TermView {
         // Load history if configured
         let _ = term_view.load_history();
 
+        // Create widgets for loaded blocks
+        {
+            let block_data_ref = term_view.block_data.borrow();
+            let config = term_view.config.borrow();
+            for block in block_data_ref.iter() {
+                let finished = FinishedBlock::new(
+                    &block.prompt,
+                    &block.cmd,
+                    block.cmd_markup.as_deref(),
+                    &block.output,
+                    block.exit_code,
+                    &config,
+                );
+                term_view.block_list.append(finished.widget());
+                term_view.finished_blocks.borrow_mut().push(finished);
+            }
+        }
+
         // Initialize viewport and visibility
         term_view.update_viewport();
         term_view.update_block_visibility();
