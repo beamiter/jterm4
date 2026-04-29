@@ -1196,12 +1196,18 @@ impl FinishedBlock {
         config: &Config,
     ) -> Self {
         // Output is already trimmed by caller, but be defensive
+        let block_outer_margin_top = 4;
+        let block_outer_margin_bottom = 2;
+        let prompt_margin_top = 4;
+        let prompt_margin_bottom = 2;
+        let content_margin_top = 2;
+        let content_margin_bottom = 6;
 
         // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
-        outer.set_margin_top(2);
-        outer.set_margin_bottom(0);
+        outer.set_margin_top(block_outer_margin_top);
+        outer.set_margin_bottom(block_outer_margin_bottom);
 
         // Prompt row
         let prompt_label = gtk4::Label::new(Some(prompt));
@@ -1209,8 +1215,8 @@ impl FinishedBlock {
         prompt_label.set_xalign(0.0);
         prompt_label.set_selectable(true);
         prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(2);
-        prompt_label.set_margin_bottom(0);
+        prompt_label.set_margin_top(prompt_margin_top);
+        prompt_label.set_margin_bottom(prompt_margin_bottom);
         prompt_label.set_single_line_mode(true);
         outer.append(&prompt_label);
 
@@ -1236,8 +1242,8 @@ impl FinishedBlock {
         // Margins (matching the previous cmd_label)
         content_view.set_left_margin(12);
         content_view.set_right_margin(8);
-        content_view.set_top_margin(0);
-        content_view.set_bottom_margin(0);
+        content_view.set_top_margin(content_margin_top);
+        content_view.set_bottom_margin(content_margin_bottom);
 
         // Layout
         content_view.set_hexpand(true);
@@ -1332,10 +1338,17 @@ struct ActiveBlock {
 
 impl ActiveBlock {
     fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
+        let block_outer_margin_top = 4;
+        let block_outer_margin_bottom = 2;
+        let prompt_margin_top = 4;
+        let prompt_margin_bottom = 2;
+        let content_margin_top = 2;
+        let content_margin_bottom = 6;
+
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_top(2);
-        widget.set_margin_bottom(0);
+        widget.set_margin_top(block_outer_margin_top);
+        widget.set_margin_bottom(block_outer_margin_bottom);
         widget.set_can_focus(false); // Don't steal focus from labels
         widget.set_can_target(false); // Let events pass through to children
         widget.set_focusable(false); // Prevent any focus interception
@@ -1348,8 +1361,8 @@ impl ActiveBlock {
         prompt_label.set_can_target(true); // Ensure it can receive mouse events
         prompt_label.set_can_focus(true); // Ensure it can receive focus
         prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(2);
-        prompt_label.set_margin_bottom(0);
+        prompt_label.set_margin_top(prompt_margin_top);
+        prompt_label.set_margin_bottom(prompt_margin_bottom);
         prompt_label.set_single_line_mode(true);
         widget.append(&prompt_label);
 
@@ -1379,8 +1392,8 @@ impl ActiveBlock {
         content_view.set_wrap_mode(gtk4::WrapMode::Char);
         content_view.set_left_margin(12);
         content_view.set_right_margin(8);
-        content_view.set_top_margin(0);
-        content_view.set_bottom_margin(0);
+        content_view.set_top_margin(content_margin_top);
+        content_view.set_bottom_margin(content_margin_bottom);
         content_view.set_monospace(true);
         widget.append(&content_view);
 
@@ -2809,12 +2822,13 @@ fn install_block_css(config: &Config) {
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
-            min-height: 0;
+            min-height: 40px;
         }}
         .block-active {{
             border-radius: 0;
             margin: 0;
             background-color: {bg_hex};
+            min-height: 40px;
         }}
         .block-header {{
             background-color: {header_bg};
