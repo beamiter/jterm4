@@ -1701,6 +1701,7 @@ impl TermView {
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
         block_list.set_vexpand(false); // Don't expand - only take space needed
         block_list.set_valign(gtk4::Align::Start); // Align to top
+        block_list.set_margin_bottom(28); // Leave more room below the current block at the bottom edge
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
