@@ -39,6 +39,10 @@ pub struct Parser {
     state: State,
 }
 
+fn is_alt_screen_mode(params: &[u8]) -> bool {
+    matches!(params, b"?47" | b"?1047" | b"?1049")
+}
+
 impl Parser {
     pub fn new() -> Self {
         Parser { state: State::default() }
@@ -91,28 +95,24 @@ impl Parser {
                 },
 
                 State::Csi { buf } => {
-                    passthrough.push(b);
                     if (0x40..=0x7e).contains(&b) {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
-                        // Check for alt-screen: CSI ? 1049 h / l
-                        if b == b'h' && params == b"?1049" {
-                            flush!();
-                            // Remove the CSI ?1049h bytes we just pushed
+                        passthrough.push(b);
+                        if b == b'h' && is_alt_screen_mode(&params) {
                             let len = passthrough.len();
-                            passthrough.truncate(len.saturating_sub("?1049h".len() + 2)); // ESC [ prefix already flushed
-                            // Easier: just re-emit without the sequence
+                            passthrough.truncate(len.saturating_sub(params.len() + 3));
                             flush!();
                             events.push(ParserEvent::AltScreenEnter);
-                        } else if b == b'l' && params == b"?1049" {
-                            flush!();
+                        } else if b == b'l' && is_alt_screen_mode(&params) {
                             let len = passthrough.len();
-                            passthrough.truncate(len.saturating_sub("?1049l".len() + 2));
+                            passthrough.truncate(len.saturating_sub(params.len() + 3));
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
                         }
                     } else {
+                        passthrough.push(b);
                         buf.push(b);
                     }
                 }

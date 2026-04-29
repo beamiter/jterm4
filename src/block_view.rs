@@ -91,6 +91,148 @@ fn dim_rgba(c: &RGBA, alpha: f32) -> RGBA {
     RGBA::new(c.red(), c.green(), c.blue(), alpha)
 }
 
+fn skip_osc_sequence(bytes: &[u8], mut i: usize) -> usize {
+    i += 2;
+    while i < bytes.len() {
+        if bytes[i] == 0x07 {
+            return i + 1;
+        }
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+            return i + 2;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn skip_escape_sequence(bytes: &[u8], i: usize) -> usize {
+    if i + 1 >= bytes.len() {
+        return i + 1;
+    }
+
+    match bytes[i + 1] {
+        b'[' => {
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() {
+                j += 1;
+            }
+            j
+        }
+        b']' => skip_osc_sequence(bytes, i),
+        next if (0x20..=0x2f).contains(&next) => {
+            let mut j = i + 2;
+            while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() && (0x30..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            j
+        }
+        _ => i + 2,
+    }
+}
+
+fn is_alt_screen_mode(params: &[u8]) -> bool {
+    matches!(params, b"?47" | b"?1047" | b"?1049")
+}
+
+fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
+    let mut i = 0;
+
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+
+        match bytes[i + 1] {
+            b'[' => {
+                i += 2;
+                let params_start = i;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    break;
+                }
+
+                let final_byte = bytes[i];
+                let params = &bytes[params_start..i];
+                i += 1;
+
+                if is_alt_screen_mode(params) {
+                    return true;
+                }
+
+                match final_byte {
+                    b'H' | b'f' | b'J' => return true,
+                    _ => {}
+                }
+            }
+            _ => {
+                i = skip_escape_sequence(bytes, i);
+            }
+        }
+    }
+
+    false
+}
+
+fn show_alt_screen(
+    block_scroll: &ScrolledWindow,
+    vte_box: &gtk4::Box,
+    vte: &Terminal,
+    pty: Rc<OwnedPty>,
+    initial_bytes: Option<&[u8]>,
+) {
+    block_scroll.set_visible(false);
+    block_scroll.set_vexpand(false);
+    vte_box.set_vexpand(true);
+    vte_box.set_visible(true);
+
+    let pty_resize = pty.clone();
+    let vte_for_resize = vte.clone();
+    glib::idle_add_local_once(move || {
+        let width = vte_for_resize.allocated_width() as i64;
+        let height = vte_for_resize.allocated_height() as i64;
+        if width > 0 && height > 0 {
+            let char_width = vte_for_resize.char_width();
+            let char_height = vte_for_resize.char_height();
+            if char_width > 0 && char_height > 0 {
+                let cols = (width / char_width) as u16;
+                let rows = (height / char_height) as u16;
+                log::debug!(
+                    "Resizing PTY to {}x{} (widget {}x{}, char {}x{})",
+                    cols,
+                    rows,
+                    width,
+                    height,
+                    char_width,
+                    char_height
+                );
+                pty_resize.resize(cols, rows);
+            }
+        }
+    });
+
+    if let Some(bytes) = initial_bytes {
+        vte.feed(bytes);
+    }
+
+    vte.grab_focus();
+}
+
+fn hide_alt_screen(block_scroll: &ScrolledWindow, vte_box: &gtk4::Box) {
+    vte_box.set_visible(false);
+    vte_box.set_vexpand(false);
+    block_scroll.set_vexpand(true);
+    block_scroll.set_visible(true);
+}
+
 fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -130,18 +272,10 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                     }
                 }
                 b']' => {
-                    // OSC sequence: skip until BEL or ST
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
-                        i += 1;
-                    }
-                    if i < bytes.len() && bytes[i] == 0x07 {
-                        i += 1;
-                    }
+                    i = skip_osc_sequence(bytes, i);
                 }
                 _ => {
-                    // Other ESC sequence: skip ESC + one byte
-                    i += 2;
+                    i = skip_escape_sequence(bytes, i);
                 }
             }
         } else {
@@ -198,25 +332,13 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'[' => {
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1;
-                    }
+                    i = skip_escape_sequence(bytes, i);
                 }
                 b']' => {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
-                        i += 1;
-                    }
-                    if i < bytes.len() && bytes[i] == 0x07 {
-                        i += 1;
-                    }
+                    i = skip_escape_sequence(bytes, i);
                 }
                 _ => {
-                    i += 2;
+                    i = skip_escape_sequence(bytes, i);
                 }
             }
         } else {
@@ -330,6 +452,8 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
                     _ => {}
                 }
             }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            i = skip_escape_sequence(bytes, i);
         } else if bytes[i] == b'\r' {
             cursor = 0;
             i += 1;
@@ -441,6 +565,8 @@ fn command_line_plain_text(input: &str) -> String {
                     _ => {}
                 }
             }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            i = skip_escape_sequence(bytes, i);
         } else if bytes[i] == b'\r' {
             cursor = 0;
             i += 1;
@@ -676,21 +802,9 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                 }
             }
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-            // OSC sequence: skip until BEL or ST (ESC \)
-            i += 2;
-            while i < bytes.len() {
-                if bytes[i] == 0x07 {
-                    i += 1;
-                    break;
-                } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
+            i = skip_osc_sequence(bytes, i);
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            // Skip unknown escape sequences (e.g. ESC + single char like ESC D)
-            i += 2;
+            i = skip_escape_sequence(bytes, i);
         } else {
             // Collect UTF-8 characters
             let ch_start = i;
@@ -1477,6 +1591,18 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
+                                        if contains_full_screen_redraw(bytes) {
+                                            bstate_rc.set(BlockState::AltScreen);
+                                            show_alt_screen(
+                                                &block_scroll_rc,
+                                                &vte_box_rc,
+                                                &vte_for_alt,
+                                                pty_for_resize.clone(),
+                                                Some(bytes),
+                                            );
+                                            continue;
+                                        }
+
                                         let (clean, should_clear) = strip_ansi_with_clear_detect(&text);
                                         if should_clear {
                                             // Clear-screen sequence detected; clear output buffer
@@ -1537,6 +1663,10 @@ impl TermView {
                             }
 
                             ParserEvent::CommandEnd(code) => {
+                                if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
+                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                }
+
                                 // Flush any pending output first
                                 active_rc.borrow().flush_output();
 
@@ -1627,39 +1757,17 @@ impl TermView {
 
                             ParserEvent::AltScreenEnter => {
                                 bstate_rc.set(BlockState::AltScreen);
-                                // Hide block view and expand VTE to fill all space
-                                block_scroll_rc.set_visible(false);
-                                block_scroll_rc.set_vexpand(false);
-                                vte_box_rc.set_vexpand(true);
-                                vte_box_rc.set_visible(true);
-
-                                // Resize PTY to match VTE widget size
-                                let pty_resize = pty_for_resize.clone();
-                                let vte_for_resize = vte_for_alt.clone();
-                                glib::idle_add_local_once(move || {
-                                    let width = vte_for_resize.allocated_width() as i64;
-                                    let height = vte_for_resize.allocated_height() as i64;
-                                    if width > 0 && height > 0 {
-                                        let char_width = vte_for_resize.char_width();
-                                        let char_height = vte_for_resize.char_height();
-                                        if char_width > 0 && char_height > 0 {
-                                            let cols = (width / char_width) as u16;
-                                            let rows = (height / char_height) as u16;
-                                            log::debug!("Resizing PTY to {}x{} (widget {}x{}, char {}x{})",
-                                                cols, rows, width, height, char_width, char_height);
-                                            pty_resize.resize(cols, rows);
-                                        }
-                                    }
-                                });
-
-                                vte_for_alt.grab_focus();
+                                show_alt_screen(
+                                    &block_scroll_rc,
+                                    &vte_box_rc,
+                                    &vte_for_alt,
+                                    pty_for_resize.clone(),
+                                    None,
+                                );
                             }
 
                             ParserEvent::AltScreenLeave => {
-                                vte_box_rc.set_visible(false);
-                                vte_box_rc.set_vexpand(false);
-                                block_scroll_rc.set_vexpand(true);
-                                block_scroll_rc.set_visible(true);
+                                hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::Idle);
                                 // Reset active block ready for next prompt
                                 active_rc.borrow().set_prompt("");
@@ -2502,4 +2610,34 @@ fn install_block_css(config: &Config) {
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ansi_to_pango, command_line_plain_text, skip_ansi_visible_chars, strip_ansi};
+    use gtk4::gdk::RGBA;
+
+    fn palette() -> [RGBA; 16] {
+        [RGBA::new(0.0, 0.0, 0.0, 1.0); 16]
+    }
+
+    #[test]
+    fn strips_charset_designation_from_output() {
+        assert_eq!(strip_ansi("\u{1b}(Btop"), "top");
+    }
+
+    #[test]
+    fn skips_charset_designation_when_counting_visible_chars() {
+        assert_eq!(skip_ansi_visible_chars("\u{1b}(Btop", 1), "op");
+    }
+
+    #[test]
+    fn ignores_charset_designation_in_command_plain_text() {
+        assert_eq!(command_line_plain_text("\u{1b}(Btop"), "top");
+    }
+
+    #[test]
+    fn ignores_charset_designation_in_pango_conversion() {
+        assert_eq!(ansi_to_pango("\u{1b}(Btop", &palette()), "top");
+    }
 }
