@@ -859,6 +859,9 @@ impl FinishedBlock {
             } else {
                 cmd.to_string()
             }
+        } else if cmd.is_empty() {
+            // Historical blocks may have empty cmd - show a subtle indicator
+            format!("[?]\n{}", output)
         } else {
             format!("{}\n{}", cmd, output)
         };
@@ -1457,13 +1460,18 @@ impl TermView {
                                         };
 
                                         active_rc.borrow().set_cmd_parts(&user_raw, &suggestion_raw);
-                                        if !strip_ansi(&user_raw).trim().is_empty() {
-                                            *last_nonempty_cmd_raw_rc.borrow_mut() = user_raw.clone();
-                                            *last_nonempty_cmd_markup_rc.borrow_mut() = user_markup.clone();
+
+                                        // Save the full command (user input + suggestion) for CommandEnd
+                                        // This ensures commands accepted via autocomplete are properly recorded
+                                        let full_cmd_raw = display.to_string();
+                                        let full_cmd_markup = ansi_to_pango(&full_cmd_raw, &config_for_cb.borrow().palette);
+
+                                        if !strip_ansi(&full_cmd_raw).trim().is_empty() {
+                                            *last_nonempty_cmd_raw_rc.borrow_mut() = full_cmd_raw.clone();
+                                            *last_nonempty_cmd_markup_rc.borrow_mut() = full_cmd_markup.clone();
                                         }
-                                        // Save only the user-entered command for CommandEnd.
-                                        *cmd_display_raw_rc.borrow_mut() = user_raw;
-                                        *cmd_display_markup_rc.borrow_mut() = user_markup;
+                                        *cmd_display_raw_rc.borrow_mut() = full_cmd_raw;
+                                        *cmd_display_markup_rc.borrow_mut() = full_cmd_markup;
 
                                         // Auto-scroll to bottom while typing command
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -2240,6 +2248,8 @@ impl TermView {
             .open(path)?;
 
         for block in blocks.iter() {
+            log::debug!("Saving block to history: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                &block.prompt, &block.cmd, block.output.len(), block.exit_code);
             let serialized = bincode::serialize(block)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -2295,6 +2305,8 @@ impl TermView {
             };
 
             if let Ok(block) = bincode::deserialize::<BlockData>(&decoded) {
+                log::debug!("Loaded historical block: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                    &block.prompt, &block.cmd, block.output.len(), block.exit_code);
                 blocks.push_back(block);
             }
         }
