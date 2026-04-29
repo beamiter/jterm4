@@ -14,6 +14,7 @@
 ///     └── vte_box (gtk4::Box)            — shown in alt-screen mode
 ///         └── vte4::Terminal + Scrollbar
 use gtk4::gdk::RGBA;
+use gtk4::glib::translate::IntoGlib;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
 use gtk4::{glib, EventControllerKey, Orientation, ScrolledWindow, TextBuffer, TextView};
@@ -598,12 +599,289 @@ fn plain_text_from_ansi(input: &str) -> String {
     command_line_plain_text(input)
 }
 
+#[derive(Clone, Default)]
+struct AnsiStyleState {
+    foreground: Option<RGBA>,
+    background: Option<RGBA>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    dim: bool,
+}
+
+#[derive(Clone)]
+struct AnsiTextRun {
+    text: String,
+    style: AnsiStyleState,
+}
+
+fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
+    if style.foreground.is_none()
+        && style.background.is_none()
+        && !style.bold
+        && !style.italic
+        && !style.underline
+        && !style.strikethrough
+        && !style.dim
+    {
+        return None;
+    }
+
+    let rgba_key = |color: Option<&RGBA>| match color {
+        Some(color) => format!(
+            "{:03}-{:03}-{:03}-{:03}",
+            (color.red() * 255.0).round() as u8,
+            (color.green() * 255.0).round() as u8,
+            (color.blue() * 255.0).round() as u8,
+            (color.alpha() * 255.0).round() as u8,
+        ),
+        None => "none".to_string(),
+    };
+
+    Some(format!(
+        "ansi-run-fg:{}-bg:{}-b{}-i{}-u{}-s{}-d{}",
+        rgba_key(style.foreground.as_ref()),
+        rgba_key(style.background.as_ref()),
+        style.bold as u8,
+        style.italic as u8,
+        style.underline as u8,
+        style.strikethrough as u8,
+        style.dim as u8,
+    ))
+}
+
+fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<gtk4::TextTag> {
+    let tag_name = ansi_tag_name(style)?;
+    let tag_table = buffer.tag_table();
+
+    if let Some(tag) = tag_table.lookup(&tag_name) {
+        return Some(tag);
+    }
+
+    let tag = gtk4::TextTag::new(Some(&tag_name));
+    if let Some(mut foreground) = style.foreground {
+        if style.dim {
+            foreground.set_alpha(0.7);
+        }
+        tag.set_foreground_rgba(Some(&foreground));
+    }
+    if let Some(background) = style.background {
+        tag.set_background_rgba(Some(&background));
+    }
+    if style.bold {
+        tag.set_weight(gtk4::pango::Weight::Bold.into_glib());
+    }
+    if style.italic {
+        tag.set_style(gtk4::pango::Style::Italic);
+    }
+    if style.underline {
+        tag.set_underline(gtk4::pango::Underline::Single);
+    }
+    if style.strikethrough {
+        tag.set_strikethrough(true);
+    }
+
+    tag_table.add(&tag);
+    Some(tag)
+}
+
+fn flush_ansi_run(runs: &mut Vec<AnsiTextRun>, text: &mut String, style: &AnsiStyleState) {
+    if text.is_empty() {
+        return;
+    }
+
+    runs.push(AnsiTextRun {
+        text: std::mem::take(text),
+        style: style.clone(),
+    });
+}
+
+fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RGBA; 16]) {
+    let mut index = 0;
+    while index < params.len() {
+        let param = if params[index].is_empty() {
+            0
+        } else {
+            params[index].parse::<u32>().unwrap_or(0)
+        };
+
+        match param {
+            0 => *style = AnsiStyleState::default(),
+            1 => style.bold = true,
+            2 => style.dim = true,
+            3 => style.italic = true,
+            4 => style.underline = true,
+            9 => style.strikethrough = true,
+            22 => {
+                style.bold = false;
+                style.dim = false;
+            }
+            23 => style.italic = false,
+            24 => style.underline = false,
+            29 => style.strikethrough = false,
+            30..=37 => {
+                let (r, g, b) = ansi256_to_rgb((param - 30) as u8, palette);
+                style.foreground = Some(RGBA::new(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            39 => style.foreground = None,
+            40..=47 => {
+                let (r, g, b) = ansi256_to_rgb((param - 40) as u8, palette);
+                style.background = Some(RGBA::new(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            49 => style.background = None,
+            90..=97 => {
+                let (r, g, b) = ansi256_to_rgb((param - 90 + 8) as u8, palette);
+                style.foreground = Some(RGBA::new(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            100..=107 => {
+                let (r, g, b) = ansi256_to_rgb((param - 100 + 8) as u8, palette);
+                style.background = Some(RGBA::new(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    1.0,
+                ));
+            }
+            38 | 48 => {
+                let target = if param == 38 {
+                    &mut style.foreground
+                } else {
+                    &mut style.background
+                };
+
+                if index + 2 < params.len() && params[index + 1] == "5" {
+                    if let Ok(color_index) = params[index + 2].parse::<u8>() {
+                        let (r, g, b) = ansi256_to_rgb(color_index, palette);
+                        *target = Some(RGBA::new(
+                            r as f32 / 255.0,
+                            g as f32 / 255.0,
+                            b as f32 / 255.0,
+                            1.0,
+                        ));
+                    }
+                    index += 2;
+                } else if index + 4 < params.len() && params[index + 1] == "2" {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        params[index + 2].parse::<u8>(),
+                        params[index + 3].parse::<u8>(),
+                        params[index + 4].parse::<u8>(),
+                    ) {
+                        *target = Some(RGBA::new(
+                            r as f32 / 255.0,
+                            g as f32 / 255.0,
+                            b as f32 / 255.0,
+                            1.0,
+                        ));
+                    }
+                    index += 4;
+                }
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+}
+
+fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
+    let bytes = input.as_bytes();
+    let mut runs = Vec::new();
+    let mut current_style = AnsiStyleState::default();
+    let mut current_text = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            let mut params = Vec::new();
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                if bytes[i] == b';' {
+                    params.push(String::new());
+                } else if let Some(last) = params.last_mut() {
+                    last.push(bytes[i] as char);
+                } else {
+                    params.push(String::from(bytes[i] as char));
+                }
+                i += 1;
+            }
+
+            if i < bytes.len() {
+                let final_byte = bytes[i];
+                i += 1;
+                if final_byte == b'm' {
+                    if params.is_empty() || params[0].is_empty() {
+                        params = vec!["0".to_string()];
+                    }
+                    flush_ansi_run(&mut runs, &mut current_text, &current_style);
+                    parse_sgr_params(&mut current_style, &params, palette);
+                }
+            }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            i = skip_osc_sequence(bytes, i);
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            i = skip_escape_sequence(bytes, i);
+        } else {
+            let ch_len = if bytes[i] & 0x80 == 0 {
+                1
+            } else if bytes[i] & 0xe0 == 0xc0 {
+                2
+            } else if bytes[i] & 0xf0 == 0xe0 {
+                3
+            } else if bytes[i] & 0xf8 == 0xf0 {
+                4
+            } else {
+                1
+            };
+            let end = (i + ch_len).min(bytes.len());
+            current_text.push_str(&String::from_utf8_lossy(&bytes[i..end]));
+            i = end;
+        }
+    }
+
+    flush_ansi_run(&mut runs, &mut current_text, &current_style);
+    runs
+}
+
+fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs: &[AnsiTextRun]) {
+    let mut offset = start_offset;
+    for run in runs {
+        let len = run.text.chars().count();
+        if len == 0 {
+            continue;
+        }
+
+        if let Some(tag) = ensure_ansi_text_tag(buffer, &run.style) {
+            let start_iter = buffer.iter_at_offset(offset as i32);
+            let end_iter = buffer.iter_at_offset((offset + len) as i32);
+            buffer.apply_tag(&tag, &start_iter, &end_iter);
+        }
+        offset += len;
+    }
+}
+
 fn set_active_buffer_text(
     buffer: &TextBuffer,
     cmd: &str,
     suggestion: &str,
     output: &str,
     cursor_visible: bool,
+    palette: &[RGBA; 16],
 ) {
     let cursor_char = if output.is_empty() {
         if cursor_visible { "█" } else { " " }
@@ -613,20 +891,31 @@ fn set_active_buffer_text(
     let text = if output.is_empty() {
         format!("{}{}{}", cmd, cursor_char, suggestion)
     } else {
-        format!("{}{}\n{}", cmd, cursor_char, output)
+        let output_plain = ansi_text_runs(output, palette)
+            .into_iter()
+            .map(|run| run.text)
+            .collect::<String>();
+        format!("{}{}\n{}", cmd, cursor_char, output_plain)
     };
 
     buffer.set_text(&text);
 
-    if suggestion.is_empty() || !output.is_empty() {
+    if !output.is_empty() {
+        let output_runs = ansi_text_runs(output, palette);
+        let output_start = cmd.chars().count() + cursor_char.chars().count() + 1;
+        apply_ansi_runs_to_buffer(buffer, output_start, &output_runs);
+        return;
+    }
+
+    if suggestion.is_empty() {
         return;
     }
 
     let tag_table = buffer.tag_table();
     if tag_table.lookup("suggestion").is_none() {
         let tag = gtk4::TextTag::new(Some("suggestion"));
-        tag.set_property("style", gtk4::pango::Style::Italic);
-        tag.set_property("foreground-rgba", &RGBA::new(0.5, 0.5, 0.5, 0.7));
+        tag.set_style(gtk4::pango::Style::Italic);
+        tag.set_foreground_rgba(Some(&RGBA::new(0.5, 0.5, 0.5, 0.7)));
         tag_table.add(&tag);
     }
 
@@ -904,7 +1193,7 @@ impl FinishedBlock {
         _cmd_markup: Option<&str>,
         output: &str,
         exit_code: i32,
-        _config: &Config,
+        config: &Config,
     ) -> Self {
         // Output is already trimmed by caller, but be defensive
 
@@ -967,7 +1256,13 @@ impl FinishedBlock {
         content_view.set_can_target(true);
 
         // Combine cmd and output text
-        let combined_text = if output.is_empty() {
+        let output_runs = ansi_text_runs(output, &config.palette);
+        let output_plain = output_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+
+        let combined_text = if output_plain.is_empty() {
             if cmd.is_empty() {
                 "(empty)".to_string()
             } else {
@@ -975,12 +1270,16 @@ impl FinishedBlock {
             }
         } else if cmd.is_empty() {
             // Historical blocks may have empty cmd - show a subtle indicator
-            format!("[?]\n{}", output)
+            format!("[?]\n{}", output_plain)
         } else {
-            format!("{}\n{}", cmd, output)
+            format!("{}\n{}", cmd, output_plain)
         };
 
         content_buffer.set_text(&combined_text);
+        if !output_plain.is_empty() {
+            let output_start = if cmd.is_empty() { 4 } else { cmd.chars().count() + 1 };
+            apply_ansi_runs_to_buffer(&content_buffer, output_start, &output_runs);
+        }
         cmd_box.append(&content_view);
 
         // Exit code badge
@@ -1028,10 +1327,11 @@ struct ActiveBlock {
     config_batch_max: u32,
     last_flushed_size: Rc<Cell<usize>>,
     cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
+    palette: [RGBA; 16],
 }
 
 impl ActiveBlock {
-    fn new(batch_min_ms: u32, batch_max_ms: u32, _config: &Config) -> Self {
+    fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         widget.set_margin_top(2);
@@ -1105,6 +1405,7 @@ impl ActiveBlock {
         let pending_cmd_clone = pending_cmd.clone();
         let pending_suggestion_clone = pending_suggestion.clone();
         let pending_output_clone = pending_output.clone();
+        let palette_for_cursor = config.palette;
 
         glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
             // Toggle cursor visibility
@@ -1127,6 +1428,7 @@ impl ActiveBlock {
                 &suggestion,
                 &output,
                 cursor_visible_clone.get(),
+                &palette_for_cursor,
             );
 
             glib::ControlFlow::Continue
@@ -1148,6 +1450,7 @@ impl ActiveBlock {
             config_batch_max: batch_max_ms,
             last_flushed_size: Rc::new(Cell::new(0)),
             cursor_visible,
+            palette: config.palette,
         }
     }
 
@@ -1195,6 +1498,7 @@ impl ActiveBlock {
             &suggestion,
             &output,
             self.cursor_visible.get(),
+            &self.palette,
         );
     }
 
@@ -1219,6 +1523,7 @@ impl ActiveBlock {
             let min_ms = self.config_batch_min;
             let max_ms = self.config_batch_max;
             let last_flushed_size = self.last_flushed_size.clone();
+            let palette = self.palette;
 
             let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
@@ -1229,13 +1534,7 @@ impl ActiveBlock {
                     let output = pending_output.borrow();
 
                     // Combine and display in TextBuffer
-                    let text = if output.is_empty() {
-                        cmd.to_string()
-                    } else {
-                        format!("{}\n{}", cmd, output)
-                    };
-                    content_buffer.set_text(&text);
-                    // Move cursor to end for blinking cursor
+                    set_active_buffer_text(&content_buffer, &cmd, "", &output, false, &palette);
                     let end_iter = content_buffer.end_iter();
                     content_buffer.place_cursor(&end_iter);
 
@@ -1275,13 +1574,7 @@ impl ActiveBlock {
         let cmd = self.pending_cmd.borrow();
         let output = self.pending_output.borrow();
 
-        let text = if output.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{}\n{}", cmd, output)
-        };
-        self.content_buffer.set_text(&text);
-        // Move cursor to end for blinking cursor
+        set_active_buffer_text(&self.content_buffer, &cmd, "", &output, false, &self.palette);
         let end_iter = self.content_buffer.end_iter();
         self.content_buffer.place_cursor(&end_iter);
         self.last_flushed_size.set(output.len());
@@ -1603,13 +1896,13 @@ impl TermView {
                                             continue;
                                         }
 
-                                        let (clean, should_clear) = strip_ansi_with_clear_detect(&text);
+                                        let (_, should_clear) = strip_ansi_with_clear_detect(&text);
                                         if should_clear {
                                             // Clear-screen sequence detected; clear output buffer
                                             active_rc.borrow().pending_output.borrow_mut().clear();
                                             active_rc.borrow().update_content_view();
                                         }
-                                        active_rc.borrow().append_output(&clean);
+                                        active_rc.borrow().append_output(&text);
                                         // Auto-scroll to bottom
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
@@ -1686,9 +1979,11 @@ impl TermView {
                                 let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
 
                                 let output = active_rc.borrow().output_text();
-                                let output_trimmed = output.trim().to_string();
-                                let preview = output.chars().take(20).collect::<String>();
-                                let bytes_preview: Vec<u8> = output.bytes().take(10).collect();
+                                let output_plain = strip_ansi(&output);
+                                let output_trimmed = output_plain.trim().to_string();
+                                let output_display = output.trim().to_string();
+                                let preview = output_plain.chars().take(20).collect::<String>();
+                                let bytes_preview: Vec<u8> = output_plain.bytes().take(10).collect();
                                 log::debug!("CommandEnd: cmd={:?}, output_len_before={}, output_len_after={}, starts_with_newline={}, first_20_chars={:?}, first_10_bytes={:?}",
                                     cmd, output.len(), output_trimmed.len(), output.starts_with('\n'), preview, bytes_preview);
 
@@ -1710,7 +2005,7 @@ impl TermView {
 
                                 // Create widget (physical representation)
                                 let finished = FinishedBlock::new(
-                                    &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_trimmed, *code, &config_for_cb.borrow(),
+                                    &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, *code, &config_for_cb.borrow(),
                                 );
 
                                 // Insert before the active block (which is always last)
@@ -2614,7 +2909,7 @@ fn install_block_css(config: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ansi_to_pango, command_line_plain_text, skip_ansi_visible_chars, strip_ansi};
+    use super::{ansi_text_runs, ansi_to_pango, command_line_plain_text, skip_ansi_visible_chars, strip_ansi};
     use gtk4::gdk::RGBA;
 
     fn palette() -> [RGBA; 16] {
@@ -2639,5 +2934,12 @@ mod tests {
     #[test]
     fn ignores_charset_designation_in_pango_conversion() {
         assert_eq!(ansi_to_pango("\u{1b}(Btop", &palette()), "top");
+    }
+
+    #[test]
+    fn preserves_colored_output_runs() {
+        let runs = ansi_text_runs("a\u{1b}[31mred\u{1b}[0mz", &palette());
+        assert_eq!(runs.iter().map(|run| run.text.as_str()).collect::<String>(), "aredz");
+        assert!(runs.iter().any(|run| run.text == "red" && run.style.foreground.is_some()));
     }
 }
