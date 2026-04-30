@@ -931,6 +931,56 @@ fn set_active_buffer_text(
     }
 }
 
+fn set_active_prompt_buffer(buffer: &TextBuffer, prompt: &str) {
+    buffer.set_text(prompt);
+}
+
+fn set_active_command_buffer(
+    buffer: &TextBuffer,
+    cmd: &str,
+    cursor_visible: bool,
+    suggestion: &str,
+    _palette: &[RGBA; 16],
+) {
+    let cursor_char = if cursor_visible { "█" } else { " " };
+    let text = format!("{}{}{}", cmd, cursor_char, suggestion);
+    buffer.set_text(&text);
+
+    if suggestion.is_empty() {
+        return;
+    }
+
+    let tag_table = buffer.tag_table();
+    if tag_table.lookup("suggestion").is_none() {
+        let tag = gtk4::TextTag::new(Some("suggestion"));
+        tag.set_style(gtk4::pango::Style::Italic);
+        tag.set_foreground_rgba(Some(&RGBA::new(0.5, 0.5, 0.5, 0.7)));
+        tag_table.add(&tag);
+    }
+
+    if let Some(tag) = tag_table.lookup("suggestion") {
+        let start_pos = cmd.chars().count() + cursor_char.chars().count();
+        let end_pos = start_pos + suggestion.chars().count();
+        let start_iter = buffer.iter_at_offset(start_pos as i32);
+        let end_iter = buffer.iter_at_offset(end_pos as i32);
+        buffer.apply_tag(&tag, &start_iter, &end_iter);
+    }
+}
+
+fn set_active_output_buffer(buffer: &TextBuffer, output: &str, palette: &[RGBA; 16]) {
+    let output_no_ansi = strip_ansi(output);
+    let output_plain = output_no_ansi
+        .lines()
+        .map(|line| command_line_plain_text(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    buffer.set_text(&output_plain);
+
+    let output_runs = ansi_text_runs(output, palette);
+    apply_ansi_runs_to_buffer(buffer, 0, &output_runs);
+}
+
+
 fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
     let bytes = input.as_bytes();
     let mut out = String::new();
@@ -1175,16 +1225,24 @@ struct BlockData {
 
 struct FinishedBlock {
     widget: gtk4::Box,
-    content_view: gtk4::TextView,
-    content_buffer: gtk4::TextBuffer,
+    prompt_view: gtk4::TextView,
+    prompt_buffer: gtk4::TextBuffer,
+    command_view: gtk4::TextView,
+    command_buffer: gtk4::TextBuffer,
+    output_view: gtk4::TextView,
+    output_buffer: gtk4::TextBuffer,
 }
 
 impl Clone for FinishedBlock {
     fn clone(&self) -> Self {
         Self {
             widget: self.widget.clone(),
-            content_view: self.content_view.clone(),
-            content_buffer: self.content_buffer.clone(),
+            prompt_view: self.prompt_view.clone(),
+            prompt_buffer: self.prompt_buffer.clone(),
+            command_view: self.command_view.clone(),
+            command_buffer: self.command_buffer.clone(),
+            output_view: self.output_view.clone(),
+            output_buffer: self.output_buffer.clone(),
         }
     }
 }
@@ -1198,108 +1256,65 @@ impl FinishedBlock {
         exit_code: i32,
         config: &Config,
     ) -> Self {
-        // Output is already trimmed by caller, but be defensive
         let block_outer_margin_top = 4;
         let block_outer_margin_bottom = 2;
-        let prompt_margin_top = 4;
-        let prompt_margin_bottom = 2;
-        let content_margin_top = 2;
-        let content_margin_bottom = 6;
+        let view_margin_top = 2;
+        let view_margin_bottom = 2;
 
-        // Outer frame
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
         outer.set_margin_top(block_outer_margin_top);
         outer.set_margin_bottom(block_outer_margin_bottom);
 
-        // Prompt row
-        let prompt_label = gtk4::Label::new(Some(prompt));
-        prompt_label.add_css_class("block-prompt");
-        prompt_label.set_xalign(0.0);
-        prompt_label.set_selectable(true);
-        prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(prompt_margin_top);
-        prompt_label.set_margin_bottom(prompt_margin_bottom);
-        prompt_label.set_single_line_mode(true);
-        outer.append(&prompt_label);
-
-        // Command + output content row using TextView
-        let cmd_box = gtk4::Box::new(Orientation::Horizontal, 8);
-        cmd_box.set_margin_start(0); // TextView has its own left margin
-        cmd_box.set_margin_top(0);
-        cmd_box.set_margin_bottom(0);
-        cmd_box.set_spacing(0);
-        cmd_box.set_can_focus(false);
-        cmd_box.set_focusable(false);
-        // Don't set can_target(false) - need to allow mouse events for TextView selection
-
-        // Create TextView + TextBuffer for content
-        let content_buffer = gtk4::TextBuffer::new(None);
-        let content_view = gtk4::TextView::with_buffer(&content_buffer);
-
-        // Basic styling
-        content_view.add_css_class("block-cmd-finished");
-        content_view.set_wrap_mode(gtk4::WrapMode::Char);
-        content_view.set_monospace(true);
-
-        // Margins (matching the previous cmd_label)
-        content_view.set_left_margin(12);
-        content_view.set_right_margin(8);
-        content_view.set_top_margin(content_margin_top);
-        content_view.set_bottom_margin(content_margin_bottom);
-
-        // Layout
-        content_view.set_hexpand(true);
-        content_view.set_vexpand(false);
-        content_view.set_valign(gtk4::Align::Start);
-
-        // Non-editable
-        content_view.set_editable(false);
-        content_view.set_cursor_visible(false);
-        content_view.set_accepts_tab(false); // Don't capture Tab key
-
-        // Focus management - allow focus for text selection
-        // Non-editable TextView won't capture keyboard input
-        content_view.set_can_focus(true);
-        content_view.set_focusable(true);
-        content_view.set_can_target(true);
-
-        // Combine cmd and output text
-        let output_runs = ansi_text_runs(output, &config.palette);
-        let output_plain = output_runs
-            .iter()
-            .map(|run| run.text.as_str())
-            .collect::<String>();
-
-        let combined_text = if output_plain.is_empty() {
-            if cmd.is_empty() {
-                "(empty)".to_string()
-            } else {
-                cmd.to_string()
-            }
-        } else if cmd.is_empty() {
-            // Historical blocks may have empty cmd - show a subtle indicator
-            format!("[?]\n{}", output_plain)
-        } else {
-            format!("{}\n{}", cmd, output_plain)
+        // Helper to create TextView
+        let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
+            let buffer = gtk4::TextBuffer::new(None);
+            let view = gtk4::TextView::with_buffer(&buffer);
+            view.add_css_class(css_class);
+            view.set_editable(false);
+            view.set_cursor_visible(false);
+            view.set_can_focus(true);
+            view.set_focusable(true);
+            view.set_hexpand(true);
+            view.set_vexpand(false);
+            view.set_valign(gtk4::Align::Start);
+            view.set_wrap_mode(gtk4::WrapMode::Char);
+            view.set_left_margin(12);
+            view.set_right_margin(8);
+            view.set_top_margin(view_margin_top);
+            view.set_bottom_margin(view_margin_bottom);
+            view.set_monospace(true);
+            view.set_accepts_tab(false);
+            (view, buffer)
         };
 
-        content_buffer.set_text(&combined_text);
-        if !output_plain.is_empty() {
-            let output_start = if cmd.is_empty() { 4 } else { cmd.chars().count() + 1 };
-            apply_ansi_runs_to_buffer(&content_buffer, output_start, &output_runs);
-        }
-        cmd_box.append(&content_view);
+        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
+        let (command_view, command_buffer) = create_textview("block-command-view");
+        let (output_view, output_buffer) = create_textview("block-output-view");
 
-        // Exit code badge
+        // Populate buffers
+        set_active_prompt_buffer(&prompt_buffer, prompt);
+
+        let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
+        set_active_command_buffer(&command_buffer, cmd_display, false, "", &config.palette);
+
+        set_active_output_buffer(&output_buffer, output, &config.palette);
+
+        // Append views to outer box
+        outer.append(&prompt_view);
+        outer.append(&command_view);
+        outer.append(&output_view);
+
+        // Exit code badge (horizontal box after views)
         if exit_code != 0 {
+            let badge_box = gtk4::Box::new(Orientation::Horizontal, 0);
+            badge_box.set_margin_start(12);
+            badge_box.set_margin_bottom(6);
             let badge = gtk4::Label::new(Some(&format!(" {exit_code} ")));
             badge.add_css_class("block-exit-bad");
-            badge.set_valign(gtk4::Align::Start);
-            cmd_box.append(&badge);
+            badge_box.append(&badge);
+            outer.append(&badge_box);
         }
-
-        outer.append(&cmd_box);
 
         // Separator line
         let sep_box = gtk4::Separator::new(Orientation::Horizontal);
@@ -1307,8 +1322,12 @@ impl FinishedBlock {
 
         FinishedBlock {
             widget: outer,
-            content_view,
-            content_buffer,
+            prompt_view,
+            prompt_buffer,
+            command_view,
+            command_buffer,
+            output_view,
+            output_buffer,
         }
     }
 
@@ -1321,9 +1340,12 @@ impl FinishedBlock {
 
 struct ActiveBlock {
     widget: gtk4::Box,
-    prompt_label: gtk4::Label,
-    content_view: gtk4::TextView, // TextView for cmd + output
-    content_buffer: gtk4::TextBuffer,
+    prompt_view: gtk4::TextView,
+    prompt_buffer: gtk4::TextBuffer,
+    command_view: gtk4::TextView,
+    command_buffer: gtk4::TextBuffer,
+    output_view: gtk4::TextView,
+    output_buffer: gtk4::TextBuffer,
     pending_output: Rc<RefCell<String>>,
     pending_cmd: Rc<RefCell<String>>,        // User input only
     pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
@@ -1343,71 +1365,59 @@ impl ActiveBlock {
     fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
         let block_outer_margin_top = 4;
         let block_outer_margin_bottom = 2;
-        let prompt_margin_top = 4;
-        let prompt_margin_bottom = 2;
-        let content_margin_top = 2;
-        let content_margin_bottom = 6;
+        let view_margin_top = 2;
+        let view_margin_bottom = 2;
 
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
         widget.set_margin_top(block_outer_margin_top);
         widget.set_margin_bottom(block_outer_margin_bottom);
-        widget.set_can_focus(false); // Don't steal focus from labels
-        widget.set_can_target(false); // Let events pass through to children
-        widget.set_focusable(false); // Prevent any focus interception
+        widget.set_can_focus(false);
+        widget.set_can_target(false);
+        widget.set_focusable(false);
 
-        // Prompt label
-        let prompt_label = gtk4::Label::new(Some(""));
-        prompt_label.add_css_class("block-prompt");
-        prompt_label.set_xalign(0.0);
-        prompt_label.set_selectable(true);
-        prompt_label.set_can_target(true); // Ensure it can receive mouse events
-        prompt_label.set_can_focus(true); // Ensure it can receive focus
-        prompt_label.set_margin_start(12);
-        prompt_label.set_margin_top(prompt_margin_top);
-        prompt_label.set_margin_bottom(prompt_margin_bottom);
-        prompt_label.set_single_line_mode(true);
-        widget.append(&prompt_label);
+        // Helper to create and configure a TextView
+        let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
+            let buffer = TextBuffer::new(None);
+            let view = TextView::with_buffer(&buffer);
+            view.add_css_class(css_class);
+            view.set_editable(false);
+            view.set_cursor_visible(false);
+            view.set_can_focus(true);
+            view.set_focusable(true);
+            view.set_hexpand(true);
+            view.set_vexpand(false);
+            view.set_wrap_mode(gtk4::WrapMode::Char);
+            view.set_left_margin(12);
+            view.set_right_margin(8);
+            view.set_top_margin(view_margin_top);
+            view.set_bottom_margin(view_margin_bottom);
+            view.set_monospace(true);
 
-        // Content view (TextView for cmd + output combined)
-        let content_buffer = TextBuffer::new(None);
-        let content_view = TextView::with_buffer(&content_buffer);
-        content_view.add_css_class("block-cmd-active");
-        content_view.set_hexpand(true);
-        content_view.set_vexpand(false);
-        content_view.set_editable(true); // Enable editing to show blinking cursor
-        content_view.set_cursor_visible(true);
-        content_view.set_can_focus(true);
-        content_view.set_focusable(true);
+            // Block keyboard input
+            let key_controller = EventControllerKey::new();
+            key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
+                glib::Propagation::Stop
+            });
+            view.add_controller(key_controller);
 
-        // Ensure GTK cursor blink is enabled
-        if let Some(settings) = gtk4::Settings::default() {
-            settings.set_property("gtk-cursor-blink", true);
-            settings.set_property("gtk-cursor-blink-time", 1200i32); // 1200ms blink cycle
-        }
+            (view, buffer)
+        };
 
-        // Block keyboard input to keep it read-only while showing cursor
-        let key_controller = EventControllerKey::new();
-        key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
-            glib::Propagation::Stop // Block all keyboard input
-        });
-        content_view.add_controller(key_controller);
-        content_view.set_wrap_mode(gtk4::WrapMode::Char);
-        content_view.set_left_margin(12);
-        content_view.set_right_margin(8);
-        content_view.set_top_margin(content_margin_top);
-        content_view.set_bottom_margin(content_margin_bottom);
-        content_view.set_monospace(true);
-        widget.append(&content_view);
+        // Create three views
+        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
+        let (command_view, command_buffer) = create_textview("block-command-view");
+        let (output_view, output_buffer) = create_textview("block-output-view");
 
-        // Place cursor at the beginning of the buffer and grab focus for cursor blinking
-        let start_iter = content_buffer.start_iter();
-        content_buffer.place_cursor(&start_iter);
+        // Append to widget
+        widget.append(&prompt_view);
+        widget.append(&command_view);
+        widget.append(&output_view);
 
-        // Schedule focus grab after widget is realized
-        let content_view_clone = content_view.clone();
-        content_view.connect_realize(move |_| {
-            content_view_clone.grab_focus();
+        // Grab focus on command_view when realized
+        let command_view_clone = command_view.clone();
+        command_view.connect_realize(move |_| {
+            command_view_clone.grab_focus();
         });
 
         let cursor_visible = Rc::new(Cell::new(true));
@@ -1415,19 +1425,18 @@ impl ActiveBlock {
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
         let pending_output = Rc::new(RefCell::new(String::new()));
 
-        // Start cursor blink animation
+        // Start cursor blink animation - update three views separately
         let cursor_visible_clone = cursor_visible.clone();
-        let content_buffer_clone = content_buffer.clone();
+        let command_buffer_clone = command_buffer.clone();
+        let output_buffer_clone = output_buffer.clone();
         let pending_cmd_clone = pending_cmd.clone();
         let pending_suggestion_clone = pending_suggestion.clone();
         let pending_output_clone = pending_output.clone();
         let palette_for_cursor = config.palette;
 
         glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
-            // Toggle cursor visibility
             cursor_visible_clone.set(!cursor_visible_clone.get());
 
-            // Update display
             let cmd = pending_cmd_clone.borrow();
             let suggestion = pending_suggestion_clone.borrow();
             let output = pending_output_clone.borrow();
@@ -1438,23 +1447,29 @@ impl ActiveBlock {
                 cursor_visible_clone.get()
             );
 
-            set_active_buffer_text(
-                &content_buffer_clone,
+            set_active_command_buffer(
+                &command_buffer_clone,
                 &cmd,
-                &suggestion,
-                &output,
                 cursor_visible_clone.get(),
+                &suggestion,
                 &palette_for_cursor,
             );
+
+            if !output.is_empty() {
+                set_active_output_buffer(&output_buffer_clone, &output, &palette_for_cursor);
+            }
 
             glib::ControlFlow::Continue
         });
 
         ActiveBlock {
             widget,
-            prompt_label,
-            content_view,
-            content_buffer,
+            prompt_view,
+            prompt_buffer,
+            command_view,
+            command_buffer,
+            output_view,
+            output_buffer,
             pending_output,
             pending_cmd,
             pending_suggestion,
@@ -1471,13 +1486,13 @@ impl ActiveBlock {
     }
 
     fn set_prompt(&self, text: &str) {
-        self.prompt_label.set_text(text);
+        set_active_prompt_buffer(&self.prompt_buffer, text);
     }
 
     fn set_cmd(&self, text: &str) {
         log::debug!("set_cmd: text={:?}", text);
         *self.pending_cmd.borrow_mut() = text.to_string();
-        *self.pending_suggestion.borrow_mut() = String::new(); // Clear suggestion when user types
+        *self.pending_suggestion.borrow_mut() = String::new();
         self.update_content_view();
     }
 
@@ -1496,11 +1511,9 @@ impl ActiveBlock {
         self.update_content_view();
     }
 
-    // Helper to update content_view with cmd + output
     fn update_content_view(&self) {
         let cmd = self.pending_cmd.borrow();
         let suggestion = self.pending_suggestion.borrow();
-        let output = self.pending_output.borrow();
         log::debug!(
             "update_content_view: cmd={:?}, suggestion={:?}, cursor_visible={}",
             cmd,
@@ -1508,12 +1521,11 @@ impl ActiveBlock {
             self.cursor_visible.get()
         );
 
-        set_active_buffer_text(
-            &self.content_buffer,
+        set_active_command_buffer(
+            &self.command_buffer,
             &cmd,
-            &suggestion,
-            &output,
             self.cursor_visible.get(),
+            &suggestion,
             &self.palette,
         );
     }
@@ -1522,16 +1534,13 @@ impl ActiveBlock {
         let text_len = text.len();
         self.pending_output.borrow_mut().push_str(text);
 
-        // Track throughput for adaptive batching
         self.bytes_since_last_flush
             .set(self.bytes_since_last_flush.get() + text_len);
 
-        // Schedule flush if not already pending
         if !self.flush_pending.get() {
             self.flush_pending.set(true);
-            let pending_cmd = self.pending_cmd.clone();
             let pending_output = self.pending_output.clone();
-            let content_buffer = self.content_buffer.clone();
+            let output_buffer = self.output_buffer.clone();
             let flush_flag = self.flush_pending.clone();
             let bytes_tracker = self.bytes_since_last_flush.clone();
             let last_flush_time = self.last_flush_time.clone();
@@ -1545,34 +1554,26 @@ impl ActiveBlock {
             glib::timeout_add_local_once(
                 std::time::Duration::from_millis(batch_interval as u64),
                 move || {
-                    // Get current cmd and output
-                    let cmd = pending_cmd.borrow();
                     let output = pending_output.borrow();
 
-                    // Combine and display in TextBuffer
-                    set_active_buffer_text(&content_buffer, &cmd, "", &output, false, &palette);
-                    let end_iter = content_buffer.end_iter();
-                    content_buffer.place_cursor(&end_iter);
+                    set_active_output_buffer(&output_buffer, &output, &palette);
+                    let end_iter = output_buffer.end_iter();
+                    output_buffer.place_cursor(&end_iter);
 
                     last_flushed_size.set(output.len());
 
-                    // Calculate adaptive batch interval based on throughput
                     let now = std::time::Instant::now();
                     let elapsed = now.duration_since(last_flush_time.get());
                     let elapsed_ms = elapsed.as_millis().max(1) as u64;
                     let bytes = bytes_tracker.get();
 
-                    // throughput in bytes/ms
                     let throughput = bytes as f64 / elapsed_ms as f64;
 
                     let new_interval = if throughput > 100.0 {
-                        // High throughput (>100KB/s) - batch aggressively
                         max_ms
                     } else if throughput < 1.0 {
-                        // Low throughput (<1KB/s) - flush quickly for responsiveness
                         min_ms
                     } else {
-                        // Linear interpolation between min and max
                         let t = (throughput - 1.0) / 99.0;
                         min_ms + ((max_ms - min_ms) as f64 * t) as u32
                     };
@@ -1587,12 +1588,11 @@ impl ActiveBlock {
     }
 
     fn flush_output(&self) {
-        let cmd = self.pending_cmd.borrow();
         let output = self.pending_output.borrow();
 
-        set_active_buffer_text(&self.content_buffer, &cmd, "", &output, false, &self.palette);
-        let end_iter = self.content_buffer.end_iter();
-        self.content_buffer.place_cursor(&end_iter);
+        set_active_output_buffer(&self.output_buffer, &output, &self.palette);
+        let end_iter = self.output_buffer.end_iter();
+        self.output_buffer.place_cursor(&end_iter);
         self.last_flushed_size.set(output.len());
     }
 
@@ -1605,7 +1605,7 @@ impl ActiveBlock {
     }
 
     fn grab_focus(&self) {
-        self.content_view.grab_focus();
+        self.command_view.grab_focus();
     }
 }
 
@@ -2085,7 +2085,7 @@ impl TermView {
                                 active_rc.borrow().set_prompt("");
                                 active_rc.borrow().set_cmd("");
                                 // Give focus to active block's TextView
-                                active_rc.borrow().content_view.grab_focus();
+                                active_rc.borrow().command_view.grab_focus();
                             }
                         }
                     }
@@ -2383,7 +2383,7 @@ impl TermView {
         }
 
         // Give initial focus to ActiveBlock's TextView for cursor blinking
-        term_view.active.borrow().content_view.grab_focus();
+        term_view.active.borrow().command_view.grab_focus();
 
         term_view
     }
@@ -2846,6 +2846,45 @@ fn install_block_css(config: &Config) {
             font-size: {font_size};
             line-height: 1.0;
             margin: 0;
+        }}
+        .block-prompt-view {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+        }}
+        .block-prompt-view text {{
+            background-color: {bg_hex};
+        }}
+        .block-command-view {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+        }}
+        .block-command-view text {{
+            background-color: {bg_hex};
+        }}
+        .block-output-view {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+        }}
+        .block-output-view text {{
+            background-color: {bg_hex};
         }}
         .block-cmd {{
             color: {fg_hex};
