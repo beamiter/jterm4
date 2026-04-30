@@ -891,10 +891,13 @@ fn set_active_buffer_text(
     let text = if output.is_empty() {
         format!("{}{}{}", cmd, cursor_char, suggestion)
     } else {
-        let output_plain = ansi_text_runs(output, palette)
-            .into_iter()
-            .map(|run| run.text)
-            .collect::<String>();
+        // First strip ANSI codes, then handle \r per-line
+        let output_no_ansi = strip_ansi(output);
+        let output_plain = output_no_ansi
+            .lines()
+            .map(|line| command_line_plain_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         format!("{}{}\n{}", cmd, cursor_char, output_plain)
     };
 
