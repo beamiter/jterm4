@@ -1462,6 +1462,9 @@ impl ActiveBlock {
             glib::ControlFlow::Continue
         });
 
+        // Initialize command_buffer with initial cursor to show immediately
+        set_active_command_buffer(&command_buffer, "", true, "", &config.palette);
+
         ActiveBlock {
             widget,
             prompt_view,
@@ -2852,12 +2855,12 @@ fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             padding: 0;
-            line-height: 1.0;
+            line-height: 1.2;
             margin: 0;
-            min-height: 0;
             background-color: {bg_hex};
         }}
         .block-prompt-view text {{
+            color: {dim_fg};
             background-color: {bg_hex};
         }}
         .block-command-view {{
@@ -2865,12 +2868,12 @@ fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             padding: 0;
-            line-height: 1.0;
+            line-height: 1.2;
             margin: 0;
-            min-height: 0;
             background-color: {bg_hex};
         }}
         .block-command-view text {{
+            color: {fg_hex};
             background-color: {bg_hex};
         }}
         .block-output-view {{
@@ -2878,12 +2881,12 @@ fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             padding: 0;
-            line-height: 1.0;
+            line-height: 1.2;
             margin: 0;
-            min-height: 0;
             background-color: {bg_hex};
         }}
         .block-output-view text {{
+            color: {fg_hex};
             background-color: {bg_hex};
         }}
         .block-cmd {{

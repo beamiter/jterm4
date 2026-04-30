@@ -606,7 +606,8 @@ impl UiState {
     }
 
     pub(crate) fn toggle_command_palette(&self) {
-        if let Some(dialog) = self.command_palette_dialog.borrow_mut().take() {
+        let dialog_to_close = self.command_palette_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
             dialog.force_close();
             return;
         }
@@ -733,7 +734,8 @@ impl UiState {
                 || (matches!(keyval, Key::P | Key::p)
                     && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
             {
-                if let Some(d) = dialog_ref.borrow_mut().take() {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
                     d.force_close();
                 }
                 return true.into();
@@ -792,7 +794,8 @@ impl UiState {
     }
 
     pub(crate) fn toggle_settings_panel(&self) {
-        if let Some(dialog) = self.settings_dialog.borrow_mut().take() {
+        let dialog_to_close = self.settings_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
             dialog.force_close();
             return;
         }
@@ -958,7 +961,8 @@ impl UiState {
             if matches!(keyval, Key::O | Key::o)
                 && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK)
             {
-                if let Some(d) = dialog_ref.borrow_mut().take() {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
                     d.force_close();
                 }
                 return true.into();
