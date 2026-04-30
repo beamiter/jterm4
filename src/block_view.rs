@@ -942,7 +942,7 @@ fn set_active_command_buffer(
     suggestion: &str,
     _palette: &[RGBA; 16],
 ) {
-    let cursor_char = if cursor_visible { "█" } else { " " };
+    let cursor_char = if cursor_visible { "▎" } else { " " };
     let text = format!("{}{}{}", cmd, cursor_char, suggestion);
     buffer.set_text(&text);
 
@@ -1365,8 +1365,8 @@ impl ActiveBlock {
     fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
         let block_outer_margin_top = 4;
         let block_outer_margin_bottom = 2;
-        let view_margin_top = 2;
-        let view_margin_bottom = 2;
+        let view_margin_top = 0;
+        let view_margin_bottom = 0;
 
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
@@ -2858,6 +2858,7 @@ fn install_block_css(config: &Config) {
             line-height: 1.2;
             margin: 0;
             background-color: {bg_hex};
+            min-height: 48px;
         }}
         .block-prompt-view text {{
             color: {dim_fg};
@@ -2871,6 +2872,7 @@ fn install_block_css(config: &Config) {
             line-height: 1.2;
             margin: 0;
             background-color: {bg_hex};
+            min-height: 48px;
         }}
         .block-command-view text {{
             color: {fg_hex};
@@ -2884,6 +2886,7 @@ fn install_block_css(config: &Config) {
             line-height: 1.2;
             margin: 0;
             background-color: {bg_hex};
+            min-height: 48px;
         }}
         .block-output-view text {{
             color: {fg_hex};
