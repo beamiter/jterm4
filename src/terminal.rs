@@ -9,7 +9,7 @@ use gtk4::{glib, Entry, Label, Orientation, Paned};
 use gtk4::GestureClick;
 use libadwaita as adw;
 use adw::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -66,6 +66,95 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
     terminal.match_add_regex(&regex_pattern.unwrap(), 0);
 
     terminal
+}
+
+// ─── VteTerminalView ──────────────────────────────────────────────────────
+
+pub struct VteTerminalView {
+    root: gtk4::Box,
+    terminal: Terminal,
+    cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
+    exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
+}
+
+impl VteTerminalView {
+    pub fn new(config: &Config, shell_argv: &[String], working_directory: Option<&str>) -> Self {
+        // Create Terminal widget
+        let terminal = create_terminal(config);
+
+        // Wrap with scrollbar
+        let root = wrap_with_scrollbar(&terminal);
+        root.add_css_class("vte-view-root");
+
+        let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
+        let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
+
+        // Listen for OSC 7 (CWD changes)
+        let cwd_callbacks_clone = cwd_callbacks.clone();
+        let terminal_for_cwd = terminal.clone();
+        terminal.connect_current_directory_uri_notify(move |_| {
+            if let Some(uri) = terminal_for_cwd.current_directory_uri() {
+                let file = gio::File::for_uri(uri.as_str());
+                if let Some(path) = file.path().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()) {
+                    for callback in cwd_callbacks_clone.borrow().iter() {
+                        callback(&path);
+                    }
+                }
+            }
+        });
+
+        // Listen for child-exited signal
+        let exited_callbacks_clone = exited_callbacks.clone();
+        terminal.connect_child_exited(move |_term, status| {
+            for callback in exited_callbacks_clone.borrow().iter() {
+                callback(status);
+            }
+        });
+
+        // Spawn shell
+        spawn_shell(&terminal, shell_argv, working_directory, None, None);
+
+        VteTerminalView {
+            root,
+            terminal,
+            cwd_callbacks,
+            exited_callbacks,
+        }
+    }
+
+    pub fn widget(&self) -> gtk4::Widget {
+        self.root.clone().upcast()
+    }
+
+    pub fn vte(&self) -> &Terminal {
+        &self.terminal
+    }
+
+    pub fn connect_cwd_changed<F>(&self, callback: F)
+    where
+        F: Fn(&str) + 'static,
+    {
+        self.cwd_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn connect_exited<F>(&self, callback: F)
+    where
+        F: Fn(i32) + 'static,
+    {
+        self.exited_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn grab_focus(&self) {
+        self.terminal.grab_focus();
+    }
+
+    pub fn copy_to_clipboard(&self) {
+        self.terminal.copy_clipboard_format(vte4::Format::Text);
+    }
+
+    pub fn paste_from_clipboard(&self) {
+        self.terminal.paste_clipboard();
+    }
 }
 
 /// Wrap a terminal in an hbox with a scrollbar on the right side.

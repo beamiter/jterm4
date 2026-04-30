@@ -25,7 +25,14 @@ use crate::terminal::{
     setup_terminal_click_handler, show_rename_dialog, show_rename_dialog_with_strip,
     default_tab_title,
     find_first_terminal, find_focused_terminal, collect_terminals, reattach_terminal_to_tree,
+    VteTerminalView,
 };
+
+#[derive(Clone)]
+pub(crate) enum TerminalViewType {
+    Block(Rc<TermView>),
+    Vte(Rc<VteTerminalView>),
+}
 
 pub(crate) struct ZoomState {
     pub(crate) original_page: gtk4::Widget,
@@ -533,16 +540,23 @@ impl UiState {
         })
     }
 
-    pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
+    pub(crate) fn current_terminal_view_type(&self) -> Option<TerminalViewType> {
         self.notebook.current_page().and_then(|page_num| {
             self.notebook.nth_page(Some(page_num)).and_then(|widget| {
                 // SAFETY: data() returns a NonNull to data we stored on the widget
                 unsafe {
-                    widget.data::<Rc<TermView>>("term-view")
+                    widget.data::<TerminalViewType>("terminal-view-type")
                         .map(|ptr| ptr.as_ref().clone())
                 }
             })
         })
+    }
+
+    pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
+        match self.current_terminal_view_type() {
+            Some(TerminalViewType::Block(term_view)) => Some(term_view),
+            _ => None,
+        }
     }
 
     pub(crate) fn toggle_search(&self) {
@@ -1559,7 +1573,7 @@ impl UiState {
         terminal.grab_focus();
     }
 
-    pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
+    pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, _initial_commands: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -1567,27 +1581,75 @@ impl UiState {
         let sid = session_id.unwrap_or_else(generate_session_id);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
 
-        // Create block-mode terminal view (owns PTY + parser + block rendering)
-        let term_view = Rc::new(TermView::new(
-            &self.config.borrow(),
-            self.shell_argv.as_ref(),
-            working_directory.as_deref(),
-        ));
-        let terminal = term_view.vte().clone();
-        let term_view_widget = term_view.widget();
+        // Create terminal view based on configured mode
+        let config = self.config.borrow();
+        let (view_type, terminal) = match &config.terminal_mode {
+            crate::config::TerminalMode::Block => {
+                let term_view = Rc::new(TermView::new(
+                    &config,
+                    self.shell_argv.as_ref(),
+                    working_directory.as_deref(),
+                ));
+                let terminal = term_view.vte().clone();
+                (TerminalViewType::Block(term_view), terminal)
+            }
+            crate::config::TerminalMode::Vte => {
+                let vte_view = Rc::new(VteTerminalView::new(
+                    &config,
+                    self.shell_argv.as_ref(),
+                    working_directory.as_deref(),
+                ));
+                let terminal = vte_view.vte().clone();
+                (TerminalViewType::Vte(vte_view), terminal)
+            }
+        };
+        drop(config);
 
-        // Setup click handler for hyperlinks and context menu (uses VTE inside TermView)
+        // Setup click handler for hyperlinks and context menu (uses VTE inside both views)
         setup_terminal_click_handler(&terminal);
         self.setup_context_menu(&terminal);
 
-        // Connect child-exited to close the tab
-        let ui_for_exit = UiState::clone(self);
-        let exit_widget = term_view_widget.clone();
-        let term_view_for_exit = term_view.clone();
-        term_view.connect_exited(move |_code| {
-            let _ = term_view_for_exit.save_history();
-            ui_for_exit.handle_terminal_exited(&exit_widget);
-        });
+        // Connect callbacks based on view type
+        match &view_type {
+            TerminalViewType::Block(term_view) => {
+                let ui_for_exit = UiState::clone(self);
+                let term_view_for_exit = term_view.clone();
+                let tab_num_for_exit = tab_num;
+                term_view.connect_exited(move |_code| {
+                    let _ = term_view_for_exit.save_history();
+                    // Find the widget by tab number and close it
+                    for i in 0..ui_for_exit.notebook.n_pages() {
+                        if let Some(page_widget) = ui_for_exit.notebook.nth_page(Some(i)) {
+                            if page_widget.widget_name() == format!("tab-{}", tab_num_for_exit) {
+                                let eff_widget = scrollbar_wrapper_of(&page_widget)
+                                    .map(|bx| bx.upcast::<gtk4::Widget>())
+                                    .unwrap_or_else(|| page_widget.clone());
+                                ui_for_exit.handle_terminal_exited(&eff_widget);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            TerminalViewType::Vte(vte_view) => {
+                let ui_for_exit = UiState::clone(self);
+                let tab_num_for_exit = tab_num;
+                vte_view.connect_exited(move |_code| {
+                    // Find the widget by tab number and close it
+                    for i in 0..ui_for_exit.notebook.n_pages() {
+                        if let Some(page_widget) = ui_for_exit.notebook.nth_page(Some(i)) {
+                            if page_widget.widget_name() == format!("tab-{}", tab_num_for_exit) {
+                                let eff_widget = scrollbar_wrapper_of(&page_widget)
+                                    .map(|bx| bx.upcast::<gtk4::Widget>())
+                                    .unwrap_or_else(|| page_widget.clone());
+                                ui_for_exit.handle_terminal_exited(&eff_widget);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         // Create tab header with a close button
         let tab_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
@@ -1625,18 +1687,39 @@ impl UiState {
         let tab_index_for_pwd = tab_num + 1;
         let strip_btn_label: Rc<RefCell<Option<Label>>> = Rc::new(RefCell::new(None));
         let strip_btn_label_for_pwd = strip_btn_label.clone();
-        term_view.connect_cwd_changed(move |dir| {
-            if custom_title_for_pwd.get() {
-                return;
+
+        match &view_type {
+            TerminalViewType::Block(term_view) => {
+                let term_view_for_pwd = term_view.clone();
+                term_view_for_pwd.connect_cwd_changed(move |dir| {
+                    if custom_title_for_pwd.get() {
+                        return;
+                    }
+                    let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
+                    if label_for_pwd.text().as_str() != new_title {
+                        label_for_pwd.set_text(&new_title);
+                        if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
+                            btn_label.set_text(&new_title);
+                        }
+                    }
+                });
             }
-            let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
-            if label_for_pwd.text().as_str() != new_title {
-                label_for_pwd.set_text(&new_title);
-                if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
-                    btn_label.set_text(&new_title);
-                }
+            TerminalViewType::Vte(vte_view) => {
+                let vte_view_for_pwd = vte_view.clone();
+                vte_view_for_pwd.connect_cwd_changed(move |dir| {
+                    if custom_title_for_pwd.get() {
+                        return;
+                    }
+                    let new_title = default_tab_title(tab_index_for_pwd, Some(dir));
+                    if label_for_pwd.text().as_str() != new_title {
+                        label_for_pwd.set_text(&new_title);
+                        if let Some(ref btn_label) = *strip_btn_label_for_pwd.borrow() {
+                            btn_label.set_text(&new_title);
+                        }
+                    }
+                });
             }
-        });
+        }
 
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.set_focus_on_click(false);
@@ -1648,13 +1731,23 @@ impl UiState {
         tab_box.append(&label);
         tab_box.append(&close_button);
 
-        // TermView root widget (replaces wrap_with_scrollbar)
-        let term_wrapper = {
-            let w = term_view.widget();
-            w.downcast::<gtk4::Box>().expect("TermView root must be a Box")
+        // Get the widget from the view
+        let term_wrapper = match &view_type {
+            TerminalViewType::Block(term_view) => {
+                let w = term_view.widget();
+                w.downcast::<gtk4::Box>().expect("TermView root must be a Box")
+            }
+            TerminalViewType::Vte(vte_view) => {
+                let w = vte_view.widget();
+                w.downcast::<gtk4::Box>().expect("VteTerminalView root must be a Box")
+            }
         };
+
+        // Store the view type on the widget
+        let term_wrapper_for_name = term_wrapper.clone();
+        term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
         unsafe {
-            term_wrapper.set_data::<Rc<TermView>>("term-view", term_view.clone());
+            term_wrapper.set_data::<TerminalViewType>("terminal-view-type", view_type.clone());
         }
 
         let ui_for_close = UiState::clone(self);
@@ -1895,7 +1988,10 @@ impl UiState {
         self.sync_tab_bar_visibility();
 
         // Focus the new terminal
-        term_view.grab_focus();
+        match &view_type {
+            TerminalViewType::Block(term_view) => term_view.grab_focus(),
+            TerminalViewType::Vte(vte_view) => vte_view.grab_focus(),
+        }
 
         terminal
     }

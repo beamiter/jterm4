@@ -7,6 +7,16 @@ use std::path::{Path, PathBuf};
 use crate::keybindings::KeybindingMap;
 
 // ---------------------------------------------------------------------------
+// Terminal Mode
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) enum TerminalMode {
+    Block,
+    Vte,
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -24,6 +34,7 @@ pub(crate) struct Config {
     pub(crate) palette: [RGBA; 16],
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
+    pub(crate) terminal_mode: TerminalMode,
     // Block view optimizations
     pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
@@ -214,6 +225,7 @@ struct FileConfig {
     keybindings: Option<toml::Table>,
     /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
     startup_commands: Option<String>,
+    terminal_mode: Option<String>,
     // Block view optimizations
     ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
@@ -250,6 +262,7 @@ fn load_file_config() -> FileConfig {
         cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         keybindings: table.get("keybindings").and_then(|v| v.as_table()).cloned(),
         startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        terminal_mode: table.get("terminal_mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
         ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
         output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
@@ -332,6 +345,15 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.block_history_path);
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
 
+    // Parse terminal mode (default: block)
+    let terminal_mode_str = env_string("JTERM4_MODE")
+        .or(fc.terminal_mode)
+        .unwrap_or_else(|| "block".to_string());
+    let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
+        "vte" => TerminalMode::Vte,
+        _ => TerminalMode::Block,
+    };
+
     let config = Config {
         window_opacity,
         terminal_scrollback_lines,
@@ -344,6 +366,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor_foreground,
         palette: theme.palette,
         startup_commands: fc.startup_commands,
+        terminal_mode,
         ansi_cache_capacity,
         max_visible_blocks,
         output_batch_min_ms,
