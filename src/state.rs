@@ -129,9 +129,15 @@ pub(crate) fn load_tabs_state() -> (
     Vec<(Option<String>, String, Option<String>, Option<String>)>,
 ) {
     let path = tabs_state_file_path();
+    log::info!("Loading tabs state from: {}", path.display());
+
     let Ok(contents) = fs::read_to_string(&path) else {
+        log::info!("No tabs state file found (first run or no previous state)");
         return (None, Vec::new());
     };
+
+    let (current_page, tabs) = parse_tabs_state(&contents);
+    log::info!("Loaded {} tabs from state file", tabs.len());
 
     // Consume-on-start: delete after read so only one instance restores this snapshot.
     // Each instance writes its own state on close; the last one closed wins.
@@ -139,7 +145,7 @@ pub(crate) fn load_tabs_state() -> (
         log::debug!("Failed to remove tabs state {}: {err}", path.display());
     }
 
-    parse_tabs_state(&contents)
+    (current_page, tabs)
 }
 
 pub(crate) fn tab_label_text(notebook: &Notebook, widget: &gtk4::Widget) -> Option<String> {
@@ -359,15 +365,18 @@ pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
 
 pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
     let path = tabs_state_file_path();
+    log::info!("Saving tabs state to: {}", path.display());
+
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            log::warn!("Failed to create state dir {}: {err}", parent.display());
+            log::error!("Failed to create state dir {}: {err}", parent.display());
             return;
         }
     }
 
     let home = std::env::var("HOME").ok();
     let n_pages = notebook.n_pages();
+    log::info!("Saving {} tabs", n_pages);
     let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 1);
     if let Some(current) = notebook.current_page() {
         lines.push(format!("current_page={current}"));
@@ -423,7 +432,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     );
 
     if let Err(err) = fs::write(&tmp_path, &payload) {
-        log::warn!(
+        log::error!(
             "Failed to write temp state file {}: {err}",
             tmp_path.display()
         );
@@ -434,12 +443,15 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         // On some platforms rename may fail if the destination exists; fall back to remove+rename.
         let _ = fs::remove_file(&path);
         if let Err(err2) = fs::rename(&tmp_path, &path) {
-            log::warn!(
+            log::error!(
                 "Failed to move temp state file {} into place {}: {err} / {err2}",
                 tmp_path.display(),
                 path.display()
             );
             let _ = fs::remove_file(&tmp_path);
+            return;
         }
     }
+
+    log::info!("Successfully saved tabs state to {}", path.display());
 }

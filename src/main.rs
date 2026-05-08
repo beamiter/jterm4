@@ -310,6 +310,31 @@ fn main() -> glib::ExitCode {
             }
         }
 
+        // Auto-save tabs state when tabs are added or removed.
+        // Use idle_add to defer saving until after the page is fully initialized.
+        let session_ids_for_page_added = ui.session_ids.clone();
+        let notebook_clone_for_added = notebook.clone();
+        notebook.connect_page_added(move |_notebook, _child, _page_num| {
+            let nb = notebook_clone_for_added.clone();
+            let sids = session_ids_for_page_added.clone();
+            glib::idle_add_local_once(move || {
+                save_tabs_state(&nb, &sids.borrow());
+            });
+        });
+
+        let session_ids_for_page_removed = ui.session_ids.clone();
+        let notebook_clone_for_removed = notebook.clone();
+        notebook.connect_page_removed(move |_notebook, _child, _page_num| {
+            let nb = notebook_clone_for_removed.clone();
+            let sids = session_ids_for_page_removed.clone();
+            glib::idle_add_local_once(move || {
+                save_tabs_state(&nb, &sids.borrow());
+            });
+        });
+
+        // Save initial state after tabs are restored
+        save_tabs_state(&notebook, &ui.session_ids.borrow());
+
         // Setup key controller on window level with Capture phase
         // This allows us to intercept shortcuts before the terminal processes them
         let key_controller = EventControllerKey::new();
