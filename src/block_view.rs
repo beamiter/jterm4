@@ -1,18 +1,77 @@
 /// TermView — block-based terminal widget.
 ///
-/// Layout:
-///   root (gtk4::Box, Vertical)
-///     ├── block_scroll (ScrolledWindow)  — shown in block mode
-///     │   └── block_list (gtk4::Box, Vertical)
-///     │       ├── finished blocks …
-///     │       └── active_block (gtk4::Box, Vertical)
-///     │           ├── prompt_row (gtk4::Box, Horizontal)
-///     │           │   └── prompt_label
-///     │           ├── cmd_row (gtk4::Box, Horizontal)
-///     │           │   └── cmd_label
-///     │           └── live_view (gtk4::TextView) — live output
-///     └── vte_box (gtk4::Box)            — shown in alt-screen mode
-///         └── vte4::Terminal + Scrollbar
+/// # Overview
+///
+/// TermView implements a "block mode" terminal that displays command history as
+/// discrete blocks, each containing a prompt, command, and output. This is in
+/// contrast to traditional line-based terminal emulators.
+///
+/// # Architecture
+///
+/// ## Widget Hierarchy
+///
+/// ```text
+/// root (gtk4::Box, Vertical)
+///   ├── block_scroll (ScrolledWindow)  — shown in block mode
+///   │   └── block_list (gtk4::Box, Vertical)
+///   │       ├── finished blocks …
+///   │       └── active_block (gtk4::Box, Vertical)
+///   │           ├── prompt_row (gtk4::Box, Horizontal)
+///   │           │   └── prompt_label
+///   │           ├── cmd_row (gtk4::Box, Horizontal)
+///   │           │   └── cmd_label
+///   │           └── live_view (gtk4::TextView) — live output
+///   └── vte_box (gtk4::Box)            — shown in alt-screen mode
+///       └── vte4::Terminal + Scrollbar
+/// ```
+///
+/// ## State Machine
+///
+/// The PTY reader processes output through a state machine:
+/// - **Idle**: Waiting for prompt
+/// - **CollectingPrompt**: Accumulating prompt output (OSC 133;A to OSC 133;B)
+/// - **AwaitingCommand**: Prompt complete, waiting for user input
+/// - **CollectingOutput**: Executing command, collecting output (OSC 133;C to OSC 133;D)
+/// - **AltScreen**: Full-screen application (vim, less, etc.) - switches to VTE fallback
+///
+/// ## Performance Optimizations
+///
+/// - **ANSI Cache (LRU)**: Caches ANSI-to-Pango conversions to avoid re-parsing
+/// - **Output Batching**: Coalesces rapid output into batches (configurable min/max ms)
+/// - **Scroll Debouncing**: Defers scroll updates to avoid cascade of timers
+/// - **Widget Pool**: Reuses block widgets to reduce allocation overhead
+/// - **Virtual Scrolling**: Only renders visible blocks (future enhancement)
+///
+/// ## Session Persistence
+///
+/// - Session ID passed via `--session` flag to rsh
+/// - Working directory tracked via OSC 7 or `/proc/<pid>/cwd`
+/// - Restorable commands (nix develop, ssh, docker) detected and saved
+/// - Commands replayed on PromptEnd events during restoration
+///
+/// # Module Organization
+///
+/// - `block_view.rs` - Main TermView implementation (3000+ lines)
+/// - `block_view_types.rs` - Type definitions (BlockState, BlockData, etc.)
+/// - `parser.rs` - OSC 133 sequence parsing
+/// - `pty.rs` - PTY management
+///
+/// # Layout
+///
+/// ```text
+/// root (gtk4::Box, Vertical)
+///   ├── block_scroll (ScrolledWindow)  — shown in block mode
+///   │   └── block_list (gtk4::Box, Vertical)
+///   │       ├── finished blocks …
+///   │       └── active_block (gtk4::Box, Vertical)
+///   │           ├── prompt_row (gtk4::Box, Horizontal)
+///   │           │   └── prompt_label
+///   │           ├── cmd_row (gtk4::Box, Horizontal)
+///   │           │   └── cmd_label
+///   │           └── live_view (gtk4::TextView) — live output
+///   └── vte_box (gtk4::Box)            — shown in alt-screen mode
+///       └── vte4::Terminal + Scrollbar
+/// ```
 use gtk4::gdk::RGBA;
 use gtk4::glib::translate::IntoGlib;
 use gtk4::pango::FontDescription;
