@@ -1,12 +1,10 @@
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
-use std::cell::RefCell;
 use std::ffi::CString;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
-use std::rc::Rc;
 use std::sync::mpsc;
 use gtk4::glib;
 

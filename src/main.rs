@@ -18,13 +18,12 @@ use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::rc::Rc;
 
 use config::{load_config, config_file_path, choose_shell_argv};
 use keybindings::{Action, KeyCombo, normalize_key};
 use state::{load_tabs_state, save_tabs_state, kill_all_terminal_children};
-use terminal::{terminal_working_directory, find_first_terminal, looks_like_legacy_default_title};
+use terminal::{terminal_working_directory, find_first_terminal};
 use ui::UiState;
 
 struct SimpleStderrLogger {

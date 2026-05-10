@@ -17,7 +17,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::{Config, Theme, load_config, save_config};
 use crate::keybindings::{Action, Direction, KeybindingMap};
-use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
+use crate::state::{generate_session_id, kill_terminal_child};
 use crate::block_view::TermView;
 use crate::terminal::{
     create_terminal, wrap_with_scrollbar, scrollbar_wrapper_of,
@@ -1650,7 +1650,7 @@ impl UiState {
                 // First, create a temporary leaf to get a page
                 let _terminal = self.add_new_tab(None, tab_name.clone(), None, None);
                 let page_num = self.notebook.n_pages().saturating_sub(1);
-                let page_widget = self
+                let _page_widget = self
                     .notebook
                     .nth_page(Some(page_num))
                     .expect("Just added a page");

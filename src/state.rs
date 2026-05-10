@@ -467,7 +467,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         }
     }
 
-    let home = std::env::var("HOME").ok();
+    let _home = std::env::var("HOME").ok();
     let n_pages = notebook.n_pages();
     log::info!("Saving {} tabs", n_pages);
     let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 1);

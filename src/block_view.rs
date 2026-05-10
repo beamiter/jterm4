@@ -1976,7 +1976,7 @@ impl TermView {
                                         let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
 
                                         // Use LRU cache for ANSI → Pango conversion
-                                        let user_markup = {
+                                        let _user_markup = {
                                             let mut cache = ansi_cache_for_cb.borrow_mut();
                                             if let Some(cached) = cache.get(&user_raw) {
                                                 cached.clone()
