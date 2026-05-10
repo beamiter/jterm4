@@ -272,26 +272,47 @@ impl UiState {
         }
     }
 
+    async fn confirm_close_tab_with_process(
+        window: &adw::ApplicationWindow,
+        process_info: &str,
+    ) -> bool {
+        let dialog = adw::MessageDialog::builder()
+            .heading("Close tab with running process?")
+            .body(&format!(
+                "This tab has a running process:\n\n{}\n\nClosing will terminate it.",
+                process_info
+            ))
+            .transient_for(window)
+            .modal(true)
+            .build();
+
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("close", "Close Tab");
+        dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        dialog.choose_future().await == "close"
+    }
+
     pub(crate) fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
-        // Kill all shell processes in this tab before removing it
-        if !kill_widget_child_processes(widget) {
-            let mut terms = Vec::new();
-            collect_terminals(widget, &mut terms);
-            for term in &terms {
-                kill_terminal_child(term);
+        // Check for running process before closing
+        if let Some(terminal) = find_first_terminal(widget) {
+            if let Some(process_info) = crate::state::get_restorable_commands(&terminal) {
+                // Spawn async confirmation dialog
+                let ui_state = self.clone();
+                let widget_clone = widget.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    if Self::confirm_close_tab_with_process(&ui_state.window, &process_info).await {
+                        ui_state.remove_tab_by_widget_internal(&widget_clone);
+                    }
+                });
+                return;
             }
         }
-        self.remove_strip_button_for(widget);
-        if let Some(page_num) = self.notebook.page_num(widget) {
-            self.notebook.remove_page(Some(page_num));
-        }
-        if self.notebook.n_pages() == 0 {
-            self.window.destroy();
-        } else {
-            self.sync_tab_strip_active(None);
-            self.sync_tab_bar_visibility();
-            self.focus_current_terminal();
-        }
+
+        // No running process, close immediately
+        self.remove_tab_by_widget_internal(widget);
     }
 
     /// Handle a terminal exiting: unsplit if in a Paned, or close the tab.
@@ -495,23 +516,47 @@ impl UiState {
 
     pub(crate) fn remove_current_tab(&self) {
         if let Some(page_num) = self.notebook.current_page() {
-            // Kill shell processes and remove the strip button for the current page
             if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
-                let mut terms = Vec::new();
-                collect_terminals(&widget, &mut terms);
-                for term in &terms {
-                    kill_terminal_child(term);
+                // Check for running process before closing
+                if let Some(terminal) = find_first_terminal(&widget) {
+                    if let Some(process_info) = crate::state::get_restorable_commands(&terminal) {
+                        // Spawn async confirmation dialog
+                        let ui_state = self.clone();
+                        let widget_clone = widget.clone();
+                        glib::MainContext::default().spawn_local(async move {
+                            if Self::confirm_close_tab_with_process(&ui_state.window, &process_info).await {
+                                ui_state.remove_tab_by_widget_internal(&widget_clone);
+                            }
+                        });
+                        return;
+                    }
                 }
-                self.remove_strip_button_for(&widget);
+
+                // No running process, close immediately
+                self.remove_tab_by_widget_internal(&widget);
             }
+        }
+    }
+
+    fn remove_tab_by_widget_internal(&self, widget: &gtk4::Widget) {
+        // Kill shell processes and remove the strip button for the current page
+        let mut terms = Vec::new();
+        collect_terminals(widget, &mut terms);
+        for term in &terms {
+            kill_terminal_child(term);
+        }
+        self.remove_strip_button_for(widget);
+
+        if let Some(page_num) = self.notebook.page_num(widget) {
             self.notebook.remove_page(Some(page_num));
-            if self.notebook.n_pages() == 0 {
-                self.window.destroy();
-            } else {
-                self.sync_tab_strip_active(None);
-                self.sync_tab_bar_visibility();
-                self.focus_current_terminal();
-            }
+        }
+
+        if self.notebook.n_pages() == 0 {
+            self.window.destroy();
+        } else {
+            self.sync_tab_strip_active(None);
+            self.sync_tab_bar_visibility();
+            self.focus_current_terminal();
         }
     }
 
