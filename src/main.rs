@@ -292,14 +292,21 @@ fn main() -> glib::ExitCode {
             let startup = ui.config.borrow().startup_commands.clone();
             ui.add_new_tab(None, None, None, startup);
         } else {
-            for (name, path, session_id, commands) in saved_tabs {
-                let dir = if Path::new(&path).is_dir() { Some(path) } else { None };
-                let effective_name = if dir.is_some() {
-                    name.and_then(|n| if looks_like_legacy_default_title(&n) { None } else { Some(n) })
+            for (name, layout) in saved_tabs {
+                // For now, only handle simple Leaf layouts
+                // TODO: Implement Split layout restoration
+                if let state::PaneLayout::Leaf { dir, sid, cmds } = layout {
+                    let valid_dir = if Path::new(&dir).is_dir() { Some(dir) } else { None };
+                    let effective_name = if valid_dir.is_some() {
+                        name.and_then(|n| if looks_like_legacy_default_title(&n) { None } else { Some(n) })
+                    } else {
+                        name
+                    };
+                    ui.add_new_tab(valid_dir, effective_name, Some(sid), cmds);
                 } else {
-                    name
-                };
-                ui.add_new_tab(dir, effective_name, session_id, commands);
+                    log::warn!("Split layout restoration not yet implemented, creating simple tab");
+                    ui.add_new_tab(None, name, None, None);
+                }
             }
 
             if let Some(page) = saved_current {

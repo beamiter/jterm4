@@ -1,6 +1,7 @@
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{Label, Notebook};
+use gtk4::{Label, Notebook, Paned};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -26,6 +27,66 @@ pub(crate) fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{}-{}", std::process::id(), ts)
+}
+
+/// Pane layout structure for serialization
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum PaneLayout {
+    Leaf {
+        dir: String,
+        sid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+    },
+    Split {
+        orientation: char,  // 'h' or 'v'
+        position: i32,
+        start: Box<PaneLayout>,
+        end: Box<PaneLayout>,
+    },
+}
+
+/// Serialize a pane layout tree from a GTK widget
+pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap<u32, String>) -> PaneLayout {
+    if let Some(paned) = widget.downcast_ref::<Paned>() {
+        let orientation = match paned.orientation() {
+            gtk4::Orientation::Horizontal => 'h',
+            gtk4::Orientation::Vertical => 'v',
+            _ => 'h',
+        };
+
+        let start = paned.start_child().expect("Paned must have start child");
+        let end = paned.end_child().expect("Paned must have end child");
+
+        PaneLayout::Split {
+            orientation,
+            position: paned.position(),
+            start: Box::new(serialize_pane_layout(&start, session_ids)),
+            end: Box::new(serialize_pane_layout(&end, session_ids)),
+        }
+    } else {
+        // Leaf terminal
+        let terminal = find_first_terminal(widget).expect("Leaf must contain terminal");
+        let dir = terminal_working_directory(&terminal)
+            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+
+        // Extract tab number from widget name "tab-N" and lookup session_id
+        let widget_name = widget.widget_name();
+        let sid = if let Some(tab_str) = widget_name.to_string().strip_prefix("tab-") {
+            if let Ok(tab_num) = tab_str.parse::<u32>() {
+                session_ids.get(&tab_num).cloned().unwrap_or_else(generate_session_id)
+            } else {
+                generate_session_id()
+            }
+        } else {
+            generate_session_id()
+        };
+
+        let cmds = get_restorable_commands(&terminal);
+
+        PaneLayout::Leaf { dir, sid, cmds }
+    }
 }
 
 pub(crate) fn escape_tab_state(value: &str) -> String {
@@ -66,10 +127,10 @@ pub(crate) fn parse_tabs_state(
     contents: &str,
 ) -> (
     Option<u32>,
-    Vec<(Option<String>, String, Option<String>, Option<String>)>,
+    Vec<(Option<String>, PaneLayout)>,
 ) {
     let mut current_page: Option<u32> = None;
-    let mut tabs: Vec<(Option<String>, String, Option<String>, Option<String>)> = Vec::new();
+    let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -81,44 +142,76 @@ pub(crate) fn parse_tabs_state(
             continue;
         }
         if let Some(rest) = line.strip_prefix("tab=") {
-            // Split into all tab-separated fields
+            // Split into fields
             let fields: Vec<&str> = rest.splitn(4, '\t').collect();
             match fields.len() {
                 1 => {
                     // Just dir (legacy)
                     let dir = unescape_tab_state(fields[0]);
-                    tabs.push((None, dir, None, None));
+                    let layout = PaneLayout::Leaf {
+                        dir,
+                        sid: generate_session_id(),
+                        cmds: None,
+                    };
+                    tabs.push((None, layout));
                 }
                 2 => {
-                    // name + dir
+                    // New format: name + layout_json OR legacy: name + dir
                     let name = unescape_tab_state(fields[0]);
-                    let dir = unescape_tab_state(fields[1]);
-                    tabs.push((Some(name), dir, None, None));
+                    let data = unescape_tab_state(fields[1]);
+
+                    // Try parsing as JSON first (new format)
+                    if let Ok(layout) = serde_json::from_str::<PaneLayout>(&data) {
+                        tabs.push((Some(name), layout));
+                    } else {
+                        // Legacy: treat as directory
+                        let layout = PaneLayout::Leaf {
+                            dir: data,
+                            sid: generate_session_id(),
+                            cmds: None,
+                        };
+                        tabs.push((Some(name), layout));
+                    }
                 }
                 3 => {
-                    // name + dir + session_id
+                    // Legacy: name + dir + session_id
                     let name = unescape_tab_state(fields[0]);
                     let dir = unescape_tab_state(fields[1]);
                     let sid = unescape_tab_state(fields[2]);
-                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
-                    tabs.push((Some(name), dir, effective_sid, None));
+                    let effective_sid = if sid.is_empty() { generate_session_id() } else { sid };
+                    let layout = PaneLayout::Leaf {
+                        dir,
+                        sid: effective_sid,
+                        cmds: None,
+                    };
+                    tabs.push((Some(name), layout));
                 }
                 4 => {
-                    // name + dir + session_id + commands
+                    // Legacy: name + dir + session_id + commands
                     let name = unescape_tab_state(fields[0]);
                     let dir = unescape_tab_state(fields[1]);
                     let sid = unescape_tab_state(fields[2]);
                     let cmds = unescape_tab_state(fields[3]);
-                    let effective_sid = if sid.is_empty() { None } else { Some(sid) };
+                    let effective_sid = if sid.is_empty() { generate_session_id() } else { sid };
                     let effective_cmds = if cmds.is_empty() { None } else { Some(cmds) };
-                    tabs.push((Some(name), dir, effective_sid, effective_cmds));
+                    let layout = PaneLayout::Leaf {
+                        dir,
+                        sid: effective_sid,
+                        cmds: effective_cmds,
+                    };
+                    tabs.push((Some(name), layout));
                 }
                 _ => {}
             }
             continue;
         }
         // Legacy: bare path line
-        tabs.push((None, line.to_string(), None, None));
+        let layout = PaneLayout::Leaf {
+            dir: line.to_string(),
+            sid: generate_session_id(),
+            cmds: None,
+        };
+        tabs.push((None, layout));
     }
 
     (current_page, tabs)
@@ -126,7 +219,7 @@ pub(crate) fn parse_tabs_state(
 
 pub(crate) fn load_tabs_state() -> (
     Option<u32>,
-    Vec<(Option<String>, String, Option<String>, Option<String>)>,
+    Vec<(Option<String>, PaneLayout)>,
 ) {
     let path = tabs_state_file_path();
     log::info!("Loading tabs state from: {}", path.display());
@@ -386,37 +479,21 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         let Some(widget) = notebook.nth_page(Some(i)) else {
             continue;
         };
-        // Find first terminal in possibly-split page
-        let Some(terminal) = find_first_terminal(&widget) else {
-            continue;
-        };
 
-        let dir = terminal_working_directory(&terminal)
-            .or_else(|| home.clone())
-            .unwrap_or_else(|| "/".to_string());
         let label_text = tab_label_text(notebook, &widget)
             .unwrap_or_else(|| format!("Terminal {}", i + 1));
 
-        // Extract tab_num from widget name (format: "tab-N")
-        let sid = widget
-            .widget_name()
-            .as_str()
-            .strip_prefix("tab-")
-            .and_then(|n: &str| n.parse::<u32>().ok())
-            .and_then(|tab_num| session_ids.get(&tab_num))
-            .map(|s| escape_tab_state(s))
-            .unwrap_or_default();
-
-        let commands = get_restorable_commands(&terminal)
-            .map(|c| escape_tab_state(&c))
-            .unwrap_or_default();
+        // Serialize the pane layout (supports splits)
+        let layout = serialize_pane_layout(&widget, session_ids);
+        let layout_json = serde_json::to_string(&layout).unwrap_or_else(|e| {
+            log::error!("Failed to serialize layout: {}", e);
+            "{}".to_string()
+        });
 
         let line = format!(
-            "tab={}\t{}\t{}\t{}",
+            "tab={}\t{}",
             escape_tab_state(&label_text),
-            escape_tab_state(&dir),
-            sid,
-            commands
+            escape_tab_state(&layout_json)
         );
         lines.push(line);
     }
