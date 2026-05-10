@@ -5,5 +5,4 @@ pub mod keybindings;
 pub mod parser;
 pub mod pty;
 pub mod block_view;
-pub mod block_view_types;
 pub mod terminal;

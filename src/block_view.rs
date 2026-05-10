@@ -147,10 +147,6 @@ fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
-fn dim_rgba(c: &RGBA, alpha: f32) -> RGBA {
-    RGBA::new(c.red(), c.green(), c.blue(), alpha)
-}
-
 fn skip_osc_sequence(bytes: &[u8], mut i: usize) -> usize {
     i += 2;
     while i < bytes.len() {

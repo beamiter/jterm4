@@ -17,17 +17,6 @@ use vte4::{TerminalExt, TerminalExtManual};
 use crate::block_view::TermView;
 use crate::config::Config;
 
-/// Create a block-mode TermView.  This is the preferred constructor for new tabs.
-pub(crate) fn create_block_terminal(
-    config: &Config,
-    shell_argv: &[String],
-    working_directory: Option<&str>,
-    session_id: Option<&str>,
-    initial_commands: Option<&str>,
-) -> TermView {
-    TermView::new(config, shell_argv, working_directory, session_id, initial_commands)
-}
-
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
     let terminal = Terminal::builder()
@@ -443,13 +432,6 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     format!("{prefix}{}", out_parts.join("/"))
 }
 
-pub(crate) fn looks_like_legacy_default_title(title: &str) -> bool {
-    let trimmed = title.trim();
-    let Some(rest) = trimmed.strip_prefix("Terminal ") else {
-        return false;
-    };
-    rest.trim().parse::<u32>().is_ok()
-}
 
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     // Use a click gesture in Capture phase to intercept Ctrl+Click before VTE sees it
