@@ -1696,7 +1696,13 @@ pub struct TermView {
 }
 
 impl TermView {
-    pub fn new(config: &Config, shell_argv: &[String], cwd: Option<&str>) -> Self {
+    pub fn new(
+        config: &Config,
+        shell_argv: &[String],
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
+    ) -> Self {
         // ── Build widget tree ──────────────────────────────────────────────
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
@@ -1739,8 +1745,33 @@ impl TermView {
         root.append(&vte_box);
 
         // ── PTY ───────────────────────────────────────────────────────────
-        let argv: Vec<&str> = shell_argv.iter().map(|s| s.as_str()).collect();
-        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &[]).expect("PTY spawn failed"));
+        // Detect rsh shell for session_id passing
+        let is_rsh = shell_argv.first()
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .and_then(|f| f.to_str())
+            .map(|name| name == "rsh")
+            .unwrap_or(false);
+
+        // Build argv with optional --session for rsh
+        let mut argv_vec: Vec<String> = shell_argv.to_vec();
+        if let Some(sid) = session_id {
+            if is_rsh {
+                argv_vec.push("--session".to_string());
+                argv_vec.push(sid.to_string());
+            }
+        }
+        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
+
+        // Build env_extra with RSH_SESSION_ID for rsh
+        let mut env_extra: Vec<(&str, &str)> = vec![];
+        let session_id_owned = session_id.map(|s| s.to_string());
+        if let Some(ref sid) = session_id_owned {
+            if is_rsh {
+                env_extra.push(("RSH_SESSION_ID", sid.as_str()));
+            }
+        }
+
+        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
 
         // Store child PID on VTE widget so kill_all_terminal_children can find it
         unsafe {
@@ -1794,6 +1825,18 @@ impl TermView {
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let scroll_debouncer = ScrollDebouncer::new();
             let ansi_cache_for_cb = ansi_cache.clone();
+
+            // Command queue for replaying initial_commands on PromptEnd events
+            let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
+                initial_commands
+                    .map(|s| s.split(", ")
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect())
+                    .unwrap_or_default()
+            ));
+            let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
+            let pty_for_init = Rc::clone(&pty);
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -1949,6 +1992,13 @@ impl TermView {
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 cmd_display_markup_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
+
+                                // Feed next initial command if any
+                                if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
+                                    let text = format!("{}\r", cmd);
+                                    pty_for_init.write_bytes(text.as_bytes());
+                                }
+
                                 // Auto-scroll to bottom when prompt ends (ready for command)
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }

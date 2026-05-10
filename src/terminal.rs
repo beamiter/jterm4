@@ -22,8 +22,10 @@ pub(crate) fn create_block_terminal(
     config: &Config,
     shell_argv: &[String],
     working_directory: Option<&str>,
+    session_id: Option<&str>,
+    initial_commands: Option<&str>,
 ) -> TermView {
-    TermView::new(config, shell_argv, working_directory)
+    TermView::new(config, shell_argv, working_directory, session_id, initial_commands)
 }
 
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
@@ -78,7 +80,13 @@ pub struct VteTerminalView {
 }
 
 impl VteTerminalView {
-    pub fn new(config: &Config, shell_argv: &[String], working_directory: Option<&str>) -> Self {
+    pub fn new(
+        config: &Config,
+        shell_argv: &[String],
+        working_directory: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
+    ) -> Self {
         // Create Terminal widget
         let terminal = create_terminal(config);
 
@@ -112,7 +120,7 @@ impl VteTerminalView {
         });
 
         // Spawn shell
-        spawn_shell(&terminal, shell_argv, working_directory, None, None);
+        spawn_shell(&terminal, shell_argv, working_directory, session_id, initial_commands);
 
         VteTerminalView {
             root,
@@ -205,11 +213,19 @@ pub(crate) fn spawn_shell(
     session_id: Option<&str>,
     initial_commands: Option<&str>,
 ) {
-    // Append --session <id> to argv when restoring a session
+    // Append --session <id> to argv when restoring a session (only for rsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) = session_id {
-        argv_vec.push("--session".to_string());
-        argv_vec.push(sid.to_string());
+        let is_rsh = argv_vec.first()
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .and_then(|f| f.to_str())
+            .map(|name| name == "rsh")
+            .unwrap_or(false);
+
+        if is_rsh {
+            argv_vec.push("--session".to_string());
+            argv_vec.push(sid.to_string());
+        }
     }
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 

@@ -1573,7 +1573,7 @@ impl UiState {
         terminal.grab_focus();
     }
 
-    pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, _initial_commands: Option<String>) -> Terminal {
+    pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -1589,6 +1589,8 @@ impl UiState {
                     &config,
                     self.shell_argv.as_ref(),
                     working_directory.as_deref(),
+                    Some(&sid),
+                    initial_commands.as_deref(),
                 ));
                 let terminal = term_view.vte().clone();
                 (TerminalViewType::Block(term_view), terminal)
@@ -1598,6 +1600,8 @@ impl UiState {
                     &config,
                     self.shell_argv.as_ref(),
                     working_directory.as_deref(),
+                    Some(&sid),
+                    initial_commands.as_deref(),
                 ));
                 let terminal = vte_view.vte().clone();
                 (TerminalViewType::Vte(vte_view), terminal)
