@@ -32,7 +32,7 @@ pub(crate) fn generate_session_id() -> String {
 /// Pane layout structure for serialization
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub(crate) enum PaneLayout {
+pub enum PaneLayout {
     Leaf {
         dir: String,
         sid: String,
@@ -89,14 +89,14 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
     }
 }
 
-pub(crate) fn escape_tab_state(value: &str) -> String {
+pub fn escape_tab_state(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")
 }
 
-pub(crate) fn unescape_tab_state(value: &str) -> String {
+pub fn unescape_tab_state(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -123,7 +123,7 @@ pub(crate) fn unescape_tab_state(value: &str) -> String {
     out
 }
 
-pub(crate) fn parse_tabs_state(
+pub fn parse_tabs_state(
     contents: &str,
 ) -> (
     Option<u32>,

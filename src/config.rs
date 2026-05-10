@@ -11,7 +11,7 @@ use crate::keybindings::KeybindingMap;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub(crate) enum TerminalMode {
+pub enum TerminalMode {
     Block,
     Vte,
 }
@@ -21,7 +21,7 @@ pub(crate) enum TerminalMode {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub(crate) struct Config {
+pub struct Config {
     pub(crate) window_opacity: f64,
     pub(crate) terminal_scrollback_lines: u32,
     pub(crate) font_desc: String,
