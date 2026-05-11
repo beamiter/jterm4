@@ -464,7 +464,9 @@ impl UiState {
              .top-bar button {{ color: rgb({fr},{fg_g},{fb}); }}
              .sidebar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
              .tab-strip-btn {{ color: rgba({fr},{fg_g},{fb},0.6); }}
-             .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}"
+             .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
+             .tab-strip-search {{ color: rgb({fr},{fg_g},{fb}); }}
+             .tab-strip-search text {{ color: rgb({fr},{fg_g},{fb}); caret-color: rgb({fr},{fg_g},{fb}); }}"
         );
         self.scrollbar_css.load_from_data(&css);
     }
