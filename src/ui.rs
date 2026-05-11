@@ -156,6 +156,10 @@ impl UiState {
                 self.sidebar.set_visible(true);
                 self.tab_search_entry.grab_focus();
             }
+            Action::CloseSelectedTabs => {
+                log::debug!("Close selected tabs");
+                self.close_selected_tabs();
+            }
             Action::SplitHorizontal => {
                 log::debug!("Split horizontal");
                 self.split_current(Orientation::Horizontal);
@@ -665,6 +669,118 @@ impl UiState {
         if let Some(term) = self.current_terminal() {
             term.search_find_previous();
         }
+    }
+
+    fn clear_tab_selection(&self) {
+        for tab_name in self.selected_tabs.borrow().iter() {
+            if let Some(mut child) = self.tab_strip.first_child() {
+                loop {
+                    if child.widget_name().as_str() == tab_name {
+                        if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
+                            btn.remove_css_class("tab-selected");
+                        }
+                        break;
+                    }
+                    match child.next_sibling() {
+                        Some(next) => child = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.selected_tabs.borrow_mut().clear();
+    }
+
+    fn toggle_tab_selection(&self, tab_name: &str) {
+        let mut selected = self.selected_tabs.borrow_mut();
+        if let Some(pos) = selected.iter().position(|x| x == tab_name) {
+            selected.remove(pos);
+            // Remove CSS class
+            if let Some(mut child) = self.tab_strip.first_child() {
+                loop {
+                    if child.widget_name().as_str() == tab_name {
+                        if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
+                            btn.remove_css_class("tab-selected");
+                        }
+                        break;
+                    }
+                    match child.next_sibling() {
+                        Some(next) => child = next,
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            selected.push(tab_name.to_string());
+            // Add CSS class
+            if let Some(mut child) = self.tab_strip.first_child() {
+                loop {
+                    if child.widget_name().as_str() == tab_name {
+                        if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
+                            btn.add_css_class("tab-selected");
+                        }
+                        break;
+                    }
+                    match child.next_sibling() {
+                        Some(next) => child = next,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn select_tab_range(&self, from_name: &str, to_name: &str) {
+        self.clear_tab_selection();
+        let mut selected = self.selected_tabs.borrow_mut();
+        let mut in_range = false;
+        let mut found_start = false;
+        let mut found_end = false;
+
+        if let Some(mut child) = self.tab_strip.first_child() {
+            loop {
+                let child_name = child.widget_name();
+                if child_name.as_str() == from_name {
+                    in_range = true;
+                    found_start = true;
+                }
+                if in_range {
+                    selected.push(child_name.to_string());
+                    if let Ok(btn) = child.clone().downcast::<ToggleButton>() {
+                        btn.add_css_class("tab-selected");
+                    }
+                }
+                if child_name.as_str() == to_name {
+                    found_end = true;
+                    in_range = false;
+                }
+                match child.next_sibling() {
+                    Some(next) => child = next,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn close_selected_tabs(&self) {
+        let selected = self.selected_tabs.borrow();
+        if selected.is_empty() {
+            return;
+        }
+
+        for tab_name in selected.iter() {
+            // Find the widget by name and close it
+            for i in 0..self.notebook.n_pages() {
+                if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
+                    if page_widget.widget_name().as_str() == tab_name {
+                        self.remove_tab_by_widget(&page_widget);
+                        break;
+                    }
+                }
+            }
+        }
+        drop(selected);
+        self.selected_tabs.borrow_mut().clear();
     }
 
     pub(crate) fn toggle_sidebar(&self) {
@@ -2108,6 +2224,11 @@ impl UiState {
             menu.append(Some("New Tab"), Some("tab-ctx.new-tab"));
             menu.append(Some("Pin Tab"), Some("tab-ctx.toggle-pin"));
 
+            // Add "Close Selected Tabs" if there are selected tabs
+            if !ui_for_ctx.selected_tabs.borrow().is_empty() {
+                menu.append(Some("Close Selected Tabs"), Some("tab-ctx.close-selected"));
+            }
+
             let popover = gtk4::PopoverMenu::from_model(Some(&menu));
             popover.set_parent(&strip_btn_for_ctx);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
@@ -2163,6 +2284,14 @@ impl UiState {
             });
             action_group.add_action(&pin_action);
 
+            // Close selected tabs action
+            let ui_close_selected = ui_for_ctx.clone();
+            let close_selected_action = gio::SimpleAction::new("close-selected", None);
+            close_selected_action.connect_activate(move |_, _| {
+                ui_close_selected.close_selected_tabs();
+            });
+            action_group.add_action(&close_selected_action);
+
             strip_btn_for_ctx.insert_action_group("tab-ctx", Some(&action_group));
 
             // Clean up when popover closes
@@ -2199,22 +2328,67 @@ impl UiState {
         });
         strip_btn.add_controller(close_gesture);
 
-        // Click to switch tab
-        let notebook_for_strip = self.notebook.clone();
-        let tab_strip_for_click = self.tab_strip.clone();
-        strip_btn.connect_clicked(move |btn| {
-            // Find the index of this button in the strip
-            let mut idx = 0u32;
-            let mut child = tab_strip_for_click.first_child();
-            while let Some(ref c) = child {
-                if c == btn.upcast_ref::<gtk4::Widget>() {
-                    break;
-                }
-                idx += 1;
-                child = c.next_sibling();
+        // Multi-select click handler: supports Ctrl+Click (toggle), Shift+Click (range), plain click (normal)
+        let click_gesture = GestureClick::new();
+        click_gesture.set_button(1);
+        click_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+
+        let ui_for_select = self.clone();
+        let strip_btn_for_select = strip_btn.clone();
+        let tab_name_for_select = tab_widget_name.clone();
+        let notebook_for_select = self.notebook.clone();
+        let tab_strip_for_select = self.tab_strip.clone();
+
+        click_gesture.connect_pressed(move |gesture, n_press, _, _| {
+            if n_press != 1 {
+                return; // Only handle single press
             }
-            notebook_for_strip.set_current_page(Some(idx));
+
+            let event_state = gesture.current_event_state();
+            let has_ctrl = event_state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+            let has_shift = event_state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+
+            if has_ctrl {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                ui_for_select.toggle_tab_selection(&tab_name_for_select);
+            } else if has_shift {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                // Find the last selected tab or current tab
+                let selected = ui_for_select.selected_tabs.borrow();
+                let from_name = if let Some(last) = selected.last() {
+                    last.clone()
+                } else {
+                    // Use currently active tab
+                    if let Some(page) = notebook_for_select.current_page() {
+                        if let Some(page_widget) = notebook_for_select.nth_page(Some(page)) {
+                            page_widget.widget_name().to_string()
+                        } else {
+                            tab_name_for_select.clone()
+                        }
+                    } else {
+                        tab_name_for_select.clone()
+                    }
+                };
+                drop(selected);
+                ui_for_select.select_tab_range(&from_name, &tab_name_for_select);
+            } else {
+                // Plain click: clear selection and switch tab
+                ui_for_select.clear_tab_selection();
+
+                // Find the index of this button in the strip
+                let mut idx = 0u32;
+                let mut child = tab_strip_for_select.first_child();
+                while let Some(ref c) = child {
+                    if c == strip_btn_for_select.upcast_ref::<gtk4::Widget>() {
+                        break;
+                    }
+                    idx += 1;
+                    child = c.next_sibling();
+                }
+                notebook_for_select.set_current_page(Some(idx));
+            }
         });
+        strip_btn.add_controller(click_gesture);
 
         // Drag source: carry the widget name so we can identify the dragged button
         let drag_source = gtk4::DragSource::new();

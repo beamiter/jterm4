@@ -39,6 +39,7 @@ pub(crate) enum Action {
     FocusPaneUp,
     FocusPaneDown,
     FilterTabs,
+    CloseSelectedTabs,
 }
 
 impl Action {
@@ -88,6 +89,7 @@ impl Action {
             Action::FocusPaneUp => "Focus pane up",
             Action::FocusPaneDown => "Focus pane down",
             Action::FilterTabs => "Filter tabs",
+            Action::CloseSelectedTabs => "Close selected tabs",
         }
     }
 
@@ -126,6 +128,7 @@ impl Action {
             Action::FocusPaneUp => Some("focus_pane_up"),
             Action::FocusPaneDown => Some("focus_pane_down"),
             Action::FilterTabs => Some("filter_tabs"),
+            Action::CloseSelectedTabs => Some("close_selected_tabs"),
         }
     }
 
@@ -163,6 +166,7 @@ impl Action {
             Action::FocusPaneUp,
             Action::FocusPaneDown,
             Action::FilterTabs,
+            Action::CloseSelectedTabs,
         ]
     }
 }
