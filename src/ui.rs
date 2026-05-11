@@ -55,6 +55,8 @@ pub(crate) struct UiState {
     pub(crate) search_entry: SearchEntry,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
+    pub(crate) tab_search_entry: SearchEntry,
+    pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
@@ -148,6 +150,11 @@ impl UiState {
             Action::ToggleSidebar => {
                 log::debug!("Toggle sidebar");
                 self.toggle_sidebar();
+            }
+            Action::FilterTabs => {
+                log::debug!("Filter tabs");
+                self.sidebar.set_visible(true);
+                self.tab_search_entry.grab_focus();
             }
             Action::SplitHorizontal => {
                 log::debug!("Split horizontal");
@@ -1941,8 +1948,15 @@ impl UiState {
         strip_close_icon.add_css_class("tab-strip-close");
         strip_close_icon.set_opacity(0.0);
 
+        // Process indicator label
+        let process_label = Label::new(None);
+        process_label.add_css_class("tab-process-indicator");
+        process_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        process_label.set_max_width_chars(15);
+
         let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         strip_box.append(&strip_label);
+        strip_box.append(&process_label);
         strip_box.append(&strip_close_icon);
 
         let strip_btn = ToggleButton::new();
@@ -1965,11 +1979,84 @@ impl UiState {
             close_for_leave.set_opacity(0.0);
         });
         strip_btn.add_controller(hover_ctrl);
+
+        // Dynamic tooltip: working directory, process name, and status
+        strip_btn.set_has_tooltip(true);
+        let terminal_for_tooltip = terminal.clone();
+        let notebook_for_tooltip = self.notebook.clone();
+        let tab_strip_for_tooltip = self.tab_strip.clone();
+        let strip_btn_for_tooltip = strip_btn.clone();
+        strip_btn.connect_query_tooltip(move |_, _x, _y, _keyboard, tooltip| {
+            // Build tooltip text with cwd, process name, and status
+            let mut tooltip_parts = Vec::new();
+
+            // Add working directory
+            if let Some(cwd) = terminal_working_directory(&terminal_for_tooltip) {
+                tooltip_parts.push(format!("Dir: {}", cwd));
+            }
+
+            // Add foreground process name
+            if let Some(proc_name) = crate::state::get_foreground_process_name(&terminal_for_tooltip) {
+                tooltip_parts.push(format!("Process: {}", proc_name));
+            }
+
+            // Add status indicators
+            let mut status = Vec::new();
+            let btn_name = strip_btn_for_tooltip.widget_name();
+            if !btn_name.is_empty() {
+                let mut child = tab_strip_for_tooltip.first_child();
+                while let Some(ref c) = child {
+                    if c.widget_name() == btn_name {
+                        if c.has_css_class("tab-activity") {
+                            status.push("activity");
+                        }
+                        if c.has_css_class("tab-bell") {
+                            status.push("bell");
+                        }
+                        if c.has_css_class("tab-pinned") {
+                            status.push("pinned");
+                        }
+                        break;
+                    }
+                    child = c.next_sibling();
+                }
+            }
+            if !status.is_empty() {
+                tooltip_parts.push(format!("Status: {}", status.join(", ")));
+            }
+
+            if !tooltip_parts.is_empty() {
+                tooltip.set_text(Some(&tooltip_parts.join("\n")));
+                true
+            } else {
+                false
+            }
+        });
+
         // Give button a unique name to correlate with notebook page
         let tab_widget_name = format!("tab-{}", tab_num);
         strip_btn.set_widget_name(&tab_widget_name);
         // Also name the wrapper widget so we can find the button when removing
         term_wrapper.set_widget_name(&tab_widget_name);
+
+        // Periodic process indicator update (every 2 seconds)
+        let terminal_for_proc = terminal.clone();
+        let process_label_for_update = process_label.clone();
+        let tab_widget_for_proc = tab_widget_name.clone();
+        glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+            // Check if widget is still alive
+            if process_label_for_update.parent().is_none() {
+                return glib::ControlFlow::Break;
+            }
+
+            if let Some(proc_name) = crate::state::get_foreground_process_name(&terminal_for_proc) {
+                process_label_for_update.set_text(&proc_name);
+                process_label_for_update.set_visible(true);
+            } else {
+                process_label_for_update.set_visible(false);
+            }
+            glib::ControlFlow::Continue
+        });
 
         // Bell signal: flash the tab strip button when bell rings on non-active tab
         let ui_for_bell = self.clone();
@@ -2004,6 +2091,90 @@ impl UiState {
             }
         });
         strip_btn.add_controller(rename_click_strip);
+
+        // Right-click context menu on tab button
+        let right_click_gesture = GestureClick::new();
+        right_click_gesture.set_button(3);
+        let ui_for_ctx = self.clone();
+        let strip_btn_for_ctx = strip_btn.clone();
+        let tab_name_for_ctx = tab_widget_name.clone();
+        let term_wrapper_for_ctx = term_wrapper.clone();
+        right_click_gesture.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+            let menu = gio::Menu::new();
+            menu.append(Some("Rename"), Some("tab-ctx.rename"));
+            menu.append(Some("Close"), Some("tab-ctx.close"));
+            menu.append(Some("New Tab"), Some("tab-ctx.new-tab"));
+            menu.append(Some("Pin Tab"), Some("tab-ctx.toggle-pin"));
+
+            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&strip_btn_for_ctx);
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+
+            let action_group = gio::SimpleActionGroup::new();
+
+            // Rename action
+            let ui_rename = ui_for_ctx.clone();
+            let label_for_rename = label.clone();
+            let strip_label_for_rename = strip_label.clone();
+            let custom_title_for_rename = custom_title.clone();
+            let window_for_rename = ui_for_ctx.window.clone();
+            let rename_action = gio::SimpleAction::new("rename", None);
+            rename_action.connect_activate(move |_, _| {
+                show_rename_dialog_with_strip(
+                    &window_for_rename,
+                    &label_for_rename,
+                    &strip_label_for_rename,
+                    custom_title_for_rename.clone(),
+                );
+            });
+            action_group.add_action(&rename_action);
+
+            // Close action
+            let ui_close_ctx = ui_for_ctx.clone();
+            let wrapper_for_ctx_close = term_wrapper_for_ctx.clone().upcast::<gtk4::Widget>();
+            let close_action = gio::SimpleAction::new("close", None);
+            close_action.connect_activate(move |_, _| {
+                ui_close_ctx.remove_tab_by_widget(&wrapper_for_ctx_close);
+            });
+            action_group.add_action(&close_action);
+
+            // New tab action
+            let ui_new_ctx = ui_for_ctx.clone();
+            let new_tab_action = gio::SimpleAction::new("new-tab", None);
+            new_tab_action.connect_activate(move |_, _| {
+                ui_new_ctx.execute_action(Action::NewTab);
+            });
+            action_group.add_action(&new_tab_action);
+
+            // Toggle pin action
+            let strip_btn_pin = strip_btn_for_ctx.clone();
+            let pin_action = gio::SimpleAction::new("toggle-pin", None);
+            pin_action.connect_activate(move |_, _| {
+                if strip_btn_pin.has_css_class("tab-pinned") {
+                    strip_btn_pin.remove_css_class("tab-pinned");
+                    unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
+                } else {
+                    strip_btn_pin.add_css_class("tab-pinned");
+                    unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
+                }
+            });
+            action_group.add_action(&pin_action);
+
+            strip_btn_for_ctx.insert_action_group("tab-ctx", Some(&action_group));
+
+            // Clean up when popover closes
+            let strip_btn_cleanup = strip_btn_for_ctx.clone();
+            popover.connect_closed(move |p| {
+                p.unparent();
+                strip_btn_cleanup.insert_action_group("tab-ctx", None::<&gio::SimpleActionGroup>);
+            });
+
+            popover.popup();
+        });
+        strip_btn.add_controller(right_click_gesture);
 
         // Close icon click: use a capture-phase gesture on the ToggleButton so we
         // intercept the press before the button's own toggle handler.
@@ -2053,6 +2224,18 @@ impl UiState {
             let name = strip_btn_for_drag.widget_name().to_string();
             Some(gtk4::gdk::ContentProvider::for_value(&name.to_value()))
         });
+
+        // Visual feedback during drag
+        let strip_btn_drag_begin = strip_btn.clone();
+        drag_source.connect_drag_begin(move |_, _| {
+            strip_btn_drag_begin.add_css_class("tab-dragging");
+        });
+
+        let strip_btn_drag_end = strip_btn.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            strip_btn_drag_end.remove_css_class("tab-dragging");
+        });
+
         strip_btn.add_controller(drag_source);
 
         // Drop target: reorder strip buttons and notebook pages
@@ -2127,6 +2310,19 @@ impl UiState {
 
             true
         });
+
+        // Visual feedback for drop target
+        let strip_btn_for_drop_motion = strip_btn.clone();
+        drop_target.connect_motion(move |_, _x, _y| {
+            strip_btn_for_drop_motion.add_css_class("tab-drop-target");
+            gtk4::gdk::DragAction::MOVE
+        });
+
+        let strip_btn_for_drop_leave = strip_btn.clone();
+        drop_target.connect_leave(move |_| {
+            strip_btn_for_drop_leave.remove_css_class("tab-drop-target");
+        });
+
         strip_btn.add_controller(drop_target);
 
         // Insert strip button at the correct position

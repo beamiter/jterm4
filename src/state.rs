@@ -463,6 +463,28 @@ pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
     None
 }
 
+/// Get the name of the foreground process in a terminal, or None if the shell itself is foreground.
+pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String> {
+    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+
+    let pty = terminal.pty()?;
+    let raw_fd = pty.fd().as_raw_fd();
+    let fg_pgid = unsafe { tcgetpgrp(raw_fd) };
+    if fg_pgid <= 0 || fg_pgid == shell_pid {
+        return None;
+    }
+
+    if let Some(args) = read_proc_cmdline(fg_pgid) {
+        if !args.is_empty() {
+            return Path::new(&args[0])
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
+}
+
 pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {
     let path = tabs_state_file_path();
     log::info!("Saving tabs state to: {}", path.display());

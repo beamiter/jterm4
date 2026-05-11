@@ -159,7 +159,13 @@ fn main() -> glib::ExitCode {
              .tab-activity { font-style: italic; }
              .tab-bell { color: #f1fa8c; }
              @keyframes bell-flash { 0% { opacity: 1.0; } 50% { opacity: 0.5; } 100% { opacity: 1.0; } }
-             .tab-bell-flash { animation: bell-flash 0.3s ease-in-out 2; }",
+             .tab-bell-flash { animation: bell-flash 0.3s ease-in-out 2; }
+             .tab-pinned { font-weight: bold; }
+             .tab-dragging { opacity: 0.5; }
+             .tab-drop-target { background-color: alpha(currentColor, 0.15); }
+             .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
+             .tab-selected { background-color: alpha(currentColor, 0.1); }
+             .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }",
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
@@ -210,6 +216,13 @@ fn main() -> glib::ExitCode {
 
         let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar-box");
+
+        // Tab search entry for filtering
+        let tab_search_entry = SearchEntry::new();
+        tab_search_entry.set_placeholder_text(Some("Filter tabs..."));
+        tab_search_entry.add_css_class("tab-strip-search");
+        sidebar.append(&tab_search_entry);
+
         sidebar.append(&tab_strip_scroll);
 
         // Content area: sidebar + notebook side by side
@@ -245,6 +258,8 @@ fn main() -> glib::ExitCode {
             search_entry: search_entry.clone(),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
+            tab_search_entry: tab_search_entry.clone(),
+            selected_tabs: Rc::new(RefCell::new(Vec::new())),
             command_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
@@ -415,6 +430,33 @@ fn main() -> glib::ExitCode {
             false.into()
         });
         search_entry.add_controller(search_key_controller);
+
+        // Wire tab search entry: filter tabs by name
+        let ui_for_tab_search = ui.clone();
+        tab_search_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string().to_lowercase();
+            let tab_strip = &ui_for_tab_search.tab_strip;
+
+            let mut child = tab_strip.first_child();
+            while let Some(ref c) = child {
+                if let Ok(btn) = c.clone().downcast::<gtk4::ToggleButton>() {
+                    // Get the button's label text
+                    if let Some(label_widget) = btn.child() {
+                        if let Ok(label) = label_widget.clone().downcast::<gtk4::Box>() {
+                            // The first child is the text label
+                            if let Some(text_label) = label.first_child() {
+                                if let Ok(txt) = text_label.clone().downcast::<gtk4::Label>() {
+                                    let btn_text = txt.text().to_string().to_lowercase();
+                                    let matches = query.is_empty() || btn_text.contains(query.as_str());
+                                    c.set_visible(matches);
+                                }
+                            }
+                        }
+                    }
+                }
+                child = c.next_sibling();
+            }
+        });
 
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();

@@ -38,6 +38,7 @@ pub(crate) enum Action {
     FocusPaneRight,
     FocusPaneUp,
     FocusPaneDown,
+    FilterTabs,
 }
 
 impl Action {
@@ -86,6 +87,7 @@ impl Action {
             Action::FocusPaneRight => "Focus pane right",
             Action::FocusPaneUp => "Focus pane up",
             Action::FocusPaneDown => "Focus pane down",
+            Action::FilterTabs => "Filter tabs",
         }
     }
 
@@ -123,6 +125,7 @@ impl Action {
             Action::FocusPaneRight => Some("focus_pane_right"),
             Action::FocusPaneUp => Some("focus_pane_up"),
             Action::FocusPaneDown => Some("focus_pane_down"),
+            Action::FilterTabs => Some("filter_tabs"),
         }
     }
 
@@ -159,6 +162,7 @@ impl Action {
             Action::FocusPaneRight,
             Action::FocusPaneUp,
             Action::FocusPaneDown,
+            Action::FilterTabs,
         ]
     }
 }
@@ -350,6 +354,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+backslash", Action::ToggleSidebar);
+        bind("Ctrl+Shift+L", Action::FilterTabs);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
