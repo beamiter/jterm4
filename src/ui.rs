@@ -2095,9 +2095,16 @@ impl UiState {
         process_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         process_label.set_max_width_chars(15);
 
+        // Pin indicator icon
+        let pin_icon = gtk4::Image::new();
+        pin_icon.set_icon_name(Some("bookmark-symbolic"));
+        pin_icon.add_css_class("tab-pin-icon");
+        pin_icon.set_visible(false);  // Hidden by default
+
         let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         strip_box.append(&strip_label);
         strip_box.append(&process_label);
+        strip_box.append(&pin_icon);
         strip_box.append(&strip_close_icon);
 
         let strip_btn = ToggleButton::new();
@@ -2298,14 +2305,17 @@ impl UiState {
             // Toggle pin action
             let strip_btn_pin = strip_btn_for_ctx.clone();
             let term_wrapper_pin = term_wrapper_for_ctx.clone();
+            let pin_icon_pin = pin_icon.clone();
             let pin_action = gio::SimpleAction::new("toggle-pin", None);
             pin_action.connect_activate(move |_, _| {
                 if strip_btn_pin.has_css_class("tab-pinned") {
                     strip_btn_pin.remove_css_class("tab-pinned");
+                    pin_icon_pin.set_visible(false);
                     unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
                     unsafe { term_wrapper_pin.set_data::<bool>("pinned", false); }
                 } else {
                     strip_btn_pin.add_css_class("tab-pinned");
+                    pin_icon_pin.set_visible(true);
                     unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
                     unsafe { term_wrapper_pin.set_data::<bool>("pinned", true); }
                 }

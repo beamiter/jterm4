@@ -164,6 +164,7 @@ fn main() -> glib::ExitCode {
              .tab-dragging { opacity: 0.5; }
              .tab-drop-target { background-color: alpha(currentColor, 0.15); }
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
+             .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
              .tab-selected { background-color: alpha(currentColor, 0.1); }
              .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }",
         );
