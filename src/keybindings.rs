@@ -40,6 +40,10 @@ pub(crate) enum Action {
     FocusPaneDown,
     FilterTabs,
     CloseSelectedTabs,
+    MoveTabLeft,
+    MoveTabRight,
+    DuplicateTab,
+    ToggleTabMarked,
 }
 
 impl Action {
@@ -90,6 +94,10 @@ impl Action {
             Action::FocusPaneDown => "Focus pane down",
             Action::FilterTabs => "Filter tabs",
             Action::CloseSelectedTabs => "Close selected tabs",
+            Action::MoveTabLeft => "Move tab left",
+            Action::MoveTabRight => "Move tab right",
+            Action::DuplicateTab => "Duplicate tab",
+            Action::ToggleTabMarked => "Toggle tab marked",
         }
     }
 
@@ -129,6 +137,10 @@ impl Action {
             Action::FocusPaneDown => Some("focus_pane_down"),
             Action::FilterTabs => Some("filter_tabs"),
             Action::CloseSelectedTabs => Some("close_selected_tabs"),
+            Action::MoveTabLeft => Some("move_tab_left"),
+            Action::MoveTabRight => Some("move_tab_right"),
+            Action::DuplicateTab => Some("duplicate_tab"),
+            Action::ToggleTabMarked => Some("toggle_tab_marked"),
         }
     }
 
@@ -167,6 +179,10 @@ impl Action {
             Action::FocusPaneDown,
             Action::FilterTabs,
             Action::CloseSelectedTabs,
+            Action::MoveTabLeft,
+            Action::MoveTabRight,
+            Action::DuplicateTab,
+            Action::ToggleTabMarked,
         ]
     }
 }

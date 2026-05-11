@@ -238,6 +238,18 @@ impl UiState {
             Action::FocusPaneDown => {
                 self.focus_pane_directional(Direction::Down);
             }
+            Action::MoveTabLeft => {
+                self.move_tab_left();
+            }
+            Action::MoveTabRight => {
+                self.move_tab_right();
+            }
+            Action::DuplicateTab => {
+                self.duplicate_current_tab();
+            }
+            Action::ToggleTabMarked => {
+                self.toggle_current_tab_marked();
+            }
         }
     }
 
@@ -465,6 +477,7 @@ impl UiState {
              .sidebar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
              .tab-strip-btn {{ color: rgba({fr},{fg_g},{fb},0.6); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
+             .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}
              .tab-strip-search {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-search text {{ color: rgb({fr},{fg_g},{fb}); caret-color: rgb({fr},{fg_g},{fb}); }}"
         );
@@ -783,6 +796,98 @@ impl UiState {
         }
         drop(selected);
         self.selected_tabs.borrow_mut().clear();
+    }
+
+    fn move_tab_left(&self) {
+        if let Some(current_page) = self.notebook.current_page() {
+            if current_page > 0 {
+                let new_page = current_page - 1;
+                self.notebook.reorder_child(&self.notebook.nth_page(Some(current_page)).unwrap(), Some(new_page));
+                self.reorder_tab_strip_buttons();
+                self.notebook.set_current_page(Some(new_page));
+                self.sync_tab_strip_active(Some(new_page));
+            }
+        }
+    }
+
+    fn move_tab_right(&self) {
+        if let Some(current_page) = self.notebook.current_page() {
+            let n_pages = self.notebook.n_pages();
+            if current_page < n_pages - 1 {
+                let new_page = current_page + 1;
+                self.notebook.reorder_child(&self.notebook.nth_page(Some(current_page)).unwrap(), Some(new_page));
+                self.reorder_tab_strip_buttons();
+                self.notebook.set_current_page(Some(new_page));
+                self.sync_tab_strip_active(Some(new_page));
+            }
+        }
+    }
+
+    fn reorder_tab_strip_buttons(&self) {
+        let mut button_order = Vec::new();
+        let mut idx = 0u32;
+        while let Some(page) = self.notebook.nth_page(Some(idx)) {
+            let name = page.widget_name();
+            button_order.push(name);
+            idx += 1;
+        }
+
+        let mut child = self.tab_strip.first_child();
+        let mut button_idx = 0;
+        while let Some(c) = child.clone() {
+            if button_idx < button_order.len() && c.widget_name() == button_order[button_idx] {
+                if button_idx > 0 {
+                    let mut prev_child = self.tab_strip.first_child();
+                    let mut prev_idx = 0;
+                    while let Some(pc) = prev_child {
+                        if prev_idx == button_idx - 1 {
+                            self.tab_strip.reorder_child_after(&c, Some(&pc));
+                            break;
+                        }
+                        prev_idx += 1;
+                        prev_child = pc.next_sibling();
+                    }
+                } else {
+                    self.tab_strip.reorder_child_after(&c, None::<&gtk4::Widget>);
+                }
+                button_idx += 1;
+            }
+            child = c.next_sibling();
+        }
+    }
+
+    fn duplicate_current_tab(&self) {
+        if let Some(page) = self.notebook.current_page() {
+            if let Some(widget) = self.notebook.nth_page(Some(page)) {
+                let working_directory = find_first_terminal(&widget)
+                    .as_ref()
+                    .and_then(|t| terminal_working_directory(t));
+                self.add_new_tab(working_directory, None, None, None);
+            }
+        }
+    }
+
+    fn toggle_current_tab_marked(&self) {
+        if let Some(page) = self.notebook.current_page() {
+            let mut idx = 0u32;
+            let mut child = self.tab_strip.first_child();
+            while let Some(c) = child {
+                if idx == page {
+                    if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+                        if btn.has_css_class("tab-marked") {
+                            btn.remove_css_class("tab-marked");
+                            unsafe { btn.set_data::<bool>("marked", false); }
+                        } else {
+                            btn.add_css_class("tab-marked");
+                            unsafe { btn.set_data::<bool>("marked", true); }
+                        }
+                    }
+                    break;
+                }
+                idx += 1;
+                child = c.next_sibling();
+            }
+        }
     }
 
     pub(crate) fn toggle_sidebar(&self) {
@@ -2247,16 +2352,19 @@ impl UiState {
         right_click_gesture.set_button(3);
         let ui_for_ctx = self.clone();
         let strip_btn_for_ctx = strip_btn.clone();
-        let tab_name_for_ctx = tab_widget_name.clone();
+        let _tab_name_for_ctx = tab_widget_name.clone();
         let term_wrapper_for_ctx = term_wrapper.clone();
+        let terminal_for_dup = terminal.clone();
         right_click_gesture.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
 
             let menu = gio::Menu::new();
             menu.append(Some("Rename"), Some("tab-ctx.rename"));
+            menu.append(Some("Duplicate"), Some("tab-ctx.duplicate"));
+            menu.append(Some("Mark Important"), Some("tab-ctx.toggle-mark"));
+            menu.append(Some("Pin Tab"), Some("tab-ctx.toggle-pin"));
             menu.append(Some("Close"), Some("tab-ctx.close"));
             menu.append(Some("New Tab"), Some("tab-ctx.new-tab"));
-            menu.append(Some("Pin Tab"), Some("tab-ctx.toggle-pin"));
 
             // Add "Close Selected Tabs" if there are selected tabs
             if !ui_for_ctx.selected_tabs.borrow().is_empty() {
@@ -2271,7 +2379,7 @@ impl UiState {
             let action_group = gio::SimpleActionGroup::new();
 
             // Rename action
-            let ui_rename = ui_for_ctx.clone();
+            let _ui_rename = ui_for_ctx.clone();
             let label_for_rename = label.clone();
             let strip_label_for_rename = strip_label.clone();
             let custom_title_for_rename = custom_title.clone();
@@ -2286,6 +2394,29 @@ impl UiState {
                 );
             });
             action_group.add_action(&rename_action);
+
+            // Duplicate action
+            let ui_duplicate_ctx = ui_for_ctx.clone();
+            let wd_for_dup = terminal_working_directory(&terminal_for_dup).or_else(|| std::env::var("HOME").ok());
+            let duplicate_action = gio::SimpleAction::new("duplicate", None);
+            duplicate_action.connect_activate(move |_, _| {
+                ui_duplicate_ctx.add_new_tab(wd_for_dup.clone(), None, None, None);
+            });
+            action_group.add_action(&duplicate_action);
+
+            // Toggle mark action
+            let strip_btn_mark = strip_btn_for_ctx.clone();
+            let mark_action = gio::SimpleAction::new("toggle-mark", None);
+            mark_action.connect_activate(move |_, _| {
+                if strip_btn_mark.has_css_class("tab-marked") {
+                    strip_btn_mark.remove_css_class("tab-marked");
+                    unsafe { strip_btn_mark.set_data::<bool>("marked", false); }
+                } else {
+                    strip_btn_mark.add_css_class("tab-marked");
+                    unsafe { strip_btn_mark.set_data::<bool>("marked", true); }
+                }
+            });
+            action_group.add_action(&mark_action);
 
             // Close action
             let ui_close_ctx = ui_for_ctx.clone();
