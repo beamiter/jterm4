@@ -38,6 +38,8 @@ pub enum PaneLayout {
         sid: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cmds: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
     },
     Split {
         orientation: char,  // 'h' or 'v'
@@ -85,7 +87,12 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
 
         let cmds = get_restorable_commands(&terminal);
 
-        PaneLayout::Leaf { dir, sid, cmds }
+        // Check if this tab is pinned
+        let pinned = unsafe {
+            widget.data::<bool>("pinned").map(|p| p.as_ref().clone())
+        };
+
+        PaneLayout::Leaf { dir, sid, cmds, pinned }
     }
 }
 
@@ -159,6 +166,7 @@ pub fn parse_tabs_state(
                         dir,
                         sid: generate_session_id(),
                         cmds: None,
+                        pinned: None,
                     };
                     tabs.push((None, layout));
                 }
@@ -176,6 +184,7 @@ pub fn parse_tabs_state(
                             dir: data,
                             sid: generate_session_id(),
                             cmds: None,
+                            pinned: None,
                         };
                         tabs.push((Some(name), layout));
                     }
@@ -190,6 +199,7 @@ pub fn parse_tabs_state(
                         dir,
                         sid: effective_sid,
                         cmds: None,
+                        pinned: None,
                     };
                     tabs.push((Some(name), layout));
                 }
@@ -205,6 +215,7 @@ pub fn parse_tabs_state(
                         dir,
                         sid: effective_sid,
                         cmds: effective_cmds,
+                        pinned: None,
                     };
                     tabs.push((Some(name), layout));
                 }
@@ -217,6 +228,7 @@ pub fn parse_tabs_state(
             dir: line.to_string(),
             sid: generate_session_id(),
             cmds: None,
+            pinned: None,
         };
         tabs.push((None, layout));
     }

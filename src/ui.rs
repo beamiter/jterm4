@@ -1750,7 +1750,7 @@ impl UiState {
         use crate::state::PaneLayout;
 
         match layout {
-            PaneLayout::Leaf { dir, sid, cmds } => {
+            PaneLayout::Leaf { dir, sid, cmds, pinned } => {
                 // Create a simple tab with the leaf layout
                 let _terminal = self.add_new_tab(
                     Some(dir),
@@ -1758,6 +1758,25 @@ impl UiState {
                     Some(sid),
                     cmds,
                 );
+                // Apply pinned state if set
+                if pinned == Some(true) {
+                    let page_num = self.notebook.n_pages().saturating_sub(1);
+                    if let Some(page_widget) = self.notebook.nth_page(Some(page_num)) {
+                        unsafe { page_widget.set_data::<bool>("pinned", true); }
+                    }
+                    // Find the corresponding strip button and mark as pinned
+                    let tab_name_fmt = format!("tab-{}", page_num);
+                    let mut child = self.tab_strip.first_child();
+                    while let Some(ref c) = child {
+                        if c.widget_name().as_str() == tab_name_fmt {
+                            if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+                                btn.add_css_class("tab-pinned");
+                            }
+                            break;
+                        }
+                        child = c.next_sibling();
+                    }
+                }
                 // Return the page widget (last added page)
                 let page_num = self.notebook.n_pages().saturating_sub(1);
                 self.notebook
@@ -1825,8 +1844,14 @@ impl UiState {
         use crate::state::PaneLayout;
 
         match layout {
-            PaneLayout::Leaf { dir, sid, cmds } => {
+            PaneLayout::Leaf { dir, sid, cmds, pinned } => {
                 let terminal = self.add_new_tab(Some(dir), None, Some(sid), cmds);
+                let page_num = self.notebook.n_pages().saturating_sub(1);
+                if let Some(page_widget) = self.notebook.nth_page(Some(page_num)) {
+                    if pinned == Some(true) {
+                        unsafe { page_widget.set_data::<bool>("pinned", true); }
+                    }
+                }
                 // Get the wrapped terminal widget
                 wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>()
             }
@@ -2272,14 +2297,17 @@ impl UiState {
 
             // Toggle pin action
             let strip_btn_pin = strip_btn_for_ctx.clone();
+            let term_wrapper_pin = term_wrapper_for_ctx.clone();
             let pin_action = gio::SimpleAction::new("toggle-pin", None);
             pin_action.connect_activate(move |_, _| {
                 if strip_btn_pin.has_css_class("tab-pinned") {
                     strip_btn_pin.remove_css_class("tab-pinned");
                     unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
+                    unsafe { term_wrapper_pin.set_data::<bool>("pinned", false); }
                 } else {
                     strip_btn_pin.add_css_class("tab-pinned");
                     unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
+                    unsafe { term_wrapper_pin.set_data::<bool>("pinned", true); }
                 }
             });
             action_group.add_action(&pin_action);
