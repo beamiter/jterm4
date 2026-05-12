@@ -83,14 +83,102 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
 use crate::parser::{Parser, ParserEvent};
 use crate::pty::OwnedPty;
+use crate::terminal::open_uri;
+
+// Global block ID counter
+static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_block_id() -> u64 {
+    BLOCK_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+// ─── Cursor Shape ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermCursorShape {
+    Block,      // 0 or 1: block cursor
+    Underline,  // 3 or 4: underline cursor
+    Bar,        // 5 or 6: bar/vertical cursor
+}
+
+impl Default for TermCursorShape {
+    fn default() -> Self {
+        TermCursorShape::Block
+    }
+}
+
+// ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseReportingMode {
+    /// No mouse reporting (CSI ?1000l, etc.)
+    None,
+    /// Basic click reporting (CSI ?1000h)
+    Click,
+    /// Button press/release/drag (CSI ?1002h)
+    Button,
+    /// All mouse motion (CSI ?1003h)
+    Motion,
+    /// SGR-style reporting (CSI ?1006h) - modern format
+    SGR,
+}
+
+impl Default for MouseReportingMode {
+    fn default() -> Self {
+        MouseReportingMode::None
+    }
+}
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+/// Simple URL detection regex (http/https/file URLs)
+fn is_url(text: &str) -> bool {
+    text.starts_with("http://") || text.starts_with("https://") || text.starts_with("file://")
+}
+
+/// Extract URL at cursor position in a TextView's buffer
+fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<String> {
+    let mut start = iter.clone();
+    let mut end = iter.clone();
+
+    // Expand backwards to find URL start
+    while !start.starts_line() {
+        let ch = start.char();
+        if ch == ' ' || ch == '\n' || ch == '\t' || ch == '<' || ch == '>' {
+            start.forward_char();
+            break;
+        }
+        if !start.backward_char() {
+            break;
+        }
+    }
+
+    // Expand forwards to find URL end
+    while !end.ends_line() {
+        let ch = end.char();
+        if ch == ' ' || ch == '\n' || ch == '\t' || ch == '<' || ch == '>' {
+            break;
+        }
+        if !end.forward_char() {
+            break;
+        }
+    }
+
+    let text = buffer.text(&start, &end, false).to_string();
+    if is_url(&text) {
+        Some(text)
+    } else {
+        None
+    }
+}
 
 /// Coalesces repeated scroll requests into a single scroll event.
 /// Eliminates cascade of timers and provides smooth scrolling under rapid output.
@@ -663,6 +751,9 @@ struct AnsiStyleState {
     underline: bool,
     strikethrough: bool,
     dim: bool,
+    reverse: bool,     // SGR 7 - swap fg/bg
+    hidden: bool,      // SGR 8 - invisible text
+    overline: bool,    // SGR 53 - line above text
 }
 
 #[derive(Clone)]
@@ -679,6 +770,9 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         && !style.underline
         && !style.strikethrough
         && !style.dim
+        && !style.reverse
+        && !style.hidden
+        && !style.overline
     {
         return None;
     }
@@ -847,6 +941,12 @@ fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RG
                     index += 4;
                 }
             }
+            7 => style.reverse = true,           // SGR 7: reverse video (swap fg/bg)
+            8 => style.hidden = true,            // SGR 8: conceal/hidden
+            27 => style.reverse = false,         // SGR 27: disable reverse video
+            28 => style.hidden = false,          // SGR 28: disable hidden
+            53 => style.overline = true,         // SGR 53: overline
+            55 => style.overline = false,        // SGR 55: disable overline
             _ => {}
         }
 
@@ -1103,6 +1203,29 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 out.push_str("<span strikethrough=\"true\">");
                                 open_spans += 1;
                             }
+                            Ok(7) => {
+                                // Reverse video - for now use background/foreground swap via CSS
+                                out.push_str("<span style=\"reverse\">");
+                                open_spans += 1;
+                            }
+                            Ok(8) => {
+                                // Hidden/conceal text - use very low opacity
+                                out.push_str("<span alpha=\"5%\">");
+                                open_spans += 1;
+                            }
+                            Ok(27) => {
+                                out.push_str("</span>");
+                                if open_spans > 0 { open_spans -= 1; }
+                            }
+                            Ok(28) => {
+                                out.push_str("</span>");
+                                if open_spans > 0 { open_spans -= 1; }
+                            }
+                            Ok(53) => {
+                                // Overline - use overline attribute (if supported)
+                                out.push_str("<span overline=\"single\">");
+                                open_spans += 1;
+                            }
                             Ok(30..=37) => {
                                 let idx = (param_str.parse::<u32>().unwrap() - 30) as usize;
                                 let (r, g, b) = ansi256_to_rgb(idx as u8, palette);
@@ -1269,6 +1392,7 @@ fn ansi_to_pango_cached(
 /// Data for a finished command block (decoupled from widget representation)
 #[derive(Clone, Serialize, Deserialize)]
 struct BlockData {
+    id: u64,
     prompt: String,
     cmd: String,
     cmd_markup: Option<String>,
@@ -1276,9 +1400,70 @@ struct BlockData {
     exit_code: i32,
     estimated_height: i32,
     line_count: usize,
+    #[serde(default)]
+    start_time: Option<SystemTime>,
+    #[serde(default)]
+    end_time: Option<SystemTime>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+impl BlockData {
+    /// Export block to JSON format
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Export block to Markdown format
+    pub fn to_markdown(&self) -> String {
+        let mut md = String::new();
+
+        md.push_str("## Command Block\n\n");
+
+        if !self.prompt.is_empty() {
+            md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+        }
+
+        md.push_str("**Command:**\n```bash\n");
+        md.push_str(&self.cmd);
+        md.push_str("\n```\n\n");
+
+        if !self.output.is_empty() {
+            md.push_str("**Output:**\n```\n");
+            md.push_str(&self.output);
+            md.push_str("\n```\n\n");
+        }
+
+        md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+
+        if let Some(dur) = self.duration_ms {
+            let dur_sec = dur as f64 / 1000.0;
+            md.push_str(&format!("**Duration:** {:.3}s\n\n", dur_sec));
+        }
+
+        md
+    }
+}
+
+/// Filters for searching/filtering blocks
+#[derive(Clone, Default)]
+pub struct BlockFilters {
+    /// Filter by exit code (e.g., Some(0) = only successful, Some(1) = only failed)
+    pub exit_code: Option<i32>,
+    /// Filter by minimum duration in milliseconds
+    pub min_duration_ms: Option<u64>,
+    /// Filter by maximum duration in milliseconds
+    pub max_duration_ms: Option<u64>,
+    /// Show only failed commands (exit_code != 0)
+    pub failed_only: bool,
+    /// Show only slow commands (duration > threshold)
+    pub slow_only: bool,
+    /// Slow threshold in milliseconds (default 1000ms)
+    pub slow_threshold_ms: u64,
 }
 
 struct FinishedBlock {
+    id: u64,
     widget: gtk4::Box,
     prompt_view: gtk4::TextView,
     prompt_buffer: gtk4::TextBuffer,
@@ -1291,6 +1476,7 @@ struct FinishedBlock {
 impl Clone for FinishedBlock {
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             widget: self.widget.clone(),
             prompt_view: self.prompt_view.clone(),
             prompt_buffer: self.prompt_buffer.clone(),
@@ -1310,6 +1496,8 @@ impl FinishedBlock {
         output: &str,
         exit_code: i32,
         config: &Config,
+        duration_ms: Option<u64>,
+        end_time: Option<SystemTime>,
     ) -> Self {
         let block_outer_margin_top = 4;
         let block_outer_margin_bottom = 2;
@@ -1320,6 +1508,18 @@ impl FinishedBlock {
         outer.add_css_class("block-finished");
         outer.set_margin_top(block_outer_margin_top);
         outer.set_margin_bottom(block_outer_margin_bottom);
+
+        // Add hover highlighting to show block is interactive
+        let hover_ctrl = gtk4::EventControllerMotion::new();
+        let outer_for_enter = outer.clone();
+        hover_ctrl.connect_enter(move |_, _, _| {
+            outer_for_enter.add_css_class("block-hovered");
+        });
+        let outer_for_leave = outer.clone();
+        hover_ctrl.connect_leave(move |_| {
+            outer_for_leave.remove_css_class("block-hovered");
+        });
+        outer.add_controller(hover_ctrl);
 
         // Helper to create TextView
         let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
@@ -1355,20 +1555,74 @@ impl FinishedBlock {
 
         set_active_output_buffer(&output_buffer, output, &config.palette);
 
+        // Add Ctrl+Click handler to open URLs in command and output views
+        for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
+            let click_controller = gtk4::GestureClick::new();
+            click_controller.set_button(1); // left click
+            click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+
+            let buffer_clone = buffer.clone();
+            let view_clone = view.clone();
+            click_controller.connect_pressed(move |controller, n_press, x, y| {
+                if n_press == 1 {
+                    let state = controller.current_event_state();
+                    if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                        // Get text iter at click position
+                        let (bx, by) = view_clone.window_to_buffer_coords(
+                            gtk4::TextWindowType::Widget,
+                            x as i32,
+                            y as i32,
+                        );
+                        if let Some(iter) = view_clone.iter_at_location(bx, by) {
+                            if let Some(url) = get_url_at_position(&buffer_clone, &iter) {
+                                open_uri(&url);
+                                controller.set_state(gtk4::EventSequenceState::Claimed);
+                                return;
+                            }
+                        }
+                    }
+                }
+                controller.set_state(gtk4::EventSequenceState::Denied);
+            });
+
+            view.add_controller(click_controller);
+        }
+
         // Append views to outer box
         outer.append(&prompt_view);
         outer.append(&command_view);
         outer.append(&output_view);
 
-        // Exit code badge (horizontal box after views)
+        // Exit code badge and metadata footer
+        let footer_box = gtk4::Box::new(Orientation::Horizontal, 8);
+        footer_box.set_margin_start(12);
+        footer_box.set_margin_bottom(6);
+
+        // Exit code badge
         if exit_code != 0 {
-            let badge_box = gtk4::Box::new(Orientation::Horizontal, 0);
-            badge_box.set_margin_start(12);
-            badge_box.set_margin_bottom(6);
-            let badge = gtk4::Label::new(Some(&format!(" {exit_code} ")));
+            let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
             badge.add_css_class("block-exit-bad");
-            badge_box.append(&badge);
-            outer.append(&badge_box);
+            footer_box.append(&badge);
+        }
+
+        // Duration badge
+        if let Some(dur_ms) = duration_ms {
+            let dur_sec = dur_ms as f64 / 1000.0;
+            let duration_text = if dur_sec < 1.0 {
+                format!("{:.0}ms", dur_ms)
+            } else if dur_sec < 60.0 {
+                format!("{:.1}s", dur_sec)
+            } else {
+                let min = dur_sec / 60.0;
+                format!("{:.0}m", min)
+            };
+            let dur_label = gtk4::Label::new(Some(&duration_text));
+            dur_label.add_css_class("block-meta-badge");
+            footer_box.append(&dur_label);
+        }
+
+        if !footer_box.first_child().is_none() {
+            outer.append(&footer_box);
         }
 
         // Separator line
@@ -1376,6 +1630,7 @@ impl FinishedBlock {
         outer.append(&sep_box);
 
         FinishedBlock {
+            id: next_block_id(),
             widget: outer,
             prompt_view,
             prompt_buffer,
@@ -1740,6 +1995,12 @@ pub struct TermView {
     pty: Rc<OwnedPty>,
     cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
+    bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
+    activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    bracketed_paste_mode: Rc<Cell<bool>>,
+    mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
+    cursor_shape: Rc<Cell<TermCursorShape>>,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -1748,6 +2009,7 @@ pub struct TermView {
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>, // Cache search results
+    selected_block_id: Rc<Cell<Option<u64>>>,
 }
 
 impl TermView {
@@ -1848,6 +2110,12 @@ impl TermView {
         let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
+        let bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>> = Rc::new(RefCell::new(vec![]));
+        let title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
+        let activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>> = Rc::new(RefCell::new(vec![]));
+        let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
+        let cursor_shape: Rc<Cell<TermCursorShape>> = Rc::new(Cell::new(TermCursorShape::Block));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1874,6 +2142,12 @@ impl TermView {
             let pty_for_resize = pty.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
+            let bell_cbs = bell_callbacks.clone();
+            let title_cbs = title_callbacks.clone();
+            let activity_cbs = activity_callbacks.clone();
+            let bracketed_paste_rc = bracketed_paste_mode.clone();
+            let mouse_reporting_rc = mouse_reporting_mode.clone();
+            let cursor_shape_rc = cursor_shape.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::new()));
             let block_data_for_cb = block_data_rc.clone();
@@ -1892,6 +2166,8 @@ impl TermView {
             ));
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
+            let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
+            let block_start_time_for_cb = block_start_time.clone();
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -1906,6 +2182,76 @@ impl TermView {
                         log::debug!("ParserEvent: {:?} (state={:?})", event, state);
                         match event {
                             ParserEvent::Bytes(bytes) => {
+                                // Check for bell character (BEL = 0x07) and trigger callbacks
+                                if bytes.contains(&7) {
+                                    for cb in bell_cbs.borrow().iter() {
+                                        cb();
+                                    }
+                                }
+
+                                // Check for OSC title sequences (OSC 0/2 title)
+                                let bytes_str = String::from_utf8_lossy(bytes);
+                                if bytes_str.contains("\x1b]0;") || bytes_str.contains("\x1b]2;") {
+                                    // Simple extraction: look for title between \x1b]<n>; and \x07 or \x1b\\
+                                    if let Some(start_idx) = bytes_str.find(';') {
+                                        if let Some(end_idx) = bytes_str[start_idx..].find('\x07')
+                                            .or_else(|| bytes_str[start_idx..].find("\x1b\\"))
+                                        {
+                                            let title = &bytes_str[start_idx + 1..start_idx + end_idx];
+                                            if !title.is_empty() {
+                                                for cb in title_cbs.borrow().iter() {
+                                                    cb(title);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check for bracketed paste mode (CSI ?2004h = enable, CSI ?2004l = disable)
+                                if bytes_str.contains("\x1b[?2004h") {
+                                    bracketed_paste_rc.set(true);
+                                } else if bytes_str.contains("\x1b[?2004l") {
+                                    bracketed_paste_rc.set(false);
+                                }
+
+                                // Check for mouse reporting mode changes
+                                if bytes_str.contains("\x1b[?1000h") {
+                                    mouse_reporting_rc.set(MouseReportingMode::Click);
+                                } else if bytes_str.contains("\x1b[?1000l") {
+                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                } else if bytes_str.contains("\x1b[?1002h") {
+                                    mouse_reporting_rc.set(MouseReportingMode::Button);
+                                } else if bytes_str.contains("\x1b[?1002l") {
+                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                } else if bytes_str.contains("\x1b[?1003h") {
+                                    mouse_reporting_rc.set(MouseReportingMode::Motion);
+                                } else if bytes_str.contains("\x1b[?1003l") {
+                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                } else if bytes_str.contains("\x1b[?1006h") {
+                                    mouse_reporting_rc.set(MouseReportingMode::SGR);
+                                } else if bytes_str.contains("\x1b[?1006l") {
+                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                }
+
+                                // Check for cursor shape changes (DECSCUSR: CSI Ps SP q)
+                                if let Some(pos) = bytes_str.find("\x1b[") {
+                                    if let Some(end_pos) = bytes_str[pos+2..].find('q') {
+                                        let shape_str = bytes_str[pos+2..pos+2+end_pos].trim_end_matches(' ');
+                                        match shape_str {
+                                            "0" | "1" => cursor_shape_rc.set(TermCursorShape::Block),
+                                            "3" | "4" => cursor_shape_rc.set(TermCursorShape::Underline),
+                                            "5" | "6" => cursor_shape_rc.set(TermCursorShape::Bar),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+
+                                // Check for Sixel graphics (DCS: ESC P)
+                                // These will be handled by VTE in alt-screen mode
+                                if bytes_str.contains("\x1bP") {
+                                    log::debug!("Sixel graphics detected (displayed in VTE/alt-screen mode)");
+                                }
+
                                 let text = String::from_utf8_lossy(bytes).to_string();
                                 match state {
                                     BlockState::CollectingPrompt => {
@@ -2002,6 +2348,11 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
+                                        // Trigger activity callbacks when there's output
+                                        for cb in activity_cbs.borrow().iter() {
+                                            cb();
+                                        }
+
                                         if contains_full_screen_redraw(bytes) {
                                             bstate_rc.set(BlockState::AltScreen);
                                             show_alt_screen(
@@ -2060,6 +2411,7 @@ impl TermView {
 
                             ParserEvent::CommandStart => {
                                 bstate_rc.set(BlockState::CollectingOutput);
+                                block_start_time_for_cb.set(Some(SystemTime::now()));
                                 let raw_cmd = cmd_display_raw_rc.borrow().clone();
                                 if !raw_cmd.trim().is_empty() {
                                     *executing_cmd_raw_rc.borrow_mut() = raw_cmd;
@@ -2116,7 +2468,17 @@ impl TermView {
                                 let line_count = output_trimmed.lines().count();
                                 let estimated_height = (line_count as i32 * 20).max(60);  // Rough estimate
 
+                                // Calculate duration if we have a start time
+                                let start_time = block_start_time_for_cb.get();
+                                let end_time = Some(SystemTime::now());
+                                let duration_ms = start_time.and_then(|st| {
+                                    end_time.and_then(|et| {
+                                        et.duration_since(st).ok().map(|d| d.as_millis() as u64)
+                                    })
+                                });
+
                                 let block_data = BlockData {
+                                    id: next_block_id(),
                                     prompt: prompt.clone(),
                                     cmd: cmd.clone(),
                                     cmd_markup: if cmd_markup.is_empty() { None } else { Some(cmd_markup.clone()) },
@@ -2124,6 +2486,9 @@ impl TermView {
                                     exit_code: *code,
                                     estimated_height,
                                     line_count,
+                                    start_time,
+                                    end_time,
+                                    duration_ms,
                                 };
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
@@ -2131,6 +2496,7 @@ impl TermView {
                                 // Create widget (physical representation)
                                 let finished = FinishedBlock::new(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, *code, &config_for_cb.borrow(),
+                                    duration_ms, end_time,
                                 );
 
                                 // Insert before the active block (which is always last)
@@ -2139,7 +2505,128 @@ impl TermView {
 
                                 // Track finished blocks and limit history
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
-                                finished_blocks_for_cb.borrow_mut().push(finished.clone());
+                                let finished_clone = finished.clone();
+                                let finished_widget = finished_clone.widget().clone();
+                                finished_blocks_for_cb.borrow_mut().push(finished);
+
+                                // Setup right-click context menu for this block
+                                let finished_blocks_for_menu = finished_blocks_for_cb.clone();
+                                let block_list_for_menu = block_list_rc.clone();
+                                let vte_for_copy = vte_for_alt.clone();
+                                let block_id = finished_clone.id;
+
+                                let right_click = gtk4::GestureClick::new();
+                                right_click.set_button(3); // right mouse button
+
+                                let finished_menu_clone = finished_clone.clone();
+                                let block_data_for_export = block_data_for_cb.clone();
+                                right_click.connect_pressed(move |gesture, _n_press, x, y| {
+                                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+                                    let menu = gtk4::gio::Menu::new();
+                                    menu.append(Some("Copy Block"), Some("block-ctx.copy"));
+
+                                    // Export submenu
+                                    let export_menu = gtk4::gio::Menu::new();
+                                    export_menu.append(Some("Export as JSON"), Some("block-ctx.export-json"));
+                                    export_menu.append(Some("Export as Markdown"), Some("block-ctx.export-markdown"));
+                                    menu.append_submenu(Some("Export Block"), &export_menu);
+
+                                    menu.append(Some("Delete Block"), Some("block-ctx.delete"));
+
+                                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                                    let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
+                                    popover.set_parent(widget);
+                                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                                        x as i32, y as i32, 1, 1,
+                                    )));
+                                    popover.set_has_arrow(false);
+
+                                    let action_group = gtk4::gio::SimpleActionGroup::new();
+
+                                    // Copy action
+                                    let copy_action = gtk4::gio::SimpleAction::new("copy", None);
+                                    let finished_for_copy = finished_menu_clone.clone();
+                                    let vte_for_action = vte_for_copy.clone();
+                                    copy_action.connect_activate(move |_, _| {
+                                        let prompt_text = finished_for_copy.prompt_buffer.text(
+                                            &finished_for_copy.prompt_buffer.start_iter(),
+                                            &finished_for_copy.prompt_buffer.end_iter(),
+                                            true,
+                                        );
+                                        let cmd_text = finished_for_copy.command_buffer.text(
+                                            &finished_for_copy.command_buffer.start_iter(),
+                                            &finished_for_copy.command_buffer.end_iter(),
+                                            true,
+                                        );
+                                        let output_text = finished_for_copy.output_buffer.text(
+                                            &finished_for_copy.output_buffer.start_iter(),
+                                            &finished_for_copy.output_buffer.end_iter(),
+                                            true,
+                                        );
+                                        let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+                                        vte_for_action.clipboard().set_text(&full_text);
+                                    });
+                                    action_group.add_action(&copy_action);
+
+                                    // Export as JSON action
+                                    let export_json_action = gtk4::gio::SimpleAction::new("export-json", None);
+                                    let block_data_for_json = block_data_for_export.clone();
+                                    let vte_for_json = vte_for_copy.clone();
+                                    let block_id_json = block_id;
+                                    export_json_action.connect_activate(move |_, _| {
+                                        let blocks = block_data_for_json.borrow();
+                                        if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                                            let json = block.to_json();
+                                            vte_for_json.clipboard().set_text(&json);
+                                            log::info!("Block exported as JSON to clipboard");
+                                        }
+                                    });
+                                    action_group.add_action(&export_json_action);
+
+                                    // Export as Markdown action
+                                    let export_md_action = gtk4::gio::SimpleAction::new("export-markdown", None);
+                                    let block_data_for_md = block_data_for_export.clone();
+                                    let vte_for_md = vte_for_copy.clone();
+                                    let block_id_md = block_id;
+                                    export_md_action.connect_activate(move |_, _| {
+                                        let blocks = block_data_for_md.borrow();
+                                        if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                                            let markdown = block.to_markdown();
+                                            vte_for_md.clipboard().set_text(&markdown);
+                                            log::info!("Block exported as Markdown to clipboard");
+                                        }
+                                    });
+                                    action_group.add_action(&export_md_action);
+
+                                    // Delete action
+                                    let delete_action = gtk4::gio::SimpleAction::new("delete", None);
+                                    let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                                    let block_list_for_delete = block_list_for_menu.clone();
+                                    let block_id_del = block_id;
+                                    delete_action.connect_activate(move |_, _| {
+                                        let mut blocks = finished_blocks_for_delete.borrow_mut();
+                                        if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
+                                            let block = blocks.remove(pos);
+                                            block_list_for_delete.remove(block.widget());
+                                        }
+                                    });
+                                    action_group.add_action(&delete_action);
+
+                                    let finished_for_actions = finished_menu_clone.clone();
+                                    finished_for_actions.widget().insert_action_group("block-ctx", Some(&action_group));
+
+                                    let finished_for_cleanup = finished_menu_clone.clone();
+                                    popover.connect_closed(move |p| {
+                                        p.unparent();
+                                        finished_for_cleanup
+                                            .widget()
+                                            .insert_action_group("block-ctx", None::<&gtk4::gio::SimpleActionGroup>);
+                                    });
+
+                                    popover.popup();
+                                });
+                                finished_widget.add_controller(right_click);
 
                                 // Remove oldest block if we exceed the limit
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {
@@ -2380,6 +2867,12 @@ impl TermView {
             pty,
             cwd_callbacks,
             exited_callbacks,
+            bell_callbacks,
+            title_callbacks,
+            activity_callbacks,
+            bracketed_paste_mode,
+            mouse_reporting_mode,
+            cursor_shape,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
@@ -2392,6 +2885,7 @@ impl TermView {
             widget_pool: Rc::new(RefCell::new(WidgetPool::new())),
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
             search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            selected_block_id: Rc::new(Cell::new(None)),
         };
 
         // Load history if configured
@@ -2409,6 +2903,8 @@ impl TermView {
                     &block.output,
                     block.exit_code,
                     &config,
+                    block.duration_ms,
+                    block.end_time,
                 );
                 term_view.block_list.append(finished.widget());
                 term_view.finished_blocks.borrow_mut().push(finished);
@@ -2598,6 +3094,7 @@ impl TermView {
         log::warn!(">>> TermView::paste_from_clipboard called");
         let clipboard = self.vte.clipboard();
         let pty = self.pty.clone();
+        let bracketed_paste = self.bracketed_paste_mode.get();
         log::warn!(">>> TermView paste: got clipboard, calling read_text_async");
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             log::warn!(
@@ -2611,7 +3108,14 @@ impl TermView {
                             ">>> TermView paste: got {} chars from clipboard",
                             text_str.len()
                         );
-                        pty.write_bytes(text_str.as_bytes());
+                        // Wrap paste with bracketed paste mode if enabled
+                        if bracketed_paste {
+                            pty.write_bytes(b"\x1b[200~");
+                            pty.write_bytes(text_str.as_bytes());
+                            pty.write_bytes(b"\x1b[201~");
+                        } else {
+                            pty.write_bytes(text_str.as_bytes());
+                        }
                         log::warn!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
                     } else {
                         log::warn!(">>> TermView paste: clipboard is None");
@@ -2630,6 +3134,22 @@ impl TermView {
 
     pub fn connect_exited<F: Fn(i32) + 'static>(&self, f: F) {
         self.exited_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn connect_bell<F: Fn() + 'static>(&self, f: F) {
+        self.bell_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn connect_title_changed<F: Fn(&str) + 'static>(&self, f: F) {
+        self.title_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
+        self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn cursor_shape(&self) -> TermCursorShape {
+        self.cursor_shape.get()
     }
 
     /// Apply updated theme colors to the block widgets.
@@ -2712,35 +3232,124 @@ impl TermView {
     /// Search blocks for a query string (case-insensitive).
     /// Returns indices of matching blocks.
     pub fn search_blocks(&self, query: &str) -> Vec<usize> {
+        self.search_blocks_with_filters(query, &BlockFilters::default())
+    }
+
+    /// Search blocks with optional filters
+    pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<usize> {
         let q = query.to_lowercase();
 
-        // Check cache first
-        if let Ok(cache) = self.search_cache.lock() {
-            if let Some(cached) = cache.get(&q) {
-                return cached.clone();
-            }
-        }
-
-        // Perform search
+        // Perform search with filters
         let results: Vec<usize> = self
             .block_data
             .borrow()
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                b.prompt.to_lowercase().contains(&q)
-                    || b.cmd.to_lowercase().contains(&q)
-                    || b.output.to_lowercase().contains(&q)
+                // Text search
+                let text_match = if q.is_empty() {
+                    true
+                } else {
+                    b.prompt.to_lowercase().contains(&q)
+                        || b.cmd.to_lowercase().contains(&q)
+                        || b.output.to_lowercase().contains(&q)
+                };
+
+                if !text_match {
+                    return false;
+                }
+
+                // Exit code filter
+                if let Some(exit_code) = filters.exit_code {
+                    if b.exit_code != exit_code {
+                        return false;
+                    }
+                }
+
+                // Failed only filter
+                if filters.failed_only && b.exit_code == 0 {
+                    return false;
+                }
+
+                // Duration filters
+                if let Some(duration) = b.duration_ms {
+                    if let Some(min_dur) = filters.min_duration_ms {
+                        if duration < min_dur {
+                            return false;
+                        }
+                    }
+                    if let Some(max_dur) = filters.max_duration_ms {
+                        if duration > max_dur {
+                            return false;
+                        }
+                    }
+                    if filters.slow_only && duration < filters.slow_threshold_ms {
+                        return false;
+                    }
+                }
+
+                true
             })
             .map(|(i, _)| i)
             .collect();
 
-        // Cache results (ignore lock errors)
-        if let Ok(mut cache) = self.search_cache.lock() {
-            cache.insert(q, results.clone());
+        results
+    }
+
+    /// Get only failed blocks (exit_code != 0)
+    pub fn get_failed_blocks(&self) -> Vec<usize> {
+        let filters = BlockFilters {
+            failed_only: true,
+            ..Default::default()
+        };
+        self.search_blocks_with_filters("", &filters)
+    }
+
+    /// Get only slow blocks (duration > threshold)
+    pub fn get_slow_blocks(&self, threshold_ms: u64) -> Vec<usize> {
+        let filters = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: threshold_ms,
+            ..Default::default()
+        };
+        self.search_blocks_with_filters("", &filters)
+    }
+
+    /// Export a block by ID to JSON format
+    pub fn export_block_json(&self, block_id: u64) -> Option<String> {
+        let blocks = self.block_data.borrow();
+        blocks.iter().find(|b| b.id == block_id).map(|b| b.to_json())
+    }
+
+    /// Export a block by ID to Markdown format
+    pub fn export_block_markdown(&self, block_id: u64) -> Option<String> {
+        let blocks = self.block_data.borrow();
+        blocks.iter().find(|b| b.id == block_id).map(|b| b.to_markdown())
+    }
+
+    /// Export all blocks in the session as JSON
+    pub fn export_session_json(&self) -> String {
+        let blocks = self.block_data.borrow();
+        let blocks_vec: Vec<&BlockData> = blocks.iter().collect();
+        serde_json::to_string_pretty(&blocks_vec).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Export all blocks in the session as Markdown
+    pub fn export_session_markdown(&self) -> String {
+        let blocks = self.block_data.borrow();
+        let mut md = String::new();
+
+        md.push_str("# Terminal Session Export\n\n");
+        md.push_str(&format!("Total blocks: {}\n\n", blocks.len()));
+        md.push_str("---\n\n");
+
+        for (index, block) in blocks.iter().enumerate() {
+            md.push_str(&format!("## Block #{}\n\n", index + 1));
+            md.push_str(&block.to_markdown());
+            md.push_str("\n---\n\n");
         }
 
-        results
+        md
     }
 
     pub fn scroll_to_block(&self, block_index: usize) {
@@ -2757,6 +3366,41 @@ impl TermView {
             {
                 adj.set_value(value.y() as f64);
             }
+        }
+    }
+
+    /// Delete a block by ID (for right-click menu).
+    pub fn delete_block_by_id(&self, block_id: u64) {
+        let mut finished = self.finished_blocks.borrow_mut();
+        if let Some(pos) = finished.iter().position(|b| b.id == block_id) {
+            let block_to_remove = finished.remove(pos);
+            self.block_list.remove(block_to_remove.widget());
+        }
+    }
+
+    /// Copy a block's content to clipboard (prompt + cmd + output).
+    pub fn copy_block_by_id(&self, block_id: u64) {
+        let finished = self.finished_blocks.borrow();
+        if let Some(block) = finished.iter().find(|b| b.id == block_id) {
+            let prompt_text = block.prompt_buffer.text(
+                &block.prompt_buffer.start_iter(),
+                &block.prompt_buffer.end_iter(),
+                true,
+            );
+            let cmd_text = block.command_buffer.text(
+                &block.command_buffer.start_iter(),
+                &block.command_buffer.end_iter(),
+                true,
+            );
+            let output_text = block.output_buffer.text(
+                &block.output_buffer.start_iter(),
+                &block.output_buffer.end_iter(),
+                true,
+            );
+
+            let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+            let clipboard = self.vte.clipboard();
+            clipboard.set_text(&full_text);
         }
     }
 
@@ -2936,6 +3580,14 @@ fn install_block_css(config: &Config) {
             background-color: {bg_hex};
             min-height: 40px;
         }}
+        .block-hovered {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.03);
+        }}
+        .block-selected {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-left: 3px solid {fg_hex};
+            padding-left: 9px;
+        }}
         .block-active {{
             border-radius: 0;
             margin: 0;
@@ -3044,6 +3696,12 @@ fn install_block_css(config: &Config) {
         .block-exit-bad {{
             color: #ff5555;
             background-color: rgba(255,85,85,0.18);
+            border-radius: 3px;
+            font-size: 0.8em;
+        }}
+        .block-meta-badge {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
             border-radius: 3px;
             font-size: 0.8em;
         }}

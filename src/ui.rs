@@ -250,6 +250,32 @@ impl UiState {
             Action::ToggleTabMarked => {
                 self.toggle_current_tab_marked();
             }
+            Action::FilterFailedBlocks => {
+                log::info!("Filter failed blocks");
+                if let Some(term_view) = self.current_term_view() {
+                    let failed_indices = term_view.get_failed_blocks();
+                    log::info!("Found {} failed blocks", failed_indices.len());
+                    // TODO: Highlight or show only these blocks in UI
+                    if !failed_indices.is_empty() {
+                        term_view.scroll_to_block(failed_indices[0]);
+                    }
+                }
+            }
+            Action::FilterSlowBlocks => {
+                log::info!("Filter slow blocks");
+                if let Some(term_view) = self.current_term_view() {
+                    let slow_threshold = 1000; // 1 second
+                    let slow_indices = term_view.get_slow_blocks(slow_threshold);
+                    log::info!("Found {} slow blocks (>{}ms)", slow_indices.len(), slow_threshold);
+                    if !slow_indices.is_empty() {
+                        term_view.scroll_to_block(slow_indices[0]);
+                    }
+                }
+            }
+            Action::ClearBlockFilter => {
+                log::info!("Clear block filter");
+                // TODO: Reset filter and show all blocks
+            }
         }
     }
 

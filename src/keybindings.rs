@@ -44,6 +44,9 @@ pub(crate) enum Action {
     MoveTabRight,
     DuplicateTab,
     ToggleTabMarked,
+    FilterFailedBlocks,
+    FilterSlowBlocks,
+    ClearBlockFilter,
 }
 
 impl Action {
@@ -98,6 +101,9 @@ impl Action {
             Action::MoveTabRight => "Move tab right",
             Action::DuplicateTab => "Duplicate tab",
             Action::ToggleTabMarked => "Toggle tab marked",
+            Action::FilterFailedBlocks => "Filter failed blocks",
+            Action::FilterSlowBlocks => "Filter slow blocks",
+            Action::ClearBlockFilter => "Clear block filter",
         }
     }
 
@@ -141,6 +147,9 @@ impl Action {
             Action::MoveTabRight => Some("move_tab_right"),
             Action::DuplicateTab => Some("duplicate_tab"),
             Action::ToggleTabMarked => Some("toggle_tab_marked"),
+            Action::FilterFailedBlocks => Some("filter_failed_blocks"),
+            Action::FilterSlowBlocks => Some("filter_slow_blocks"),
+            Action::ClearBlockFilter => Some("clear_block_filter"),
         }
     }
 
