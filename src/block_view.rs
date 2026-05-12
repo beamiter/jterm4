@@ -2054,6 +2054,7 @@ impl TermView {
         let vte_box = gtk4::Box::new(Orientation::Horizontal, 0);
         vte_box.set_hexpand(true);
         vte_box.set_vexpand(true);
+        vte_box.add_css_class("terminal-box"); // Allow find_first_terminal to discover the VTE inside
         vte_box.append(&vte);
         vte_box.append(&vte_scrollbar);
         vte_box.set_visible(false); // hidden until alt-screen

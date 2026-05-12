@@ -348,7 +348,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     // Parse terminal mode (default: block)
     let terminal_mode_str = env_string("JTERM4_MODE")
         .or(fc.terminal_mode)
-        .unwrap_or_else(|| "vte".to_string());
+        .unwrap_or_else(|| "block".to_string());
     let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
         "vte" => TerminalMode::Vte,
         _ => TerminalMode::Block,
