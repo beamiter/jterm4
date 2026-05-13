@@ -314,6 +314,13 @@ fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
 
                 match final_byte {
                     b'H' | b'f' | b'J' => return true,
+                    b'l' | b'h' => {
+                        // ESC[?25l - hide cursor / ESC[?25h - show cursor
+                        // Strong indicator of interactive TUI application
+                        if params == b"?25" {
+                            return true;
+                        }
+                    }
                     _ => {}
                 }
             }
