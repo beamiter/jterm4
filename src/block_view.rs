@@ -284,7 +284,11 @@ fn is_alt_screen_mode(params: &[u8]) -> bool {
     matches!(params, b"?47" | b"?1047" | b"?1049")
 }
 
-fn contains_explicit_alt_screen_switch(bytes: &[u8]) -> bool {
+fn is_application_cursor_mode(params: &[u8]) -> bool {
+    params == b"?1"
+}
+
+fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
     let mut i = 0;
 
     while i + 1 < bytes.len() {
@@ -308,11 +312,11 @@ fn contains_explicit_alt_screen_switch(bytes: &[u8]) -> bool {
                 let params = &bytes[params_start..i];
                 i += 1;
 
-                if is_alt_screen_mode(params) {
+                if final_byte == b'h'
+                    && (is_alt_screen_mode(params) || is_application_cursor_mode(params))
+                {
                     return true;
                 }
-
-                let _ = final_byte;
             }
             _ => {
                 i = skip_escape_sequence(bytes, i);
@@ -321,6 +325,61 @@ fn contains_explicit_alt_screen_switch(bytes: &[u8]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod interactive_screen_tests {
+    use super::contains_interactive_screen_enter;
+
+    #[test]
+    fn detects_alt_screen_enter() {
+        assert!(contains_interactive_screen_enter(b"\x1b[?1049h"));
+    }
+
+    #[test]
+    fn detects_less_application_cursor_enter() {
+        assert!(contains_interactive_screen_enter(b"\x1b[?1h\x1b="));
+    }
+
+    #[test]
+    fn ignores_leave_sequences() {
+        assert!(!contains_interactive_screen_enter(b"\x1b[?1049l\x1b[?1l\x1b>"));
+    }
+}
+
+#[cfg(test)]
+mod pager_snapshot_tests {
+    use super::{merge_pager_snapshots, normalize_pager_snapshot};
+
+    #[test]
+    fn filters_less_status_lines() {
+        let snapshot = normalize_pager_snapshot("\ncommit a\nAuthor: me\n:\n");
+        assert_eq!(snapshot, "commit a\nAuthor: me");
+    }
+
+    #[test]
+    fn merges_viewed_pages_by_overlap() {
+        let merged = merge_pager_snapshots(vec![
+            "commit a\nAuthor: me\nDate: today\n\n    first".to_string(),
+            "Date: today\n\n    first\ncommit b\nAuthor: you".to_string(),
+            "commit b\nAuthor: you\nDate: yesterday".to_string(),
+        ]);
+
+        assert_eq!(
+            merged,
+            "commit a\nAuthor: me\nDate: today\n\n    first\ncommit b\nAuthor: you\nDate: yesterday"
+        );
+    }
+
+    #[test]
+    fn skips_duplicate_pages() {
+        let merged = merge_pager_snapshots(vec![
+            "commit a\nAuthor: me".to_string(),
+            "commit a\nAuthor: me".to_string(),
+        ]);
+
+        assert_eq!(merged, "commit a\nAuthor: me");
+    }
 }
 
 fn show_alt_screen(
@@ -372,6 +431,126 @@ fn hide_alt_screen(block_scroll: &ScrolledWindow, vte_box: &gtk4::Box) {
     vte_box.set_vexpand(false);
     block_scroll.set_vexpand(true);
     block_scroll.set_visible(true);
+}
+
+fn visible_vte_text(vte: &Terminal) -> String {
+    let rows = vte.row_count();
+    let cols = vte.column_count();
+    if rows <= 0 || cols <= 0 {
+        return String::new();
+    }
+
+    let (text, _) = vte.text_range_format(
+        vte4::Format::Text,
+        0,
+        0,
+        rows.saturating_sub(1),
+        cols,
+    );
+
+    text.map(|s| s.to_string()).unwrap_or_default()
+}
+
+fn normalize_pager_snapshot(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end().to_string())
+        .filter(|line| !is_pager_chrome_line(line))
+        .collect();
+
+    if lines
+        .iter()
+        .any(|line| line.trim().contains("...skipping..."))
+    {
+        return String::new();
+    }
+
+    let first = lines.iter().position(|line| !line.trim().is_empty());
+    let last = lines.iter().rposition(|line| !line.trim().is_empty());
+
+    match (first, last) {
+        (Some(start), Some(end)) if start <= end => lines[start..=end].join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn is_pager_chrome_line(line: &str) -> bool {
+    matches!(line.trim(), ":" | "(END)" | "END")
+}
+
+fn overlap_line_count(existing: &[String], next: &[String]) -> usize {
+    let max_overlap = existing.len().min(next.len());
+    for count in (1..=max_overlap).rev() {
+        if existing[existing.len() - count..] == next[..count] {
+            if count > 1 || !existing[existing.len() - count].trim().is_empty() {
+                return count;
+            }
+        }
+    }
+    0
+}
+
+fn merge_pager_snapshots(pages: Vec<String>) -> String {
+    let mut merged: Vec<String> = Vec::new();
+
+    for page in pages {
+        let page_lines: Vec<String> = page.lines().map(|line| line.to_string()).collect();
+        if page_lines.is_empty() {
+            continue;
+        }
+
+        if merged.is_empty() {
+            merged = page_lines;
+            continue;
+        }
+
+        if merged
+            .windows(page_lines.len())
+            .any(|window| window == page_lines.as_slice())
+        {
+            continue;
+        }
+
+        let overlap = overlap_line_count(&merged, &page_lines);
+        merged.extend(page_lines.into_iter().skip(overlap));
+    }
+
+    merged.join("\n")
+}
+
+fn record_pager_snapshot(vte: &Terminal, snapshots: &Rc<RefCell<Vec<String>>>) {
+    let snapshot = normalize_pager_snapshot(&visible_vte_text(vte));
+    if snapshot.is_empty() {
+        return;
+    }
+
+    let mut snapshots = snapshots.borrow_mut();
+    if snapshots.last().map(|last| last == &snapshot).unwrap_or(false) {
+        return;
+    }
+    snapshots.push(snapshot);
+}
+
+fn schedule_pager_snapshot(
+    vte: &Terminal,
+    snapshots: &Rc<RefCell<Vec<String>>>,
+    generation: &Rc<Cell<u64>>,
+) {
+    let token = generation.get();
+
+    let vte = vte.clone();
+    let snapshots = snapshots.clone();
+    let generation = generation.clone();
+    glib::idle_add_local_once(move || {
+        if generation.get() == token {
+            record_pager_snapshot(&vte, &snapshots);
+        }
+    });
+}
+
+fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
+    let pages = std::mem::take(&mut *snapshots.borrow_mut());
+    merge_pager_snapshots(pages)
 }
 
 fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
@@ -2095,6 +2274,7 @@ pub struct TermView {
     title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
     bracketed_paste_mode: Rc<Cell<bool>>,
+    application_cursor_mode: Rc<Cell<bool>>,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
     cursor_shape: Rc<Cell<TermCursorShape>>,
     config: Rc<RefCell<Config>>,
@@ -2176,8 +2356,9 @@ impl TermView {
         }
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-        // Build env_extra with RSH_SESSION_ID for rsh
-        let mut env_extra: Vec<(&str, &str)> = vec![];
+        // Build env_extra for block-mode shells. Git output should stream into
+        // the block transcript instead of being trapped in a single pager screen.
+        let mut env_extra: Vec<(&str, &str)> = vec![("GIT_PAGER", "cat")];
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
@@ -2211,11 +2392,14 @@ impl TermView {
         let title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>> = Rc::new(RefCell::new(vec![]));
         let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let application_cursor_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
         let cursor_shape: Rc<Cell<TermCursorShape>> = Rc::new(Cell::new(TermCursorShape::Block));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+        let pager_snapshots: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let pager_snapshot_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
             LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
         ));
@@ -2243,12 +2427,15 @@ impl TermView {
             let title_cbs = title_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
             let bracketed_paste_rc = bracketed_paste_mode.clone();
+            let application_cursor_rc = application_cursor_mode.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let cursor_shape_rc = cursor_shape.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::new()));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
+            let pager_snapshots_rc = pager_snapshots.clone();
+            let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
             let scroll_debouncer = ScrollDebouncer::new();
             let ansi_cache_for_cb = ansi_cache.clone();
 
@@ -2309,6 +2496,14 @@ impl TermView {
                                     bracketed_paste_rc.set(true);
                                 } else if bytes_str.contains("\x1b[?2004l") {
                                     bracketed_paste_rc.set(false);
+                                }
+
+                                // Git's default pager options often keep less on the main screen
+                                // while still enabling application cursor keys for navigation.
+                                if bytes_str.contains("\x1b[?1h") {
+                                    application_cursor_rc.set(true);
+                                } else if bytes_str.contains("\x1b[?1l") {
+                                    application_cursor_rc.set(false);
                                 }
 
                                 // Check for mouse reporting mode changes
@@ -2450,14 +2645,24 @@ impl TermView {
                                             cb();
                                         }
 
-                                        if contains_explicit_alt_screen_switch(bytes) {
+                                        if contains_interactive_screen_enter(bytes) {
                                             bstate_rc.set(BlockState::AltScreen);
+                                            pager_snapshots_rc.borrow_mut().clear();
+                                            pager_snapshot_generation_rc.set(
+                                                pager_snapshot_generation_rc.get().wrapping_add(1),
+                                            );
                                             show_alt_screen(
                                                 &block_scroll_rc,
                                                 &vte_box_rc,
                                                 &vte_for_alt,
                                                 pty_for_resize.clone(),
                                                 Some(bytes),
+                                            );
+                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                            schedule_pager_snapshot(
+                                                &vte_for_alt,
+                                                &pager_snapshots_rc,
+                                                &pager_snapshot_generation_rc,
                                             );
                                             continue;
                                         }
@@ -2473,6 +2678,12 @@ impl TermView {
                                     BlockState::AltScreen => {
                                         // Feed raw bytes directly to VTE
                                         vte_for_alt.feed(bytes);
+                                        record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                        schedule_pager_snapshot(
+                                            &vte_for_alt,
+                                            &pager_snapshots_rc,
+                                            &pager_snapshot_generation_rc,
+                                        );
                                     }
                                     BlockState::Idle => {
                                         // Bytes before first prompt — ignore (pre-prompt noise)
@@ -2529,7 +2740,20 @@ impl TermView {
 
                             ParserEvent::CommandEnd(code) => {
                                 if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
+                                    record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                }
+
+                                let pager_output = drain_pager_snapshots(&pager_snapshots_rc);
+                                pager_snapshot_generation_rc.set(
+                                    pager_snapshot_generation_rc.get().wrapping_add(1),
+                                );
+                                if !pager_output.is_empty() {
+                                    let needs_separator = !active_rc.borrow().output_text().trim().is_empty();
+                                    if needs_separator {
+                                        active_rc.borrow().append_output("\n\n");
+                                    }
+                                    active_rc.borrow().append_output(&pager_output);
                                 }
 
                                 // Flush any pending output first
@@ -2756,6 +2980,10 @@ impl TermView {
 
                             ParserEvent::AltScreenEnter => {
                                 bstate_rc.set(BlockState::AltScreen);
+                                pager_snapshots_rc.borrow_mut().clear();
+                                pager_snapshot_generation_rc.set(
+                                    pager_snapshot_generation_rc.get().wrapping_add(1),
+                                );
                                 show_alt_screen(
                                     &block_scroll_rc,
                                     &vte_box_rc,
@@ -2766,10 +2994,9 @@ impl TermView {
                             }
 
                             ParserEvent::AltScreenLeave => {
+                                record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
-                                bstate_rc.set(BlockState::Idle);
-                                // Reset active block ready for next prompt
-                                active_rc.borrow().reset_for_next_prompt();
+                                bstate_rc.set(BlockState::CollectingOutput);
                                 // Give focus to active block's TextView
                                 active_rc.borrow().command_view.grab_focus();
                             }
@@ -2832,6 +3059,7 @@ impl TermView {
             let vte_for_key = vte.clone();
             let root_for_key = root.clone();
             let im_context_for_key = im_context.clone();
+            let application_cursor_for_key = application_cursor_mode.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -2935,6 +3163,10 @@ impl TermView {
                     v if v == gtk4::gdk::Key::BackSpace => Some(b"\x7f".to_vec()),
                     v if v == gtk4::gdk::Key::Tab => Some(b"\t".to_vec()),
                     v if v == gtk4::gdk::Key::Escape => Some(b"\x1b".to_vec()),
+                    v if v == gtk4::gdk::Key::Up && application_cursor_for_key.get() => Some(b"\x1bOA".to_vec()),
+                    v if v == gtk4::gdk::Key::Down && application_cursor_for_key.get() => Some(b"\x1bOB".to_vec()),
+                    v if v == gtk4::gdk::Key::Right && application_cursor_for_key.get() => Some(b"\x1bOC".to_vec()),
+                    v if v == gtk4::gdk::Key::Left && application_cursor_for_key.get() => Some(b"\x1bOD".to_vec()),
                     v if v == gtk4::gdk::Key::Up => Some(b"\x1b[A".to_vec()),
                     v if v == gtk4::gdk::Key::Down => Some(b"\x1b[B".to_vec()),
                     v if v == gtk4::gdk::Key::Right => Some(b"\x1b[C".to_vec()),
@@ -3014,6 +3246,7 @@ impl TermView {
             title_callbacks,
             activity_callbacks,
             bracketed_paste_mode,
+            application_cursor_mode,
             mouse_reporting_mode,
             cursor_shape,
             config: Rc::new(RefCell::new(config.clone())),
