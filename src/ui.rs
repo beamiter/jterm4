@@ -17,7 +17,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::{Config, Theme, load_config, save_config};
 use crate::keybindings::{Action, Direction, KeybindingMap};
-use crate::state::{generate_session_id, kill_terminal_child};
+use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
 use crate::block_view::TermView;
 use crate::terminal::{
     create_terminal, wrap_with_scrollbar, scrollbar_wrapper_of,
@@ -592,10 +592,12 @@ impl UiState {
 
     fn remove_tab_by_widget_internal(&self, widget: &gtk4::Widget) {
         // Kill shell processes and remove the strip button for the current page
-        let mut terms = Vec::new();
-        collect_terminals(widget, &mut terms);
-        for term in &terms {
-            kill_terminal_child(term);
+        if !kill_widget_child_processes(widget) {
+            let mut terms = Vec::new();
+            collect_terminals(widget, &mut terms);
+            for term in &terms {
+                kill_terminal_child(term);
+            }
         }
         self.remove_strip_button_for(widget);
 
@@ -2191,6 +2193,9 @@ impl UiState {
         term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
         unsafe {
             term_wrapper.set_data::<TerminalViewType>("terminal-view-type", view_type.clone());
+            if let TerminalViewType::Block(term_view) = &view_type {
+                term_wrapper.set_data::<Rc<TermView>>("term-view", term_view.clone());
+            }
         }
 
         let ui_for_close = UiState::clone(self);
