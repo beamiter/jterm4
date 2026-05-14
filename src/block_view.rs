@@ -284,7 +284,7 @@ fn is_alt_screen_mode(params: &[u8]) -> bool {
     matches!(params, b"?47" | b"?1047" | b"?1049")
 }
 
-fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
+fn contains_explicit_alt_screen_switch(bytes: &[u8]) -> bool {
     let mut i = 0;
 
     while i + 1 < bytes.len() {
@@ -312,17 +312,7 @@ fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
                     return true;
                 }
 
-                match final_byte {
-                    b'H' | b'f' | b'J' => return true,
-                    b'l' | b'h' => {
-                        // ESC[?25l - hide cursor / ESC[?25h - show cursor
-                        // Strong indicator of interactive TUI application
-                        if params == b"?25" {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
+                let _ = final_byte;
             }
             _ => {
                 i = skip_escape_sequence(bytes, i);
@@ -405,16 +395,13 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                         let final_byte = bytes[i];
                         i += 1;
 
-                        // Detect clear-screen sequences
+                        // Detect clear-screen sequences. Cursor movement and partial erase
+                        // are common in command progress output, so only full-display erase
+                        // should clear the active block's rendered output.
                         match final_byte {
                             b'J' => {
-                                // CSI J, CSI 1J, CSI 2J — any erase in display
-                                should_clear = true;
-                            }
-                            b'H' | b'f' => {
-                                // CSI H or CSI f — cursor movement to position
-                                // If no params or params = "1;1", it's home position (clear-like behavior)
-                                if params.is_empty() || params == b"" || params == b"1;1" {
+                                // CSI 2J / CSI 3J — erase full display / scrollback.
+                                if params == b"2" || params == b"3" {
                                     should_clear = true;
                                 }
                             }
@@ -1101,13 +1088,15 @@ fn set_active_command_buffer(
     buffer: &TextBuffer,
     cmd: &str,
     preedit: &str,
-    cursor_visible: bool,
+    _cursor_visible: bool,
     suggestion: &str,
     _palette: &[RGBA; 16],
 ) {
-    let cursor_char = if cursor_visible { "▎" } else { " " };
-    let text = format!("{}{}{}{}", cmd, preedit, cursor_char, suggestion);
+    let cursor_pos = cmd.chars().count() + preedit.chars().count();
+    let text = format!("{}{}{}", cmd, preedit, suggestion);
     buffer.set_text(&text);
+    let cursor_iter = buffer.iter_at_offset(cursor_pos as i32);
+    buffer.place_cursor(&cursor_iter);
 
     let tag_table = buffer.tag_table();
 
@@ -1139,7 +1128,7 @@ fn set_active_command_buffer(
     }
 
     if let Some(tag) = tag_table.lookup("suggestion") {
-        let start_pos = cmd.chars().count() + preedit.chars().count() + cursor_char.chars().count();
+        let start_pos = cursor_pos;
         let end_pos = start_pos + suggestion.chars().count();
         let start_iter = buffer.iter_at_offset(start_pos as i32);
         let end_iter = buffer.iter_at_offset(end_pos as i32);
@@ -1744,6 +1733,7 @@ impl ActiveBlock {
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
         let (command_view, command_buffer) = create_textview("block-command-view");
         let (output_view, output_buffer) = create_textview("block-output-view");
+        command_view.set_cursor_visible(true);
 
         // Append to widget
         widget.append(&prompt_view);
@@ -1885,10 +1875,18 @@ impl ActiveBlock {
 
     fn append_output(&self, text: &str) {
         let text_len = text.len();
+        let first_output = self.pending_output.borrow().is_empty();
         self.pending_output.borrow_mut().push_str(text);
 
         self.bytes_since_last_flush
             .set(self.bytes_since_last_flush.get() + text_len);
+
+        if first_output {
+            self.flush_output();
+            self.bytes_since_last_flush.set(0);
+            self.last_flush_time.set(std::time::Instant::now());
+            return;
+        }
 
         if !self.flush_pending.get() {
             self.flush_pending.set(true);
@@ -1951,6 +1949,32 @@ impl ActiveBlock {
 
     fn output_text(&self) -> String {
         self.pending_output.borrow().clone()
+    }
+
+    fn clear_output(&self) {
+        self.pending_output.borrow_mut().clear();
+        self.flush_pending.set(false);
+        self.bytes_since_last_flush.set(0);
+        self.last_flushed_size.set(0);
+        set_active_output_buffer(&self.output_buffer, "", &self.palette);
+    }
+
+    fn start_command(&self, command: &str) {
+        *self.pending_cmd.borrow_mut() = command.to_string();
+        self.pending_preedit.borrow_mut().clear();
+        self.pending_suggestion.borrow_mut().clear();
+        self.clear_output();
+        self.last_flush_time.set(std::time::Instant::now());
+        self.update_content_view();
+    }
+
+    fn reset_for_next_prompt(&self) {
+        self.set_prompt("");
+        *self.pending_cmd.borrow_mut() = String::new();
+        self.pending_preedit.borrow_mut().clear();
+        self.pending_suggestion.borrow_mut().clear();
+        self.clear_output();
+        self.update_content_view();
     }
 
     fn widget(&self) -> &gtk4::Box {
@@ -2394,7 +2418,7 @@ impl TermView {
                                             cb();
                                         }
 
-                                        if contains_full_screen_redraw(bytes) {
+                                        if contains_explicit_alt_screen_switch(bytes) {
                                             bstate_rc.set(BlockState::AltScreen);
                                             show_alt_screen(
                                                 &block_scroll_rc,
@@ -2408,9 +2432,7 @@ impl TermView {
 
                                         let (_, should_clear) = strip_ansi_with_clear_detect(&text);
                                         if should_clear {
-                                            // Clear-screen sequence detected; clear output buffer
-                                            active_rc.borrow().pending_output.borrow_mut().clear();
-                                            active_rc.borrow().update_content_view();
+                                            active_rc.borrow().clear_output();
                                         }
                                         active_rc.borrow().append_output(&text);
                                         // Auto-scroll to bottom
@@ -2465,10 +2487,10 @@ impl TermView {
                                     *executing_cmd_raw_rc.borrow_mut() = active_cmd.clone();
                                     *executing_cmd_markup_rc.borrow_mut() = ansi_to_pango(&active_cmd, &config_for_cb.borrow().palette);
                                 }
-                                // Clear output buffer for new command
-                                active_rc.borrow().pending_suggestion.borrow_mut().clear();
-                                active_rc.borrow().pending_output.borrow_mut().clear();
-                                active_rc.borrow().update_content_view();
+                                let executing_cmd = plain_text_from_ansi(&executing_cmd_raw_rc.borrow())
+                                    .trim()
+                                    .to_string();
+                                active_rc.borrow().start_command(&executing_cmd);
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
@@ -2681,10 +2703,7 @@ impl TermView {
                                 }
 
                                 // Reset active block for next command
-                                active_rc.borrow().set_prompt("");
-                                active_rc.borrow().set_cmd("");
-                                active_rc.borrow().pending_output.borrow_mut().clear();
-                                active_rc.borrow().update_content_view();
+                                active_rc.borrow().reset_for_next_prompt();
 
                                 executing_cmd_raw_rc.borrow_mut().clear();
                                 executing_cmd_markup_rc.borrow_mut().clear();
@@ -2718,8 +2737,7 @@ impl TermView {
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::Idle);
                                 // Reset active block ready for next prompt
-                                active_rc.borrow().set_prompt("");
-                                active_rc.borrow().set_cmd("");
+                                active_rc.borrow().reset_for_next_prompt();
                                 // Give focus to active block's TextView
                                 active_rc.borrow().command_view.grab_focus();
                             }
@@ -3828,7 +3846,10 @@ fn install_block_css(config: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ansi_text_runs, ansi_to_pango, command_line_plain_text, skip_ansi_visible_chars, strip_ansi};
+    use super::{
+        ansi_text_runs, ansi_to_pango, command_line_plain_text, separate_input_and_suggestion,
+        skip_ansi_visible_chars, strip_ansi, strip_ansi_with_clear_detect,
+    };
     use gtk4::gdk::RGBA;
 
     fn palette() -> [RGBA; 16] {
@@ -3858,7 +3879,35 @@ mod tests {
     #[test]
     fn preserves_colored_output_runs() {
         let runs = ansi_text_runs("a\u{1b}[31mred\u{1b}[0mz", &palette());
-        assert_eq!(runs.iter().map(|run| run.text.as_str()).collect::<String>(), "aredz");
-        assert!(runs.iter().any(|run| run.text == "red" && run.style.foreground.is_some()));
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "aredz"
+        );
+        assert!(runs
+            .iter()
+            .any(|run| run.text == "red" && run.style.foreground.is_some()));
+    }
+
+    #[test]
+    fn cursor_home_and_partial_erase_do_not_clear_block_output() {
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[Hgit output"),
+            ("git output".to_string(), false)
+        );
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[Jgit output"),
+            ("git output".to_string(), false)
+        );
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[2Jfresh"),
+            ("fresh".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn separates_dim_suggestion_without_cursor_padding() {
+        let (input, suggestion) = separate_input_and_suggestion("git p\u{1b}[2mull\u{1b}[0m", 0);
+        assert_eq!(input, "git p");
+        assert_eq!(suggestion, "ull");
     }
 }
