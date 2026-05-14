@@ -1088,17 +1088,33 @@ fn set_active_command_buffer(
     buffer: &TextBuffer,
     cmd: &str,
     preedit: &str,
-    _cursor_visible: bool,
+    cursor_visible: bool,
     suggestion: &str,
-    _palette: &[RGBA; 16],
+    cursor_color: &RGBA,
+    cursor_foreground: &RGBA,
 ) {
     let cursor_pos = cmd.chars().count() + preedit.chars().count();
-    let text = format!("{}{}{}", cmd, preedit, suggestion);
+    let text = format!("{}{} {}", cmd, preedit, suggestion);
     buffer.set_text(&text);
     let cursor_iter = buffer.iter_at_offset(cursor_pos as i32);
     buffer.place_cursor(&cursor_iter);
 
     let tag_table = buffer.tag_table();
+
+    if tag_table.lookup("cursor").is_none() {
+        let tag = gtk4::TextTag::new(Some("cursor"));
+        tag_table.add(&tag);
+    }
+
+    if cursor_visible {
+        if let Some(tag) = tag_table.lookup("cursor") {
+            tag.set_background_rgba(Some(cursor_color));
+            tag.set_foreground_rgba(Some(cursor_foreground));
+            let start_iter = buffer.iter_at_offset(cursor_pos as i32);
+            let end_iter = buffer.iter_at_offset((cursor_pos + 1) as i32);
+            buffer.apply_tag(&tag, &start_iter, &end_iter);
+        }
+    }
 
     if !preedit.is_empty() {
         if tag_table.lookup("preedit").is_none() {
@@ -1128,7 +1144,7 @@ fn set_active_command_buffer(
     }
 
     if let Some(tag) = tag_table.lookup("suggestion") {
-        let start_pos = cursor_pos;
+        let start_pos = cursor_pos + 1;
         let end_pos = start_pos + suggestion.chars().count();
         let start_iter = buffer.iter_at_offset(start_pos as i32);
         let end_iter = buffer.iter_at_offset(end_pos as i32);
@@ -1565,7 +1581,7 @@ impl FinishedBlock {
         set_active_prompt_buffer(&prompt_buffer, prompt);
 
         let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
-        set_active_command_buffer(&command_buffer, cmd_display, "", false, "", &config.palette);
+        command_buffer.set_text(cmd_display);
 
         set_active_output_buffer(&output_buffer, output, &config.palette);
 
@@ -1684,6 +1700,8 @@ struct ActiveBlock {
     last_flushed_size: Rc<Cell<usize>>,
     cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
     palette: [RGBA; 16],
+    cursor_color: RGBA,
+    cursor_foreground: RGBA,
 }
 
 impl ActiveBlock {
@@ -1721,6 +1739,7 @@ impl ActiveBlock {
 
             // Block keyboard input
             let key_controller = EventControllerKey::new();
+            key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
             key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
                 glib::Propagation::Stop
             });
@@ -1733,7 +1752,6 @@ impl ActiveBlock {
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
         let (command_view, command_buffer) = create_textview("block-command-view");
         let (output_view, output_buffer) = create_textview("block-output-view");
-        command_view.set_cursor_visible(true);
 
         // Append to widget
         widget.append(&prompt_view);
@@ -1761,6 +1779,8 @@ impl ActiveBlock {
         let pending_suggestion_clone = pending_suggestion.clone();
         let pending_output_clone = pending_output.clone();
         let palette_for_cursor = config.palette;
+        let cursor_color_for_timer = config.cursor;
+        let cursor_foreground_for_timer = config.cursor_foreground;
 
         glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
             cursor_visible_clone.set(!cursor_visible_clone.get());
@@ -1782,7 +1802,8 @@ impl ActiveBlock {
                 &preedit,
                 cursor_visible_clone.get(),
                 &suggestion,
-                &palette_for_cursor,
+                &cursor_color_for_timer,
+                &cursor_foreground_for_timer,
             );
 
             if !output.is_empty() {
@@ -1793,7 +1814,15 @@ impl ActiveBlock {
         });
 
         // Initialize command_buffer with initial cursor to show immediately
-        set_active_command_buffer(&command_buffer, "", "", true, "", &config.palette);
+        set_active_command_buffer(
+            &command_buffer,
+            "",
+            "",
+            true,
+            "",
+            &config.cursor,
+            &config.cursor_foreground,
+        );
 
         ActiveBlock {
             widget,
@@ -1816,6 +1845,8 @@ impl ActiveBlock {
             last_flushed_size: Rc::new(Cell::new(0)),
             cursor_visible,
             palette: config.palette,
+            cursor_color: config.cursor,
+            cursor_foreground: config.cursor_foreground,
         }
     }
 
@@ -1869,7 +1900,8 @@ impl ActiveBlock {
             &preedit,
             self.cursor_visible.get(),
             &suggestion,
-            &self.palette,
+            &self.cursor_color,
+            &self.cursor_foreground,
         );
     }
 
