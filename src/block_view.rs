@@ -1100,19 +1100,37 @@ fn set_active_prompt_buffer(buffer: &TextBuffer, prompt: &str) {
 fn set_active_command_buffer(
     buffer: &TextBuffer,
     cmd: &str,
+    preedit: &str,
     cursor_visible: bool,
     suggestion: &str,
     _palette: &[RGBA; 16],
 ) {
     let cursor_char = if cursor_visible { "▎" } else { " " };
-    let text = format!("{}{}{}", cmd, cursor_char, suggestion);
+    let text = format!("{}{}{}{}", cmd, preedit, cursor_char, suggestion);
     buffer.set_text(&text);
+
+    let tag_table = buffer.tag_table();
+
+    if !preedit.is_empty() {
+        if tag_table.lookup("preedit").is_none() {
+            let tag = gtk4::TextTag::new(Some("preedit"));
+            tag.set_underline(gtk4::pango::Underline::Single);
+            tag_table.add(&tag);
+        }
+
+        if let Some(tag) = tag_table.lookup("preedit") {
+            let start_pos = cmd.chars().count();
+            let end_pos = start_pos + preedit.chars().count();
+            let start_iter = buffer.iter_at_offset(start_pos as i32);
+            let end_iter = buffer.iter_at_offset(end_pos as i32);
+            buffer.apply_tag(&tag, &start_iter, &end_iter);
+        }
+    }
 
     if suggestion.is_empty() {
         return;
     }
 
-    let tag_table = buffer.tag_table();
     if tag_table.lookup("suggestion").is_none() {
         let tag = gtk4::TextTag::new(Some("suggestion"));
         tag.set_style(gtk4::pango::Style::Italic);
@@ -1121,7 +1139,7 @@ fn set_active_command_buffer(
     }
 
     if let Some(tag) = tag_table.lookup("suggestion") {
-        let start_pos = cmd.chars().count() + cursor_char.chars().count();
+        let start_pos = cmd.chars().count() + preedit.chars().count() + cursor_char.chars().count();
         let end_pos = start_pos + suggestion.chars().count();
         let start_iter = buffer.iter_at_offset(start_pos as i32);
         let end_iter = buffer.iter_at_offset(end_pos as i32);
@@ -1558,7 +1576,7 @@ impl FinishedBlock {
         set_active_prompt_buffer(&prompt_buffer, prompt);
 
         let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
-        set_active_command_buffer(&command_buffer, cmd_display, false, "", &config.palette);
+        set_active_command_buffer(&command_buffer, cmd_display, "", false, "", &config.palette);
 
         set_active_output_buffer(&output_buffer, output, &config.palette);
 
@@ -1665,6 +1683,7 @@ struct ActiveBlock {
     output_buffer: gtk4::TextBuffer,
     pending_output: Rc<RefCell<String>>,
     pending_cmd: Rc<RefCell<String>>,        // User input only
+    pending_preedit: Rc<RefCell<String>>,    // IME composing text
     pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
     flush_pending: Rc<Cell<bool>>,
     // Adaptive batching state
@@ -1739,6 +1758,7 @@ impl ActiveBlock {
 
         let cursor_visible = Rc::new(Cell::new(true));
         let pending_cmd = Rc::new(RefCell::new(String::new()));
+        let pending_preedit = Rc::new(RefCell::new(String::new()));
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
         let pending_output = Rc::new(RefCell::new(String::new()));
 
@@ -1747,6 +1767,7 @@ impl ActiveBlock {
         let command_buffer_clone = command_buffer.clone();
         let output_buffer_clone = output_buffer.clone();
         let pending_cmd_clone = pending_cmd.clone();
+        let pending_preedit_clone = pending_preedit.clone();
         let pending_suggestion_clone = pending_suggestion.clone();
         let pending_output_clone = pending_output.clone();
         let palette_for_cursor = config.palette;
@@ -1755,6 +1776,7 @@ impl ActiveBlock {
             cursor_visible_clone.set(!cursor_visible_clone.get());
 
             let cmd = pending_cmd_clone.borrow();
+            let preedit = pending_preedit_clone.borrow();
             let suggestion = pending_suggestion_clone.borrow();
             let output = pending_output_clone.borrow();
             log::debug!(
@@ -1767,6 +1789,7 @@ impl ActiveBlock {
             set_active_command_buffer(
                 &command_buffer_clone,
                 &cmd,
+                &preedit,
                 cursor_visible_clone.get(),
                 &suggestion,
                 &palette_for_cursor,
@@ -1780,7 +1803,7 @@ impl ActiveBlock {
         });
 
         // Initialize command_buffer with initial cursor to show immediately
-        set_active_command_buffer(&command_buffer, "", true, "", &config.palette);
+        set_active_command_buffer(&command_buffer, "", "", true, "", &config.palette);
 
         ActiveBlock {
             widget,
@@ -1792,6 +1815,7 @@ impl ActiveBlock {
             output_buffer,
             pending_output,
             pending_cmd,
+            pending_preedit,
             pending_suggestion,
             flush_pending: Rc::new(Cell::new(false)),
             bytes_since_last_flush: Rc::new(Cell::new(0)),
@@ -1812,7 +1836,13 @@ impl ActiveBlock {
     fn set_cmd(&self, text: &str) {
         log::debug!("set_cmd: text={:?}", text);
         *self.pending_cmd.borrow_mut() = text.to_string();
+        self.pending_preedit.borrow_mut().clear();
         *self.pending_suggestion.borrow_mut() = String::new();
+        self.update_content_view();
+    }
+
+    fn set_preedit(&self, text: &str) {
+        *self.pending_preedit.borrow_mut() = text.to_string();
         self.update_content_view();
     }
 
@@ -1827,12 +1857,14 @@ impl ActiveBlock {
         );
 
         *self.pending_cmd.borrow_mut() = user_plain;
+        self.pending_preedit.borrow_mut().clear();
         *self.pending_suggestion.borrow_mut() = suggestion_plain;
         self.update_content_view();
     }
 
     fn update_content_view(&self) {
         let cmd = self.pending_cmd.borrow();
+        let preedit = self.pending_preedit.borrow();
         let suggestion = self.pending_suggestion.borrow();
         log::debug!(
             "update_content_view: cmd={:?}, suggestion={:?}, cursor_visible={}",
@@ -1844,6 +1876,7 @@ impl ActiveBlock {
         set_active_command_buffer(
             &self.command_buffer,
             &cmd,
+            &preedit,
             self.cursor_visible.get(),
             &suggestion,
             &self.palette,
@@ -2705,15 +2738,54 @@ impl TermView {
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
 
+        // ── GTK input method support ─────────────────────────────────────
+        let im_context = gtk4::IMMulticontext::new();
+        let im_client_widget = active.borrow().command_view.clone();
+        im_context.set_client_widget(Some(&im_client_widget));
+
+        {
+            let pty_for_commit = pty.clone();
+            im_context.connect_commit(move |_, text| {
+                pty_for_commit.write_bytes(text.as_bytes());
+            });
+        }
+
+        {
+            let active_for_preedit = active.clone();
+            im_context.connect_preedit_changed(move |context| {
+                let (preedit, _, _) = context.preedit_string();
+                active_for_preedit.borrow().set_preedit(preedit.as_str());
+            });
+        }
+
+        {
+            let focus_ctrl = gtk4::EventControllerFocus::new();
+            let im_for_focus_in = im_context.clone();
+            focus_ctrl.connect_enter(move |_| {
+                im_for_focus_in.focus_in();
+            });
+
+            let im_for_focus_out = im_context.clone();
+            let active_for_focus_out = active.clone();
+            focus_ctrl.connect_leave(move |_| {
+                im_for_focus_out.focus_out();
+                im_for_focus_out.reset();
+                active_for_focus_out.borrow().set_preedit("");
+            });
+            im_client_widget.add_controller(focus_ctrl);
+            im_context.focus_in();
+        }
+
         // ── Keyboard input → PTY ──────────────────────────────────────────
         {
             let pty_for_key = pty.clone();
             let vte_for_key = vte.clone();
             let root_for_key = root.clone();
+            let im_context_for_key = im_context.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
-            key_ctrl.connect_key_pressed(move |_, keyval, _keycode, modifiers| {
+            key_ctrl.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
                 // All keyboard input goes through here to the PTY.
                 // VTE has no PTY attached — it's display-only (fed via feed()).
                 // Main app's key_controller on the window (also Capture phase) runs first
@@ -2800,6 +2872,12 @@ impl TermView {
                     }
                 }
 
+                if let Some(event) = controller.current_event() {
+                    if im_context_for_key.filter_keypress(&event) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+
                 let bytes: Option<Vec<u8>> = match keyval {
                     v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
                         Some(b"\r".to_vec())
@@ -2855,6 +2933,13 @@ impl TermView {
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
+                }
+            });
+
+            let im_context_for_release = im_context.clone();
+            key_ctrl.connect_key_released(move |controller, _keyval, _keycode, _modifiers| {
+                if let Some(event) = controller.current_event() {
+                    im_context_for_release.filter_keypress(&event);
                 }
             });
             root.add_controller(key_ctrl);
