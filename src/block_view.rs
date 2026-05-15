@@ -2494,8 +2494,11 @@ impl TermView {
                                 // Check for bracketed paste mode (CSI ?2004h = enable, CSI ?2004l = disable)
                                 if bytes_str.contains("\x1b[?2004h") {
                                     bracketed_paste_rc.set(true);
-                                } else if bytes_str.contains("\x1b[?2004l") {
+                                    log::info!("Bracketed paste mode ENABLED");
+                                }
+                                if bytes_str.contains("\x1b[?2004l") {
                                     bracketed_paste_rc.set(false);
+                                    log::info!("Bracketed paste mode DISABLED");
                                 }
 
                                 // Git's default pager options often keep less on the main screen
@@ -3060,6 +3063,7 @@ impl TermView {
             let root_for_key = root.clone();
             let im_context_for_key = im_context.clone();
             let application_cursor_for_key = application_cursor_mode.clone();
+            let bracketed_paste_for_key = bracketed_paste_mode.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -3126,14 +3130,22 @@ impl TermView {
                             // Paste: read clipboard and write to PTY
                             let clipboard = vte_for_key.clipboard();
                             let pty_for_paste = pty_for_key.clone();
-                            log::warn!(">>> Paste: got clipboard, calling read_text_async");
+                            let bracketed_paste = bracketed_paste_for_key.get();
+                            log::warn!(">>> Paste: got clipboard, bracketed_paste={}, calling read_text_async", bracketed_paste);
                             clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
                                 log::warn!(">>> Paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
                                 match result {
                                     Ok(text_opt) => {
                                         if let Some(text_str) = text_opt {
                                             log::warn!(">>> Paste: got {} chars from clipboard", text_str.len());
-                                            pty_for_paste.write_bytes(text_str.as_bytes());
+                                            // Wrap paste with bracketed paste mode if enabled
+                                            if bracketed_paste {
+                                                pty_for_paste.write_bytes(b"\x1b[200~");
+                                                pty_for_paste.write_bytes(text_str.as_bytes());
+                                                pty_for_paste.write_bytes(b"\x1b[201~");
+                                            } else {
+                                                pty_for_paste.write_bytes(text_str.as_bytes());
+                                            }
                                             log::warn!(">>> Paste: wrote {} bytes to PTY", text_str.len());
                                         } else {
                                             log::warn!(">>> Paste: clipboard is None");
