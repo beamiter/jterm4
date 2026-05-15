@@ -41,7 +41,10 @@ impl OwnedPty {
                 let slave_fd = slave.as_raw_fd();
 
                 unsafe {
-                    libc::setsid();
+                    if libc::setsid() < 0 {
+                        eprintln!("setsid() failed: {}", std::io::Error::last_os_error());
+                        std::process::exit(1);
+                    }
                     libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
                     libc::dup2(slave_fd, 0);
                     libc::dup2(slave_fd, 1);

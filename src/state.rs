@@ -285,14 +285,51 @@ fn process_exists(pid: i32) -> bool {
     matches!(std::io::Error::last_os_error().raw_os_error(), Some(nix::libc::EPERM))
 }
 
+fn get_process_group_id(pid: i32) -> Option<i32> {
+    if pid <= 0 {
+        return None;
+    }
+
+    let path = format!("/proc/{}/stat", pid);
+    let contents = fs::read_to_string(path).ok()?;
+
+    // The stat file format: pid (comm) state ppid pgrp ...
+    // comm is in parentheses and may contain spaces, so we need to find the last ')'
+    let rparen_pos = contents.rfind(')')?;
+    let after_comm = &contents[rparen_pos + 1..];
+
+    // After ')' we have: state ppid pgrp ...
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    if fields.len() >= 3 {
+        // fields[0] = state, fields[1] = ppid, fields[2] = pgrp
+        fields[2].parse().ok()
+    } else {
+        None
+    }
+}
+
 fn signal_pid_and_group(pid: i32, sig: std::ffi::c_int) {
     if pid <= 0 {
         return;
     }
 
-    unsafe {
-        nix::libc::kill(pid, sig);
-        nix::libc::kill(-pid, sig);
+    // First, send signal to the main process
+    let rc = unsafe { nix::libc::kill(pid, sig) };
+    if rc < 0 {
+        // Process doesn't exist or we don't have permission, skip process group signal
+        return;
+    }
+
+    // Verify the process group leader is the process we want to kill
+    // This prevents accidentally killing processes from other sessions if PID was reused
+    if let Some(pgid) = get_process_group_id(pid) {
+        // Only send signal to process group if this process is the group leader
+        // (pgid == pid) or explicitly belongs to a group we created
+        if pgid == pid {
+            unsafe {
+                nix::libc::kill(-pid, sig);
+            }
+        }
     }
 }
 
