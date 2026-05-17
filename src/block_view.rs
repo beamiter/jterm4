@@ -1350,6 +1350,42 @@ fn set_active_output_buffer(buffer: &TextBuffer, output: &str, palette: &[RGBA; 
     apply_ansi_runs_to_buffer(buffer, 0, &output_runs);
 }
 
+/// Incrementally append new output to buffer without full rewrite
+fn append_active_output_buffer(
+    buffer: &TextBuffer,
+    full_output: &str,
+    last_flushed_size: usize,
+    palette: &[RGBA; 16],
+) {
+    // Extract only the new portion
+    if full_output.len() <= last_flushed_size {
+        return; // Nothing new to append
+    }
+
+    let new_output = &full_output[last_flushed_size..];
+
+    // Process new output (strip ANSI and handle carriage returns)
+    let new_output_no_ansi = strip_ansi(new_output);
+    let new_output_plain = new_output_no_ansi
+        .lines()
+        .map(|line| command_line_plain_text(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Get current buffer char count before appending
+    let buffer_char_count_before = buffer.char_count() as usize;
+
+    // Append the new text to the buffer
+    let mut end_iter = buffer.end_iter();
+    buffer.insert(&mut end_iter, &new_output_plain);
+
+    // Parse ANSI runs for the new portion only
+    let new_output_runs = ansi_text_runs(new_output, palette);
+
+    // Apply ANSI tags starting from where we appended
+    apply_ansi_runs_to_buffer(buffer, buffer_char_count_before, &new_output_runs);
+}
+
 
 fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
     let bytes = input.as_bytes();
@@ -2058,15 +2094,12 @@ impl ActiveBlock {
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
         let pending_output = Rc::new(RefCell::new(String::new()));
 
-        // Start cursor blink animation - update three views separately
+        // Start cursor blink animation - update command view only (output is handled separately)
         let cursor_visible_clone = cursor_visible.clone();
         let command_buffer_clone = command_buffer.clone();
-        let output_buffer_clone = output_buffer.clone();
         let pending_cmd_clone = pending_cmd.clone();
         let pending_preedit_clone = pending_preedit.clone();
         let pending_suggestion_clone = pending_suggestion.clone();
-        let pending_output_clone = pending_output.clone();
-        let palette_for_cursor = config.palette;
         let cursor_color_for_timer = config.cursor;
         let cursor_foreground_for_timer = config.cursor_foreground;
 
@@ -2076,7 +2109,6 @@ impl ActiveBlock {
             let cmd = pending_cmd_clone.borrow();
             let preedit = pending_preedit_clone.borrow();
             let suggestion = pending_suggestion_clone.borrow();
-            let output = pending_output_clone.borrow();
             log::debug!(
                 "cursor_blink_timer: cmd={:?}, suggestion={:?}, cursor_visible={}",
                 cmd,
@@ -2094,9 +2126,8 @@ impl ActiveBlock {
                 &cursor_foreground_for_timer,
             );
 
-            if !output.is_empty() {
-                set_active_output_buffer(&output_buffer_clone, &output, &palette_for_cursor);
-            }
+            // Note: Output buffer updates are now handled only during actual output changes
+            // via append_output() and flush_output(), not during cursor blink cycles.
 
             glib::ControlFlow::Continue
         });
@@ -2226,8 +2257,22 @@ impl ActiveBlock {
                 std::time::Duration::from_millis(batch_interval as u64),
                 move || {
                     let output = pending_output.borrow();
+                    let prev_size = last_flushed_size.get();
 
-                    set_active_output_buffer(&output_buffer, &output, &palette);
+                    // Skip rendering if output hasn't changed
+                    if output.len() == prev_size {
+                        flush_flag.set(false);
+                        return;
+                    }
+
+                    // Use incremental rendering for appends
+                    if prev_size > 0 && output.len() > prev_size {
+                        append_active_output_buffer(&output_buffer, &output, prev_size, &palette);
+                    } else {
+                        // Full rewrite needed (e.g., output was cleared and restarted)
+                        set_active_output_buffer(&output_buffer, &output, &palette);
+                    }
+
                     let end_iter = output_buffer.end_iter();
                     output_buffer.place_cursor(&end_iter);
 
@@ -2260,8 +2305,21 @@ impl ActiveBlock {
 
     fn flush_output(&self) {
         let output = self.pending_output.borrow();
+        let prev_size = self.last_flushed_size.get();
 
-        set_active_output_buffer(&self.output_buffer, &output, &self.palette);
+        // Skip rendering if output hasn't changed
+        if output.len() == prev_size {
+            return;
+        }
+
+        // Use incremental rendering for appends
+        if prev_size > 0 && output.len() > prev_size {
+            append_active_output_buffer(&self.output_buffer, &output, prev_size, &self.palette);
+        } else {
+            // Full rewrite needed (e.g., first flush or output was cleared)
+            set_active_output_buffer(&self.output_buffer, &output, &self.palette);
+        }
+
         let end_iter = self.output_buffer.end_iter();
         self.output_buffer.place_cursor(&end_iter);
         self.last_flushed_size.set(output.len());
@@ -2517,6 +2575,8 @@ impl TermView {
             LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
         ));
 
+        let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
+
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
             let active_rc = active.clone();
@@ -2551,6 +2611,7 @@ impl TermView {
             let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
             let scroll_debouncer = ScrollDebouncer::new();
             let ansi_cache_for_cb = ansi_cache.clone();
+            let widget_pool_for_cb = widget_pool.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -3066,7 +3127,10 @@ impl TermView {
                                 // Remove oldest block if we exceed the limit
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                    block_list_rc.remove(oldest.widget());
+                                    let widget_to_release = oldest.widget().clone();
+                                    block_list_rc.remove(&widget_to_release);
+                                    // Return widget to pool for potential reuse
+                                    widget_pool_for_cb.borrow_mut().release(widget_to_release);
                                 }
 
                                 // Also evict from block_data if needed
@@ -3396,7 +3460,7 @@ impl TermView {
                 last_visible: 0,
                 total_height: 0,
             })),
-            widget_pool: Rc::new(RefCell::new(WidgetPool::new())),
+            widget_pool,
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
             search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             selected_block_id: Rc::new(Cell::new(None)),
@@ -3888,7 +3952,10 @@ impl TermView {
         let mut finished = self.finished_blocks.borrow_mut();
         if let Some(pos) = finished.iter().position(|b| b.id == block_id) {
             let block_to_remove = finished.remove(pos);
-            self.block_list.remove(block_to_remove.widget());
+            let widget_to_release = block_to_remove.widget().clone();
+            self.block_list.remove(&widget_to_release);
+            // Return widget to pool for potential reuse
+            self.widget_pool.borrow_mut().release(widget_to_release);
         }
     }
 
@@ -3971,8 +4038,10 @@ impl TermView {
 
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
-        let mut blocks = self.block_data.borrow_mut();
+        let lazy_load_threshold = self.config.borrow().lazy_load_threshold as usize;
+        let mut temp_blocks = Vec::new();
 
+        // First pass: load all blocks into temporary storage
         loop {
             let mut len_bytes = [0u8; 4];
             if file.read_exact(&mut len_bytes).is_err() {
@@ -3991,8 +4060,25 @@ impl TermView {
             };
 
             if let Ok(block) = bincode::deserialize::<BlockData>(&decoded) {
-                log::debug!("Loaded historical block: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                    &block.prompt, &block.cmd, block.output.len(), block.exit_code);
+                temp_blocks.push(block);
+            }
+        }
+
+        // Second pass: only load the most recent N blocks (lazy loading optimization)
+        let total_loaded = temp_blocks.len();
+        let start_idx = if total_loaded > lazy_load_threshold {
+            log::info!("Lazy loading history: keeping {} recent blocks out of {} total (skipping {} old blocks)",
+                lazy_load_threshold, total_loaded, total_loaded - lazy_load_threshold);
+            total_loaded - lazy_load_threshold
+        } else {
+            0
+        };
+
+        let mut blocks = self.block_data.borrow_mut();
+        for (idx, block) in temp_blocks.into_iter().enumerate() {
+            if idx >= start_idx {
+                log::debug!("Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                    idx, &block.prompt, &block.cmd, block.output.len(), block.exit_code);
                 blocks.push_back(block);
             }
         }
