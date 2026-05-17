@@ -1801,37 +1801,37 @@ impl FinishedBlock {
             });
 
             view.add_controller(click_controller);
-
-            // Add mouse motion handler for cursor auto-hide
-            let motion_ctrl = gtk4::EventControllerMotion::new();
-            let view_for_motion = view.clone();
-            let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-            let cursor_timeout_clone = cursor_timeout.clone();
-
-            motion_ctrl.connect_motion(move |_, _x, _y| {
-                // Show cursor on motion
-                view_for_motion.set_cursor_from_name(Some("text"));
-
-                // Cancel existing timeout
-                if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
-                    handle.remove();
-                }
-
-                // Hide cursor after 1 second of no motion
-                let view_for_timeout = view_for_motion.clone();
-                let timeout_clone = cursor_timeout_clone.clone();
-                let handle = glib::timeout_add_local_once(
-                    std::time::Duration::from_secs(1),
-                    move || {
-                        view_for_timeout.set_cursor_from_name(Some("none"));
-                        timeout_clone.borrow_mut().take();
-                    }
-                );
-                cursor_timeout_clone.borrow_mut().replace(handle);
-            });
-
-            view.add_controller(motion_ctrl);
         }
+
+        // Add mouse motion handler for cursor auto-hide (only for output view)
+        let motion_ctrl = gtk4::EventControllerMotion::new();
+        let output_view_for_motion = output_view.clone();
+        let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let cursor_timeout_clone = cursor_timeout.clone();
+
+        motion_ctrl.connect_motion(move |_, _x, _y| {
+            // Show cursor on motion
+            output_view_for_motion.set_cursor_from_name(Some("text"));
+
+            // Cancel existing timeout
+            if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
+                handle.remove();
+            }
+
+            // Hide cursor after 1 second of no motion
+            let view_for_timeout = output_view_for_motion.clone();
+            let timeout_clone = cursor_timeout_clone.clone();
+            let handle = glib::timeout_add_local_once(
+                std::time::Duration::from_secs(1),
+                move || {
+                    view_for_timeout.set_cursor_from_name(Some("none"));
+                    timeout_clone.borrow_mut().take();
+                }
+            );
+            cursor_timeout_clone.borrow_mut().replace(handle);
+        });
+
+        output_view.add_controller(motion_ctrl);
 
         // Append views to outer box
         outer.append(&prompt_view);
@@ -1999,37 +1999,38 @@ impl ActiveBlock {
             });
 
             view.add_controller(click_controller);
-
-            // Add mouse motion handler for cursor auto-hide
-            let motion_ctrl = gtk4::EventControllerMotion::new();
-            let view_for_motion = view.clone();
-            let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-            let cursor_timeout_clone = cursor_timeout.clone();
-
-            motion_ctrl.connect_motion(move |_, _x, _y| {
-                // Show cursor on motion
-                view_for_motion.set_cursor_from_name(Some("text"));
-
-                // Cancel existing timeout
-                if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
-                    handle.remove();
-                }
-
-                // Hide cursor after 1 second of no motion
-                let view_for_timeout = view_for_motion.clone();
-                let timeout_clone = cursor_timeout_clone.clone();
-                let handle = glib::timeout_add_local_once(
-                    std::time::Duration::from_secs(1),
-                    move || {
-                        view_for_timeout.set_cursor_from_name(Some("none"));
-                        timeout_clone.borrow_mut().take();
-                    }
-                );
-                cursor_timeout_clone.borrow_mut().replace(handle);
-            });
-
-            view.add_controller(motion_ctrl);
         }
+
+        // Add mouse motion handler for cursor auto-hide (only for output view)
+        // Don't add to command_view as it interferes with text input cursor
+        let motion_ctrl = gtk4::EventControllerMotion::new();
+        let output_view_for_motion = output_view.clone();
+        let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let cursor_timeout_clone = cursor_timeout.clone();
+
+        motion_ctrl.connect_motion(move |_, _x, _y| {
+            // Show cursor on motion
+            output_view_for_motion.set_cursor_from_name(Some("text"));
+
+            // Cancel existing timeout
+            if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
+                handle.remove();
+            }
+
+            // Hide cursor after 1 second of no motion
+            let view_for_timeout = output_view_for_motion.clone();
+            let timeout_clone = cursor_timeout_clone.clone();
+            let handle = glib::timeout_add_local_once(
+                std::time::Duration::from_secs(1),
+                move || {
+                    view_for_timeout.set_cursor_from_name(Some("none"));
+                    timeout_clone.borrow_mut().take();
+                }
+            );
+            cursor_timeout_clone.borrow_mut().replace(handle);
+        });
+
+        output_view.add_controller(motion_ctrl);
 
         // Append to widget
         widget.append(&prompt_view);
