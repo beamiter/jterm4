@@ -1768,6 +1768,15 @@ impl FinishedBlock {
         let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
         command_buffer.set_text(cmd_display);
 
+        // Explicitly remove any cursor tags from finished block command buffer
+        // (cursor tags should only be on active block)
+        let tag_table = command_buffer.tag_table();
+        if let Some(cursor_tag) = tag_table.lookup("cursor") {
+            let start = command_buffer.start_iter();
+            let end = command_buffer.end_iter();
+            command_buffer.remove_tag(&cursor_tag, &start, &end);
+        }
+
         set_active_output_buffer(&output_buffer, output, &config.palette);
 
         // Add Ctrl+Click handler to open URLs in command and output views
@@ -2287,6 +2296,8 @@ impl ActiveBlock {
         self.clear_output();
         // Ensure cursor is visible after reset (don't wait for blink timer)
         self.cursor_visible.set(true);
+        // Force immediate update to clear any old content
+        self.command_buffer.set_text(" ");  // Space to ensure cursor has a position
         self.update_content_view();
     }
 
