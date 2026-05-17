@@ -921,7 +921,7 @@ fn plain_text_from_ansi(input: &str) -> String {
     command_line_plain_text(input)
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 struct AnsiStyleState {
     foreground: Option<RGBA>,
     background: Option<RGBA>,
@@ -1133,11 +1133,16 @@ fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RG
     }
 }
 
+/// Parse ANSI text with proper cursor movement handling
+/// This ensures colors align with the final text after \r and cursor movements
 fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
     let bytes = input.as_bytes();
     let mut runs = Vec::new();
     let mut current_style = AnsiStyleState::default();
-    let mut current_text = String::new();
+
+    // Track cells with their styles (like command_line_plain_text but with colors)
+    let mut cells: Vec<(String, AnsiStyleState)> = Vec::new();
+    let mut cursor = 0usize;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -1158,19 +1163,63 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
             if i < bytes.len() {
                 let final_byte = bytes[i];
                 i += 1;
-                if final_byte == b'm' {
-                    if params.is_empty() || params[0].is_empty() {
-                        params = vec!["0".to_string()];
+
+                match final_byte {
+                    b'm' => {
+                        // Color change
+                        if params.is_empty() || params[0].is_empty() {
+                            params = vec!["0".to_string()];
+                        }
+                        parse_sgr_params(&mut current_style, &params, palette);
                     }
-                    flush_ansi_run(&mut runs, &mut current_text, &current_style);
-                    parse_sgr_params(&mut current_style, &params, palette);
+                    b'D' => {
+                        // Cursor left
+                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = cursor.saturating_sub(count);
+                    }
+                    b'C' => {
+                        // Cursor right
+                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = (cursor + count).min(cells.len());
+                    }
+                    b'G' => {
+                        // Cursor to column
+                        let col = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = col.saturating_sub(1).min(cells.len());
+                    }
+                    b'K' => {
+                        // Erase in line
+                        let mode = params.first().map(String::as_str).unwrap_or("0");
+                        match mode {
+                            "" | "0" => cells.truncate(cursor),
+                            "1" => {
+                                cells.drain(..cursor);
+                                cursor = 0;
+                            }
+                            "2" => {
+                                cells.clear();
+                                cursor = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
             i = skip_osc_sequence(bytes, i);
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
+        } else if bytes[i] == b'\r' {
+            // Carriage return - move cursor to start
+            cursor = 0;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            // Backspace
+            cursor = cursor.saturating_sub(1);
+            i += 1;
         } else {
+            // Regular character - write to cell with current style
             let ch_len = if bytes[i] & 0x80 == 0 {
                 1
             } else if bytes[i] & 0xe0 == 0xc0 {
@@ -1183,12 +1232,49 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                 1
             };
             let end = (i + ch_len).min(bytes.len());
-            current_text.push_str(&String::from_utf8_lossy(&bytes[i..end]));
+            let ch = String::from_utf8_lossy(&bytes[i..end]).to_string();
+
+            if cursor < cells.len() {
+                cells[cursor] = (ch, current_style.clone());
+            } else {
+                cells.push((ch, current_style.clone()));
+            }
+            cursor += 1;
             i = end;
         }
     }
 
-    flush_ansi_run(&mut runs, &mut current_text, &current_style);
+    // Convert cells to runs by merging adjacent cells with the same style
+    let mut current_run_text = String::new();
+    let mut current_run_style = AnsiStyleState::default();
+    let mut first = true;
+
+    for (ch, style) in cells {
+        if first {
+            current_run_text = ch;
+            current_run_style = style;
+            first = false;
+        } else if style == current_run_style {
+            current_run_text.push_str(&ch);
+        } else {
+            if !current_run_text.is_empty() {
+                runs.push(AnsiTextRun {
+                    text: current_run_text.clone(),
+                    style: current_run_style.clone(),
+                });
+            }
+            current_run_text = ch;
+            current_run_style = style;
+        }
+    }
+
+    if !current_run_text.is_empty() {
+        runs.push(AnsiTextRun {
+            text: current_run_text,
+            style: current_run_style,
+        });
+    }
+
     runs
 }
 
