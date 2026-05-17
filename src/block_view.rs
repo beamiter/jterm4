@@ -2285,6 +2285,8 @@ impl ActiveBlock {
         self.pending_preedit.borrow_mut().clear();
         self.pending_suggestion.borrow_mut().clear();
         self.clear_output();
+        // Ensure cursor is visible after reset (don't wait for blink timer)
+        self.cursor_visible.set(true);
         self.update_content_view();
     }
 
@@ -3063,8 +3065,19 @@ impl TermView {
 
                                 // Reset active block for next command
                                 active_rc.borrow().reset_for_next_prompt();
+
                                 // Grab focus to ensure cursor is visible at new prompt
-                                active_rc.borrow().grab_focus();
+                                // Use timeout to ensure UI is fully updated and scrolled
+                                let active_for_focus = active_rc.clone();
+                                let block_scroll_for_focus = block_scroll_rc.clone();
+                                glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                                    // Scroll to bottom first
+                                    let adj = block_scroll_for_focus.vadjustment();
+                                    let target = adj.upper() - adj.page_size();
+                                    adj.set_value(target);
+                                    // Then grab focus
+                                    active_for_focus.borrow().grab_focus();
+                                });
 
                                 executing_cmd_raw_rc.borrow_mut().clear();
                                 executing_cmd_markup_rc.borrow_mut().clear();
