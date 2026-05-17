@@ -3063,6 +3063,8 @@ impl TermView {
 
                                 // Reset active block for next command
                                 active_rc.borrow().reset_for_next_prompt();
+                                // Grab focus to ensure cursor is visible at new prompt
+                                active_rc.borrow().grab_focus();
 
                                 executing_cmd_raw_rc.borrow_mut().clear();
                                 executing_cmd_markup_rc.borrow_mut().clear();
