@@ -180,6 +180,12 @@ fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<Str
     }
 }
 
+/// Format mouse event in SGR mode (CSI <button;x;y M/m)
+fn format_mouse_event_sgr(button: u8, x: i32, y: i32, pressed: bool) -> Vec<u8> {
+    let event_type = if pressed { 'M' } else { 'm' };
+    format!("\x1b[<{};{};{}{}", button, x + 1, y + 1, event_type).into_bytes()
+}
+
 /// Coalesces repeated scroll requests into a single scroll event.
 /// Eliminates cascade of timers and provides smooth scrolling under rapid output.
 struct ScrollDebouncer {
@@ -1795,6 +1801,36 @@ impl FinishedBlock {
             });
 
             view.add_controller(click_controller);
+
+            // Add mouse motion handler for cursor auto-hide
+            let motion_ctrl = gtk4::EventControllerMotion::new();
+            let view_for_motion = view.clone();
+            let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+            let cursor_timeout_clone = cursor_timeout.clone();
+
+            motion_ctrl.connect_motion(move |_, _x, _y| {
+                // Show cursor on motion
+                view_for_motion.set_cursor_from_name(Some("text"));
+
+                // Cancel existing timeout
+                if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
+                    handle.remove();
+                }
+
+                // Hide cursor after 1 second of no motion
+                let view_for_timeout = view_for_motion.clone();
+                let timeout_clone = cursor_timeout_clone.clone();
+                let handle = glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(1),
+                    move || {
+                        view_for_timeout.set_cursor_from_name(Some("none"));
+                        timeout_clone.borrow_mut().take();
+                    }
+                );
+                cursor_timeout_clone.borrow_mut().replace(handle);
+            });
+
+            view.add_controller(motion_ctrl);
         }
 
         // Append views to outer box
@@ -1931,6 +1967,69 @@ impl ActiveBlock {
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
         let (command_view, command_buffer) = create_textview("block-command-view");
         let (output_view, output_buffer) = create_textview("block-output-view");
+
+        // Add Ctrl+Click handler to open URLs in command and output views
+        for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
+            let click_controller = gtk4::GestureClick::new();
+            click_controller.set_button(1); // left click
+            click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+
+            let buffer_clone = buffer.clone();
+            let view_clone = view.clone();
+            click_controller.connect_pressed(move |controller, n_press, x, y| {
+                if n_press == 1 {
+                    let state = controller.current_event_state();
+                    if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                        // Get text iter at click position
+                        let (bx, by) = view_clone.window_to_buffer_coords(
+                            gtk4::TextWindowType::Widget,
+                            x as i32,
+                            y as i32,
+                        );
+                        if let Some(iter) = view_clone.iter_at_location(bx, by) {
+                            if let Some(url) = get_url_at_position(&buffer_clone, &iter) {
+                                open_uri(&url);
+                                controller.set_state(gtk4::EventSequenceState::Claimed);
+                                return;
+                            }
+                        }
+                    }
+                }
+                controller.set_state(gtk4::EventSequenceState::Denied);
+            });
+
+            view.add_controller(click_controller);
+
+            // Add mouse motion handler for cursor auto-hide
+            let motion_ctrl = gtk4::EventControllerMotion::new();
+            let view_for_motion = view.clone();
+            let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+            let cursor_timeout_clone = cursor_timeout.clone();
+
+            motion_ctrl.connect_motion(move |_, _x, _y| {
+                // Show cursor on motion
+                view_for_motion.set_cursor_from_name(Some("text"));
+
+                // Cancel existing timeout
+                if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
+                    handle.remove();
+                }
+
+                // Hide cursor after 1 second of no motion
+                let view_for_timeout = view_for_motion.clone();
+                let timeout_clone = cursor_timeout_clone.clone();
+                let handle = glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(1),
+                    move || {
+                        view_for_timeout.set_cursor_from_name(Some("none"));
+                        timeout_clone.borrow_mut().take();
+                    }
+                );
+                cursor_timeout_clone.borrow_mut().replace(handle);
+            });
+
+            view.add_controller(motion_ctrl);
+        }
 
         // Append to widget
         widget.append(&prompt_view);
