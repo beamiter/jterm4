@@ -1379,11 +1379,18 @@ fn append_active_output_buffer(
     let mut end_iter = buffer.end_iter();
     buffer.insert(&mut end_iter, &new_output_plain);
 
-    // Parse ANSI runs for the new portion only
-    let new_output_runs = ansi_text_runs(new_output, palette);
+    // IMPORTANT: Parse ANSI runs from the FULL output, not just the new portion
+    // ANSI color codes are stateful (e.g., setting yellow persists until reset)
+    // Parsing only the new portion would lose the inherited color state
+    let all_output_runs = ansi_text_runs(full_output, palette);
 
-    // Apply ANSI tags starting from where we appended
-    apply_ansi_runs_to_buffer(buffer, buffer_char_count_before, &new_output_runs);
+    // Clear all existing tags first to avoid stale coloring
+    let start = buffer.start_iter();
+    let end = buffer.end_iter();
+    buffer.remove_all_tags(&start, &end);
+
+    // Re-apply all ANSI tags from the beginning
+    apply_ansi_runs_to_buffer(buffer, 0, &all_output_runs);
 }
 
 
