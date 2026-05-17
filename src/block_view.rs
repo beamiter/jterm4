@@ -1137,7 +1137,7 @@ fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RG
 /// This ensures colors align with the final text after \r and cursor movements
 fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
     let bytes = input.as_bytes();
-    let mut runs = Vec::new();
+    let mut runs: Vec<AnsiTextRun> = Vec::new();
     let mut current_style = AnsiStyleState::default();
 
     // Track cells with their styles (like command_line_plain_text but with colors)
@@ -1211,7 +1211,27 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
         } else if bytes[i] == b'\r' {
-            // Carriage return - move cursor to start
+            // Carriage return - move cursor to start of current line
+            cursor = 0;
+            i += 1;
+        } else if bytes[i] == b'\n' {
+            // Newline - flush current line's cells to runs, add newline, start new line
+            // Convert current cells to runs
+            for (ch, style) in cells.drain(..) {
+                if runs.is_empty() || runs.last().unwrap().style != style {
+                    runs.push(AnsiTextRun {
+                        text: ch,
+                        style: style.clone(),
+                    });
+                } else {
+                    runs.last_mut().unwrap().text.push_str(&ch);
+                }
+            }
+            // Add newline as a separate run
+            runs.push(AnsiTextRun {
+                text: "\n".to_string(),
+                style: current_style.clone(),
+            });
             cursor = 0;
             i += 1;
         } else if bytes[i] == b'\x08' {
