@@ -14,7 +14,6 @@ use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
-use crate::block_view::TermView;
 use crate::config::Config;
 
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
@@ -64,20 +63,24 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 pub struct VteTerminalView {
     root: gtk4::Box,
     terminal: Terminal,
+    config: Rc<RefCell<Config>>,
     cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
     exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
+    bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
+    activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
 }
 
 impl VteTerminalView {
     pub fn new(
-        config: &Config,
+        config: Rc<RefCell<Config>>,
         shell_argv: &[String],
         working_directory: Option<&str>,
         session_id: Option<&str>,
         initial_commands: Option<&str>,
     ) -> Self {
         // Create Terminal widget
-        let terminal = create_terminal(config);
+        let terminal = create_terminal(&config.borrow());
 
         // Wrap with scrollbar
         let root = wrap_with_scrollbar(&terminal);
@@ -85,6 +88,9 @@ impl VteTerminalView {
 
         let cwd_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
         let exited_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(i32)>>::new()));
+        let bell_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
+        let title_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn(&str)>>::new()));
+        let activity_callbacks = Rc::new(RefCell::new(Vec::<Box<dyn Fn()>>::new()));
 
         // Listen for OSC 7 (CWD changes)
         let cwd_callbacks_clone = cwd_callbacks.clone();
@@ -108,14 +114,48 @@ impl VteTerminalView {
             }
         });
 
+        // Listen for bell signal
+        let bell_callbacks_clone = bell_callbacks.clone();
+        terminal.connect_bell(move |_term| {
+            for callback in bell_callbacks_clone.borrow().iter() {
+                callback();
+            }
+        });
+
+        // Listen for window-title-changed signal
+        let title_callbacks_clone = title_callbacks.clone();
+        let terminal_for_title = terminal.clone();
+        terminal.connect_window_title_changed(move |_term| {
+            if let Some(title) = terminal_for_title.window_title() {
+                let title_str = title.to_string();
+                if !title_str.is_empty() {
+                    for callback in title_callbacks_clone.borrow().iter() {
+                        callback(&title_str);
+                    }
+                }
+            }
+        });
+
+        // Listen for contents-changed signal (activity)
+        let activity_callbacks_clone = activity_callbacks.clone();
+        terminal.connect_contents_changed(move |_term| {
+            for callback in activity_callbacks_clone.borrow().iter() {
+                callback();
+            }
+        });
+
         // Spawn shell
         spawn_shell(&terminal, shell_argv, working_directory, session_id, initial_commands);
 
         VteTerminalView {
             root,
             terminal,
+            config,
             cwd_callbacks,
             exited_callbacks,
+            bell_callbacks,
+            title_callbacks,
+            activity_callbacks,
         }
     }
 
@@ -151,6 +191,72 @@ impl VteTerminalView {
 
     pub fn paste_from_clipboard(&self) {
         self.terminal.paste_clipboard();
+    }
+
+    pub fn connect_bell<F>(&self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.bell_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn connect_title_changed<F>(&self, callback: F)
+    where
+        F: Fn(&str) + 'static,
+    {
+        self.title_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn connect_activity<F>(&self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.activity_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn set_font(&self, font_desc: &FontDescription) {
+        self.terminal.set_font(Some(font_desc));
+    }
+
+    pub fn set_font_scale(&self, scale: f64) {
+        self.terminal.set_font_scale(scale);
+    }
+
+    pub fn apply_theme(&self) {
+        let config = self.config.borrow();
+        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+        self.terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+        self.terminal.set_color_bold(None);
+        self.terminal.set_color_cursor(Some(&config.cursor));
+        self.terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
+    }
+
+    pub fn write_input(&self, data: &[u8]) {
+        self.terminal.feed_child(data);
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(pty) = self.terminal.pty() {
+            let _ = pty.set_size(rows as i32, cols as i32);
+        }
+    }
+
+    pub fn kill(&self) {
+        // Send SIGHUP to child process to gracefully terminate
+        if let Some(pid) = unsafe { self.terminal.data::<i32>("child-pid") } {
+            let pid_val = unsafe { *pid.as_ref() };
+            unsafe {
+                nix::libc::kill(pid_val, nix::libc::SIGHUP);
+            }
+        }
+    }
+
+    pub fn pid_i32(&self) -> i32 {
+        unsafe {
+            self.terminal.data::<i32>("child-pid")
+                .map(|pid| *pid.as_ref())
+                .unwrap_or(0)
+        }
     }
 }
 

@@ -2023,32 +2023,35 @@ impl UiState {
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
 
         // Create terminal view based on configured mode
-        let config = self.config.borrow();
-        let (view_type, terminal) = match &config.terminal_mode {
-            crate::config::TerminalMode::Block => {
-                let term_view = Rc::new(TermView::new(
-                    &config,
-                    self.shell_argv.as_ref(),
-                    working_directory.as_deref(),
-                    Some(&sid),
-                    initial_commands.as_deref(),
-                ));
-                let terminal = term_view.vte().clone();
-                (TerminalViewType::Block(term_view), terminal)
-            }
-            crate::config::TerminalMode::Vte => {
-                let vte_view = Rc::new(VteTerminalView::new(
-                    &config,
-                    self.shell_argv.as_ref(),
-                    working_directory.as_deref(),
-                    Some(&sid),
-                    initial_commands.as_deref(),
-                ));
-                let terminal = vte_view.vte().clone();
-                (TerminalViewType::Vte(vte_view), terminal)
+        let (view_type, terminal) = {
+            let config = self.config.borrow();
+            match &config.terminal_mode {
+                crate::config::TerminalMode::Block => {
+                    drop(config);
+                    let term_view = Rc::new(TermView::new(
+                        &self.config.borrow(),
+                        self.shell_argv.as_ref(),
+                        working_directory.as_deref(),
+                        Some(&sid),
+                        initial_commands.as_deref(),
+                    ));
+                    let terminal = term_view.vte().clone();
+                    (TerminalViewType::Block(term_view), terminal)
+                }
+                crate::config::TerminalMode::Vte => {
+                    drop(config);
+                    let vte_view = Rc::new(VteTerminalView::new(
+                        self.config.clone(),
+                        self.shell_argv.as_ref(),
+                        working_directory.as_deref(),
+                        Some(&sid),
+                        initial_commands.as_deref(),
+                    ));
+                    let terminal = vte_view.vte().clone();
+                    (TerminalViewType::Vte(vte_view), terminal)
+                }
             }
         };
-        drop(config);
 
         // Setup click handler for hyperlinks and context menu (uses VTE inside both views)
         setup_terminal_click_handler(&terminal);
