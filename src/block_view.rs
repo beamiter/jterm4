@@ -1470,6 +1470,13 @@ fn append_active_output_buffer(
 
     let new_output = &full_output[last_flushed_size..];
 
+    // If new output contains \r, it may need to overwrite previous lines
+    // (e.g., progress updates like apt/curl). Fall back to full rewrite.
+    if new_output.contains('\r') {
+        set_active_output_buffer(buffer, full_output, palette);
+        return;
+    }
+
     // Process new output (strip ANSI and handle carriage returns)
     let new_output_no_ansi = strip_ansi(new_output);
     let new_output_plain = new_output_no_ansi
