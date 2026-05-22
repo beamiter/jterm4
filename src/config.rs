@@ -32,6 +32,8 @@ pub struct Config {
     pub(crate) cursor: RGBA,
     pub(crate) cursor_foreground: RGBA,
     pub(crate) palette: [RGBA; 16],
+    /// Explicit shell path (overrides auto-detection). Useful when PATH is stripped by launchers.
+    pub(crate) shell: Option<String>,
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
     pub(crate) terminal_mode: TerminalMode,
@@ -223,6 +225,7 @@ struct FileConfig {
     cursor: Option<String>,
     cursor_foreground: Option<String>,
     keybindings: Option<toml::Table>,
+    shell: Option<String>,
     /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
     startup_commands: Option<String>,
     terminal_mode: Option<String>,
@@ -261,6 +264,7 @@ fn load_file_config() -> FileConfig {
         cursor: colors.and_then(|c| c.get("cursor")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         cursor_foreground: colors.and_then(|c| c.get("cursor_foreground")).and_then(|v| v.as_str()).map(|s| s.to_string()),
         keybindings: table.get("keybindings").and_then(|v| v.as_table()).cloned(),
+        shell: table.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string()),
         startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
         terminal_mode: table.get("terminal_mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
         ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
@@ -344,6 +348,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let block_history_path = std::env::var("JTERM4_HISTORY_PATH").ok()
         .or(fc.block_history_path);
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
+    let shell = std::env::var("JTERM4_SHELL").ok().or(fc.shell);
 
     // Parse terminal mode (default: block)
     let terminal_mode_str = env_string("JTERM4_MODE")
@@ -365,6 +370,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         cursor,
         cursor_foreground,
         palette: theme.palette,
+        shell,
         startup_commands: fc.startup_commands,
         terminal_mode,
         ansi_cache_capacity,
@@ -464,8 +470,16 @@ fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-pub(crate) fn choose_shell_argv() -> Vec<String> {
-    // Prefer rsh.
+pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
+    // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
+    if let Some(path) = configured_shell {
+        if is_executable(Path::new(path)) {
+            return vec![path.to_string()];
+        }
+        log::warn!("Configured shell '{}' is not executable, falling back to auto-detection", path);
+    }
+
+    // Prefer rsh when it's on PATH.
     if let Some(rsh_path) = find_executable_in_path("rsh") {
         return vec![rsh_path.to_string_lossy().to_string()];
     }

@@ -91,7 +91,7 @@ fn main() -> glib::ExitCode {
         let (config, themes, keybinding_map) = load_config();
 
         // Cache shell selection once to avoid extra process probes per new tab.
-        let shell_argv = Rc::new(choose_shell_argv());
+        let shell_argv = Rc::new(choose_shell_argv(config.shell.as_deref()));
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
         let config = Rc::new(RefCell::new(config));
