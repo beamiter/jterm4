@@ -1493,7 +1493,141 @@ fn set_active_command_buffer(
     }
 }
 
-fn set_active_output_buffer(buffer: &TextBuffer, output: &str, palette: &[RGBA; 16]) {
+/// Returns (cursor_col_in_last_line, after_newline).
+/// after_newline=true means cursor is at start of a new line following \n
+/// (buffer may not render that empty trailing line).
+fn output_cursor_col(output: &str) -> (usize, bool) {
+    let bytes = output.as_bytes();
+    let mut cells_len = 0usize;
+    let mut cursor = 0usize;
+    let mut after_newline = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            let mut params: Vec<String> = Vec::new();
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                if bytes[i] == b';' {
+                    params.push(String::new());
+                } else if let Some(last) = params.last_mut() {
+                    last.push(bytes[i] as char);
+                } else {
+                    params.push(String::from(bytes[i] as char));
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                let final_byte = bytes[i];
+                i += 1;
+                match final_byte {
+                    b'D' => {
+                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = cursor.saturating_sub(count);
+                        after_newline = false;
+                    }
+                    b'C' => {
+                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = (cursor + count).min(cells_len);
+                        after_newline = false;
+                    }
+                    b'G' => {
+                        let col = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        cursor = col.saturating_sub(1).min(cells_len);
+                        after_newline = false;
+                    }
+                    b'K' => {
+                        let mode = params.first().map(String::as_str).unwrap_or("0");
+                        match mode {
+                            "" | "0" => { cells_len = cursor; }
+                            "1" => { cursor = 0; after_newline = false; }
+                            "2" => { cells_len = 0; cursor = 0; after_newline = false; }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            i = skip_osc_sequence(bytes, i);
+        } else if bytes[i] == 0x1b {
+            i = skip_escape_sequence(bytes, i);
+        } else if bytes[i] == b'\n' {
+            cursor = 0;
+            cells_len = 0;
+            after_newline = true;
+            i += 1;
+        } else if bytes[i] == b'\r' {
+            cursor = 0;
+            after_newline = false;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            cursor = cursor.saturating_sub(1);
+            after_newline = false;
+            i += 1;
+        } else {
+            let ch_len = if bytes[i] & 0x80 == 0 { 1 }
+                else if bytes[i] & 0xe0 == 0xc0 { 2 }
+                else if bytes[i] & 0xf0 == 0xe0 { 3 }
+                else if bytes[i] & 0xf8 == 0xf0 { 4 }
+                else { 1 };
+            i = (i + ch_len).min(bytes.len());
+            if cursor >= cells_len { cells_len += 1; }
+            cursor += 1;
+            after_newline = false;
+        }
+    }
+    (cursor, after_newline)
+}
+
+fn apply_output_cursor(
+    buffer: &TextBuffer,
+    output: &str,
+    cursor_color: &RGBA,
+    cursor_foreground: &RGBA,
+) {
+    let (cursor_col, after_newline) = output_cursor_col(output);
+
+    let tag_table = buffer.tag_table();
+    if tag_table.lookup("output-cursor").is_none() {
+        let tag = gtk4::TextTag::new(Some("output-cursor"));
+        tag_table.add(&tag);
+    }
+    if let Some(tag) = tag_table.lookup("output-cursor") {
+        tag.set_background_rgba(Some(cursor_color));
+        tag.set_foreground_rgba(Some(cursor_foreground));
+    }
+
+    let buffer_len = buffer.char_count() as usize;
+    let cursor_abs: usize = if after_newline {
+        buffer_len
+    } else {
+        let last_line = (buffer.line_count() - 1).max(0);
+        if let Some(line_start) = buffer.iter_at_line(last_line) {
+            line_start.offset() as usize + cursor_col
+        } else {
+            buffer_len
+        }
+    };
+
+    if cursor_abs >= buffer.char_count() as usize {
+        let mut end_iter = buffer.end_iter();
+        buffer.insert(&mut end_iter, " ");
+    }
+
+    if let Some(tag) = tag_table.lookup("output-cursor") {
+        let start = buffer.iter_at_offset(cursor_abs as i32);
+        let end = buffer.iter_at_offset(cursor_abs as i32 + 1);
+        buffer.apply_tag(&tag, &start, &end);
+    }
+}
+
+fn set_active_output_buffer(
+    buffer: &TextBuffer,
+    output: &str,
+    palette: &[RGBA; 16],
+    cursor_colors: Option<(&RGBA, &RGBA)>,
+) {
     let output_no_ansi = strip_ansi(output);
     let output_plain = output_no_ansi
         .lines()
@@ -1504,6 +1638,10 @@ fn set_active_output_buffer(buffer: &TextBuffer, output: &str, palette: &[RGBA; 
 
     let output_runs = ansi_text_runs(output, palette);
     apply_ansi_runs_to_buffer(buffer, 0, &output_runs);
+
+    if let Some((cursor_color, cursor_foreground)) = cursor_colors {
+        apply_output_cursor(buffer, output, cursor_color, cursor_foreground);
+    }
 }
 
 /// Incrementally append new output to buffer without full rewrite
@@ -1512,6 +1650,7 @@ fn append_active_output_buffer(
     full_output: &str,
     last_flushed_size: usize,
     palette: &[RGBA; 16],
+    cursor_colors: Option<(&RGBA, &RGBA)>,
 ) {
     // Extract only the new portion
     if full_output.len() <= last_flushed_size {
@@ -1523,7 +1662,7 @@ fn append_active_output_buffer(
     // If new output contains \r, it may need to overwrite previous lines
     // (e.g., progress updates like apt/curl). Fall back to full rewrite.
     if new_output.contains('\r') {
-        set_active_output_buffer(buffer, full_output, palette);
+        set_active_output_buffer(buffer, full_output, palette, cursor_colors);
         return;
     }
 
@@ -1534,9 +1673,6 @@ fn append_active_output_buffer(
         .map(|line| command_line_plain_text(line))
         .collect::<Vec<_>>()
         .join("\n");
-
-    // Get current buffer char count before appending
-    let buffer_char_count_before = buffer.char_count() as usize;
 
     // Append the new text to the buffer
     let mut end_iter = buffer.end_iter();
@@ -1554,6 +1690,10 @@ fn append_active_output_buffer(
 
     // Re-apply all ANSI tags from the beginning
     apply_ansi_runs_to_buffer(buffer, 0, &all_output_runs);
+
+    if let Some((cursor_color, cursor_foreground)) = cursor_colors {
+        apply_output_cursor(buffer, full_output, cursor_color, cursor_foreground);
+    }
 }
 
 
@@ -1983,7 +2123,7 @@ impl FinishedBlock {
             command_buffer.remove_tag(&cursor_tag, &start, &end);
         }
 
-        set_active_output_buffer(&output_buffer, output, &config.palette);
+        set_active_output_buffer(&output_buffer, output, &config.palette, None);
 
         // Add Ctrl+Click handler to open URLs in command and output views
         for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
@@ -2421,6 +2561,8 @@ impl ActiveBlock {
             let max_ms = self.config_batch_max;
             let last_flushed_size = self.last_flushed_size.clone();
             let palette = self.palette;
+            let cursor_color = self.cursor_color;
+            let cursor_foreground = self.cursor_foreground;
 
             let batch_interval = current_batch_ms.get();
             glib::timeout_add_local_once(
@@ -2437,10 +2579,10 @@ impl ActiveBlock {
 
                     // Use incremental rendering for appends
                     if prev_size > 0 && output.len() > prev_size {
-                        append_active_output_buffer(&output_buffer, &output, prev_size, &palette);
+                        append_active_output_buffer(&output_buffer, &output, prev_size, &palette, Some((&cursor_color, &cursor_foreground)));
                     } else {
                         // Full rewrite needed (e.g., output was cleared and restarted)
-                        set_active_output_buffer(&output_buffer, &output, &palette);
+                        set_active_output_buffer(&output_buffer, &output, &palette, Some((&cursor_color, &cursor_foreground)));
                     }
 
                     let end_iter = output_buffer.end_iter();
@@ -2484,10 +2626,10 @@ impl ActiveBlock {
 
         // Use incremental rendering for appends
         if prev_size > 0 && output.len() > prev_size {
-            append_active_output_buffer(&self.output_buffer, &output, prev_size, &self.palette);
+            append_active_output_buffer(&self.output_buffer, &output, prev_size, &self.palette, Some((&self.cursor_color, &self.cursor_foreground)));
         } else {
             // Full rewrite needed (e.g., first flush or output was cleared)
-            set_active_output_buffer(&self.output_buffer, &output, &self.palette);
+            set_active_output_buffer(&self.output_buffer, &output, &self.palette, Some((&self.cursor_color, &self.cursor_foreground)));
         }
 
         let end_iter = self.output_buffer.end_iter();
@@ -2504,7 +2646,7 @@ impl ActiveBlock {
         self.flush_pending.set(false);
         self.bytes_since_last_flush.set(0);
         self.last_flushed_size.set(0);
-        set_active_output_buffer(&self.output_buffer, "", &self.palette);
+        set_active_output_buffer(&self.output_buffer, "", &self.palette, None);
     }
 
     fn start_command(&self, command: &str) {
@@ -4575,5 +4717,35 @@ mod tests {
         let (input, suggestion) = separate_input_and_suggestion("git p\u{1b}[2mull\u{1b}[0m", 0);
         assert_eq!(input, "git p");
         assert_eq!(suggestion, "ull");
+    }
+
+    #[test]
+    fn output_cursor_col_end_of_line() {
+        // Plain text: cursor at end of last line
+        assert_eq!(super::output_cursor_col("hello"), (5, false));
+    }
+
+    #[test]
+    fn output_cursor_col_after_newline() {
+        // After \n: cursor at start of new (empty) line, after_newline=true
+        assert_eq!(super::output_cursor_col("hello\n"), (0, true));
+    }
+
+    #[test]
+    fn output_cursor_col_carriage_return() {
+        // After \r: cursor at start of current line, after_newline=false
+        assert_eq!(super::output_cursor_col("hello\r"), (0, false));
+    }
+
+    #[test]
+    fn output_cursor_col_progress_update() {
+        // \r then overwrite: cursor ends at col 8 (length of "50% done")
+        assert_eq!(super::output_cursor_col("Loading...\r50% done"), (8, false));
+    }
+
+    #[test]
+    fn output_cursor_col_multiline() {
+        // Multi-line: cursor at end of last line
+        assert_eq!(super::output_cursor_col("line1\nline2\nend"), (3, false));
     }
 }
