@@ -323,6 +323,10 @@ fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
                 {
                     return true;
                 }
+                // ESC[?25l — cursor hide, strong indicator of TUI app (Claude CLI, etc.)
+                if final_byte == b'l' && params == b"?25" {
+                    return true;
+                }
             }
             _ => {
                 i = skip_escape_sequence(bytes, i);
@@ -345,6 +349,16 @@ mod interactive_screen_tests {
     #[test]
     fn detects_less_application_cursor_enter() {
         assert!(contains_interactive_screen_enter(b"\x1b[?1h\x1b="));
+    }
+
+    #[test]
+    fn detects_cursor_hide() {
+        assert!(contains_interactive_screen_enter(b"\x1b[?25l"));
+    }
+
+    #[test]
+    fn ignores_cursor_show() {
+        assert!(!contains_interactive_screen_enter(b"\x1b[?25h"));
     }
 
     #[test]
@@ -524,16 +538,46 @@ fn merge_pager_snapshots(pages: Vec<String>) -> String {
     merged.join("\n")
 }
 
+fn contains_clear_screen(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            let mut params = Vec::new();
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                params.push(bytes[i]);
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'J' {
+                // CSI 2J or CSI 3J = clear screen
+                if params == b"2" || params == b"3" {
+                    return true;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 fn record_pager_snapshot(vte: &Terminal, snapshots: &Rc<RefCell<Vec<String>>>) {
-    let snapshot = normalize_pager_snapshot(&visible_vte_text(vte));
+    let raw_text = visible_vte_text(vte);
+    log::debug!("record_pager_snapshot: raw_text len={}, first 100 chars: {:?}",
+               raw_text.len(), raw_text.chars().take(100).collect::<String>());
+
+    let snapshot = normalize_pager_snapshot(&raw_text);
     if snapshot.is_empty() {
+        log::debug!("record_pager_snapshot: snapshot is empty after normalization");
         return;
     }
 
     let mut snapshots = snapshots.borrow_mut();
     if snapshots.last().map(|last| last == &snapshot).unwrap_or(false) {
+        log::debug!("record_pager_snapshot: snapshot is duplicate, skipping");
         return;
     }
+    log::debug!("record_pager_snapshot: adding snapshot #{}, len={}", snapshots.len() + 1, snapshot.len());
     snapshots.push(snapshot);
 }
 
@@ -556,7 +600,13 @@ fn schedule_pager_snapshot(
 
 fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
     let pages = std::mem::take(&mut *snapshots.borrow_mut());
-    merge_pager_snapshots(pages)
+    log::debug!("drain_pager_snapshots: draining {} snapshots", pages.len());
+    for (i, page) in pages.iter().enumerate() {
+        log::debug!("  snapshot #{}: {} lines, {} chars", i + 1, page.lines().count(), page.len());
+    }
+    let merged = merge_pager_snapshots(pages);
+    log::debug!("drain_pager_snapshots: merged result: {} lines, {} chars", merged.lines().count(), merged.len());
+    merged
 }
 
 fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
@@ -2973,9 +3023,16 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AltScreen => {
+                                        // If bytes contain clear screen, record current page BEFORE clearing
+                                        if contains_clear_screen(bytes) {
+                                            log::debug!("Detected clear screen in pager, recording current page first");
+                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                        }
+
                                         // Feed raw bytes directly to VTE
                                         vte_for_alt.feed(bytes);
-                                        record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+
+                                        // Schedule snapshot to capture the new page after rendering
                                         schedule_pager_snapshot(
                                             &vte_for_alt,
                                             &pager_snapshots_rc,
