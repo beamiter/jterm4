@@ -423,6 +423,10 @@ pub(crate) fn save_config(config: &Config) {
     table.insert("font".into(), toml::Value::String(config.font_desc.clone()));
     table.insert("font_scale".into(), toml::Value::Float(config.default_font_scale));
     table.insert("theme".into(), toml::Value::String(config.theme_name.clone()));
+    table.insert("terminal_mode".into(), toml::Value::String(match config.terminal_mode {
+        TerminalMode::Block => "block",
+        TerminalMode::Vte => "vte",
+    }.to_string()));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));
