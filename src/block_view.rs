@@ -85,7 +85,7 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
+use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
@@ -2542,16 +2542,11 @@ impl ActiveBlock {
     }
 
     fn output_text(&self) -> String {
-        let (row, col) = self.output_vte.cursor_position();
-        if row <= 0 && col <= 0 {
+        let raw = self.raw_output.borrow();
+        if raw.is_empty() {
             return String::new();
         }
-        let (text, _) = self.output_vte.text_range_format(
-            Format::Text,
-            0, 0,
-            row, col,
-        );
-        text.map(|s| s.to_string()).unwrap_or_default()
+        String::from_utf8_lossy(&raw).into_owned()
     }
 
     fn append_output(&self, text: &str) {
