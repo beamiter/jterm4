@@ -2578,6 +2578,7 @@ impl UiState {
                 ui_for_select.select_tab_range(&from_name, &tab_name_for_select);
             } else {
                 // Plain click: clear selection and switch tab
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
                 ui_for_select.clear_tab_selection();
 
                 // Find the index of this button in the strip
@@ -2591,6 +2592,7 @@ impl UiState {
                     child = c.next_sibling();
                 }
                 notebook_for_select.set_current_page(Some(idx));
+                ui_for_select.sync_tab_strip_active(Some(idx));
             }
         });
         strip_btn.add_controller(click_gesture);

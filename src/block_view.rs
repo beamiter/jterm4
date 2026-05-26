@@ -85,7 +85,7 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-use vte4::{CursorBlinkMode, CursorShape, Terminal};
+use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
@@ -239,6 +239,31 @@ fn rgba_to_hex(c: &RGBA) -> String {
         (c.green() * 255.0) as u8,
         (c.blue() * 255.0) as u8,
     )
+}
+
+fn shorten_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let display = if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    };
+    let parts: Vec<&str> = display.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 3 {
+        display
+    } else {
+        format!("…/{}", parts[parts.len()-2..].join("/"))
+    }
+}
+
+fn chrono_local_offset_secs() -> i64 {
+    use nix::libc;
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm.tm_gmtoff as i64
+    }
 }
 
 fn skip_osc_sequence(bytes: &[u8], mut i: usize) -> usize {
@@ -1434,7 +1459,22 @@ fn set_active_command_buffer(
     cursor_color: &RGBA,
     cursor_foreground: &RGBA,
 ) {
-    let cursor_pos = cmd.chars().count() + preedit.chars().count();
+    set_active_command_buffer_at(
+        buffer, cmd, preedit, cursor_visible, suggestion, cursor_color, cursor_foreground, None,
+    );
+}
+
+fn set_active_command_buffer_at(
+    buffer: &TextBuffer,
+    cmd: &str,
+    preedit: &str,
+    cursor_visible: bool,
+    suggestion: &str,
+    cursor_color: &RGBA,
+    cursor_foreground: &RGBA,
+    explicit_cursor_pos: Option<usize>,
+) {
+    let cursor_pos = explicit_cursor_pos.unwrap_or_else(|| cmd.chars().count() + preedit.chars().count());
     let text = format!("{}{} {}", cmd, preedit, suggestion);
     buffer.set_text(&text);
     let cursor_iter = buffer.iter_at_offset(cursor_pos as i32);
@@ -1967,6 +2007,8 @@ struct BlockData {
     end_time: Option<SystemTime>,
     #[serde(default)]
     duration_ms: Option<u64>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 impl BlockData {
@@ -2059,16 +2101,17 @@ impl FinishedBlock {
         config: &Config,
         duration_ms: Option<u64>,
         end_time: Option<SystemTime>,
+        cwd: Option<&str>,
     ) -> Self {
-        let block_outer_margin_top = 4;
-        let block_outer_margin_bottom = 2;
         let view_margin_top = 2;
         let view_margin_bottom = 2;
 
         let outer = gtk4::Box::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
-        outer.set_margin_top(block_outer_margin_top);
-        outer.set_margin_bottom(block_outer_margin_bottom);
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
 
         // Add hover highlighting to show block is interactive
         let hover_ctrl = gtk4::EventControllerMotion::new();
@@ -2082,6 +2125,83 @@ impl FinishedBlock {
         });
         outer.add_controller(hover_ctrl);
 
+        // ── Header row ──────────────────────────────────────────────────────
+        let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
+        header_row.add_css_class("block-header");
+        header_row.set_margin_start(12);
+        header_row.set_margin_end(8);
+        header_row.set_margin_top(6);
+        header_row.set_margin_bottom(2);
+
+        // CWD label (shortened to last 2 segments)
+        if let Some(cwd_path) = cwd {
+            let shortened = shorten_path(cwd_path);
+            let cwd_label = gtk4::Label::new(Some(&shortened));
+            cwd_label.add_css_class("block-header-label");
+            cwd_label.set_halign(gtk4::Align::Start);
+            cwd_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+            cwd_label.set_max_width_chars(40);
+            header_row.append(&cwd_label);
+        }
+
+        // Spacer
+        let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        header_row.append(&spacer);
+
+        // Timestamp label
+        if let Some(et) = end_time {
+            if let Ok(duration_since_epoch) = et.duration_since(SystemTime::UNIX_EPOCH) {
+                let secs = duration_since_epoch.as_secs();
+                let hours = (secs % 86400) / 3600;
+                let mins = (secs % 3600) / 60;
+                let s = secs % 60;
+                // Adjust to local timezone offset (approximate)
+                let local_offset = chrono_local_offset_secs();
+                let local_secs = secs as i64 + local_offset;
+                let local_secs = local_secs.rem_euclid(86400) as u64;
+                let h = local_secs / 3600;
+                let m = (local_secs % 3600) / 60;
+                let sec = local_secs % 60;
+                let _ = (hours, mins, s); // suppress warnings
+                let ts_label = gtk4::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
+                ts_label.add_css_class("block-header-label");
+                header_row.append(&ts_label);
+            }
+        }
+
+        // Duration badge
+        if let Some(dur_ms) = duration_ms {
+            let dur_sec = dur_ms as f64 / 1000.0;
+            let duration_text = if dur_sec < 1.0 {
+                format!("{:.0}ms", dur_ms)
+            } else if dur_sec < 60.0 {
+                format!("{:.1}s", dur_sec)
+            } else {
+                let min = dur_sec / 60.0;
+                format!("{:.0}m", min)
+            };
+            let dur_label = gtk4::Label::new(Some(&duration_text));
+            dur_label.add_css_class("block-meta-badge");
+            header_row.append(&dur_label);
+        }
+
+        // Exit code badge
+        if exit_code != 0 {
+            let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
+            badge.add_css_class("block-exit-bad");
+            header_row.append(&badge);
+        }
+
+        // Collapse toggle button
+        let collapse_btn = gtk4::Button::with_label("\u{25BC}"); // ▼
+        collapse_btn.add_css_class("block-collapse-btn");
+        collapse_btn.add_css_class("flat");
+        header_row.append(&collapse_btn);
+
+        outer.append(&header_row);
+
+        // ── Text Views ──────────────────────────────────────────────────────
         // Helper to create TextView
         let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
             let buffer = gtk4::TextBuffer::new(None);
@@ -2115,7 +2235,6 @@ impl FinishedBlock {
         command_buffer.set_text(cmd_display);
 
         // Explicitly remove any cursor tags from finished block command buffer
-        // (cursor tags should only be on active block)
         let tag_table = command_buffer.tag_table();
         if let Some(cursor_tag) = tag_table.lookup("cursor") {
             let start = command_buffer.start_iter();
@@ -2137,7 +2256,6 @@ impl FinishedBlock {
                 if n_press == 1 {
                     let state = controller.current_event_state();
                     if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                        // Get text iter at click position
                         let (bx, by) = view_clone.window_to_buffer_coords(
                             gtk4::TextWindowType::Widget,
                             x as i32,
@@ -2158,76 +2276,24 @@ impl FinishedBlock {
             view.add_controller(click_controller);
         }
 
-        // Add mouse motion handler for cursor auto-hide (only for output view)
-        let motion_ctrl = gtk4::EventControllerMotion::new();
-        let output_view_for_motion = output_view.clone();
-        let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        let cursor_timeout_clone = cursor_timeout.clone();
-
-        motion_ctrl.connect_motion(move |_, _x, _y| {
-            // Show cursor on motion
-            output_view_for_motion.set_cursor_from_name(Some("text"));
-
-            // Cancel existing timeout
-            if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
-                handle.remove();
-            }
-
-            // Hide cursor after 1 second of no motion
-            let view_for_timeout = output_view_for_motion.clone();
-            let timeout_clone = cursor_timeout_clone.clone();
-            let handle = glib::timeout_add_local_once(
-                std::time::Duration::from_secs(1),
-                move || {
-                    view_for_timeout.set_cursor_from_name(Some("none"));
-                    timeout_clone.borrow_mut().take();
-                }
-            );
-            cursor_timeout_clone.borrow_mut().replace(handle);
-        });
-
-        output_view.add_controller(motion_ctrl);
-
         // Append views to outer box
-        outer.append(&prompt_view);
         outer.append(&command_view);
         outer.append(&output_view);
 
-        // Exit code badge and metadata footer
-        let footer_box = gtk4::Box::new(Orientation::Horizontal, 8);
-        footer_box.set_margin_start(12);
-        footer_box.set_margin_bottom(6);
-
-        // Exit code badge
-        if exit_code != 0 {
-            let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
-            badge.add_css_class("block-exit-bad");
-            footer_box.append(&badge);
+        // Wire collapse button to toggle output visibility
+        let output_view_for_collapse = output_view.clone();
+        let has_output = !output.trim().is_empty();
+        if !has_output {
+            output_view.set_visible(false);
         }
-
-        // Duration badge
-        if let Some(dur_ms) = duration_ms {
-            let dur_sec = dur_ms as f64 / 1000.0;
-            let duration_text = if dur_sec < 1.0 {
-                format!("{:.0}ms", dur_ms)
-            } else if dur_sec < 60.0 {
-                format!("{:.1}s", dur_sec)
-            } else {
-                let min = dur_sec / 60.0;
-                format!("{:.0}m", min)
-            };
-            let dur_label = gtk4::Label::new(Some(&duration_text));
-            dur_label.add_css_class("block-meta-badge");
-            footer_box.append(&dur_label);
+        collapse_btn.connect_clicked(move |btn| {
+            let visible = output_view_for_collapse.is_visible();
+            output_view_for_collapse.set_visible(!visible);
+            btn.set_label(if visible { "\u{25B6}" } else { "\u{25BC}" }); // ▶ / ▼
+        });
+        if !has_output {
+            collapse_btn.set_label("\u{25B6}"); // ▶
         }
-
-        if !footer_box.first_child().is_none() {
-            outer.append(&footer_box);
-        }
-
-        // Separator line
-        let sep_box = gtk4::Separator::new(Orientation::Horizontal);
-        outer.append(&sep_box);
 
         FinishedBlock {
             id: next_block_id(),
@@ -2254,48 +2320,34 @@ struct ActiveBlock {
     prompt_buffer: gtk4::TextBuffer,
     command_view: gtk4::TextView,
     command_buffer: gtk4::TextBuffer,
-    output_view: gtk4::TextView,
-    output_buffer: gtk4::TextBuffer,
-    pending_output: Rc<RefCell<String>>,
+    output_vte: Terminal,
+    raw_output: Rc<RefCell<Vec<u8>>>,
     pending_cmd: Rc<RefCell<String>>,        // User input only
     pending_preedit: Rc<RefCell<String>>,    // IME composing text
     pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
-    flush_pending: Rc<Cell<bool>>,
-    // Adaptive batching state
-    bytes_since_last_flush: Rc<Cell<usize>>,
-    last_flush_time: Rc<Cell<std::time::Instant>>,
-    current_batch_ms: Rc<Cell<u32>>,
-    config_batch_min: u32,
-    config_batch_max: u32,
-    last_flushed_size: Rc<Cell<usize>>,
     cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
-    palette: [RGBA; 16],
+    cursor_offset: Rc<Cell<usize>>, // Cursor position in chars (editor mode)
     cursor_color: RGBA,
     cursor_foreground: RGBA,
 }
 
 impl ActiveBlock {
-    fn new(batch_min_ms: u32, batch_max_ms: u32, config: &Config) -> Self {
-        let block_outer_margin_top = 4;
-        let block_outer_margin_bottom = 2;
-        let view_margin_top = 0;
-        let view_margin_bottom = 0;
-
+    fn new(_batch_min_ms: u32, _batch_max_ms: u32, config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_top(block_outer_margin_top);
-        widget.set_margin_bottom(block_outer_margin_bottom);
+        widget.set_margin_top(4);
+        widget.set_margin_bottom(2);
         widget.set_can_focus(false);
         widget.set_can_target(false);
         widget.set_focusable(false);
 
         // Helper to create and configure a TextView
-        let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
+        let create_textview = |css_class: &str, editable: bool| -> (gtk4::TextView, gtk4::TextBuffer) {
             let buffer = TextBuffer::new(None);
             let view = TextView::with_buffer(&buffer);
             view.add_css_class(css_class);
-            view.set_editable(false);
-            view.set_cursor_visible(false);
+            view.set_editable(editable);
+            view.set_cursor_visible(editable);
             view.set_can_focus(true);
             view.set_focusable(true);
             view.set_hexpand(true);
@@ -2303,94 +2355,33 @@ impl ActiveBlock {
             view.set_wrap_mode(gtk4::WrapMode::Char);
             view.set_left_margin(12);
             view.set_right_margin(8);
-            view.set_top_margin(view_margin_top);
-            view.set_bottom_margin(view_margin_bottom);
+            view.set_top_margin(0);
+            view.set_bottom_margin(0);
             view.set_monospace(true);
 
-            // Block keyboard input
-            let key_controller = EventControllerKey::new();
-            key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
-                glib::Propagation::Stop
-            });
-            view.add_controller(key_controller);
+            if !editable {
+                let key_controller = EventControllerKey::new();
+                key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
+                    glib::Propagation::Stop
+                });
+                view.add_controller(key_controller);
+            }
 
             (view, buffer)
         };
 
-        // Create three views
-        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
-        let (command_view, command_buffer) = create_textview("block-command-view");
-        let (output_view, output_buffer) = create_textview("block-output-view");
+        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view", false);
+        let (command_view, command_buffer) = create_textview("block-command-view", false);
 
-        // Add Ctrl+Click handler to open URLs in command and output views
-        for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
-            let click_controller = gtk4::GestureClick::new();
-            click_controller.set_button(1); // left click
-            click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-
-            let buffer_clone = buffer.clone();
-            let view_clone = view.clone();
-            click_controller.connect_pressed(move |controller, n_press, x, y| {
-                if n_press == 1 {
-                    let state = controller.current_event_state();
-                    if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                        // Get text iter at click position
-                        let (bx, by) = view_clone.window_to_buffer_coords(
-                            gtk4::TextWindowType::Widget,
-                            x as i32,
-                            y as i32,
-                        );
-                        if let Some(iter) = view_clone.iter_at_location(bx, by) {
-                            if let Some(url) = get_url_at_position(&buffer_clone, &iter) {
-                                open_uri(&url);
-                                controller.set_state(gtk4::EventSequenceState::Claimed);
-                                return;
-                            }
-                        }
-                    }
-                }
-                controller.set_state(gtk4::EventSequenceState::Denied);
-            });
-
-            view.add_controller(click_controller);
-        }
-
-        // Add mouse motion handler for cursor auto-hide (only for output view)
-        // Don't add to command_view as it interferes with text input cursor
-        let motion_ctrl = gtk4::EventControllerMotion::new();
-        let output_view_for_motion = output_view.clone();
-        let cursor_timeout: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        let cursor_timeout_clone = cursor_timeout.clone();
-
-        motion_ctrl.connect_motion(move |_, _x, _y| {
-            // Show cursor on motion
-            output_view_for_motion.set_cursor_from_name(Some("text"));
-
-            // Cancel existing timeout
-            if let Some(handle) = cursor_timeout_clone.borrow_mut().take() {
-                handle.remove();
-            }
-
-            // Hide cursor after 1 second of no motion
-            let view_for_timeout = output_view_for_motion.clone();
-            let timeout_clone = cursor_timeout_clone.clone();
-            let handle = glib::timeout_add_local_once(
-                std::time::Duration::from_secs(1),
-                move || {
-                    view_for_timeout.set_cursor_from_name(Some("none"));
-                    timeout_clone.borrow_mut().take();
-                }
-            );
-            cursor_timeout_clone.borrow_mut().replace(handle);
-        });
-
-        output_view.add_controller(motion_ctrl);
+        // Output: use VTE widget for full terminal compatibility
+        let output_vte = build_output_vte(config);
+        output_vte.set_visible(false); // Hidden until there's output
 
         // Append to widget
         widget.append(&prompt_view);
         widget.append(&command_view);
-        widget.append(&output_view);
+        widget.append(&output_vte);
 
         // Grab focus on command_view when realized
         let command_view_clone = command_view.clone();
@@ -2399,59 +2390,58 @@ impl ActiveBlock {
         });
 
         let cursor_visible = Rc::new(Cell::new(true));
+        let cursor_offset: Rc<Cell<usize>> = Rc::new(Cell::new(0));
         let pending_cmd = Rc::new(RefCell::new(String::new()));
         let pending_preedit = Rc::new(RefCell::new(String::new()));
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
-        let pending_output = Rc::new(RefCell::new(String::new()));
 
-        // Start cursor blink animation - update command view only (output is handled separately)
-        let cursor_visible_clone = cursor_visible.clone();
-        let command_buffer_clone = command_buffer.clone();
-        let pending_cmd_clone = pending_cmd.clone();
-        let pending_preedit_clone = pending_preedit.clone();
-        let pending_suggestion_clone = pending_suggestion.clone();
-        let cursor_color_for_timer = config.cursor;
-        let cursor_foreground_for_timer = config.cursor_foreground;
+        {
+            // Manual cursor blink animation (both editor and non-editor modes)
+            let cursor_visible_clone = cursor_visible.clone();
+            let cursor_offset_clone = cursor_offset.clone();
+            let command_buffer_clone = command_buffer.clone();
+            let pending_cmd_clone = pending_cmd.clone();
+            let pending_preedit_clone = pending_preedit.clone();
+            let pending_suggestion_clone = pending_suggestion.clone();
+            let cursor_color_for_timer = config.cursor;
+            let cursor_foreground_for_timer = config.cursor_foreground;
 
-        glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
-            cursor_visible_clone.set(!cursor_visible_clone.get());
+            glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
+                cursor_visible_clone.set(!cursor_visible_clone.get());
 
-            let cmd = pending_cmd_clone.borrow();
-            let preedit = pending_preedit_clone.borrow();
-            let suggestion = pending_suggestion_clone.borrow();
-            log::debug!(
-                "cursor_blink_timer: cmd={:?}, suggestion={:?}, cursor_visible={}",
-                cmd,
-                suggestion,
-                cursor_visible_clone.get()
+                let cmd = pending_cmd_clone.borrow();
+                let preedit = pending_preedit_clone.borrow();
+                let suggestion = pending_suggestion_clone.borrow();
+
+                let cur_pos = cursor_offset_clone.get();
+                let default_pos = cmd.chars().count() + preedit.chars().count();
+                let explicit_pos = if cur_pos != default_pos { Some(cur_pos) } else { None };
+
+                set_active_command_buffer_at(
+                    &command_buffer_clone,
+                    &cmd,
+                    &preedit,
+                    cursor_visible_clone.get(),
+                    &suggestion,
+                    &cursor_color_for_timer,
+                    &cursor_foreground_for_timer,
+                    explicit_pos,
+                );
+
+                glib::ControlFlow::Continue
+            });
+
+            set_active_command_buffer_at(
+                &command_buffer,
+                "",
+                "",
+                true,
+                "",
+                &config.cursor,
+                &config.cursor_foreground,
+                None,
             );
-
-            set_active_command_buffer(
-                &command_buffer_clone,
-                &cmd,
-                &preedit,
-                cursor_visible_clone.get(),
-                &suggestion,
-                &cursor_color_for_timer,
-                &cursor_foreground_for_timer,
-            );
-
-            // Note: Output buffer updates are now handled only during actual output changes
-            // via append_output() and flush_output(), not during cursor blink cycles.
-
-            glib::ControlFlow::Continue
-        });
-
-        // Initialize command_buffer with initial cursor to show immediately
-        set_active_command_buffer(
-            &command_buffer,
-            "",
-            "",
-            true,
-            "",
-            &config.cursor,
-            &config.cursor_foreground,
-        );
+        }
 
         ActiveBlock {
             widget,
@@ -2459,21 +2449,13 @@ impl ActiveBlock {
             prompt_buffer,
             command_view,
             command_buffer,
-            output_view,
-            output_buffer,
-            pending_output,
+            output_vte,
+            raw_output: Rc::new(RefCell::new(Vec::new())),
             pending_cmd,
             pending_preedit,
             pending_suggestion,
-            flush_pending: Rc::new(Cell::new(false)),
-            bytes_since_last_flush: Rc::new(Cell::new(0)),
-            last_flush_time: Rc::new(Cell::new(std::time::Instant::now())),
-            current_batch_ms: Rc::new(Cell::new(batch_min_ms)),
-            config_batch_min: batch_min_ms,
-            config_batch_max: batch_max_ms,
-            last_flushed_size: Rc::new(Cell::new(0)),
             cursor_visible,
-            palette: config.palette,
+            cursor_offset,
             cursor_color: config.cursor,
             cursor_foreground: config.cursor_foreground,
         }
@@ -2488,6 +2470,7 @@ impl ActiveBlock {
         *self.pending_cmd.borrow_mut() = text.to_string();
         self.pending_preedit.borrow_mut().clear();
         *self.pending_suggestion.borrow_mut() = String::new();
+        self.cursor_offset.set(text.chars().count());
         self.update_content_view();
     }
 
@@ -2513,6 +2496,9 @@ impl ActiveBlock {
     }
 
     fn update_content_view(&self) {
+        if self.command_view.is_editable() {
+            return;
+        }
         let cmd = self.pending_cmd.borrow();
         let preedit = self.pending_preedit.borrow();
         let suggestion = self.pending_suggestion.borrow();
@@ -2523,7 +2509,15 @@ impl ActiveBlock {
             self.cursor_visible.get()
         );
 
-        set_active_command_buffer(
+        let cursor_pos = self.cursor_offset.get();
+        let default_pos = cmd.chars().count() + preedit.chars().count();
+        let explicit_pos = if cursor_pos != default_pos {
+            Some(cursor_pos)
+        } else {
+            None
+        };
+
+        set_active_command_buffer_at(
             &self.command_buffer,
             &cmd,
             &preedit,
@@ -2531,122 +2525,43 @@ impl ActiveBlock {
             &suggestion,
             &self.cursor_color,
             &self.cursor_foreground,
+            explicit_pos,
         );
     }
 
-    fn append_output(&self, text: &str) {
-        let text_len = text.len();
-        let first_output = self.pending_output.borrow().is_empty();
-        self.pending_output.borrow_mut().push_str(text);
-
-        self.bytes_since_last_flush
-            .set(self.bytes_since_last_flush.get() + text_len);
-
-        if first_output {
-            self.flush_output();
-            self.bytes_since_last_flush.set(0);
-            self.last_flush_time.set(std::time::Instant::now());
-            return;
+    fn feed_output(&self, raw_bytes: &[u8]) {
+        if !self.output_vte.is_visible() {
+            self.output_vte.set_visible(true);
         }
-
-        if !self.flush_pending.get() {
-            self.flush_pending.set(true);
-            let pending_output = self.pending_output.clone();
-            let output_buffer = self.output_buffer.clone();
-            let flush_flag = self.flush_pending.clone();
-            let bytes_tracker = self.bytes_since_last_flush.clone();
-            let last_flush_time = self.last_flush_time.clone();
-            let current_batch_ms = self.current_batch_ms.clone();
-            let min_ms = self.config_batch_min;
-            let max_ms = self.config_batch_max;
-            let last_flushed_size = self.last_flushed_size.clone();
-            let palette = self.palette;
-            let cursor_color = self.cursor_color;
-            let cursor_foreground = self.cursor_foreground;
-
-            let batch_interval = current_batch_ms.get();
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(batch_interval as u64),
-                move || {
-                    let output = pending_output.borrow();
-                    let prev_size = last_flushed_size.get();
-
-                    // Skip rendering if output hasn't changed
-                    if output.len() == prev_size {
-                        flush_flag.set(false);
-                        return;
-                    }
-
-                    // Use incremental rendering for appends
-                    if prev_size > 0 && output.len() > prev_size {
-                        append_active_output_buffer(&output_buffer, &output, prev_size, &palette, Some((&cursor_color, &cursor_foreground)));
-                    } else {
-                        // Full rewrite needed (e.g., output was cleared and restarted)
-                        set_active_output_buffer(&output_buffer, &output, &palette, Some((&cursor_color, &cursor_foreground)));
-                    }
-
-                    let end_iter = output_buffer.end_iter();
-                    output_buffer.place_cursor(&end_iter);
-
-                    last_flushed_size.set(output.len());
-
-                    let now = std::time::Instant::now();
-                    let elapsed = now.duration_since(last_flush_time.get());
-                    let elapsed_ms = elapsed.as_millis().max(1) as u64;
-                    let bytes = bytes_tracker.get();
-
-                    let throughput = bytes as f64 / elapsed_ms as f64;
-
-                    let new_interval = if throughput > 100.0 {
-                        max_ms
-                    } else if throughput < 1.0 {
-                        min_ms
-                    } else {
-                        let t = (throughput - 1.0) / 99.0;
-                        min_ms + ((max_ms - min_ms) as f64 * t) as u32
-                    };
-
-                    current_batch_ms.set(new_interval);
-                    last_flush_time.set(now);
-                    bytes_tracker.set(0);
-                    flush_flag.set(false);
-                },
-            );
-        }
+        self.raw_output.borrow_mut().extend_from_slice(raw_bytes);
+        self.output_vte.feed(raw_bytes);
     }
 
     fn flush_output(&self) {
-        let output = self.pending_output.borrow();
-        let prev_size = self.last_flushed_size.get();
-
-        // Skip rendering if output hasn't changed
-        if output.len() == prev_size {
-            return;
-        }
-
-        // Use incremental rendering for appends
-        if prev_size > 0 && output.len() > prev_size {
-            append_active_output_buffer(&self.output_buffer, &output, prev_size, &self.palette, Some((&self.cursor_color, &self.cursor_foreground)));
-        } else {
-            // Full rewrite needed (e.g., first flush or output was cleared)
-            set_active_output_buffer(&self.output_buffer, &output, &self.palette, Some((&self.cursor_color, &self.cursor_foreground)));
-        }
-
-        let end_iter = self.output_buffer.end_iter();
-        self.output_buffer.place_cursor(&end_iter);
-        self.last_flushed_size.set(output.len());
+        // VTE renders immediately on feed(), no flush needed
     }
 
     fn output_text(&self) -> String {
-        self.pending_output.borrow().clone()
+        let (row, col) = self.output_vte.cursor_position();
+        if row <= 0 && col <= 0 {
+            return String::new();
+        }
+        let (text, _) = self.output_vte.text_range_format(
+            Format::Text,
+            0, 0,
+            row, col,
+        );
+        text.map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    fn append_output(&self, text: &str) {
+        self.feed_output(text.as_bytes());
     }
 
     fn clear_output(&self) {
-        self.pending_output.borrow_mut().clear();
-        self.flush_pending.set(false);
-        self.bytes_since_last_flush.set(0);
-        self.last_flushed_size.set(0);
-        set_active_output_buffer(&self.output_buffer, "", &self.palette, None);
+        self.raw_output.borrow_mut().clear();
+        self.output_vte.reset(true, true);
+        self.output_vte.set_visible(false);
     }
 
     fn start_command(&self, command: &str) {
@@ -2654,8 +2569,7 @@ impl ActiveBlock {
         self.pending_preedit.borrow_mut().clear();
         self.pending_suggestion.borrow_mut().clear();
         self.clear_output();
-        self.last_flush_time.set(std::time::Instant::now());
-        self.update_content_view();
+        self.command_buffer.set_text("");
     }
 
     fn reset_for_next_prompt(&self) {
@@ -2664,11 +2578,9 @@ impl ActiveBlock {
         self.pending_preedit.borrow_mut().clear();
         self.pending_suggestion.borrow_mut().clear();
         self.clear_output();
-        // Ensure cursor is visible after reset (don't wait for blink timer)
         self.cursor_visible.set(true);
-        // Force immediate update to clear any old content
-        self.command_buffer.set_text(" ");  // Space to ensure cursor has a position
-        self.update_content_view();
+        self.cursor_offset.set(0);
+        self.command_buffer.set_text("");
     }
 
     fn widget(&self) -> &gtk4::Box {
@@ -2924,6 +2836,7 @@ impl TermView {
             let scroll_debouncer = ScrollDebouncer::new();
             let ansi_cache_for_cb = ansi_cache.clone();
             let widget_pool_for_cb = widget_pool.clone();
+            let editor_input_for_cb = config.editor_input;
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -2938,6 +2851,10 @@ impl TermView {
             let pty_for_init = Rc::clone(&pty);
             let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
             let block_start_time_for_cb = block_start_time.clone();
+            let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
+                cwd.unwrap_or("").to_string()
+            ));
+            let current_cwd_for_cb = current_cwd.clone();
 
             pty.start_reader(
                 move |data: Vec<u8>| {
@@ -3046,6 +2963,11 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AwaitingCommand => {
+                                        // In editor mode, ignore shell echo — we handle input locally
+                                        if editor_input_for_cb {
+                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                            continue;
+                                        }
                                         // Shell's line editor sends the full line (prompt + input) with each keystroke.
                                         // Store raw text with ANSI codes preserved
                                         let raw_text = text.clone();
@@ -3129,7 +3051,6 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::CollectingOutput => {
-                                        // Trigger activity callbacks when there's output
                                         for cb in activity_cbs.borrow().iter() {
                                             cb();
                                         }
@@ -3156,12 +3077,8 @@ impl TermView {
                                             continue;
                                         }
 
-                                        let (_, should_clear) = strip_ansi_with_clear_detect(&text);
-                                        if should_clear {
-                                            active_rc.borrow().clear_output();
-                                        }
-                                        active_rc.borrow().append_output(&text);
-                                        // Auto-scroll to bottom
+                                        // Feed raw bytes directly to VTE output widget
+                                        active_rc.borrow().feed_output(bytes);
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AltScreen => {
@@ -3200,6 +3117,13 @@ impl TermView {
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 cmd_display_markup_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
+
+                                if editor_input_for_cb {
+                                    let active_for_prompt_focus = active_rc.clone();
+                                    glib::idle_add_local_once(move || {
+                                        active_for_prompt_focus.borrow().grab_focus();
+                                    });
+                                }
 
                                 // Feed next initial command if any
                                 if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
@@ -3292,6 +3216,11 @@ impl TermView {
                                     })
                                 });
 
+                                let block_cwd = {
+                                    let cwd_str = current_cwd_for_cb.borrow().clone();
+                                    if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                };
+
                                 let block_data = BlockData {
                                     id: next_block_id(),
                                     prompt: prompt.clone(),
@@ -3304,6 +3233,7 @@ impl TermView {
                                     start_time,
                                     end_time,
                                     duration_ms,
+                                    cwd: block_cwd.clone(),
                                 };
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
@@ -3311,7 +3241,7 @@ impl TermView {
                                 // Create widget (physical representation)
                                 let finished = FinishedBlock::new(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, *code, &config_for_cb.borrow(),
-                                    duration_ms, end_time,
+                                    duration_ms, end_time, block_cwd.as_deref(),
                                 );
 
                                 // Insert before the active block (which is always last)
@@ -3485,6 +3415,7 @@ impl TermView {
                             }
 
                             ParserEvent::CwdUpdate(path) => {
+                                *current_cwd_for_cb.borrow_mut() = path.clone();
                                 for cb in cwd_cbs.borrow().iter() {
                                     cb(&path);
                                 }
@@ -3530,7 +3461,11 @@ impl TermView {
         // ── GTK input method support ─────────────────────────────────────
         let im_context = gtk4::IMMulticontext::new();
         let im_client_widget = active.borrow().command_view.clone();
-        im_context.set_client_widget(Some(&im_client_widget));
+
+        if !config.editor_input {
+            // Non-editor mode: external IM context manages all text input → PTY
+            im_context.set_client_widget(Some(&im_client_widget));
+        }
 
         {
             let pty_for_commit = pty.clone();
@@ -3547,7 +3482,12 @@ impl TermView {
             });
         }
 
-        {
+        if config.editor_input {
+            // Editor mode: keep the external IM focused for non-AwaitingCommand states
+            // but don't attach focus controller to command_view (would conflict with
+            // the TextView's internal IM context).
+            im_context.focus_in();
+        } else {
             let focus_ctrl = gtk4::EventControllerFocus::new();
             let im_for_focus_in = im_context.clone();
             focus_ctrl.connect_enter(move |_| {
@@ -3573,19 +3513,304 @@ impl TermView {
             let im_context_for_key = im_context.clone();
             let application_cursor_for_key = application_cursor_mode.clone();
             let bracketed_paste_for_key = bracketed_paste_mode.clone();
+            let bstate_for_key = bstate.clone();
+            let active_for_key = active.clone();
+            let editor_input_enabled = config.editor_input;
+            let block_data_for_key = block_data_rc.clone();
+            let history_index: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
             key_ctrl.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
-                // All keyboard input goes through here to the PTY.
-                // VTE has no PTY attached — it's display-only (fed via feed()).
-                // Main app's key_controller on the window (also Capture phase) runs first
-                // and will intercept keybindings before we get here.
                 let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
                 let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
 
                 log::debug!("KEY: keyval={:?}, ctrl={}, shift={}, alt={}", keyval, ctrl, shift, alt);
+
+                // Editor mode: when awaiting command input, handle editing locally
+                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand {
+                    // Ctrl+Shift+V: paste
+                    if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
+                        let clipboard = root_for_key.clipboard();
+                        let active_for_paste = active_for_key.clone();
+                        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+                            if let Ok(Some(text)) = result {
+                                let active = active_for_paste.borrow();
+                                let pos = active.cursor_offset.get();
+                                let mut cmd = active.pending_cmd.borrow().clone();
+                                let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                                cmd.insert_str(byte_pos, &text);
+                                let new_pos = pos + text.chars().count();
+                                *active.pending_cmd.borrow_mut() = cmd;
+                                active.cursor_offset.set(new_pos);
+                                active.cursor_visible.set(true);
+                                active.update_content_view();
+                            }
+                        });
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+Shift+C: copy (let it propagate for global handler)
+                    if ctrl && shift && (keyval == gtk4::gdk::Key::c || keyval == gtk4::gdk::Key::C) {
+                        let active = active_for_key.borrow();
+                        let cmd = active.pending_cmd.borrow().clone();
+                        if !cmd.is_empty() {
+                            let clipboard = root_for_key.clipboard();
+                            clipboard.set_text(&cmd);
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Enter: send command to PTY
+                    if keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter {
+                        if shift {
+                            // Shift+Enter: insert newline
+                            let active = active_for_key.borrow();
+                            let pos = active.cursor_offset.get();
+                            let mut cmd = active.pending_cmd.borrow().clone();
+                            let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                            cmd.insert(byte_pos, '\n');
+                            *active.pending_cmd.borrow_mut() = cmd;
+                            active.cursor_offset.set(pos + 1);
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                            return glib::Propagation::Stop;
+                        }
+                        // Regular Enter: send the command
+                        let active = active_for_key.borrow();
+                        let cmd = active.pending_cmd.borrow().clone();
+                        let trimmed = cmd.trim();
+                        if !trimmed.is_empty() {
+                            pty_for_key.write_bytes(format!("{}\r", trimmed).as_bytes());
+                        } else {
+                            pty_for_key.write_bytes(b"\r");
+                        }
+                        active.cursor_offset.set(0);
+                        history_index.set(None);
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+C: send SIGINT
+                    if ctrl && (keyval == gtk4::gdk::Key::c || keyval == gtk4::gdk::Key::C) {
+                        pty_for_key.write_bytes(b"\x03");
+                        let active = active_for_key.borrow();
+                        *active.pending_cmd.borrow_mut() = String::new();
+                        active.cursor_offset.set(0);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        history_index.set(None);
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Tab: send current text + tab to shell for completion
+                    if keyval == gtk4::gdk::Key::Tab {
+                        let active = active_for_key.borrow();
+                        let cmd = active.pending_cmd.borrow().clone();
+                        pty_for_key.write_bytes(cmd.as_bytes());
+                        pty_for_key.write_bytes(b"\t");
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Up/Down: history navigation
+                    if keyval == gtk4::gdk::Key::Up || keyval == gtk4::gdk::Key::Down {
+                        let block_data = block_data_for_key.borrow();
+                        if block_data.is_empty() {
+                            return glib::Propagation::Stop;
+                        }
+                        let current_idx = history_index.get();
+                        let new_idx = if keyval == gtk4::gdk::Key::Up {
+                            match current_idx {
+                                None => Some(block_data.len().saturating_sub(1)),
+                                Some(0) => Some(0),
+                                Some(i) => Some(i - 1),
+                            }
+                        } else {
+                            match current_idx {
+                                None => None,
+                                Some(i) if i >= block_data.len().saturating_sub(1) => None,
+                                Some(i) => Some(i + 1),
+                            }
+                        };
+                        history_index.set(new_idx);
+                        let active = active_for_key.borrow();
+                        if let Some(idx) = new_idx {
+                            if let Some(block) = block_data.get(idx) {
+                                *active.pending_cmd.borrow_mut() = block.cmd.clone();
+                                active.cursor_offset.set(block.cmd.chars().count());
+                            }
+                        } else {
+                            *active.pending_cmd.borrow_mut() = String::new();
+                            active.cursor_offset.set(0);
+                        }
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Escape: clear input
+                    if keyval == gtk4::gdk::Key::Escape {
+                        let active = active_for_key.borrow();
+                        *active.pending_cmd.borrow_mut() = String::new();
+                        active.cursor_offset.set(0);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        history_index.set(None);
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Backspace: delete character before cursor
+                    if keyval == gtk4::gdk::Key::BackSpace {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        if pos > 0 {
+                            let mut cmd = active.pending_cmd.borrow().clone();
+                            let byte_pos = cmd.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
+                            let next_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                            cmd.drain(byte_pos..next_byte);
+                            *active.pending_cmd.borrow_mut() = cmd;
+                            active.cursor_offset.set(pos - 1);
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Delete: delete character after cursor
+                    if keyval == gtk4::gdk::Key::Delete {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let mut cmd = active.pending_cmd.borrow().clone();
+                        let char_count = cmd.chars().count();
+                        if pos < char_count {
+                            let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                            let next_byte = cmd.char_indices().nth(pos + 1).map(|(i, _)| i).unwrap_or(cmd.len());
+                            cmd.drain(byte_pos..next_byte);
+                            *active.pending_cmd.borrow_mut() = cmd;
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Left: move cursor left
+                    if keyval == gtk4::gdk::Key::Left {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        if pos > 0 {
+                            active.cursor_offset.set(pos - 1);
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Right: move cursor right
+                    if keyval == gtk4::gdk::Key::Right {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let len = active.pending_cmd.borrow().chars().count();
+                        if pos < len {
+                            active.cursor_offset.set(pos + 1);
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Home: move cursor to start
+                    if keyval == gtk4::gdk::Key::Home {
+                        let active = active_for_key.borrow();
+                        active.cursor_offset.set(0);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // End: move cursor to end
+                    if keyval == gtk4::gdk::Key::End {
+                        let active = active_for_key.borrow();
+                        let len = active.pending_cmd.borrow().chars().count();
+                        active.cursor_offset.set(len);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+A: select all (move cursor to end for now)
+                    if ctrl && (keyval == gtk4::gdk::Key::a || keyval == gtk4::gdk::Key::A) {
+                        let active = active_for_key.borrow();
+                        let len = active.pending_cmd.borrow().chars().count();
+                        active.cursor_offset.set(len);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+U: clear line before cursor
+                    if ctrl && (keyval == gtk4::gdk::Key::u || keyval == gtk4::gdk::Key::U) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let mut cmd = active.pending_cmd.borrow().clone();
+                        let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                        cmd.drain(..byte_pos);
+                        *active.pending_cmd.borrow_mut() = cmd;
+                        active.cursor_offset.set(0);
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+W: delete word before cursor
+                    if ctrl && (keyval == gtk4::gdk::Key::w || keyval == gtk4::gdk::Key::W) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        if pos > 0 {
+                            let mut cmd = active.pending_cmd.borrow().clone();
+                            let chars: Vec<char> = cmd.chars().collect();
+                            let mut new_pos = pos;
+                            // Skip trailing spaces
+                            while new_pos > 0 && chars[new_pos - 1] == ' ' {
+                                new_pos -= 1;
+                            }
+                            // Skip word chars
+                            while new_pos > 0 && chars[new_pos - 1] != ' ' {
+                                new_pos -= 1;
+                            }
+                            let start_byte = cmd.char_indices().nth(new_pos).map(|(i, _)| i).unwrap_or(0);
+                            let end_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                            cmd.drain(start_byte..end_byte);
+                            *active.pending_cmd.borrow_mut() = cmd;
+                            active.cursor_offset.set(new_pos);
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Normal printable characters: insert at cursor position
+                    if !ctrl && !alt {
+                        if let Some(ch) = keyval.to_unicode() {
+                            if !ch.is_control() {
+                                let active = active_for_key.borrow();
+                                let pos = active.cursor_offset.get();
+                                let mut cmd = active.pending_cmd.borrow().clone();
+                                let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                                let mut buf = [0u8; 4];
+                                let s = ch.encode_utf8(&mut buf);
+                                cmd.insert_str(byte_pos, s);
+                                *active.pending_cmd.borrow_mut() = cmd;
+                                active.cursor_offset.set(pos + 1);
+                                active.cursor_visible.set(true);
+                                active.update_content_view();
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                    }
+
+                    // Unhandled keys: consume to prevent interference
+                    return glib::Propagation::Stop;
+                }
 
                 // Handle Ctrl+Shift+C (copy) and Ctrl+Shift+V (paste)
                 if ctrl && shift {
@@ -3740,7 +3965,11 @@ impl TermView {
             });
 
             let im_context_for_release = im_context.clone();
+            let bstate_for_release = bstate.clone();
             key_ctrl.connect_key_released(move |controller, _keyval, _keycode, _modifiers| {
+                if editor_input_enabled && bstate_for_release.get() == BlockState::AwaitingCommand {
+                    return;
+                }
                 if let Some(event) = controller.current_event() {
                     im_context_for_release.filter_keypress(&event);
                 }
@@ -3802,6 +4031,7 @@ impl TermView {
                     &config,
                     block.duration_ms,
                     block.end_time,
+                    block.cwd.as_deref(),
                 );
                 term_view.block_list.append(finished.widget());
                 term_view.finished_blocks.borrow_mut().push(finished);
@@ -3902,6 +4132,7 @@ impl TermView {
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) {
         self.pty.resize(cols, rows);
+        self.active.borrow().output_vte.set_size(cols as i64, rows as i64);
     }
 
     /// Kill the child process.
@@ -4438,6 +4669,36 @@ fn build_vte(config: &Config) -> Terminal {
     terminal
 }
 
+fn build_output_vte(config: &Config) -> Terminal {
+    let terminal = Terminal::builder()
+        .hexpand(true)
+        .vexpand(false)
+        .can_focus(false)
+        .allow_hyperlink(true)
+        .bold_is_bright(true)
+        .input_enabled(false)
+        .scrollback_lines(0)
+        .cursor_blink_mode(CursorBlinkMode::Off)
+        .cursor_shape(CursorShape::Block)
+        .font_scale(config.default_font_scale)
+        .opacity(1.0)
+        .pointer_autohide(true)
+        .enable_sixel(true)
+        .build();
+    terminal.set_mouse_autohide(true);
+    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
+    terminal.set_color_cursor(Some(&config.cursor));
+    terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
+    let font_desc = FontDescription::from_string(&config.font_desc);
+    terminal.set_font(Some(&font_desc));
+    terminal
+}
+
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 fn install_block_css(config: &Config) {
@@ -4445,19 +4706,13 @@ fn install_block_css(config: &Config) {
     let bg = &config.background;
     let bg_hex = rgba_to_hex(bg);
     let fg_hex = rgba_to_hex(fg);
-    // Slightly lighter bg for header
-    let header_bg = format!(
-        "rgba({},{},{},0.08)",
-        (fg.red() * 255.0) as u8,
-        (fg.green() * 255.0) as u8,
-        (fg.blue() * 255.0) as u8,
-    );
     let dim_fg = format!(
         "rgba({},{},{},0.55)",
         (fg.red() * 255.0) as u8,
         (fg.green() * 255.0) as u8,
         (fg.blue() * 255.0) as u8,
     );
+    let cursor_hex = rgba_to_hex(&config.cursor);
     // Accent color for active chevron (use palette color 2 = green-ish)
     let accent = rgba_to_hex(&config.palette[2]);
 
@@ -4493,14 +4748,14 @@ fn install_block_css(config: &Config) {
             background-color: {bg_hex};
         }}
         .block-finished {{
-            border-bottom: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
-            border-radius: 0;
-            margin: 0;
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 6px;
             background-color: {bg_hex};
             min-height: 40px;
         }}
         .block-hovered {{
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.03);
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.18);
         }}
         .block-selected {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
@@ -4508,16 +4763,25 @@ fn install_block_css(config: &Config) {
             padding-left: 9px;
         }}
         .block-active {{
-            border-radius: 0;
-            margin: 0;
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 6px;
+            margin: 4px 8px;
             background-color: {bg_hex};
             min-height: 40px;
         }}
         .block-header {{
-            background-color: {header_bg};
-            border-radius: 5px 5px 0 0;
-            padding-top: 8px;
-            padding-bottom: 8px;
+            border-radius: 6px 6px 0 0;
+        }}
+        .block-header-label {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .block-collapse-btn {{
+            color: {dim_fg};
+            font-size: 0.75em;
+            min-width: 20px;
+            min-height: 20px;
+            padding: 0;
         }}
         .block-prompt {{
             color: {dim_fg};
@@ -4548,11 +4812,13 @@ fn install_block_css(config: &Config) {
             line-height: 1.2;
             margin: 0;
             background-color: {bg_hex};
-            min-height: 48px;
+            min-height: 24px;
+            caret-color: {cursor_hex};
         }}
         .block-command-view text {{
             color: {fg_hex};
             background-color: {bg_hex};
+            caret-color: {cursor_hex};
         }}
         .block-output-view {{
             color: {fg_hex};
@@ -4562,7 +4828,7 @@ fn install_block_css(config: &Config) {
             line-height: 1.2;
             margin: 0;
             background-color: {bg_hex};
-            min-height: 48px;
+            min-height: 0;
         }}
         .block-output-view text {{
             color: {fg_hex};

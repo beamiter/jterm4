@@ -47,6 +47,7 @@ pub struct Config {
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
+    pub(crate) editor_input: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +240,7 @@ struct FileConfig {
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
+    editor_input: Option<bool>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -276,6 +278,7 @@ fn load_file_config() -> FileConfig {
         virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
+        editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
     }
 }
 
@@ -382,6 +385,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         virtual_scroll_margin,
         block_history_path,
         block_history_compress,
+        editor_input: fc.editor_input.unwrap_or(true),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
