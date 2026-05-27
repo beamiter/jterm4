@@ -4009,6 +4009,15 @@ impl TermView {
                         return glib::Propagation::Stop;
                     }
 
+                    // Ctrl+D: send EOF when command is empty (closes shell)
+                    if ctrl && (keyval == gtk4::gdk::Key::d || keyval == gtk4::gdk::Key::D) {
+                        let active = active_for_key.borrow();
+                        if active.pending_cmd.borrow().is_empty() {
+                            pty_for_key.write_bytes(b"\x04");
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
                     // Tab: trigger shell completion
                     if keyval == gtk4::gdk::Key::Tab {
                         if !pty_synced_for_key.get() {
