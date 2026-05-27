@@ -3230,6 +3230,11 @@ impl TermView {
                                             pager_snapshot_generation_rc.set(
                                                 pager_snapshot_generation_rc.get().wrapping_add(1),
                                             );
+                                            vte_for_alt.reset(true, true);
+                                            let prior = active_rc.borrow().raw_output.borrow().clone();
+                                            if !prior.is_empty() {
+                                                vte_for_alt.feed(&prior);
+                                            }
                                             show_alt_screen(
                                                 &block_scroll_rc,
                                                 active_rc.borrow().widget(),
@@ -3603,6 +3608,7 @@ impl TermView {
                                 pager_snapshot_generation_rc.set(
                                     pager_snapshot_generation_rc.get().wrapping_add(1),
                                 );
+                                vte_for_alt.reset(true, true);
                                 show_alt_screen(
                                     &block_scroll_rc,
                                     active_rc.borrow().widget(),
