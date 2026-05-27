@@ -144,8 +144,11 @@ fn is_url(text: &str) -> bool {
     text.starts_with("http://") || text.starts_with("https://") || text.starts_with("file://")
 }
 
-/// Extract URL at cursor position in a TextView's buffer
-fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<String> {
+/// Extract URL at cursor position in a TextView's buffer, returning bounds and text
+fn get_url_bounds_at_position(
+    buffer: &TextBuffer,
+    iter: &gtk4::TextIter,
+) -> Option<(gtk4::TextIter, gtk4::TextIter, String)> {
     let mut start = iter.clone();
     let mut end = iter.clone();
 
@@ -174,10 +177,14 @@ fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<Str
 
     let text = buffer.text(&start, &end, false).to_string();
     if is_url(&text) {
-        Some(text)
+        Some((start, end, text))
     } else {
         None
     }
+}
+
+fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<String> {
+    get_url_bounds_at_position(buffer, iter).map(|(_, _, url)| url)
 }
 
 /// Format mouse event in SGR mode (CSI <button;x;y M/m)
@@ -191,18 +198,25 @@ fn format_mouse_event_sgr(button: u8, x: i32, y: i32, pressed: bool) -> Vec<u8> 
 struct ScrollDebouncer {
     dirty: Rc<Cell<bool>>,
     pending_handle: Rc<RefCell<Option<glib::source::SourceId>>>,
+    user_scrolled_up: Rc<Cell<bool>>,
+    programmatic_scroll: Rc<Cell<bool>>,
 }
 
 impl ScrollDebouncer {
-    fn new() -> Self {
+    fn with_scroll_lock(
+        user_scrolled_up: Rc<Cell<bool>>,
+        programmatic_scroll: Rc<Cell<bool>>,
+    ) -> Self {
         Self {
             dirty: Rc::new(Cell::new(false)),
             pending_handle: Rc::new(RefCell::new(None)),
+            user_scrolled_up,
+            programmatic_scroll,
         }
     }
 
     fn mark_dirty(&self, scroll: &ScrolledWindow) {
-        if self.dirty.get() {
+        if self.dirty.get() || self.user_scrolled_up.get() {
             return;
         }
         self.dirty.set(true);
@@ -210,8 +224,8 @@ impl ScrollDebouncer {
         let scroll = scroll.clone();
         let dirty = self.dirty.clone();
         let pending = self.pending_handle.clone();
+        let programmatic = self.programmatic_scroll.clone();
 
-        // Cancel existing timer if present (ignore error if already fired)
         if let Some(handle) = pending.borrow_mut().take() {
             let _ = handle.remove();
         }
@@ -222,13 +236,18 @@ impl ScrollDebouncer {
                 let adj = scroll.vadjustment();
                 let target = adj.upper() - adj.page_size();
                 if adj.value() < target {
+                    programmatic.set(true);
                     adj.set_value(target);
+                    programmatic.set(false);
                 }
                 dirty.set(false);
-                // Clear the handle after firing to prevent double-remove
                 pending_for_clear.borrow_mut().take();
             });
         pending.borrow_mut().replace(handle);
+    }
+
+    fn reset_scroll_lock(&self) {
+        self.user_scrolled_up.set(false);
     }
 }
 
@@ -429,7 +448,6 @@ mod pager_snapshot_tests {
 
 fn show_alt_screen(
     block_scroll: &ScrolledWindow,
-    active_widget: &gtk4::Box,
     vte_box: &gtk4::Box,
     vte: &Terminal,
     pty: Rc<OwnedPty>,
@@ -437,7 +455,6 @@ fn show_alt_screen(
 ) {
     block_scroll.set_visible(false);
     block_scroll.set_vexpand(false);
-    active_widget.set_visible(false);
     vte_box.set_vexpand(true);
     vte_box.set_visible(true);
 
@@ -473,12 +490,11 @@ fn show_alt_screen(
     vte.grab_focus();
 }
 
-fn hide_alt_screen(block_scroll: &ScrolledWindow, active_widget: &gtk4::Box, vte_box: &gtk4::Box) {
+fn hide_alt_screen(block_scroll: &ScrolledWindow, vte_box: &gtk4::Box) {
     vte_box.set_visible(false);
     vte_box.set_vexpand(false);
     block_scroll.set_vexpand(true);
     block_scroll.set_visible(true);
-    active_widget.set_visible(true);
 }
 
 fn visible_vte_text(vte: &Terminal) -> String {
@@ -2079,6 +2095,7 @@ struct FinishedBlock {
     output_buffer: gtk4::TextBuffer,
     show_more_btn: Option<gtk4::Button>,
     full_output: Rc<RefCell<String>>,
+    cmd_text: String,
 }
 
 impl Clone for FinishedBlock {
@@ -2093,6 +2110,7 @@ impl Clone for FinishedBlock {
             output_view: self.output_view.clone(),
             output_buffer: self.output_buffer.clone(),
             show_more_btn: self.show_more_btn.clone(),
+            cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
         }
     }
@@ -2293,6 +2311,55 @@ impl FinishedBlock {
             });
 
             view.add_controller(click_controller);
+
+            // URL hover: underline + pointer cursor on mouse over
+            let url_tag = gtk4::TextTag::new(Some("url-hover"));
+            url_tag.set_underline(gtk4::pango::Underline::Single);
+            buffer.tag_table().add(&url_tag);
+
+            let motion_ctrl = gtk4::EventControllerMotion::new();
+            let view_for_motion = view.clone();
+            let buffer_for_motion = buffer.clone();
+            let tag_for_motion = url_tag.clone();
+            motion_ctrl.connect_motion(move |_ctrl, x, y| {
+                let (bx, by) = view_for_motion.window_to_buffer_coords(
+                    gtk4::TextWindowType::Widget,
+                    x as i32,
+                    y as i32,
+                );
+                let start = buffer_for_motion.start_iter();
+                let end = buffer_for_motion.end_iter();
+                buffer_for_motion.remove_tag(&tag_for_motion, &start, &end);
+
+                if let Some(iter) = view_for_motion.iter_at_location(bx, by) {
+                    if let Some((url_start, url_end, _)) =
+                        get_url_bounds_at_position(&buffer_for_motion, &iter)
+                    {
+                        buffer_for_motion.apply_tag(&tag_for_motion, &url_start, &url_end);
+                        view_for_motion.set_cursor(
+                            gtk4::gdk::Cursor::from_name("pointer", None).as_ref(),
+                        );
+                        return;
+                    }
+                }
+                view_for_motion.set_cursor(
+                    gtk4::gdk::Cursor::from_name("text", None).as_ref(),
+                );
+            });
+
+            let view_for_leave = view.clone();
+            let buffer_for_leave = buffer.clone();
+            let tag_for_leave = url_tag;
+            motion_ctrl.connect_leave(move |_| {
+                let start = buffer_for_leave.start_iter();
+                let end = buffer_for_leave.end_iter();
+                buffer_for_leave.remove_tag(&tag_for_leave, &start, &end);
+                view_for_leave.set_cursor(
+                    gtk4::gdk::Cursor::from_name("text", None).as_ref(),
+                );
+            });
+
+            view.add_controller(motion_ctrl);
         }
 
         // Append views to outer box
@@ -2366,6 +2433,7 @@ impl FinishedBlock {
             output_buffer,
             show_more_btn,
             full_output,
+            cmd_text: cmd.to_string(),
         }
     }
 
@@ -2391,6 +2459,8 @@ struct ActiveBlock {
     cursor_offset: Rc<Cell<usize>>, // Cursor position in chars (editor mode)
     cursor_color: RGBA,
     cursor_foreground: RGBA,
+    running_label: gtk4::Label,
+    running_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
 impl ActiveBlock {
@@ -2436,12 +2506,24 @@ impl ActiveBlock {
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view", false);
         let (command_view, command_buffer) = create_textview("block-command-view", false);
 
+        // Running timer label (shown during command execution)
+        let running_label = gtk4::Label::new(None);
+        running_label.add_css_class("block-running-label");
+        running_label.set_halign(gtk4::Align::End);
+        running_label.set_hexpand(true);
+        running_label.set_visible(false);
+
+        // Prompt row: prompt_view + running_label
+        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 4);
+        prompt_row.append(&prompt_view);
+        prompt_row.append(&running_label);
+
         // Output: use VTE widget for full terminal compatibility
         let output_vte = build_output_vte(config);
         output_vte.set_visible(false); // Hidden until there's output
 
         // Append to widget
-        widget.append(&prompt_view);
+        widget.append(&prompt_row);
         widget.append(&command_view);
         widget.append(&output_vte);
 
@@ -2520,6 +2602,8 @@ impl ActiveBlock {
             cursor_offset,
             cursor_color: config.cursor,
             cursor_foreground: config.cursor_foreground,
+            running_label,
+            running_timer_handle: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -2629,7 +2713,37 @@ impl ActiveBlock {
         self.command_buffer.set_text("");
     }
 
+    fn start_timer(&self) {
+        self.stop_timer();
+        self.running_label.set_text("0s");
+        self.running_label.set_visible(true);
+        let label = self.running_label.clone();
+        let start = std::time::Instant::now();
+        let handle = glib::timeout_add_local(
+            std::time::Duration::from_secs(1),
+            move || {
+                let elapsed = start.elapsed().as_secs();
+                let text = if elapsed < 60 {
+                    format!("{}s", elapsed)
+                } else {
+                    format!("{}m{}s", elapsed / 60, elapsed % 60)
+                };
+                label.set_text(&text);
+                glib::ControlFlow::Continue
+            },
+        );
+        *self.running_timer_handle.borrow_mut() = Some(handle);
+    }
+
+    fn stop_timer(&self) {
+        if let Some(handle) = self.running_timer_handle.borrow_mut().take() {
+            handle.remove();
+        }
+        self.running_label.set_visible(false);
+    }
+
     fn reset_for_next_prompt(&self) {
+        self.stop_timer();
         self.set_prompt("");
         *self.pending_cmd.borrow_mut() = String::new();
         self.pending_preedit.borrow_mut().clear();
@@ -2787,8 +2901,8 @@ impl TermView {
         vte_box.append(&vte_scrollbar);
         vte_box.set_visible(false); // hidden until alt-screen
 
+        block_list.append(active.borrow().widget());
         root.append(&block_scroll);
-        root.append(active.borrow().widget());
         root.append(&vte_box);
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -2859,6 +2973,9 @@ impl TermView {
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -2892,7 +3009,10 @@ impl TermView {
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let pager_snapshots_rc = pager_snapshots.clone();
             let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
-            let scroll_debouncer = ScrollDebouncer::new();
+            let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
+                user_scrolled_up.clone(),
+                programmatic_scroll.clone(),
+            );
             let ansi_cache_for_cb = ansi_cache.clone();
             let widget_pool_for_cb = widget_pool.clone();
             let editor_input_for_cb = config.editor_input;
@@ -3235,7 +3355,6 @@ impl TermView {
                                             }
                                             show_alt_screen(
                                                 &block_scroll_rc,
-                                                active_rc.borrow().widget(),
                                                 &vte_box_rc,
                                                 &vte_for_alt,
                                                 pty_for_resize.clone(),
@@ -3311,7 +3430,8 @@ impl TermView {
                                     pty_for_init.write_bytes(text.as_bytes());
                                 }
 
-                                // Auto-scroll to bottom when prompt ends (ready for command)
+                                // Reset scroll lock and auto-scroll when prompt ends
+                                scroll_debouncer.reset_scroll_lock();
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
 
@@ -3334,14 +3454,16 @@ impl TermView {
                                     .trim()
                                     .to_string();
                                 active_rc.borrow().start_command(&executing_cmd);
+                                active_rc.borrow().start_timer();
                                 // Auto-scroll to bottom when command starts executing
                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                             }
 
                             ParserEvent::CommandEnd(code) => {
+                                active_rc.borrow().stop_timer();
                                 if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
-                                    hide_alt_screen(&block_scroll_rc, active_rc.borrow().widget(), &vte_box_rc);
+                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 }
 
                                 let pager_output = drain_pager_snapshots(&pager_snapshots_rc);
@@ -3424,8 +3546,8 @@ impl TermView {
                                     duration_ms, end_time, block_cwd.as_deref(),
                                 );
 
-                                // Append to block_list (active block is outside scroll area)
-                                block_list_rc.append(finished.widget());
+                                // Insert before the active block (last child in block_list)
+                                finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
 
                                 // Track finished blocks and limit history
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
@@ -3573,12 +3695,14 @@ impl TermView {
                                 // Use timeout to ensure UI is fully updated and scrolled
                                 let active_for_focus = active_rc.clone();
                                 let block_scroll_for_focus = block_scroll_rc.clone();
+                                let programmatic_for_focus = scroll_debouncer.programmatic_scroll.clone();
+                                scroll_debouncer.reset_scroll_lock();
                                 glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-                                    // Scroll to bottom first
                                     let adj = block_scroll_for_focus.vadjustment();
                                     let target = adj.upper() - adj.page_size();
+                                    programmatic_for_focus.set(true);
                                     adj.set_value(target);
-                                    // Then grab focus
+                                    programmatic_for_focus.set(false);
                                     active_for_focus.borrow().grab_focus();
                                 });
 
@@ -3609,7 +3733,6 @@ impl TermView {
                                 vte_for_alt.reset(true, true);
                                 show_alt_screen(
                                     &block_scroll_rc,
-                                    active_rc.borrow().widget(),
                                     &vte_box_rc,
                                     &vte_for_alt,
                                     pty_for_resize.clone(),
@@ -3619,7 +3742,7 @@ impl TermView {
 
                             ParserEvent::AltScreenLeave => {
                                 record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
-                                hide_alt_screen(&block_scroll_rc, active_rc.borrow().widget(), &vte_box_rc);
+                                hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Give focus to active block's TextView
                                 active_rc.borrow().command_view.grab_focus();
@@ -3634,6 +3757,19 @@ impl TermView {
                     }
                 },
             );
+        }
+
+        // ── Scroll lock: detect user scrolling up ─────────────────────────
+        {
+            let user_scrolled = user_scrolled_up.clone();
+            let programmatic = programmatic_scroll.clone();
+            block_scroll.vadjustment().connect_value_changed(move |adj| {
+                if programmatic.get() {
+                    return;
+                }
+                let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 5.0;
+                user_scrolled.set(!at_bottom);
+            });
         }
 
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
@@ -3725,6 +3861,11 @@ impl TermView {
             let pty_synced_for_key = pty_synced.clone();
             let tab_pending_for_key = tab_pending.clone();
             let completion_active_for_key = completion_active.clone();
+            let finished_blocks_for_key = finished_blocks_rc.clone();
+            let block_list_for_key = block_list.clone();
+            let user_scrolled_up_for_key = user_scrolled_up.clone();
+            let selected_block_id_for_key = selected_block_id.clone();
+            let block_scroll_for_key = block_scroll.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -3799,6 +3940,30 @@ impl TermView {
                             active.update_content_view();
                             return glib::Propagation::Stop;
                         }
+                        // If a block is selected, copy its command to input instead of submitting
+                        if let Some(sel_id) = selected_block_id_for_key.get() {
+                            let finished = finished_blocks_for_key.borrow();
+                            if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
+                                block.widget().remove_css_class("block-selected");
+                                let cmd_text = block.cmd_text.clone();
+                                selected_block_id_for_key.set(None);
+                                drop(finished);
+                                let active = active_for_key.borrow();
+                                *active.pending_cmd.borrow_mut() = cmd_text.clone();
+                                active.cursor_offset.set(cmd_text.chars().count());
+                                if pty_synced_for_key.get() {
+                                    pty_for_key.write_bytes(b"\x15");
+                                }
+                                pty_for_key.write_bytes(cmd_text.as_bytes());
+                                pty_synced_for_key.set(true);
+                                *active.pending_suggestion.borrow_mut() = String::new();
+                                active.cursor_visible.set(true);
+                                active.update_content_view();
+                            } else {
+                                selected_block_id_for_key.set(None);
+                            }
+                            return glib::Propagation::Stop;
+                        }
                         // Regular Enter: send the command
                         let active = active_for_key.borrow();
                         let cmd = active.pending_cmd.borrow().clone();
@@ -3814,6 +3979,7 @@ impl TermView {
                         *active.pending_suggestion.borrow_mut() = String::new();
                         pty_synced_for_key.set(false);
                         history_index.set(None);
+                        user_scrolled_up_for_key.set(false);
                         return glib::Propagation::Stop;
                     }
 
@@ -3839,6 +4005,58 @@ impl TermView {
                         }
                         pty_for_key.write_bytes(b"\t");
                         tab_pending_for_key.set(true);
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+Shift+Up/Down: block navigation
+                    if ctrl && shift && (keyval == gtk4::gdk::Key::Up || keyval == gtk4::gdk::Key::Down) {
+                        let finished = finished_blocks_for_key.borrow();
+                        if finished.is_empty() {
+                            return glib::Propagation::Stop;
+                        }
+                        let current = selected_block_id_for_key.get();
+                        let current_idx = current.and_then(|id| finished.iter().position(|b| b.id == id));
+
+                        let new_idx = if keyval == gtk4::gdk::Key::Up {
+                            match current_idx {
+                                None => Some(finished.len() - 1),
+                                Some(0) => Some(0),
+                                Some(i) => Some(i - 1),
+                            }
+                        } else {
+                            match current_idx {
+                                None => None,
+                                Some(i) if i >= finished.len() - 1 => None,
+                                Some(i) => Some(i + 1),
+                            }
+                        };
+
+                        if let Some(old_idx) = current_idx {
+                            if let Some(block) = finished.get(old_idx) {
+                                block.widget().remove_css_class("block-selected");
+                            }
+                        }
+
+                        if let Some(idx) = new_idx {
+                            if let Some(block) = finished.get(idx) {
+                                block.widget().add_css_class("block-selected");
+                                selected_block_id_for_key.set(Some(block.id));
+                                let widget = block.widget().clone();
+                                let scroll = block_scroll_for_key.clone();
+                                glib::idle_add_local_once(move || {
+                                    if let Some(point) = widget.compute_point(
+                                        &scroll,
+                                        &gtk4::graphene::Point::new(0.0, 0.0),
+                                    ) {
+                                        let adj = scroll.vadjustment();
+                                        let target = (point.y() as f64) - adj.page_size() / 3.0;
+                                        adj.set_value(target.max(0.0));
+                                    }
+                                });
+                            }
+                        } else {
+                            selected_block_id_for_key.set(None);
+                        }
                         return glib::Propagation::Stop;
                     }
 
@@ -3887,8 +4105,15 @@ impl TermView {
                         return glib::Propagation::Stop;
                     }
 
-                    // Escape: clear input
+                    // Escape: clear input and block selection
                     if keyval == gtk4::gdk::Key::Escape {
+                        if let Some(sel_id) = selected_block_id_for_key.get() {
+                            let finished = finished_blocks_for_key.borrow();
+                            if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
+                                block.widget().remove_css_class("block-selected");
+                            }
+                            selected_block_id_for_key.set(None);
+                        }
                         let active = active_for_key.borrow();
                         *active.pending_cmd.borrow_mut() = String::new();
                         active.cursor_offset.set(0);
@@ -4020,13 +4245,79 @@ impl TermView {
                         return glib::Propagation::Stop;
                     }
 
-                    // Ctrl+A: select all (move cursor to end for now)
+                    // Ctrl+A: move cursor to beginning of line
                     if ctrl && (keyval == gtk4::gdk::Key::a || keyval == gtk4::gdk::Key::A) {
+                        let active = active_for_key.borrow();
+                        active.cursor_offset.set(0);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x01");
+                        }
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+E: move cursor to end of line
+                    if ctrl && (keyval == gtk4::gdk::Key::e || keyval == gtk4::gdk::Key::E) {
                         let active = active_for_key.borrow();
                         let len = active.pending_cmd.borrow().chars().count();
                         active.cursor_offset.set(len);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x05");
+                        }
                         active.cursor_visible.set(true);
                         active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+K: kill text from cursor to end of line
+                    if ctrl && (keyval == gtk4::gdk::Key::k || keyval == gtk4::gdk::Key::K) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let mut cmd = active.pending_cmd.borrow().clone();
+                        let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                        cmd.truncate(byte_pos);
+                        *active.pending_cmd.borrow_mut() = cmd.clone();
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x15");
+                            if !cmd.is_empty() {
+                                pty_for_key.write_bytes(cmd.as_bytes());
+                            }
+                        }
+                        *active.pending_suggestion.borrow_mut() = String::new();
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+B: move cursor back one character
+                    if ctrl && (keyval == gtk4::gdk::Key::b || keyval == gtk4::gdk::Key::B) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        if pos > 0 {
+                            active.cursor_offset.set(pos - 1);
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x02");
+                            }
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+F: move cursor forward one character
+                    if ctrl && (keyval == gtk4::gdk::Key::f || keyval == gtk4::gdk::Key::F) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let len = active.pending_cmd.borrow().chars().count();
+                        if pos < len {
+                            active.cursor_offset.set(pos + 1);
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x06");
+                            }
+                            active.cursor_visible.set(true);
+                            active.update_content_view();
+                        }
                         return glib::Propagation::Stop;
                     }
 
@@ -4082,6 +4373,61 @@ impl TermView {
                             active.cursor_visible.set(true);
                             active.update_content_view();
                         }
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+L: clear visible block history
+                    if ctrl && (keyval == gtk4::gdk::Key::l || keyval == gtk4::gdk::Key::L) {
+                        let mut blocks = finished_blocks_for_key.borrow_mut();
+                        for block in blocks.drain(..) {
+                            block_list_for_key.remove(block.widget());
+                        }
+                        pty_for_key.write_bytes(b"\x0c");
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Alt+B: move cursor back one word
+                    if alt && !ctrl && (keyval == gtk4::gdk::Key::b || keyval == gtk4::gdk::Key::B) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let cmd = active.pending_cmd.borrow().clone();
+                        let chars: Vec<char> = cmd.chars().collect();
+                        let mut new_pos = pos;
+                        while new_pos > 0 && !chars[new_pos - 1].is_alphanumeric() {
+                            new_pos -= 1;
+                        }
+                        while new_pos > 0 && chars[new_pos - 1].is_alphanumeric() {
+                            new_pos -= 1;
+                        }
+                        active.cursor_offset.set(new_pos);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x1bb");
+                        }
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Alt+F: move cursor forward one word
+                    if alt && !ctrl && (keyval == gtk4::gdk::Key::f || keyval == gtk4::gdk::Key::F) {
+                        let active = active_for_key.borrow();
+                        let pos = active.cursor_offset.get();
+                        let cmd = active.pending_cmd.borrow().clone();
+                        let chars: Vec<char> = cmd.chars().collect();
+                        let len = chars.len();
+                        let mut new_pos = pos;
+                        while new_pos < len && !chars[new_pos].is_alphanumeric() {
+                            new_pos += 1;
+                        }
+                        while new_pos < len && chars[new_pos].is_alphanumeric() {
+                            new_pos += 1;
+                        }
+                        active.cursor_offset.set(new_pos);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x1bf");
+                        }
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
                         return glib::Propagation::Stop;
                     }
 
@@ -4315,7 +4661,7 @@ impl TermView {
             widget_pool,
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
             search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            selected_block_id: Rc::new(Cell::new(None)),
+            selected_block_id,
         };
 
         // Load history if configured
@@ -4337,7 +4683,7 @@ impl TermView {
                     block.end_time,
                     block.cwd.as_deref(),
                 );
-                term_view.block_list.append(finished.widget());
+                finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
         }
@@ -5078,11 +5424,11 @@ fn install_block_css(config: &Config) {
             padding-left: 9px;
         }}
         .block-active {{
-            border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
-            border-radius: 0;
-            margin: 0 8px;
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 6px;
+            margin: 4px 8px;
             padding-top: 4px;
-            background-color: {bg_hex};
+            background-color: {block_bg_hex};
             min-height: 40px;
         }}
         .block-header {{
@@ -5217,6 +5563,11 @@ fn install_block_css(config: &Config) {
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
             border-radius: 3px;
             font-size: 0.8em;
+        }}
+        .block-running-label {{
+            color: {dim_fg};
+            font-size: 0.85em;
+            padding-right: 8px;
         }}
         .block-output {{
             background-color: {bg_hex};
