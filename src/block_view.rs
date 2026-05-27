@@ -2795,6 +2795,8 @@ impl TermView {
         ));
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
+        let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -2832,6 +2834,8 @@ impl TermView {
             let ansi_cache_for_cb = ansi_cache.clone();
             let widget_pool_for_cb = widget_pool.clone();
             let editor_input_for_cb = config.editor_input;
+            let tab_pending_rc = tab_pending.clone();
+            let pty_synced_rc = pty_synced.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -2958,8 +2962,63 @@ impl TermView {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AwaitingCommand => {
-                                        // In editor mode, ignore shell echo — we handle input locally
                                         if editor_input_for_cb {
+                                            // Extract suggestion from shell echo (rsh sends dim text for inline hints)
+                                            let raw_text = text.clone();
+                                            let stripped = strip_ansi(&raw_text);
+                                            let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
+                                            let prompt_clean = prompt_text.trim();
+
+                                            if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
+                                                *cmd_buf_rc.borrow_mut() = raw_text.clone();
+                                            } else {
+                                                cmd_buf_rc.borrow_mut().push_str(&raw_text);
+                                            }
+
+                                            let current_raw_buf = cmd_buf_rc.borrow().clone();
+                                            let current_stripped = strip_ansi(&current_raw_buf);
+                                            let prompt_char_count = prompt_clean.chars().count();
+                                            let (mut raw_cmd, mut command_column_offset) = if !prompt_clean.is_empty() {
+                                                if current_stripped.strip_prefix(prompt_clean).is_some() {
+                                                    (
+                                                        skip_ansi_visible_chars(&current_raw_buf, prompt_char_count),
+                                                        prompt_char_count,
+                                                    )
+                                                } else if let Some(pos) = current_stripped.find(prompt_clean) {
+                                                    let pos_chars = current_stripped[..pos].chars().count();
+                                                    (
+                                                        skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count),
+                                                        pos_chars + prompt_char_count,
+                                                    )
+                                                } else {
+                                                    (current_raw_buf.clone(), 0)
+                                                }
+                                            } else {
+                                                (current_raw_buf.clone(), 0)
+                                            };
+
+                                            command_column_offset += strip_ansi(&raw_cmd)
+                                                .chars()
+                                                .take_while(|ch| ch.is_whitespace() && *ch != '\n')
+                                                .count();
+                                            raw_cmd = raw_cmd.trim_start().to_string();
+                                            let display = raw_cmd.trim_end_matches('\n').trim_end();
+
+                                            let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
+
+                                            if tab_pending_rc.get() {
+                                                // Tab completion: shell has modified the command line
+                                                let user_plain = plain_text_from_ansi(&user_raw);
+                                                if !user_plain.is_empty() {
+                                                    *active_rc.borrow().pending_cmd.borrow_mut() = user_plain.clone();
+                                                    active_rc.borrow().cursor_offset.set(user_plain.chars().count());
+                                                }
+                                                tab_pending_rc.set(false);
+                                            }
+
+                                            let suggestion_plain = plain_text_from_ansi(&suggestion_raw);
+                                            *active_rc.borrow().pending_suggestion.borrow_mut() = suggestion_plain;
+                                            active_rc.borrow().update_content_view();
                                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                                             continue;
                                         }
@@ -3112,6 +3171,8 @@ impl TermView {
                                 cmd_display_raw_rc.borrow_mut().clear();
                                 cmd_display_markup_rc.borrow_mut().clear();
                                 active_rc.borrow().set_cmd("");
+                                pty_synced_rc.set(false);
+                                tab_pending_rc.set(false);
 
                                 if editor_input_for_cb {
                                     let active_for_prompt_focus = active_rc.clone();
@@ -3513,6 +3574,8 @@ impl TermView {
             let editor_input_enabled = config.editor_input;
             let block_data_for_key = block_data_rc.clone();
             let history_index: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+            let pty_synced_for_key = pty_synced.clone();
+            let tab_pending_for_key = tab_pending.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -3529,6 +3592,8 @@ impl TermView {
                     if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
                         let clipboard = root_for_key.clipboard();
                         let active_for_paste = active_for_key.clone();
+                        let pty_for_paste = pty_for_key.clone();
+                        let pty_synced_for_paste = pty_synced_for_key.clone();
                         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
                             if let Ok(Some(text)) = result {
                                 let active = active_for_paste.borrow();
@@ -3537,8 +3602,13 @@ impl TermView {
                                 let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
                                 cmd.insert_str(byte_pos, &text);
                                 let new_pos = pos + text.chars().count();
-                                *active.pending_cmd.borrow_mut() = cmd;
+                                *active.pending_cmd.borrow_mut() = cmd.clone();
                                 active.cursor_offset.set(new_pos);
+                                // Resync PTY with new full content
+                                pty_for_paste.write_bytes(b"\x15");
+                                pty_for_paste.write_bytes(cmd.as_bytes());
+                                pty_synced_for_paste.set(true);
+                                *active.pending_suggestion.borrow_mut() = String::new();
                                 active.cursor_visible.set(true);
                                 active.update_content_view();
                             }
@@ -3576,12 +3646,16 @@ impl TermView {
                         let active = active_for_key.borrow();
                         let cmd = active.pending_cmd.borrow().clone();
                         let trimmed = cmd.trim();
-                        if !trimmed.is_empty() {
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\r");
+                        } else if !trimmed.is_empty() {
                             pty_for_key.write_bytes(format!("{}\r", trimmed).as_bytes());
                         } else {
                             pty_for_key.write_bytes(b"\r");
                         }
                         active.cursor_offset.set(0);
+                        *active.pending_suggestion.borrow_mut() = String::new();
+                        pty_synced_for_key.set(false);
                         history_index.set(None);
                         return glib::Propagation::Stop;
                     }
@@ -3598,12 +3672,16 @@ impl TermView {
                         return glib::Propagation::Stop;
                     }
 
-                    // Tab: send current text + tab to shell for completion
+                    // Tab: trigger shell completion
                     if keyval == gtk4::gdk::Key::Tab {
-                        let active = active_for_key.borrow();
-                        let cmd = active.pending_cmd.borrow().clone();
-                        pty_for_key.write_bytes(cmd.as_bytes());
+                        if !pty_synced_for_key.get() {
+                            let active = active_for_key.borrow();
+                            let cmd = active.pending_cmd.borrow().clone();
+                            pty_for_key.write_bytes(cmd.as_bytes());
+                            pty_synced_for_key.set(true);
+                        }
                         pty_for_key.write_bytes(b"\t");
+                        tab_pending_for_key.set(true);
                         return glib::Propagation::Stop;
                     }
 
@@ -3633,11 +3711,20 @@ impl TermView {
                             if let Some(block) = block_data.get(idx) {
                                 *active.pending_cmd.borrow_mut() = block.cmd.clone();
                                 active.cursor_offset.set(block.cmd.chars().count());
+                                // Resync PTY with history selection
+                                pty_for_key.write_bytes(b"\x15");
+                                pty_for_key.write_bytes(block.cmd.as_bytes());
+                                pty_synced_for_key.set(true);
                             }
                         } else {
                             *active.pending_cmd.borrow_mut() = String::new();
                             active.cursor_offset.set(0);
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x15");
+                                pty_synced_for_key.set(false);
+                            }
                         }
+                        *active.pending_suggestion.borrow_mut() = String::new();
                         active.cursor_visible.set(true);
                         active.update_content_view();
                         return glib::Propagation::Stop;
@@ -3648,6 +3735,11 @@ impl TermView {
                         let active = active_for_key.borrow();
                         *active.pending_cmd.borrow_mut() = String::new();
                         active.cursor_offset.set(0);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x15");
+                            pty_synced_for_key.set(false);
+                        }
+                        *active.pending_suggestion.borrow_mut() = String::new();
                         active.cursor_visible.set(true);
                         active.update_content_view();
                         history_index.set(None);
@@ -3663,8 +3755,18 @@ impl TermView {
                             let byte_pos = cmd.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
                             let next_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
                             cmd.drain(byte_pos..next_byte);
-                            *active.pending_cmd.borrow_mut() = cmd;
+                            *active.pending_cmd.borrow_mut() = cmd.clone();
                             active.cursor_offset.set(pos - 1);
+                            if pty_synced_for_key.get() {
+                                let new_cursor = active.cursor_offset.get();
+                                if new_cursor == cmd.chars().count() {
+                                    pty_for_key.write_bytes(b"\x7f");
+                                } else {
+                                    pty_for_key.write_bytes(b"\x15");
+                                    pty_for_key.write_bytes(cmd.as_bytes());
+                                }
+                            }
+                            *active.pending_suggestion.borrow_mut() = String::new();
                             active.cursor_visible.set(true);
                             active.update_content_view();
                         }
@@ -3681,7 +3783,12 @@ impl TermView {
                             let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
                             let next_byte = cmd.char_indices().nth(pos + 1).map(|(i, _)| i).unwrap_or(cmd.len());
                             cmd.drain(byte_pos..next_byte);
-                            *active.pending_cmd.borrow_mut() = cmd;
+                            *active.pending_cmd.borrow_mut() = cmd.clone();
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x15");
+                                pty_for_key.write_bytes(cmd.as_bytes());
+                            }
+                            *active.pending_suggestion.borrow_mut() = String::new();
                             active.cursor_visible.set(true);
                             active.update_content_view();
                         }
@@ -3694,22 +3801,40 @@ impl TermView {
                         let pos = active.cursor_offset.get();
                         if pos > 0 {
                             active.cursor_offset.set(pos - 1);
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x1b[D");
+                            }
                             active.cursor_visible.set(true);
                             active.update_content_view();
                         }
                         return glib::Propagation::Stop;
                     }
 
-                    // Right: move cursor right
+                    // Right: move cursor right or accept suggestion at EOL
                     if keyval == gtk4::gdk::Key::Right {
                         let active = active_for_key.borrow();
                         let pos = active.cursor_offset.get();
                         let len = active.pending_cmd.borrow().chars().count();
                         if pos < len {
                             active.cursor_offset.set(pos + 1);
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x1b[C");
+                            }
+                        } else {
+                            // At end of line: accept inline suggestion if present
+                            let suggestion = active.pending_suggestion.borrow().clone();
+                            if !suggestion.is_empty() {
+                                let mut cmd = active.pending_cmd.borrow().clone();
+                                cmd.push_str(&suggestion);
+                                *active.pending_cmd.borrow_mut() = cmd.clone();
+                                active.cursor_offset.set(cmd.chars().count());
+                                *active.pending_suggestion.borrow_mut() = String::new();
+                                pty_for_key.write_bytes(b"\x1b[C");
+                                pty_synced_for_key.set(true);
+                            }
                         }
+                        active.cursor_visible.set(true);
+                        active.update_content_view();
                         return glib::Propagation::Stop;
                     }
 
@@ -3717,6 +3842,9 @@ impl TermView {
                     if keyval == gtk4::gdk::Key::Home {
                         let active = active_for_key.borrow();
                         active.cursor_offset.set(0);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x1b[H");
+                        }
                         active.cursor_visible.set(true);
                         active.update_content_view();
                         return glib::Propagation::Stop;
@@ -3727,6 +3855,9 @@ impl TermView {
                         let active = active_for_key.borrow();
                         let len = active.pending_cmd.borrow().chars().count();
                         active.cursor_offset.set(len);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x1b[F");
+                        }
                         active.cursor_visible.set(true);
                         active.update_content_view();
                         return glib::Propagation::Stop;
@@ -3749,8 +3880,15 @@ impl TermView {
                         let mut cmd = active.pending_cmd.borrow().clone();
                         let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
                         cmd.drain(..byte_pos);
-                        *active.pending_cmd.borrow_mut() = cmd;
+                        *active.pending_cmd.borrow_mut() = cmd.clone();
                         active.cursor_offset.set(0);
+                        if pty_synced_for_key.get() {
+                            pty_for_key.write_bytes(b"\x15");
+                            if !cmd.is_empty() {
+                                pty_for_key.write_bytes(cmd.as_bytes());
+                            }
+                        }
+                        *active.pending_suggestion.borrow_mut() = String::new();
                         active.cursor_visible.set(true);
                         active.update_content_view();
                         return glib::Propagation::Stop;
@@ -3775,8 +3913,15 @@ impl TermView {
                             let start_byte = cmd.char_indices().nth(new_pos).map(|(i, _)| i).unwrap_or(0);
                             let end_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
                             cmd.drain(start_byte..end_byte);
-                            *active.pending_cmd.borrow_mut() = cmd;
+                            *active.pending_cmd.borrow_mut() = cmd.clone();
                             active.cursor_offset.set(new_pos);
+                            if pty_synced_for_key.get() {
+                                pty_for_key.write_bytes(b"\x15");
+                                if !cmd.is_empty() {
+                                    pty_for_key.write_bytes(cmd.as_bytes());
+                                }
+                            }
+                            *active.pending_suggestion.borrow_mut() = String::new();
                             active.cursor_visible.set(true);
                             active.update_content_view();
                         }
@@ -3794,8 +3939,19 @@ impl TermView {
                                 let mut buf = [0u8; 4];
                                 let s = ch.encode_utf8(&mut buf);
                                 cmd.insert_str(byte_pos, s);
-                                *active.pending_cmd.borrow_mut() = cmd;
+                                *active.pending_cmd.borrow_mut() = cmd.clone();
                                 active.cursor_offset.set(pos + 1);
+                                // Mirror to PTY for suggestion generation
+                                let new_cursor = active.cursor_offset.get();
+                                if new_cursor == cmd.chars().count() {
+                                    pty_for_key.write_bytes(s.as_bytes());
+                                    pty_synced_for_key.set(true);
+                                } else if pty_synced_for_key.get() {
+                                    pty_for_key.write_bytes(b"\x15");
+                                    pty_for_key.write_bytes(cmd.as_bytes());
+                                    pty_synced_for_key.set(true);
+                                }
+                                *active.pending_suggestion.borrow_mut() = String::new();
                                 active.cursor_visible.set(true);
                                 active.update_content_view();
                                 return glib::Propagation::Stop;
