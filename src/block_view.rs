@@ -429,6 +429,7 @@ mod pager_snapshot_tests {
 
 fn show_alt_screen(
     block_scroll: &ScrolledWindow,
+    active_widget: &gtk4::Box,
     vte_box: &gtk4::Box,
     vte: &Terminal,
     pty: Rc<OwnedPty>,
@@ -436,6 +437,7 @@ fn show_alt_screen(
 ) {
     block_scroll.set_visible(false);
     block_scroll.set_vexpand(false);
+    active_widget.set_visible(false);
     vte_box.set_vexpand(true);
     vte_box.set_visible(true);
 
@@ -471,11 +473,12 @@ fn show_alt_screen(
     vte.grab_focus();
 }
 
-fn hide_alt_screen(block_scroll: &ScrolledWindow, vte_box: &gtk4::Box) {
+fn hide_alt_screen(block_scroll: &ScrolledWindow, active_widget: &gtk4::Box, vte_box: &gtk4::Box) {
     vte_box.set_visible(false);
     vte_box.set_vexpand(false);
     block_scroll.set_vexpand(true);
     block_scroll.set_visible(true);
+    active_widget.set_visible(true);
 }
 
 fn visible_vte_text(vte: &Terminal) -> String {
@@ -2074,6 +2077,8 @@ struct FinishedBlock {
     command_buffer: gtk4::TextBuffer,
     output_view: gtk4::TextView,
     output_buffer: gtk4::TextBuffer,
+    show_more_btn: Option<gtk4::Button>,
+    full_output: Rc<RefCell<String>>,
 }
 
 impl Clone for FinishedBlock {
@@ -2087,6 +2092,8 @@ impl Clone for FinishedBlock {
             command_buffer: self.command_buffer.clone(),
             output_view: self.output_view.clone(),
             output_buffer: self.output_buffer.clone(),
+            show_more_btn: self.show_more_btn.clone(),
+            full_output: self.full_output.clone(),
         }
     }
 }
@@ -2242,7 +2249,19 @@ impl FinishedBlock {
             command_buffer.remove_tag(&cursor_tag, &start, &end);
         }
 
-        set_active_output_buffer(&output_buffer, output, &config.palette, None);
+        // Output truncation: show first N lines with "Show more" button for long output
+        let threshold = config.max_collapsed_output_lines as usize;
+        let output_lines: Vec<&str> = output.lines().collect();
+        let total_lines = output_lines.len();
+        let is_truncated = total_lines > threshold;
+        let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
+
+        let display_output = if is_truncated {
+            output_lines[..threshold].join("\n")
+        } else {
+            output.to_string()
+        };
+        set_active_output_buffer(&output_buffer, &display_output, &config.palette, None);
 
         // Add Ctrl+Click handler to open URLs in command and output views
         for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
@@ -2280,8 +2299,46 @@ impl FinishedBlock {
         outer.append(&command_view);
         outer.append(&output_view);
 
+        // "Show more" button for truncated output
+        let show_more_btn = if is_truncated {
+            let remaining = total_lines - threshold;
+            let btn = gtk4::Button::with_label(&format!("Show more ({} more lines)", remaining));
+            btn.add_css_class("block-show-more");
+            btn.add_css_class("flat");
+            outer.append(&btn);
+
+            let is_expanded = Rc::new(Cell::new(false));
+            let output_buffer_clone = output_buffer.clone();
+            let palette = config.palette;
+            let full_output_clone = full_output.clone();
+            let is_expanded_clone = is_expanded.clone();
+
+            btn.connect_clicked(move |btn| {
+                let expanded = is_expanded_clone.get();
+                if expanded {
+                    let full = full_output_clone.borrow();
+                    let lines: Vec<&str> = full.lines().collect();
+                    let truncated = lines[..threshold].join("\n");
+                    set_active_output_buffer(&output_buffer_clone, &truncated, &palette, None);
+                    let remaining = lines.len() - threshold;
+                    btn.set_label(&format!("Show more ({} more lines)", remaining));
+                    is_expanded_clone.set(false);
+                } else {
+                    let full = full_output_clone.borrow();
+                    set_active_output_buffer(&output_buffer_clone, &full, &palette, None);
+                    btn.set_label("Show less");
+                    is_expanded_clone.set(true);
+                }
+            });
+
+            Some(btn)
+        } else {
+            None
+        };
+
         // Wire collapse button to toggle output visibility
         let output_view_for_collapse = output_view.clone();
+        let show_more_for_collapse = show_more_btn.clone();
         let has_output = !output.trim().is_empty();
         if !has_output {
             output_view.set_visible(false);
@@ -2289,6 +2346,9 @@ impl FinishedBlock {
         collapse_btn.connect_clicked(move |btn| {
             let visible = output_view_for_collapse.is_visible();
             output_view_for_collapse.set_visible(!visible);
+            if let Some(ref smb) = show_more_for_collapse {
+                smb.set_visible(!visible);
+            }
             btn.set_label(if visible { "\u{25B6}" } else { "\u{25BC}" }); // ▶ / ▼
         });
         if !has_output {
@@ -2304,6 +2364,8 @@ impl FinishedBlock {
             command_buffer,
             output_view,
             output_buffer,
+            show_more_btn,
+            full_output,
         }
     }
 
@@ -2696,7 +2758,7 @@ impl TermView {
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
         block_list.set_vexpand(false); // Don't expand - only take space needed
         block_list.set_valign(gtk4::Align::Start); // Align to top
-        block_list.set_margin_bottom(28); // Leave more room below the current block at the bottom edge
+        block_list.set_margin_bottom(8);
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
@@ -2712,7 +2774,7 @@ impl TermView {
             config.output_batch_max_ms,
             config,
         )));
-        block_list.append(active.borrow().widget());
+        // Active block is pinned outside the scroll area (appended to root below)
 
         // VTE fallback for alt-screen mode
         let vte = build_vte(config);
@@ -2726,6 +2788,7 @@ impl TermView {
         vte_box.set_visible(false); // hidden until alt-screen
 
         root.append(&block_scroll);
+        root.append(active.borrow().widget());
         root.append(&vte_box);
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -3169,6 +3232,7 @@ impl TermView {
                                             );
                                             show_alt_screen(
                                                 &block_scroll_rc,
+                                                active_rc.borrow().widget(),
                                                 &vte_box_rc,
                                                 &vte_for_alt,
                                                 pty_for_resize.clone(),
@@ -3274,7 +3338,7 @@ impl TermView {
                             ParserEvent::CommandEnd(code) => {
                                 if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
-                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                    hide_alt_screen(&block_scroll_rc, active_rc.borrow().widget(), &vte_box_rc);
                                 }
 
                                 let pager_output = drain_pager_snapshots(&pager_snapshots_rc);
@@ -3357,9 +3421,8 @@ impl TermView {
                                     duration_ms, end_time, block_cwd.as_deref(),
                                 );
 
-                                // Insert before the active block (which is always last)
-                                let active_widget = active_rc.borrow().widget().clone().upcast::<gtk4::Widget>();
-                                finished.widget().insert_before(&block_list_rc, Some(&active_widget));
+                                // Append to block_list (active block is outside scroll area)
+                                block_list_rc.append(finished.widget());
 
                                 // Track finished blocks and limit history
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
@@ -3542,6 +3605,7 @@ impl TermView {
                                 );
                                 show_alt_screen(
                                     &block_scroll_rc,
+                                    active_rc.borrow().widget(),
                                     &vte_box_rc,
                                     &vte_for_alt,
                                     pty_for_resize.clone(),
@@ -3551,7 +3615,7 @@ impl TermView {
 
                             ParserEvent::AltScreenLeave => {
                                 record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
-                                hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                hide_alt_screen(&block_scroll_rc, active_rc.borrow().widget(), &vte_box_rc);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 // Give focus to active block's TextView
                                 active_rc.borrow().command_view.grab_focus();
@@ -4956,6 +5020,17 @@ fn install_block_css(config: &Config) {
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
 
+    // Slightly different background for finished blocks (3% toward fg)
+    let bg_r = (bg.red() * 255.0) as u8;
+    let bg_g = (bg.green() * 255.0) as u8;
+    let bg_b = (bg.blue() * 255.0) as u8;
+    let block_bg_hex = format!(
+        "#{:02x}{:02x}{:02x}",
+        (bg_r as f32 + (fg_r as f32 - bg_r as f32) * 0.03) as u8,
+        (bg_g as f32 + (fg_g as f32 - bg_g as f32) * 0.03) as u8,
+        (bg_b as f32 + (fg_b as f32 - bg_b as f32) * 0.03) as u8,
+    );
+
     // Parse font description to extract font family and size
     // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Regular 14"
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
@@ -4986,7 +5061,7 @@ fn install_block_css(config: &Config) {
         .block-finished {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
             border-radius: 6px;
-            background-color: {bg_hex};
+            background-color: {block_bg_hex};
             min-height: 40px;
         }}
         .block-hovered {{
@@ -4999,9 +5074,10 @@ fn install_block_css(config: &Config) {
             padding-left: 9px;
         }}
         .block-active {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
-            border-radius: 6px;
-            margin: 4px 8px;
+            border-top: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 0;
+            margin: 0 8px;
+            padding-top: 4px;
             background-color: {bg_hex};
             min-height: 40px;
         }}
@@ -5069,6 +5145,18 @@ fn install_block_css(config: &Config) {
         .block-output-view text {{
             color: {fg_hex};
             background-color: {bg_hex};
+        }}
+        .block-finished .block-command-view {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-command-view text {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-output-view {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-output-view text {{
+            background-color: {block_bg_hex};
         }}
         .block-cmd {{
             color: {fg_hex};
@@ -5141,6 +5229,8 @@ fn install_block_css(config: &Config) {
             margin-left: 12px;
             margin-top: 4px;
             margin-bottom: 4px;
+            font-size: 0.85em;
+            padding: 2px 8px;
         }}
         "#,
     );
