@@ -2809,9 +2809,7 @@ impl TermView {
         }
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-        // Build env_extra for block-mode shells. Git output should stream into
-        // the block transcript instead of being trapped in a single pager screen.
-        let mut env_extra: Vec<(&str, &str)> = vec![("GIT_PAGER", "cat")];
+        let mut env_extra: Vec<(&str, &str)> = vec![];
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {

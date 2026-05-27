@@ -32,8 +32,14 @@ impl OwnedPty {
         cwd: Option<&str>,
         env_extra: &[(&str, &str)],
     ) -> io::Result<Self> {
+        let initial_size = nix::pty::Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         let OpenptyResult { master, slave } =
-            openpty(None, None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            openpty(Some(&initial_size), None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
