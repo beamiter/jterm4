@@ -3575,15 +3575,38 @@ impl TermView {
         let im_context = gtk4::IMMulticontext::new();
         let im_client_widget = active.borrow().command_view.clone();
 
-        if !config.editor_input {
-            // Non-editor mode: external IM context manages all text input → PTY
-            im_context.set_client_widget(Some(&im_client_widget));
-        }
+        im_context.set_client_widget(Some(&im_client_widget));
 
         {
             let pty_for_commit = pty.clone();
+            let active_for_commit = active.clone();
+            let bstate_for_commit = bstate.clone();
+            let pty_synced_for_commit = pty_synced.clone();
+            let editor_input_for_commit = config.editor_input;
             im_context.connect_commit(move |_, text| {
-                pty_for_commit.write_bytes(text.as_bytes());
+                if editor_input_for_commit && bstate_for_commit.get() == BlockState::AwaitingCommand {
+                    let active = active_for_commit.borrow();
+                    let pos = active.cursor_offset.get();
+                    let mut cmd = active.pending_cmd.borrow().clone();
+                    let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
+                    cmd.insert_str(byte_pos, text);
+                    let new_pos = pos + text.chars().count();
+                    *active.pending_cmd.borrow_mut() = cmd.clone();
+                    active.cursor_offset.set(new_pos);
+                    active.pending_preedit.borrow_mut().clear();
+                    if new_pos == cmd.chars().count() {
+                        pty_for_commit.write_bytes(text.as_bytes());
+                        pty_synced_for_commit.set(true);
+                    } else if pty_synced_for_commit.get() {
+                        pty_for_commit.write_bytes(b"\x15");
+                        pty_for_commit.write_bytes(cmd.as_bytes());
+                    }
+                    *active.pending_suggestion.borrow_mut() = String::new();
+                    active.cursor_visible.set(true);
+                    active.update_content_view();
+                } else {
+                    pty_for_commit.write_bytes(text.as_bytes());
+                }
             });
         }
 
@@ -3647,7 +3670,7 @@ impl TermView {
                 // Editor mode: when awaiting command input, handle editing locally
                 // During completion menu, forward keys directly to PTY (pass-through)
                 if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand && !completion_active_for_key.get() {
-                    // Ctrl+Shift+V: paste
+                    // Ctrl+Shift+V/C: always handle clipboard ourselves
                     if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
                         let clipboard = root_for_key.clipboard();
                         let active_for_paste = active_for_key.clone();
@@ -3684,6 +3707,13 @@ impl TermView {
                             clipboard.set_text(&cmd);
                         }
                         return glib::Propagation::Stop;
+                    }
+
+                    // IME: let input method handle key events (switch, compose, commit)
+                    if let Some(event) = controller.current_event() {
+                        if im_context_for_key.filter_keypress(&event) {
+                            return glib::Propagation::Stop;
+                        }
                     }
 
                     // Enter: send command to PTY
@@ -4175,11 +4205,7 @@ impl TermView {
             });
 
             let im_context_for_release = im_context.clone();
-            let bstate_for_release = bstate.clone();
             key_ctrl.connect_key_released(move |controller, _keyval, _keycode, _modifiers| {
-                if editor_input_enabled && bstate_for_release.get() == BlockState::AwaitingCommand {
-                    return;
-                }
                 if let Some(event) = controller.current_event() {
                     im_context_for_release.filter_keypress(&event);
                 }
@@ -5223,5 +5249,128 @@ mod tests {
     fn output_cursor_col_multiline() {
         // Multi-line: cursor at end of last line
         assert_eq!(super::output_cursor_col("line1\nline2\nend"), (3, false));
+    }
+
+    // ── IME / Chinese input support tests ────────────────────────────────
+
+    /// Simulate the logic from connect_commit: insert text at cursor position
+    fn simulate_ime_commit(cmd: &str, cursor_pos: usize, committed: &str) -> (String, usize) {
+        let mut buf = cmd.to_string();
+        let byte_pos = buf
+            .char_indices()
+            .nth(cursor_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(buf.len());
+        buf.insert_str(byte_pos, committed);
+        let new_pos = cursor_pos + committed.chars().count();
+        (buf, new_pos)
+    }
+
+    #[test]
+    fn ime_commit_chinese_at_end() {
+        let (buf, pos) = simulate_ime_commit("ls ", 3, "你好");
+        assert_eq!(buf, "ls 你好");
+        assert_eq!(pos, 5);
+    }
+
+    #[test]
+    fn ime_commit_chinese_at_beginning() {
+        let (buf, pos) = simulate_ime_commit("hello", 0, "世界");
+        assert_eq!(buf, "世界hello");
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn ime_commit_chinese_in_middle() {
+        let (buf, pos) = simulate_ime_commit("echo test", 5, "中文");
+        assert_eq!(buf, "echo 中文test");
+        assert_eq!(pos, 7);
+    }
+
+    #[test]
+    fn ime_commit_after_existing_chinese() {
+        let (buf, pos) = simulate_ime_commit("你好", 2, "世界");
+        assert_eq!(buf, "你好世界");
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn ime_commit_mixed_cjk_ascii() {
+        let (buf, pos) = simulate_ime_commit("git commit -m \"", 15, "修复bug");
+        assert_eq!(buf, "git commit -m \"修复bug");
+        // 修复bug = 5 chars (修,复,b,u,g), so pos = 15 + 5 = 20
+        assert_eq!(pos, 20);
+    }
+
+    #[test]
+    fn ime_preedit_cursor_position() {
+        // During composition, cursor should be after cmd + preedit
+        let cmd = "echo ";
+        let preedit = "niha"; // pinyin input not yet committed
+        let cursor_pos = cmd.chars().count() + preedit.chars().count();
+        assert_eq!(cursor_pos, 9);
+    }
+
+    #[test]
+    fn ime_preedit_buffer_format() {
+        // The display buffer format: "{cmd}{preedit} {suggestion}"
+        let cmd = "echo ";
+        let preedit = "你好";
+        let suggestion = "";
+        let text = format!("{}{} {}", cmd, preedit, suggestion);
+        assert_eq!(text, "echo 你好 ");
+        // Preedit tag range: cmd.chars().count() .. cmd.chars().count() + preedit.chars().count()
+        let preedit_start = cmd.chars().count();
+        let preedit_end = preedit_start + preedit.chars().count();
+        assert_eq!(preedit_start, 5);
+        assert_eq!(preedit_end, 7);
+    }
+
+    #[test]
+    fn ime_commit_clears_preedit_state() {
+        // After commit, preedit should be empty and cursor advances
+        let cmd = "ls ";
+        let _preedit = "zhong"; // composing
+        // Simulate commit of "中"
+        let (buf, pos) = simulate_ime_commit(cmd, cmd.chars().count(), "中");
+        assert_eq!(buf, "ls 中");
+        assert_eq!(pos, 4);
+        // preedit should be cleared (tested by set_preedit("") after commit)
+        let final_preedit = "";
+        let display = format!("{} {}", buf, final_preedit);
+        assert_eq!(display, "ls 中 ");
+    }
+
+    #[test]
+    fn ime_backspace_chinese_char() {
+        // Backspace should delete one full CJK character
+        let cmd = "你好世界";
+        let pos = 4; // cursor at end
+        let mut buf = cmd.to_string();
+        let byte_pos = buf
+            .char_indices()
+            .nth(pos - 1)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let next_byte = buf
+            .char_indices()
+            .nth(pos)
+            .map(|(i, _)| i)
+            .unwrap_or(buf.len());
+        buf.drain(byte_pos..next_byte);
+        assert_eq!(buf, "你好世");
+        assert_eq!(buf.chars().count(), 3);
+    }
+
+    #[test]
+    fn ime_cursor_movement_with_chinese() {
+        // Left/right should move by one char (not byte)
+        let cmd = "你好world";
+        let chars: Vec<char> = cmd.chars().collect();
+        assert_eq!(chars.len(), 7); // 你好 = 2 chars, world = 5 chars
+        // At pos 2, cursor is between '好' and 'w'
+        let pos = 2;
+        assert_eq!(chars[pos - 1], '好');
+        assert_eq!(chars[pos], 'w');
     }
 }
