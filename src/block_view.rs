@@ -2797,6 +2797,7 @@ impl TermView {
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -2836,6 +2837,7 @@ impl TermView {
             let editor_input_for_cb = config.editor_input;
             let tab_pending_rc = tab_pending.clone();
             let pty_synced_rc = pty_synced.clone();
+            let completion_active_rc = completion_active.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -2963,12 +2965,62 @@ impl TermView {
                                     }
                                     BlockState::AwaitingCommand => {
                                         if editor_input_for_cb {
-                                            // Extract suggestion from shell echo (rsh sends dim text for inline hints)
                                             let raw_text = text.clone();
                                             let stripped = strip_ansi(&raw_text);
                                             let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
                                             let prompt_clean = prompt_text.trim();
 
+                                            // Detect multi-line content (completion menu)
+                                            let after_prompt = if !prompt_clean.is_empty() {
+                                                stripped.strip_prefix(prompt_clean).unwrap_or(&stripped)
+                                            } else {
+                                                &stripped
+                                            };
+                                            let has_menu_content = after_prompt.contains('\n')
+                                                || raw_text.contains("\x1b[B")
+                                                || raw_text.contains("\x1b[A");
+
+                                            if completion_active_rc.get() {
+                                                // Completion menu is active: render in output VTE
+                                                active_rc.borrow().feed_output(bytes);
+
+                                                // Check if this is a clean single-line redraw (menu closed)
+                                                if !has_menu_content && !stripped.is_empty()
+                                                    && (prompt_clean.is_empty() || stripped.contains(prompt_clean))
+                                                {
+                                                    // Menu closed — extract the completed command
+                                                    let cmd_part = if !prompt_clean.is_empty() {
+                                                        after_prompt.trim()
+                                                    } else {
+                                                        stripped.trim()
+                                                    };
+                                                    if !cmd_part.is_empty() {
+                                                        *active_rc.borrow().pending_cmd.borrow_mut() = cmd_part.to_string();
+                                                        active_rc.borrow().cursor_offset.set(cmd_part.chars().count());
+                                                        pty_synced_rc.set(true);
+                                                    }
+                                                    // Hide completion output
+                                                    active_rc.borrow().output_vte.set_visible(false);
+                                                    active_rc.borrow().raw_output.borrow_mut().clear();
+                                                    completion_active_rc.set(false);
+                                                    tab_pending_rc.set(false);
+                                                    *active_rc.borrow().pending_suggestion.borrow_mut() = String::new();
+                                                    active_rc.borrow().update_content_view();
+                                                }
+                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                                continue;
+                                            }
+
+                                            if tab_pending_rc.get() && has_menu_content {
+                                                // Tab triggered a completion menu — show it in output VTE
+                                                completion_active_rc.set(true);
+                                                active_rc.borrow().raw_output.borrow_mut().clear();
+                                                active_rc.borrow().feed_output(bytes);
+                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                                continue;
+                                            }
+
+                                            // Normal single-line: extract suggestion
                                             if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
                                                 *cmd_buf_rc.borrow_mut() = raw_text.clone();
                                             } else {
@@ -3007,7 +3059,7 @@ impl TermView {
                                             let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
 
                                             if tab_pending_rc.get() {
-                                                // Tab completion: shell has modified the command line
+                                                // Single-line tab completion (direct insert, no menu)
                                                 let user_plain = plain_text_from_ansi(&user_raw);
                                                 if !user_plain.is_empty() {
                                                     *active_rc.borrow().pending_cmd.borrow_mut() = user_plain.clone();
@@ -3173,6 +3225,11 @@ impl TermView {
                                 active_rc.borrow().set_cmd("");
                                 pty_synced_rc.set(false);
                                 tab_pending_rc.set(false);
+                                if completion_active_rc.get() {
+                                    active_rc.borrow().output_vte.set_visible(false);
+                                    active_rc.borrow().raw_output.borrow_mut().clear();
+                                    completion_active_rc.set(false);
+                                }
 
                                 if editor_input_for_cb {
                                     let active_for_prompt_focus = active_rc.clone();
@@ -3576,6 +3633,7 @@ impl TermView {
             let history_index: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
             let pty_synced_for_key = pty_synced.clone();
             let tab_pending_for_key = tab_pending.clone();
+            let completion_active_for_key = completion_active.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
             key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
@@ -3587,7 +3645,8 @@ impl TermView {
                 log::debug!("KEY: keyval={:?}, ctrl={}, shift={}, alt={}", keyval, ctrl, shift, alt);
 
                 // Editor mode: when awaiting command input, handle editing locally
-                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand {
+                // During completion menu, forward keys directly to PTY (pass-through)
+                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand && !completion_active_for_key.get() {
                     // Ctrl+Shift+V: paste
                     if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
                         let clipboard = root_for_key.clipboard();
