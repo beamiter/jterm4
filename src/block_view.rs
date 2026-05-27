@@ -3907,14 +3907,28 @@ impl TermView {
                         return glib::Propagation::Stop;
                     }
 
-                    // Ctrl+Shift+C: copy (let it propagate for global handler)
+                    // Ctrl+Shift+C: copy selected text (PRIMARY) or pending_cmd
                     if ctrl && shift && (keyval == gtk4::gdk::Key::c || keyval == gtk4::gdk::Key::C) {
-                        let active = active_for_key.borrow();
-                        let cmd = active.pending_cmd.borrow().clone();
-                        if !cmd.is_empty() {
-                            let clipboard = root_for_key.clipboard();
-                            clipboard.set_text(&cmd);
-                        }
+                        let display = root_for_key.display();
+                        let primary = display.primary_clipboard();
+                        let clipboard = display.clipboard();
+                        let active_for_copy = active_for_key.clone();
+                        primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+                            let copied_from_primary = match result {
+                                Ok(Some(ref text)) if !text.is_empty() => {
+                                    clipboard.set_text(text);
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if !copied_from_primary {
+                                let active = active_for_copy.borrow();
+                                let cmd = active.pending_cmd.borrow().clone();
+                                if !cmd.is_empty() {
+                                    clipboard.set_text(&cmd);
+                                }
+                            }
+                        });
                         return glib::Propagation::Stop;
                     }
 
@@ -5323,7 +5337,7 @@ fn build_output_vte(config: &Config) -> Terminal {
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
-        .can_focus(false)
+        .can_focus(true)
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
