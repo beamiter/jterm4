@@ -2679,6 +2679,27 @@ impl ActiveBlock {
         if !self.output_vte.is_visible() {
             self.output_vte.set_visible(true);
         }
+        // Sync column count with actual widget width to avoid line wrap mismatch
+        let char_width = self.output_vte.char_width();
+        let widget_width = self.output_vte.allocated_width() as i64;
+        let mut cols = self.output_vte.column_count();
+        if char_width > 0 && widget_width > 0 {
+            let actual_cols = (widget_width / char_width).max(40);
+            if actual_cols != cols {
+                cols = actual_cols;
+            }
+        }
+        // Pre-grow VTE rows before feeding to prevent content scrolling off
+        // with scrollback_lines(0). Count newlines in incoming data and add
+        // them to current cursor row to estimate needed rows.
+        let newlines = raw_bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+        let (_col, row) = self.output_vte.cursor_position();
+        let needed_rows = row as i64 + newlines + 2;
+        let current_rows = self.output_vte.row_count();
+        if needed_rows > current_rows || cols != self.output_vte.column_count() {
+            self.output_vte.set_size(cols, needed_rows.max(current_rows));
+            self.output_vte.queue_resize();
+        }
         self.raw_output.borrow_mut().extend_from_slice(raw_bytes);
         self.output_vte.feed(raw_bytes);
     }
@@ -2702,6 +2723,8 @@ impl ActiveBlock {
     fn clear_output(&self) {
         self.raw_output.borrow_mut().clear();
         self.output_vte.reset(true, true);
+        let cols = self.output_vte.column_count();
+        self.output_vte.set_size(cols, 1);
         self.output_vte.set_visible(false);
     }
 
@@ -3038,11 +3061,25 @@ impl TermView {
             ));
             let current_cwd_for_cb = current_cwd.clone();
 
+            let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
             pty.start_reader(
                 move |data: Vec<u8>| {
                     log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
                     if data.len() < 512 {
                         log::debug!("PTY hex: {:02x?}", &data);
+                    }
+                    // Sync PTY columns with output VTE's actual widget width
+                    {
+                        let active = active_rc.borrow();
+                        let char_w = active.output_vte.char_width();
+                        let widget_w = active.output_vte.allocated_width() as i64;
+                        if char_w > 0 && widget_w > 0 {
+                            let new_cols = (widget_w / char_w).max(40) as u16;
+                            if new_cols != last_pty_cols.get() {
+                                last_pty_cols.set(new_cols);
+                                pty_for_resize.resize(new_cols, 24);
+                            }
+                        }
                     }
                     let events = parser.borrow_mut().feed(&data);
 
@@ -4805,7 +4842,10 @@ impl TermView {
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) {
         self.pty.resize(cols, rows);
-        self.active.borrow().output_vte.set_size(cols as i64, rows as i64);
+        let active = self.active.borrow();
+        let current_rows = active.output_vte.row_count();
+        let new_rows = current_rows.max(rows as i64);
+        active.output_vte.set_size(cols as i64, new_rows);
     }
 
     /// Kill the child process.
