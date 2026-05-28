@@ -154,6 +154,8 @@ impl UiState {
             Action::FilterTabs => {
                 log::debug!("Filter tabs");
                 self.sidebar.set_visible(true);
+                self.tab_search_entry.set_can_focus(true);
+                self.tab_search_entry.set_focusable(true);
                 self.tab_search_entry.grab_focus();
             }
             Action::CloseSelectedTabs => {

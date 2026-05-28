@@ -491,10 +491,13 @@ fn show_alt_screen(
 }
 
 fn hide_alt_screen(block_scroll: &ScrolledWindow, vte_box: &gtk4::Box) {
-    vte_box.set_visible(false);
-    vte_box.set_vexpand(false);
+    // Show block_scroll BEFORE hiding vte_box so GTK's automatic focus
+    // navigation finds a widget inside the terminal area rather than
+    // falling through to the sidebar's search entry.
     block_scroll.set_vexpand(true);
     block_scroll.set_visible(true);
+    vte_box.set_visible(false);
+    vte_box.set_vexpand(false);
 }
 
 fn visible_vte_text(vte: &Terminal) -> String {
@@ -3501,6 +3504,7 @@ impl TermView {
                                 if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                    active_rc.borrow().command_view.grab_focus();
                                 }
 
                                 let pager_output = drain_pager_snapshots(&pager_snapshots_rc);
@@ -3710,6 +3714,19 @@ impl TermView {
                                     popover.popup();
                                 });
                                 finished_widget.add_controller(right_click);
+
+                                // Left-click on finished block transfers focus to active input
+                                {
+                                    let active_for_click = active_rc.clone();
+                                    let left_click = gtk4::GestureClick::new();
+                                    left_click.set_button(1);
+                                    left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                                    left_click.connect_pressed(move |gesture, _, _, _| {
+                                        active_for_click.borrow().grab_focus();
+                                        gesture.set_state(gtk4::EventSequenceState::Denied);
+                                    });
+                                    finished_widget.add_controller(left_click);
+                                }
 
                                 // Remove oldest block if we exceed the limit
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {

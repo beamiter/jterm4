@@ -148,7 +148,7 @@ fn main() -> glib::ExitCode {
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
-             .tab-strip-btn:checked { font-weight: bold; border-left: 3px solid currentColor; border-radius: 0; }
+             .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .sidebar-box { min-width: 140px; padding: 2px 4px; }
              .top-bar { padding: 2px 4px; }
@@ -218,11 +218,32 @@ fn main() -> glib::ExitCode {
         let sidebar = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar-box");
 
-        // Tab search entry for filtering
+        // Tab search entry for filtering.
+        // Non-focusable by default to prevent GTK's automatic focus navigation
+        // from landing here when alt-screen VTE is hidden. Enabled on mouse click
+        // or via the FilterTabs keybinding.
         let tab_search_entry = SearchEntry::new();
         tab_search_entry.set_placeholder_text(Some("Filter tabs..."));
         tab_search_entry.add_css_class("tab-strip-search");
-        sidebar.append(&tab_search_entry);
+        tab_search_entry.set_can_focus(false);
+        tab_search_entry.set_focusable(false);
+        // Wrap in a clickable box so clicks on the text area are captured even
+        // when the entry itself is non-focusable.
+        let tab_search_wrapper = gtk4::Box::new(Orientation::Horizontal, 0);
+        tab_search_wrapper.append(&tab_search_entry);
+        {
+            let entry_for_click = tab_search_entry.clone();
+            let click_ctrl = gtk4::GestureClick::new();
+            click_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            click_ctrl.connect_pressed(move |gesture, _, _, _| {
+                entry_for_click.set_can_focus(true);
+                entry_for_click.set_focusable(true);
+                entry_for_click.grab_focus();
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            });
+            tab_search_wrapper.add_controller(click_ctrl);
+        }
+        sidebar.append(&tab_search_wrapper);
 
         sidebar.append(&tab_strip_scroll);
 
@@ -431,6 +452,17 @@ fn main() -> glib::ExitCode {
             false.into()
         });
         search_entry.add_controller(search_key_controller);
+
+        // Disable tab_search_entry focusability when focus leaves it
+        {
+            let entry_for_focus = tab_search_entry.clone();
+            let focus_ctrl = gtk4::EventControllerFocus::new();
+            focus_ctrl.connect_leave(move |_| {
+                entry_for_focus.set_can_focus(false);
+                entry_for_focus.set_focusable(false);
+            });
+            tab_search_entry.add_controller(focus_ctrl);
+        }
 
         // Wire tab search entry: filter tabs by name
         let ui_for_tab_search = ui.clone();
