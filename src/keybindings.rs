@@ -192,6 +192,9 @@ impl Action {
             Action::MoveTabRight,
             Action::DuplicateTab,
             Action::ToggleTabMarked,
+            Action::FilterFailedBlocks,
+            Action::FilterSlowBlocks,
+            Action::ClearBlockFilter,
         ]
     }
 }

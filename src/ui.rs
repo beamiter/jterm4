@@ -276,7 +276,9 @@ impl UiState {
             }
             Action::ClearBlockFilter => {
                 log::info!("Clear block filter");
-                // TODO: Reset filter and show all blocks
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.scroll_to_block(0);
+                }
             }
         }
     }
@@ -779,15 +781,12 @@ impl UiState {
         self.clear_tab_selection();
         let mut selected = self.selected_tabs.borrow_mut();
         let mut in_range = false;
-        let mut found_start = false;
-        let mut found_end = false;
 
         if let Some(mut child) = self.tab_strip.first_child() {
             loop {
                 let child_name = child.widget_name();
                 if child_name.as_str() == from_name {
                     in_range = true;
-                    found_start = true;
                 }
                 if in_range {
                     selected.push(child_name.to_string());
@@ -796,7 +795,6 @@ impl UiState {
                     }
                 }
                 if child_name.as_str() == to_name {
-                    found_end = true;
                     in_range = false;
                 }
                 match child.next_sibling() {
@@ -2274,7 +2272,6 @@ impl UiState {
         // Dynamic tooltip: working directory, process name, and status
         strip_btn.set_has_tooltip(true);
         let terminal_for_tooltip = terminal.clone();
-        let notebook_for_tooltip = self.notebook.clone();
         let tab_strip_for_tooltip = self.tab_strip.clone();
         let strip_btn_for_tooltip = strip_btn.clone();
         strip_btn.connect_query_tooltip(move |_, _x, _y, _keyboard, tooltip| {
@@ -2333,7 +2330,6 @@ impl UiState {
         // Periodic process indicator update (every 2 seconds)
         let terminal_for_proc = terminal.clone();
         let process_label_for_update = process_label.clone();
-        let tab_widget_for_proc = tab_widget_name.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
             // Check if widget is still alive
             if process_label_for_update.parent().is_none() {

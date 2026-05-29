@@ -187,11 +187,6 @@ fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<Str
     get_url_bounds_at_position(buffer, iter).map(|(_, _, url)| url)
 }
 
-/// Format mouse event in SGR mode (CSI <button;x;y M/m)
-fn format_mouse_event_sgr(button: u8, x: i32, y: i32, pressed: bool) -> Vec<u8> {
-    let event_type = if pressed { 'M' } else { 'm' };
-    format!("\x1b[<{};{};{}{}", button, x + 1, y + 1, event_type).into_bytes()
-}
 
 /// Coalesces repeated scroll requests into a single scroll event.
 /// Eliminates cascade of timers and provides smooth scrolling under rapid output.
@@ -710,16 +705,6 @@ fn strip_ansi(input: &str) -> String {
     strip_ansi_with_clear_detect(input).0
 }
 
-fn strip_ansi_cached(
-    input: &str,
-    cache: &std::collections::HashMap<String, String>,
-) -> (String, bool) {
-    if let Some(cached) = cache.get(input) {
-        (cached.clone(), true)
-    } else {
-        (strip_ansi(input), false)
-    }
-}
 
 fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
     match idx {
@@ -1111,16 +1096,6 @@ fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<g
     Some(tag)
 }
 
-fn flush_ansi_run(runs: &mut Vec<AnsiTextRun>, text: &mut String, style: &AnsiStyleState) {
-    if text.is_empty() {
-        return;
-    }
-
-    runs.push(AnsiTextRun {
-        text: std::mem::take(text),
-        style: style.clone(),
-    });
-}
 
 fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RGBA; 16]) {
     let mut index = 0;
@@ -1412,79 +1387,11 @@ fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs: &[A
     }
 }
 
-fn set_active_buffer_text(
-    buffer: &TextBuffer,
-    cmd: &str,
-    suggestion: &str,
-    output: &str,
-    cursor_visible: bool,
-    palette: &[RGBA; 16],
-) {
-    let cursor_char = if output.is_empty() {
-        if cursor_visible { "█" } else { " " }
-    } else {
-        ""
-    };
-    let text = if output.is_empty() {
-        format!("{}{}{}", cmd, cursor_char, suggestion)
-    } else {
-        // First strip ANSI codes, then handle \r per-line
-        let output_no_ansi = strip_ansi(output);
-        let output_plain = output_no_ansi
-            .lines()
-            .map(|line| command_line_plain_text(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("{}{}\n{}", cmd, cursor_char, output_plain)
-    };
-
-    buffer.set_text(&text);
-
-    if !output.is_empty() {
-        let output_runs = ansi_text_runs(output, palette);
-        let output_start = cmd.chars().count() + cursor_char.chars().count() + 1;
-        apply_ansi_runs_to_buffer(buffer, output_start, &output_runs);
-        return;
-    }
-
-    if suggestion.is_empty() {
-        return;
-    }
-
-    let tag_table = buffer.tag_table();
-    if tag_table.lookup("suggestion").is_none() {
-        let tag = gtk4::TextTag::new(Some("suggestion"));
-        tag.set_style(gtk4::pango::Style::Italic);
-        tag.set_foreground_rgba(Some(&RGBA::new(0.5, 0.5, 0.5, 0.7)));
-        tag_table.add(&tag);
-    }
-
-    if let Some(tag) = tag_table.lookup("suggestion") {
-        let start_pos = cmd.chars().count() + cursor_char.chars().count();
-        let end_pos = start_pos + suggestion.chars().count();
-        let start_iter = buffer.iter_at_offset(start_pos as i32);
-        let end_iter = buffer.iter_at_offset(end_pos as i32);
-        buffer.apply_tag(&tag, &start_iter, &end_iter);
-    }
-}
 
 fn set_active_prompt_buffer(buffer: &TextBuffer, prompt: &str) {
     buffer.set_text(prompt);
 }
 
-fn set_active_command_buffer(
-    buffer: &TextBuffer,
-    cmd: &str,
-    preedit: &str,
-    cursor_visible: bool,
-    suggestion: &str,
-    cursor_color: &RGBA,
-    cursor_foreground: &RGBA,
-) {
-    set_active_command_buffer_at(
-        buffer, cmd, preedit, cursor_visible, suggestion, cursor_color, cursor_foreground, None,
-    );
-}
 
 fn set_active_command_buffer_at(
     buffer: &TextBuffer,
@@ -1706,57 +1613,6 @@ fn set_active_output_buffer(
     }
 }
 
-/// Incrementally append new output to buffer without full rewrite
-fn append_active_output_buffer(
-    buffer: &TextBuffer,
-    full_output: &str,
-    last_flushed_size: usize,
-    palette: &[RGBA; 16],
-    cursor_colors: Option<(&RGBA, &RGBA)>,
-) {
-    // Extract only the new portion
-    if full_output.len() <= last_flushed_size {
-        return; // Nothing new to append
-    }
-
-    let new_output = &full_output[last_flushed_size..];
-
-    // If new output contains \r, it may need to overwrite previous lines
-    // (e.g., progress updates like apt/curl). Fall back to full rewrite.
-    if new_output.contains('\r') {
-        set_active_output_buffer(buffer, full_output, palette, cursor_colors);
-        return;
-    }
-
-    // Process new output (strip ANSI and handle carriage returns)
-    let new_output_no_ansi = strip_ansi(new_output);
-    let new_output_plain = new_output_no_ansi
-        .lines()
-        .map(|line| command_line_plain_text(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Append the new text to the buffer
-    let mut end_iter = buffer.end_iter();
-    buffer.insert(&mut end_iter, &new_output_plain);
-
-    // IMPORTANT: Parse ANSI runs from the FULL output, not just the new portion
-    // ANSI color codes are stateful (e.g., setting yellow persists until reset)
-    // Parsing only the new portion would lose the inherited color state
-    let all_output_runs = ansi_text_runs(full_output, palette);
-
-    // Clear all existing tags first to avoid stale coloring
-    let start = buffer.start_iter();
-    let end = buffer.end_iter();
-    buffer.remove_all_tags(&start, &end);
-
-    // Re-apply all ANSI tags from the beginning
-    apply_ansi_runs_to_buffer(buffer, 0, &all_output_runs);
-
-    if let Some((cursor_color, cursor_foreground)) = cursor_colors {
-        apply_output_cursor(buffer, full_output, cursor_color, cursor_foreground);
-    }
-}
 
 
 fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
@@ -1998,17 +1854,6 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
     out
 }
 
-fn ansi_to_pango_cached(
-    input: &str,
-    palette: &[RGBA; 16],
-    cache: &std::collections::HashMap<String, String>,
-) -> (String, bool) {
-    if let Some(cached) = cache.get(input) {
-        (cached.clone(), true)
-    } else {
-        (ansi_to_pango(input, palette), false)
-    }
-}
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
@@ -2131,15 +1976,39 @@ impl FinishedBlock {
         end_time: Option<SystemTime>,
         cwd: Option<&str>,
     ) -> Self {
+        Self::new_with_pool(prompt, cmd, _cmd_markup, output, exit_code, config, duration_ms, end_time, cwd, None)
+    }
+
+    fn new_with_pool(
+        prompt: &str,
+        cmd: &str,
+        _cmd_markup: Option<&str>,
+        output: &str,
+        exit_code: i32,
+        config: &Config,
+        duration_ms: Option<u64>,
+        end_time: Option<SystemTime>,
+        cwd: Option<&str>,
+        recycled: Option<gtk4::Box>,
+    ) -> Self {
         let view_margin_top = 2;
         let view_margin_bottom = 2;
 
-        let outer = gtk4::Box::new(Orientation::Vertical, 0);
-        outer.add_css_class("block-finished");
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
-        outer.set_margin_start(8);
-        outer.set_margin_end(8);
+        let outer = if let Some(reused) = recycled {
+            while let Some(child) = reused.first_child() {
+                reused.remove(&child);
+            }
+            reused.remove_css_class("block-hovered");
+            reused
+        } else {
+            let b = gtk4::Box::new(Orientation::Vertical, 0);
+            b.add_css_class("block-finished");
+            b.set_margin_top(4);
+            b.set_margin_bottom(4);
+            b.set_margin_start(8);
+            b.set_margin_end(8);
+            b
+        };
 
         // Add hover highlighting to show block is interactive
         let hover_ctrl = gtk4::EventControllerMotion::new();
@@ -2449,7 +2318,6 @@ impl FinishedBlock {
 
 struct ActiveBlock {
     widget: gtk4::Box,
-    prompt_view: gtk4::TextView,
     prompt_buffer: gtk4::TextBuffer,
     command_view: gtk4::TextView,
     command_buffer: gtk4::TextBuffer,
@@ -2592,7 +2460,6 @@ impl ActiveBlock {
 
         ActiveBlock {
             widget,
-            prompt_view,
             prompt_buffer,
             command_view,
             command_buffer,
@@ -2849,6 +2716,7 @@ impl WidgetPool {
 
 // ─── TermView ─────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
     block_scroll: ScrolledWindow,
@@ -2880,6 +2748,7 @@ pub struct TermView {
     selected_block_id: Rc<Cell<Option<u64>>>,
 }
 
+#[allow(dead_code)]
 impl TermView {
     pub fn new(
         config: &Config,
@@ -3539,8 +3408,27 @@ impl TermView {
 
                                 let output = active_rc.borrow().output_text();
                                 let output_plain = strip_ansi(&output);
-                                let output_trimmed = output_plain.trim().to_string();
-                                let output_display = output.trim().to_string();
+                                let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
+                                let output_trimmed = {
+                                    let trimmed = output_plain.trim();
+                                    let lines: Vec<&str> = trimmed.lines().collect();
+                                    if lines.len() > truncation_limit {
+                                        let kept: String = lines[..truncation_limit].join("\n");
+                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
+                                    } else {
+                                        trimmed.to_string()
+                                    }
+                                };
+                                let output_display = {
+                                    let trimmed = output.trim();
+                                    let lines: Vec<&str> = trimmed.lines().collect();
+                                    if lines.len() > truncation_limit {
+                                        let kept: String = lines[..truncation_limit].join("\n");
+                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
+                                    } else {
+                                        trimmed.to_string()
+                                    }
+                                };
                                 let preview = output_plain.chars().take(20).collect::<String>();
                                 let bytes_preview: Vec<u8> = output_plain.bytes().take(10).collect();
                                 log::debug!("CommandEnd: cmd={:?}, output_len_before={}, output_len_after={}, starts_with_newline={}, first_20_chars={:?}, first_10_bytes={:?}",
@@ -3581,10 +3469,11 @@ impl TermView {
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
-                                // Create widget (physical representation)
-                                let finished = FinishedBlock::new(
+                                // Create widget (reuse from pool if available)
+                                let recycled = widget_pool_for_cb.borrow_mut().acquire();
+                                let finished = FinishedBlock::new_with_pool(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, *code, &config_for_cb.borrow(),
-                                    duration_ms, end_time, block_cwd.as_deref(),
+                                    duration_ms, end_time, block_cwd.as_deref(), recycled,
                                 );
 
                                 // Insert before the active block (last child in block_list)

@@ -32,7 +32,7 @@ enum State {
     /// Just saw ESC while in OSC — next byte should be '\' for ST
     OscEsc { payload: Vec<u8> },
     /// Inside DCS/PM/APC — just consume until ST
-    Ignore { buf: Vec<u8> },
+    Ignore,
 }
 
 pub struct Parser {
@@ -84,7 +84,7 @@ impl Parser {
                     }
                     b'P' | b'^' | b'_' => {
                         // DCS / PM / APC — ignore until ST
-                        self.state = State::Ignore { buf: Vec::new() };
+                        self.state = State::Ignore;
                     }
                     _ => {
                         // Other ESC sequences: pass through as-is
@@ -148,7 +148,7 @@ impl Parser {
                     }
                 }
 
-                State::Ignore { buf: _ } => {
+                State::Ignore => {
                     // Consume until BEL or ESC
                     if b == 0x07 || b == 0x1b {
                         self.state = State::Ground;

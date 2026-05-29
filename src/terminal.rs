@@ -60,6 +60,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 
 // ─── VteTerminalView ──────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct VteTerminalView {
     root: gtk4::Box,
     terminal: Terminal,
@@ -71,6 +72,7 @@ pub struct VteTerminalView {
     activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
 }
 
+#[allow(dead_code)]
 impl VteTerminalView {
     pub fn new(
         config: Rc<RefCell<Config>>,

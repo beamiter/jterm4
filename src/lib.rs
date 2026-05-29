@@ -1,4 +1,5 @@
-// Library exports for testing and external use
+#![allow(dead_code)]
+
 pub mod state;
 pub mod config;
 pub mod keybindings;

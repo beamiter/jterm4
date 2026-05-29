@@ -4,7 +4,6 @@ use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::io::RawFd;
 use std::sync::mpsc;
 use gtk4::glib;
 
@@ -83,16 +82,6 @@ impl OwnedPty {
             }
             Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
         }
-    }
-
-    pub fn master_fd(&self) -> Option<RawFd> {
-        self.master.lock().ok().and_then(|guard| {
-            guard.as_ref().map(|fd| fd.as_raw_fd())
-        })
-    }
-
-    pub fn pid(&self) -> Pid {
-        self.pid
     }
 
     pub fn pid_i32(&self) -> i32 {
