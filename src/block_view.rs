@@ -1858,7 +1858,8 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 /// Data for a finished command block (decoupled from widget representation)
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[archive(check_bytes)]
 struct BlockData {
     id: u64,
     prompt: String,
@@ -1869,9 +1870,9 @@ struct BlockData {
     estimated_height: i32,
     line_count: usize,
     #[serde(default)]
-    start_time: Option<SystemTime>,
+    start_time_ms: Option<u64>,
     #[serde(default)]
-    end_time: Option<SystemTime>,
+    end_time_ms: Option<u64>,
     #[serde(default)]
     duration_ms: Option<u64>,
     #[serde(default)]
@@ -1973,10 +1974,10 @@ impl FinishedBlock {
         exit_code: i32,
         config: &Config,
         duration_ms: Option<u64>,
-        end_time: Option<SystemTime>,
+        end_time_ms: Option<u64>,
         cwd: Option<&str>,
     ) -> Self {
-        Self::new_with_pool(prompt, cmd, _cmd_markup, output, exit_code, config, duration_ms, end_time, cwd, None)
+        Self::new_with_pool(prompt, cmd, _cmd_markup, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
     }
 
     fn new_with_pool(
@@ -1987,7 +1988,7 @@ impl FinishedBlock {
         exit_code: i32,
         config: &Config,
         duration_ms: Option<u64>,
-        end_time: Option<SystemTime>,
+        end_time_ms: Option<u64>,
         cwd: Option<&str>,
         recycled: Option<gtk4::Box>,
     ) -> Self {
@@ -2047,24 +2048,16 @@ impl FinishedBlock {
         header_row.append(&spacer);
 
         // Timestamp label
-        if let Some(et) = end_time {
-            if let Ok(duration_since_epoch) = et.duration_since(SystemTime::UNIX_EPOCH) {
-                let secs = duration_since_epoch.as_secs();
-                let hours = (secs % 86400) / 3600;
-                let mins = (secs % 3600) / 60;
-                let s = secs % 60;
-                // Adjust to local timezone offset (approximate)
-                let local_offset = chrono_local_offset_secs();
-                let local_secs = secs as i64 + local_offset;
-                let local_secs = local_secs.rem_euclid(86400) as u64;
-                let h = local_secs / 3600;
-                let m = (local_secs % 3600) / 60;
-                let sec = local_secs % 60;
-                let _ = (hours, mins, s); // suppress warnings
-                let ts_label = gtk4::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
-                ts_label.add_css_class("block-header-label");
-                header_row.append(&ts_label);
-            }
+        if let Some(et_ms) = end_time_ms {
+            let secs = et_ms / 1000;
+            let local_offset = chrono_local_offset_secs();
+            let local_secs = (secs as i64 + local_offset).rem_euclid(86400) as u64;
+            let h = local_secs / 3600;
+            let m = (local_secs % 3600) / 60;
+            let sec = local_secs % 60;
+            let ts_label = gtk4::Label::new(Some(&format!("{:02}:{:02}:{:02}", h, m, sec)));
+            ts_label.add_css_class("block-header-label");
+            header_row.append(&ts_label);
         }
 
         // Duration badge
@@ -2838,6 +2831,7 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+        let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -2876,6 +2870,7 @@ impl TermView {
         {
             let active_rc = active.clone();
             let bstate_rc = bstate.clone();
+            let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
             let cmd_buf_rc = cmd_buf.clone();
             let cmd_display_raw_rc = cmd_display_raw.clone();
@@ -3306,6 +3301,10 @@ impl TermView {
                             }
 
                             ParserEvent::PromptStart => {
+                                let state = bstate_rc.get();
+                                if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                    continue;
+                                }
                                 bstate_rc.set(BlockState::CollectingPrompt);
                                 prompt_buf_rc.borrow_mut().clear();
                                 // Auto-scroll to bottom when new prompt starts
@@ -3313,6 +3312,9 @@ impl TermView {
                             }
 
                             ParserEvent::PromptEnd => {
+                                if bstate_rc.get() != BlockState::CollectingPrompt {
+                                    continue;
+                                }
                                 bstate_rc.set(BlockState::AwaitingCommand);
                                 cmd_buf_rc.borrow_mut().clear();
                                 cmd_display_raw_rc.borrow_mut().clear();
@@ -3345,6 +3347,15 @@ impl TermView {
                             }
 
                             ParserEvent::CommandStart => {
+                                let state = bstate_rc.get();
+                                if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                    osc133_depth_rc.set(osc133_depth_rc.get() + 1);
+                                    continue;
+                                }
+                                if state != BlockState::AwaitingCommand {
+                                    continue;
+                                }
+                                osc133_depth_rc.set(0);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 block_start_time_for_cb.set(Some(SystemTime::now()));
                                 let raw_cmd = cmd_display_raw_rc.borrow().clone();
@@ -3369,8 +3380,16 @@ impl TermView {
                             }
 
                             ParserEvent::CommandEnd(code) => {
+                                let state = bstate_rc.get();
+                                if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+                                    continue;
+                                }
+                                if osc133_depth_rc.get() > 0 {
+                                    osc133_depth_rc.set(osc133_depth_rc.get() - 1);
+                                    continue;
+                                }
                                 active_rc.borrow().stop_timer();
-                                if bstate_rc.get() == BlockState::AltScreen || vte_box_rc.is_visible() {
+                                if state == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                     active_rc.borrow().command_view.grab_focus();
@@ -3440,11 +3459,11 @@ impl TermView {
 
                                 // Calculate duration if we have a start time
                                 let start_time = block_start_time_for_cb.get();
-                                let end_time = Some(SystemTime::now());
+                                let now = SystemTime::now();
+                                let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
+                                let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
                                 let duration_ms = start_time.and_then(|st| {
-                                    end_time.and_then(|et| {
-                                        et.duration_since(st).ok().map(|d| d.as_millis() as u64)
-                                    })
+                                    now.duration_since(st).ok().map(|d| d.as_millis() as u64)
                                 });
 
                                 let block_cwd = {
@@ -3461,8 +3480,8 @@ impl TermView {
                                     exit_code: *code,
                                     estimated_height,
                                     line_count,
-                                    start_time,
-                                    end_time,
+                                    start_time_ms,
+                                    end_time_ms,
                                     duration_ms,
                                     cwd: block_cwd.clone(),
                                 };
@@ -3473,7 +3492,7 @@ impl TermView {
                                 let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                 let finished = FinishedBlock::new_with_pool(
                                     &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, *code, &config_for_cb.borrow(),
-                                    duration_ms, end_time, block_cwd.as_deref(), recycled,
+                                    duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                 );
 
                                 // Insert before the active block (last child in block_list)
@@ -3668,6 +3687,9 @@ impl TermView {
                             }
 
                             ParserEvent::AltScreenEnter => {
+                                if bstate_rc.get() != BlockState::CollectingOutput {
+                                    continue;
+                                }
                                 bstate_rc.set(BlockState::AltScreen);
                                 pager_snapshots_rc.borrow_mut().clear();
                                 pager_snapshot_generation_rc.set(
@@ -3684,6 +3706,9 @@ impl TermView {
                             }
 
                             ParserEvent::AltScreenLeave => {
+                                if bstate_rc.get() != BlockState::AltScreen {
+                                    continue;
+                                }
                                 record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::CollectingOutput);
@@ -4646,7 +4671,7 @@ impl TermView {
                     block.exit_code,
                     &config,
                     block.duration_ms,
-                    block.end_time,
+                    block.end_time_ms,
                     block.cwd.as_deref(),
                 );
                 finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
@@ -5172,7 +5197,7 @@ impl TermView {
         for block in blocks.iter() {
             log::debug!("Saving block to history: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
                 &block.prompt, &block.cmd, block.output.len(), block.exit_code);
-            let serialized = bincode::serialize(block)
+            let serialized = rkyv::to_bytes::<_, 256>(block)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
             if self.config.borrow().block_history_compress {
@@ -5228,7 +5253,7 @@ impl TermView {
                 data
             };
 
-            if let Ok(block) = bincode::deserialize::<BlockData>(&decoded) {
+            if let Ok(block) = rkyv::from_bytes::<BlockData>(&decoded) {
                 temp_blocks.push(block);
             }
         }
