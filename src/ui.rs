@@ -682,12 +682,23 @@ impl UiState {
             return;
         }
 
+        // Detect regex pattern: /pattern/ syntax
+        let text_str = text.as_str();
+        let (query, use_regex) = if text_str.starts_with('/') && text_str.ends_with('/') && text_str.len() > 2 {
+            (text_str[1..text_str.len() - 1].to_string(), true)
+        } else {
+            (text_str.to_string(), false)
+        };
+
         // Try block search first (in block mode)
         if let Some(term_view) = self.current_term_view() {
-            let matches = term_view.search_blocks(&text);
+            let filters = crate::block_view::BlockFilters {
+                use_regex,
+                ..Default::default()
+            };
+            let matches = term_view.search_blocks_with_filters(&query, &filters);
             if !matches.is_empty() {
                 if let Some(first_match) = matches.first() {
-                    // Scroll to first matching block
                     term_view.scroll_to_block(*first_match);
                     return;
                 }
@@ -696,8 +707,12 @@ impl UiState {
 
         // Fall back to terminal regex search
         if let Some(term) = self.current_terminal() {
-            let escaped = glib::Regex::escape_string(&text);
-            let regex = vte4::Regex::for_search(&escaped, pcre2_sys::PCRE2_CASELESS);
+            let pattern = if use_regex {
+                query
+            } else {
+                glib::Regex::escape_string(&text).to_string()
+            };
+            let regex = vte4::Regex::for_search(&pattern, pcre2_sys::PCRE2_CASELESS);
             if let Ok(regex) = regex {
                 term.search_set_regex(Some(&regex), 0);
                 term.search_set_wrap_around(true);

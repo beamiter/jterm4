@@ -17,6 +17,10 @@ pub enum ParserEvent {
     AltScreenEnter,
     /// CSI ? 1049 l — alt screen left.
     AltScreenLeave,
+    /// OSC 52 — application set clipboard content.
+    ClipboardSet(String),
+    /// APC sequence (ESC _) — Kitty graphics protocol or similar.
+    ApcSequence(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -31,7 +35,11 @@ enum State {
     Osc { buf: Vec<u8> },
     /// Just saw ESC while in OSC — next byte should be '\' for ST
     OscEsc { payload: Vec<u8> },
-    /// Inside DCS/PM/APC — just consume until ST
+    /// Inside APC (ESC _): collecting bytes for Kitty graphics etc.
+    Apc { buf: Vec<u8> },
+    /// Saw ESC while in APC — next byte should be '\' for ST
+    ApcEsc { payload: Vec<u8> },
+    /// Inside DCS/PM — just consume until ST
     Ignore,
 }
 
@@ -73,21 +81,20 @@ impl Parser {
 
                 State::Esc => match b {
                     b'[' => {
-                        // ESC [ — start CSI; pass ESC [ through so ANSI colors etc. work
                         passthrough.push(0x1b);
                         passthrough.push(b'[');
                         self.state = State::Csi { buf: Vec::new() };
                     }
                     b']' => {
-                        // ESC ] — start OSC; do NOT pass through yet (strip markers)
                         self.state = State::Osc { buf: Vec::new() };
                     }
-                    b'P' | b'^' | b'_' => {
-                        // DCS / PM / APC — ignore until ST
+                    b'_' => {
+                        self.state = State::Apc { buf: Vec::new() };
+                    }
+                    b'P' | b'^' => {
                         self.state = State::Ignore;
                     }
                     _ => {
-                        // Other ESC sequences: pass through as-is
                         passthrough.push(0x1b);
                         passthrough.push(b);
                         self.state = State::Ground;
@@ -148,8 +155,38 @@ impl Parser {
                     }
                 }
 
+                State::Apc { buf } => {
+                    match b {
+                        0x07 => {
+                            let payload = std::mem::take(buf);
+                            self.state = State::Ground;
+                            flush!();
+                            events.push(ParserEvent::ApcSequence(payload));
+                        }
+                        0x1b => {
+                            let payload = std::mem::take(buf);
+                            self.state = State::ApcEsc { payload };
+                        }
+                        _ => {
+                            buf.push(b);
+                        }
+                    }
+                }
+
+                State::ApcEsc { payload } => {
+                    let payload = std::mem::take(payload);
+                    self.state = State::Ground;
+                    if b == b'\\' {
+                        flush!();
+                        events.push(ParserEvent::ApcSequence(payload));
+                    } else {
+                        flush!();
+                        events.push(ParserEvent::ApcSequence(payload));
+                        passthrough.push(b);
+                    }
+                }
+
                 State::Ignore => {
-                    // Consume until BEL or ESC
                     if b == 0x07 || b == 0x1b {
                         self.state = State::Ground;
                     }
@@ -220,6 +257,21 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
+    // OSC 52 ; <selection> ; <base64-data> — clipboard set
+    if let Some(rest) = s.strip_prefix("52;") {
+        if let Some(data_start) = rest.find(';') {
+            let b64_data = &rest[data_start + 1..];
+            if b64_data != "?" {
+                if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
+                    if let Ok(text) = String::from_utf8(decoded) {
+                        events.push(ParserEvent::ClipboardSet(text));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     // All other OSC sequences (e.g. OSC 0 for window title, OSC 8 for hyperlinks):
     // reconstruct and pass through so the VTE fallback can handle them
     let mut bytes = Vec::with_capacity(payload.len() + 4);
@@ -228,4 +280,53 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     bytes.extend_from_slice(payload);
     bytes.push(0x07);
     events.push(ParserEvent::Bytes(bytes));
+}
+
+fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
+    const TABLE: [u8; 256] = {
+        let mut t = [0xFFu8; 256];
+        let mut i = 0u8;
+        loop {
+            if i >= 26 { break; }
+            t[(b'A' + i) as usize] = i;
+            i += 1;
+        }
+        i = 0;
+        loop {
+            if i >= 26 { break; }
+            t[(b'a' + i) as usize] = 26 + i;
+            i += 1;
+        }
+        i = 0;
+        loop {
+            if i >= 10 { break; }
+            t[(b'0' + i) as usize] = 52 + i;
+            i += 1;
+        }
+        t[b'+' as usize] = 62;
+        t[b'/' as usize] = 63;
+        t
+    };
+
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for &b in input {
+        if b == b'=' || b == b'\n' || b == b'\r' {
+            continue;
+        }
+        let val = TABLE[b as usize];
+        if val == 0xFF {
+            return Err(());
+        }
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
 }

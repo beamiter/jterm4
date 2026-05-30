@@ -20,6 +20,7 @@ serde_json = "1.0"
 rkyv = { version = "0.7", features = ["validation"] }
 bytecheck = { version = "0.6", default-features = false }
 zstd = "0.13"
+regex = "1"
 
 [dev-dependencies]
 env_logger = "0.11"

@@ -70,8 +70,14 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
     } else {
         // Leaf terminal
         let terminal = find_first_terminal(widget).expect("Leaf must contain terminal");
-        let dir = terminal_working_directory(&terminal)
-            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+        let dir = unsafe {
+            widget.data::<std::rc::Rc<TermView>>("term-view")
+                .map(|tv| tv.as_ref().cwd())
+                .filter(|s| !s.is_empty())
+        }.unwrap_or_else(|| {
+            terminal_working_directory(&terminal)
+                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
+        });
 
         // Extract tab number from widget name "tab-N" and lookup session_id
         let widget_name = widget.widget_name();

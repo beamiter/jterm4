@@ -531,8 +531,8 @@ fn main() -> glib::ExitCode {
         let session_ids_for_close = ui.session_ids.clone();
         let app_for_close = app.clone();
         window.connect_close_request(move |_| {
-            kill_all_terminal_children(&notebook_for_close_request);
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
+            kill_all_terminal_children(&notebook_for_close_request);
 
             // Explicitly clear all pages to break reference cycles and allow TermView cleanup.
             // This ensures OwnedPty drops, closing PTY master FD and signaling reader threads.

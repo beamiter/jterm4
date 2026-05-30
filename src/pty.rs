@@ -63,7 +63,6 @@ impl OwnedPty {
                 for (key, val) in env_extra {
                     unsafe { std::env::set_var(key, val) };
                 }
-                // TERM must be set for applications that check it
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
 
                 let c_argv: Vec<CString> = argv
@@ -120,9 +119,8 @@ impl OwnedPty {
         terminate_terminal_process(self.pid.as_raw());
     }
 
-    /// Start an async reader: spawns a background thread to read PTY output
-    /// and delivers chunks to `callback` on the GLib main thread via idle_add_local.
-    /// When the child exits, sends `PtyMsg::Exit(code)` so `on_exit` is called on the main thread.
+    /// Start an async reader: spawns a background thread reading with 64KB buffer,
+    /// delivers data via mpsc channel polled at 1ms on the GLib main thread.
     pub fn start_reader<F, E>(&self, mut callback: F, on_exit: E)
     where
         F: FnMut(Vec<u8>) + 'static,
@@ -141,7 +139,7 @@ impl OwnedPty {
 
         std::thread::spawn(move || {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
             loop {
                 match file.read(&mut buf) {
                     Ok(0) | Err(_) => {
@@ -157,7 +155,6 @@ impl OwnedPty {
                 }
             }
 
-            // Wait for the child with timeout using non-blocking checks
             let max_wait_secs = 5;
             for _ in 0..(max_wait_secs * 10) {
                 match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
@@ -170,13 +167,11 @@ impl OwnedPty {
                         return;
                     }
                     Err(_) | Ok(_) => {
-                        // WNOHANG returns Ok(current status) or Err if not found
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
             }
 
-            // Final blocking wait (should be quick if process is responsive to SIGHUP)
             match nix::sys::wait::waitpid(child_pid, None) {
                 Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
                     let _ = tx.send(PtyMsg::Exit(code));
@@ -192,28 +187,22 @@ impl OwnedPty {
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
-        // Use timeout instead of idle to limit CPU usage
-        // Process all available data, then yield for 10ms
-        glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
             loop {
                 match rx.borrow().try_recv() {
                     Ok(PtyMsg::Data(data)) => {
-                        log::debug!("PTY: processing {} bytes", data.len());
                         callback(data);
                     }
                     Ok(PtyMsg::Exit(code)) => {
-                        log::debug!("PTY: exit code {}", code);
                         if let Some(f) = on_exit.take() {
                             f(code);
                         }
                         return glib::ControlFlow::Break;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        // No more data, will check again in 10ms
                         return glib::ControlFlow::Continue;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        log::debug!("PTY: channel disconnected");
                         return glib::ControlFlow::Break;
                     }
                 }

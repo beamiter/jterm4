@@ -184,6 +184,13 @@ fn get_url_bounds_at_position(
 }
 
 fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<String> {
+    for tag in iter.tags() {
+        if let Some(name) = tag.name() {
+            if let Some(uri) = name.strip_prefix("osc8-link:") {
+                return Some(uri.to_string());
+            }
+        }
+    }
     get_url_bounds_at_position(buffer, iter).map(|(_, _, url)| url)
 }
 
@@ -653,7 +660,8 @@ fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
 
 fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut cells: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
     let mut i = 0;
     let mut should_clear = false;
 
@@ -661,26 +669,56 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'[' => {
-                    // CSI sequence: collect params and final byte
                     i += 2;
                     let mut params = Vec::new();
                     while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        params.push(bytes[i]);
+                        if bytes[i] == b';' {
+                            params.push(String::new());
+                        } else if let Some(last) = params.last_mut() {
+                            last.push(bytes[i] as char);
+                        } else {
+                            params.push(String::from(bytes[i] as char));
+                        }
                         i += 1;
                     }
                     if i < bytes.len() {
                         let final_byte = bytes[i];
                         i += 1;
 
-                        // Detect clear-screen sequences. Cursor movement and partial erase
-                        // are common in command progress output, so only full-display erase
-                        // should clear the active block's rendered output.
                         match final_byte {
                             b'J' => {
-                                // CSI 2J / CSI 3J — erase full display / scrollback.
-                                if params == b"2" || params == b"3" {
+                                let param_str: String = params.concat();
+                                if param_str == "2" || param_str == "3" {
                                     should_clear = true;
                                 }
+                            }
+                            b'K' => {
+                                let mode = params.first().map(String::as_str).unwrap_or("0");
+                                match mode {
+                                    "" | "0" => cells.truncate(cursor),
+                                    "1" => {
+                                        for c in cells.iter_mut().take(cursor) {
+                                            *c = " ".to_string();
+                                        }
+                                    }
+                                    "2" => {
+                                        cells.clear();
+                                        cursor = 0;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            b'C' => {
+                                let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                cursor = (cursor + count).min(cells.len());
+                            }
+                            b'D' => {
+                                let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                cursor = cursor.saturating_sub(count);
+                            }
+                            b'G' => {
+                                let col = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                cursor = col.saturating_sub(1).min(cells.len());
                             }
                             _ => {}
                         }
@@ -693,12 +731,29 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                     i = skip_escape_sequence(bytes, i);
                 }
             }
-        } else {
-            out.push(bytes[i]);
+        } else if bytes[i] == b'\r' {
+            cursor = 0;
             i += 1;
+        } else if bytes[i] == b'\x08' {
+            cursor = cursor.saturating_sub(1);
+            i += 1;
+        } else {
+            let ch_start = i;
+            i += input[i..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
+            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            if cursor < cells.len() {
+                cells[cursor] = ch;
+            } else {
+                cells.push(ch);
+            }
+            cursor += 1;
         }
     }
-    (String::from_utf8_lossy(&out).to_string(), should_clear)
+    (cells.concat(), should_clear)
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1003,18 +1058,31 @@ fn plain_text_from_ansi(input: &str) -> String {
     command_line_plain_text(input)
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Default, PartialEq)]
 struct AnsiStyleState {
     foreground: Option<RGBA>,
     background: Option<RGBA>,
     bold: bool,
     italic: bool,
-    underline: bool,
+    underline_style: UnderlineStyle,
+    underline_color: Option<RGBA>,
     strikethrough: bool,
     dim: bool,
-    reverse: bool,     // SGR 7 - swap fg/bg
-    hidden: bool,      // SGR 8 - invisible text
-    overline: bool,    // SGR 53 - line above text
+    reverse: bool,
+    hidden: bool,
+    overline: bool,
+    hyperlink: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1028,12 +1096,14 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         && style.background.is_none()
         && !style.bold
         && !style.italic
-        && !style.underline
+        && style.underline_style == UnderlineStyle::None
+        && style.underline_color.is_none()
         && !style.strikethrough
         && !style.dim
         && !style.reverse
         && !style.hidden
         && !style.overline
+        && style.hyperlink.is_none()
     {
         return None;
     }
@@ -1049,15 +1119,37 @@ fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         None => "none".to_string(),
     };
 
+    let ul_style = match style.underline_style {
+        UnderlineStyle::None => 0,
+        UnderlineStyle::Single => 1,
+        UnderlineStyle::Double => 2,
+        UnderlineStyle::Curly => 3,
+        UnderlineStyle::Dotted => 4,
+        UnderlineStyle::Dashed => 5,
+    };
+
+    let link_key = match &style.hyperlink {
+        Some(uri) => {
+            let mut h: u64 = 0;
+            for b in uri.bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u64);
+            }
+            format!("{:016x}", h)
+        }
+        None => "none".to_string(),
+    };
+
     Some(format!(
-        "ansi-run-fg:{}-bg:{}-b{}-i{}-u{}-s{}-d{}",
+        "ansi-run-fg:{}-bg:{}-b{}-i{}-u{}-uc:{}-s{}-d{}-lk:{}",
         rgba_key(style.foreground.as_ref()),
         rgba_key(style.background.as_ref()),
         style.bold as u8,
         style.italic as u8,
-        style.underline as u8,
+        ul_style,
+        rgba_key(style.underline_color.as_ref()),
         style.strikethrough as u8,
         style.dim as u8,
+        link_key,
     ))
 }
 
@@ -1076,6 +1168,9 @@ fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<g
         }
         tag.set_foreground_rgba(Some(&foreground));
     }
+    if style.hyperlink.is_some() && style.foreground.is_none() {
+        tag.set_foreground_rgba(Some(&RGBA::new(0.4, 0.6, 1.0, 1.0)));
+    }
     if let Some(background) = style.background {
         tag.set_background_rgba(Some(&background));
     }
@@ -1085,8 +1180,20 @@ fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<g
     if style.italic {
         tag.set_style(gtk4::pango::Style::Italic);
     }
-    if style.underline {
+    match style.underline_style {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Single => tag.set_underline(gtk4::pango::Underline::Single),
+        UnderlineStyle::Double => tag.set_underline(gtk4::pango::Underline::Double),
+        UnderlineStyle::Curly => tag.set_underline(gtk4::pango::Underline::Error),
+        UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
+            tag.set_underline(gtk4::pango::Underline::Single);
+        }
+    }
+    if style.hyperlink.is_some() && style.underline_style == UnderlineStyle::None {
         tag.set_underline(gtk4::pango::Underline::Single);
+    }
+    if let Some(ul_color) = style.underline_color {
+        tag.set_underline_rgba(Some(&ul_color));
     }
     if style.strikethrough {
         tag.set_strikethrough(true);
@@ -1100,6 +1207,51 @@ fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) -> Option<g
 fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RGBA; 16]) {
     let mut index = 0;
     while index < params.len() {
+        // Handle colon-separated subparams (e.g., "4:3" for curly underline, "58:2:r:g:b")
+        if params[index].contains(':') {
+            let sub_parts: Vec<&str> = params[index].split(':').collect();
+            let base = sub_parts[0].parse::<u32>().unwrap_or(0);
+            match base {
+                4 => {
+                    let sub = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                    style.underline_style = match sub {
+                        0 => UnderlineStyle::None,
+                        1 => UnderlineStyle::Single,
+                        2 => UnderlineStyle::Double,
+                        3 => UnderlineStyle::Curly,
+                        4 => UnderlineStyle::Dotted,
+                        5 => UnderlineStyle::Dashed,
+                        _ => UnderlineStyle::Single,
+                    };
+                }
+                58 => {
+                    // 58:2:r:g:b or 58:5:n (underline color)
+                    let mode = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                    if mode == 5 && sub_parts.len() >= 3 {
+                        if let Ok(idx) = sub_parts[2].parse::<u8>() {
+                            let (r, g, b) = ansi256_to_rgb(idx, palette);
+                            style.underline_color = Some(RGBA::new(
+                                r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
+                            ));
+                        }
+                    } else if mode == 2 && sub_parts.len() >= 5 {
+                        if let (Ok(r), Ok(g), Ok(b)) = (
+                            sub_parts[2].parse::<u8>(),
+                            sub_parts[3].parse::<u8>(),
+                            sub_parts[4].parse::<u8>(),
+                        ) {
+                            style.underline_color = Some(RGBA::new(
+                                r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+
         let param = if params[index].is_empty() {
             0
         } else {
@@ -1111,14 +1263,17 @@ fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RG
             1 => style.bold = true,
             2 => style.dim = true,
             3 => style.italic = true,
-            4 => style.underline = true,
+            4 => style.underline_style = UnderlineStyle::Single,
             9 => style.strikethrough = true,
             22 => {
                 style.bold = false;
                 style.dim = false;
             }
             23 => style.italic = false,
-            24 => style.underline = false,
+            24 => {
+                style.underline_style = UnderlineStyle::None;
+                style.underline_color = None;
+            }
             29 => style.strikethrough = false,
             30..=37 => {
                 let (r, g, b) = ansi256_to_rgb((param - 30) as u8, palette);
@@ -1192,12 +1347,35 @@ fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RG
                     index += 4;
                 }
             }
-            7 => style.reverse = true,           // SGR 7: reverse video (swap fg/bg)
-            8 => style.hidden = true,            // SGR 8: conceal/hidden
-            27 => style.reverse = false,         // SGR 27: disable reverse video
-            28 => style.hidden = false,          // SGR 28: disable hidden
-            53 => style.overline = true,         // SGR 53: overline
-            55 => style.overline = false,        // SGR 55: disable overline
+            58 => {
+                if index + 2 < params.len() && params[index + 1] == "5" {
+                    if let Ok(color_index) = params[index + 2].parse::<u8>() {
+                        let (r, g, b) = ansi256_to_rgb(color_index, palette);
+                        style.underline_color = Some(RGBA::new(
+                            r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
+                        ));
+                    }
+                    index += 2;
+                } else if index + 4 < params.len() && params[index + 1] == "2" {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        params[index + 2].parse::<u8>(),
+                        params[index + 3].parse::<u8>(),
+                        params[index + 4].parse::<u8>(),
+                    ) {
+                        style.underline_color = Some(RGBA::new(
+                            r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
+                        ));
+                    }
+                    index += 4;
+                }
+            }
+            59 => style.underline_color = None,
+            7 => style.reverse = true,
+            8 => style.hidden = true,
+            27 => style.reverse = false,
+            28 => style.hidden = false,
+            53 => style.overline = true,
+            55 => style.overline = false,
             _ => {}
         }
 
@@ -1279,11 +1457,33 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                 }
             }
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
-            i = skip_osc_sequence(bytes, i);
+            let osc_start = i + 2;
+            let osc_end = skip_osc_sequence(bytes, i);
+            let osc_payload_end = if osc_end > 0 && osc_end <= bytes.len() && bytes.get(osc_end - 1) == Some(&0x07) {
+                osc_end - 1
+            } else if osc_end >= 2 && bytes.get(osc_end - 2) == Some(&0x1b) && bytes.get(osc_end - 1) == Some(&b'\\') {
+                osc_end - 2
+            } else {
+                osc_end
+            };
+            if osc_start < osc_payload_end && osc_payload_end <= bytes.len() {
+                if let Ok(osc_str) = std::str::from_utf8(&bytes[osc_start..osc_payload_end]) {
+                    if let Some(rest) = osc_str.strip_prefix("8;") {
+                        if let Some(sep) = rest.find(';') {
+                            let uri = &rest[sep + 1..];
+                            if uri.is_empty() {
+                                current_style.hyperlink = None;
+                            } else {
+                                current_style.hyperlink = Some(uri.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            i = osc_end;
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
         } else if bytes[i] == b'\r' {
-            // Carriage return - move cursor to start of current line
             cursor = 0;
             i += 1;
         } else if bytes[i] == b'\n' {
@@ -1383,6 +1583,22 @@ fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize, runs: &[A
             let end_iter = buffer.iter_at_offset((offset + len) as i32);
             buffer.apply_tag(&tag, &start_iter, &end_iter);
         }
+
+        if let Some(ref uri) = run.style.hyperlink {
+            let link_tag_name = format!("osc8-link:{}", uri);
+            let tag_table = buffer.tag_table();
+            let link_tag = if let Some(existing) = tag_table.lookup(&link_tag_name) {
+                existing
+            } else {
+                let new_tag = gtk4::TextTag::new(Some(&link_tag_name));
+                tag_table.add(&new_tag);
+                new_tag
+            };
+            let start_iter = buffer.iter_at_offset(offset as i32);
+            let end_iter = buffer.iter_at_offset((offset + len) as i32);
+            buffer.apply_tag(&link_tag, &start_iter, &end_iter);
+        }
+
         offset += len;
     }
 }
@@ -1649,6 +1865,24 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                         if param_str.is_empty() {
                             continue;
                         }
+                        // Handle colon-separated subparams (e.g., "4:3")
+                        if param_str.contains(':') {
+                            let sub_parts: Vec<&str> = param_str.split(':').collect();
+                            if let Ok(base) = sub_parts[0].parse::<u32>() {
+                                if base == 4 {
+                                    let sub = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+                                    let ul = match sub {
+                                        0 => { continue; }
+                                        2 => "double",
+                                        3 => "error",
+                                        _ => "single",
+                                    };
+                                    out.push_str(&format!("<span underline=\"{}\">", ul));
+                                    open_spans += 1;
+                                }
+                            }
+                            continue;
+                        }
                         match param_str.parse::<u32>() {
                             Ok(0) => {
                                 while open_spans > 0 {
@@ -1661,7 +1895,6 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 open_spans += 1;
                             }
                             Ok(2) => {
-                                // Dim - used for shell suggestions/hints, show in italic with reduced opacity
                                 out.push_str("<span style=\"italic\" alpha=\"65%\">");
                                 open_spans += 1;
                             }
@@ -1674,7 +1907,6 @@ fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 open_spans += 1;
                             }
                             Ok(5) => {
-                                // Blink - map to different opacity/style
                                 out.push_str("<span alpha=\"60%\">");
                                 open_spans += 1;
                             }
@@ -1919,18 +2151,13 @@ impl BlockData {
 /// Filters for searching/filtering blocks
 #[derive(Clone, Default)]
 pub struct BlockFilters {
-    /// Filter by exit code (e.g., Some(0) = only successful, Some(1) = only failed)
     pub exit_code: Option<i32>,
-    /// Filter by minimum duration in milliseconds
     pub min_duration_ms: Option<u64>,
-    /// Filter by maximum duration in milliseconds
     pub max_duration_ms: Option<u64>,
-    /// Show only failed commands (exit_code != 0)
     pub failed_only: bool,
-    /// Show only slow commands (duration > threshold)
     pub slow_only: bool,
-    /// Slow threshold in milliseconds (default 1000ms)
     pub slow_threshold_ms: u64,
+    pub use_regex: bool,
 }
 
 struct FinishedBlock {
@@ -2579,6 +2806,24 @@ impl ActiveBlock {
         String::from_utf8_lossy(&raw).into_owned()
     }
 
+    fn visible_output_text(&self) -> String {
+        let rows = self.output_vte.row_count();
+        let cols = self.output_vte.column_count();
+        if rows <= 0 || cols <= 0 {
+            return String::new();
+        }
+        let (text, _) = self.output_vte.text_range_format(
+            vte4::Format::Text,
+            0,
+            0,
+            rows.saturating_sub(1),
+            cols,
+        );
+        let raw = text.map(|s| s.to_string()).unwrap_or_default();
+        // Trim trailing empty lines left by pre-grown VTE rows
+        raw.trim_end().to_string()
+    }
+
     fn append_output(&self, text: &str) {
         self.feed_output(text.as_bytes());
     }
@@ -2739,6 +2984,7 @@ pub struct TermView {
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>, // Cache search results
     selected_block_id: Rc<Cell<Option<u64>>>,
+    current_cwd: Rc<RefCell<String>>,
 }
 
 #[allow(dead_code)]
@@ -2865,6 +3111,9 @@ impl TermView {
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
+            cwd.unwrap_or("").to_string()
+        ));
 
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
@@ -2923,9 +3172,6 @@ impl TermView {
             let pty_for_init = Rc::clone(&pty);
             let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
             let block_start_time_for_cb = block_start_time.clone();
-            let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
-                cwd.unwrap_or("").to_string()
-            ));
             let current_cwd_for_cb = current_cwd.clone();
 
             let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
@@ -3425,8 +3671,8 @@ impl TermView {
                                 }
                                 let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
 
-                                let output = active_rc.borrow().output_text();
-                                let output_plain = strip_ansi(&output);
+                                // Use VTE's rendered text (properly handles \r, cursor moves, etc.)
+                                let output_plain = active_rc.borrow().visible_output_text();
                                 let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
                                 let output_trimmed = {
                                     let trimmed = output_plain.trim();
@@ -3438,20 +3684,9 @@ impl TermView {
                                         trimmed.to_string()
                                     }
                                 };
-                                let output_display = {
-                                    let trimmed = output.trim();
-                                    let lines: Vec<&str> = trimmed.lines().collect();
-                                    if lines.len() > truncation_limit {
-                                        let kept: String = lines[..truncation_limit].join("\n");
-                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
-                                    } else {
-                                        trimmed.to_string()
-                                    }
-                                };
-                                let preview = output_plain.chars().take(20).collect::<String>();
-                                let bytes_preview: Vec<u8> = output_plain.bytes().take(10).collect();
-                                log::debug!("CommandEnd: cmd={:?}, output_len_before={}, output_len_after={}, starts_with_newline={}, first_20_chars={:?}, first_10_bytes={:?}",
-                                    cmd, output.len(), output_trimmed.len(), output.starts_with('\n'), preview, bytes_preview);
+                                let output_display = output_trimmed.clone();
+                                log::debug!("CommandEnd: cmd={:?}, output_len={}, first_20_chars={:?}",
+                                    cmd, output_trimmed.len(), output_plain.chars().take(20).collect::<String>());
 
                                 // Create BlockData (logical representation)
                                 let line_count = output_trimmed.lines().count();
@@ -3712,8 +3947,31 @@ impl TermView {
                                 record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::CollectingOutput);
-                                // Give focus to active block's TextView
                                 active_rc.borrow().command_view.grab_focus();
+                            }
+
+                            ParserEvent::ClipboardSet(text) => {
+                                if let Some(display) = gtk4::gdk::Display::default() {
+                                    let clipboard = display.clipboard();
+                                    clipboard.set_text(&text);
+                                    log::info!("OSC 52: clipboard set ({} chars)", text.len());
+                                }
+                            }
+
+                            ParserEvent::ApcSequence(payload) => {
+                                let is_kitty = payload.first() == Some(&b'G');
+                                if is_kitty {
+                                    log::info!("Kitty graphics protocol detected ({} bytes)", payload.len());
+                                    if bstate_rc.get() == BlockState::AltScreen {
+                                        let mut seq = Vec::with_capacity(payload.len() + 4);
+                                        seq.push(0x1b);
+                                        seq.push(b'_');
+                                        seq.extend_from_slice(&payload);
+                                        seq.push(0x1b);
+                                        seq.push(b'\\');
+                                        vte_for_alt.feed(&seq);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4653,6 +4911,7 @@ impl TermView {
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
             search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             selected_block_id,
+            current_cwd: current_cwd.clone(),
         };
 
         // Load history if configured
@@ -4754,6 +5013,76 @@ impl TermView {
             });
         }
 
+        // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
+        {
+            let pty_for_resize = term_view.pty.clone();
+            let active_for_resize = term_view.active.clone();
+            let vte_for_resize = term_view.vte.clone();
+            let vte_box_for_resize = term_view.vte_box.clone();
+            let last_cols: Rc<Cell<u16>> = Rc::new(Cell::new(0));
+            let last_rows: Rc<Cell<u16>> = Rc::new(Cell::new(0));
+            let last_alloc_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+            let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+
+            term_view.root.add_tick_callback(move |widget, _clock| {
+                let width = widget.allocated_width();
+                let height = widget.allocated_height();
+                if width <= 0 || height <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                if width == last_alloc_w.get() && height == last_alloc_h.get() {
+                    return glib::ControlFlow::Continue;
+                }
+                last_alloc_w.set(width);
+                last_alloc_h.set(height);
+                let (cols, rows) = if vte_box_for_resize.is_visible() {
+                    let char_w = vte_for_resize.char_width();
+                    let char_h = vte_for_resize.char_height();
+                    if char_w <= 0 || char_h <= 0 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let vte_w = vte_for_resize.allocated_width() as i64;
+                    let vte_h = vte_for_resize.allocated_height() as i64;
+                    if vte_w <= 0 || vte_h <= 0 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    ((vte_w / char_w) as u16, (vte_h / char_h) as u16)
+                } else {
+                    let Ok(active) = active_for_resize.try_borrow() else {
+                        return glib::ControlFlow::Continue;
+                    };
+                    let char_w = active.output_vte.char_width();
+                    if char_w <= 0 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let widget_w = active.output_vte.allocated_width() as i64;
+                    if widget_w <= 0 {
+                        return glib::ControlFlow::Continue;
+                    }
+                    let c = (widget_w / char_w).max(40) as u16;
+                    let char_h = active.output_vte.char_height();
+                    let r = if char_h > 0 {
+                        (height as i64 / char_h).max(1) as u16
+                    } else {
+                        24
+                    };
+                    (c, r)
+                };
+                if cols != last_cols.get() || rows != last_rows.get() {
+                    last_cols.set(cols);
+                    last_rows.set(rows);
+                    pty_for_resize.resize(cols, rows);
+                    if vte_box_for_resize.is_visible() {
+                        vte_for_resize.set_size(cols as i64, rows as i64);
+                    } else if let Ok(active) = active_for_resize.try_borrow() {
+                        let current_rows = active.output_vte.row_count();
+                        active.output_vte.set_size(cols as i64, current_rows.max(rows as i64));
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
         // Give initial focus to ActiveBlock's TextView for cursor blinking
         term_view.active.borrow().command_view.grab_focus();
 
@@ -4790,6 +5119,10 @@ impl TermView {
 
     pub fn vte(&self) -> &Terminal {
         &self.vte
+    }
+
+    pub fn cwd(&self) -> String {
+        self.current_cwd.borrow().clone()
     }
 
     pub fn grab_focus(&self) {
@@ -5011,16 +5344,27 @@ impl TermView {
     pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<usize> {
         let q = query.to_lowercase();
 
-        // Perform search with filters
+        let re = if filters.use_regex && !query.is_empty() {
+            regex::RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
         let results: Vec<usize> = self
             .block_data
             .borrow()
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                // Text search
                 let text_match = if q.is_empty() {
                     true
+                } else if let Some(ref re) = re {
+                    re.is_match(&b.prompt)
+                        || re.is_match(&b.cmd)
+                        || re.is_match(&b.output)
                 } else {
                     b.prompt.to_lowercase().contains(&q)
                         || b.cmd.to_lowercase().contains(&q)
@@ -5650,6 +5994,160 @@ mod tests {
         assert_eq!(
             strip_ansi_with_clear_detect("\u{1b}[2Jfresh"),
             ("fresh".to_string(), true)
+        );
+    }
+
+    // ── strip_ansi_with_clear_detect: cursor model tests ────────────────
+
+    #[test]
+    fn carriage_return_overwrites_line() {
+        // \r moves cursor to col 0, shorter text overwrites prefix but leaves tail
+        assert_eq!(
+            strip_ansi_with_clear_detect("Loading...\rDone!"),
+            ("Done!ng...".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn carriage_return_full_overwrite() {
+        // Full overwrite of same-length text
+        assert_eq!(
+            strip_ansi_with_clear_detect("AAAA\rBBBB"),
+            ("BBBB".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn spinner_animation_shows_final_frame() {
+        // Simulates spinner: multiple frames separated by \r
+        assert_eq!(
+            strip_ansi_with_clear_detect("| working\r/ working\r- working\r\\ working"),
+            ("\\ working".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_erase_line_to_end() {
+        // CSI 0K: erase from cursor to end of line
+        assert_eq!(
+            strip_ansi_with_clear_detect("hello world\r\u{1b}[0Kdone"),
+            ("done".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_erase_line_implicit_zero() {
+        // CSI K (no param) is same as CSI 0K
+        assert_eq!(
+            strip_ansi_with_clear_detect("old text\r\u{1b}[Knew"),
+            ("new".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_erase_line_from_start() {
+        // CSI 1K: erase from start to cursor (fills with spaces)
+        assert_eq!(
+            strip_ansi_with_clear_detect("abcdef\r\u{1b}[3C\u{1b}[1K"),
+            ("   def".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_erase_entire_line() {
+        // CSI 2K: erase entire line
+        assert_eq!(
+            strip_ansi_with_clear_detect("something\r\u{1b}[2Kresult"),
+            ("result".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_cursor_forward() {
+        // CSI C: move cursor forward
+        assert_eq!(
+            strip_ansi_with_clear_detect("abcdef\r\u{1b}[3CX"),
+            ("abcXef".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_cursor_backward() {
+        // CSI D: move cursor backward
+        assert_eq!(
+            strip_ansi_with_clear_detect("abcdef\u{1b}[2DXY"),
+            ("abcdXY".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn csi_cursor_absolute_column() {
+        // CSI G: absolute column positioning (1-based)
+        assert_eq!(
+            strip_ansi_with_clear_detect("abcdef\u{1b}[2GX"),
+            ("aXcdef".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn backspace_moves_cursor_back() {
+        assert_eq!(
+            strip_ansi_with_clear_detect("abc\x08X"),
+            ("abX".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn backspace_at_start_does_not_underflow() {
+        assert_eq!(
+            strip_ansi_with_clear_detect("\x08\x08hello"),
+            ("hello".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn claude_code_progress_pattern() {
+        // Claude Code CLI pattern: write progress, \r, erase line, write new status
+        let input = "⠋ Thinking...\r\u{1b}[K⠙ Analyzing...\r\u{1b}[K✓ Done";
+        assert_eq!(
+            strip_ansi_with_clear_detect(input),
+            ("✓ Done".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn unicode_overwrite_preserves_chars() {
+        // CJK characters with cursor moves
+        assert_eq!(
+            strip_ansi_with_clear_detect("你好世界\r\u{1b}[2C再"),
+            ("你好再界".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn mixed_ansi_colors_stripped_correctly() {
+        // Colored text with cursor movement should strip colors and handle cursor
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[32mhello\u{1b}[0m\rbye"),
+            ("byelo".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn clear_screen_still_detected() {
+        // CSI 2J and 3J still trigger clear
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[2J"),
+            ("".to_string(), true)
+        );
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[3J"),
+            ("".to_string(), true)
+        );
+        // CSI 0J / CSI 1J do not trigger clear
+        assert_eq!(
+            strip_ansi_with_clear_detect("\u{1b}[0J"),
+            ("".to_string(), false)
         );
     }
 
