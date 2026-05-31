@@ -97,7 +97,7 @@ use crate::terminal::open_uri;
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn next_block_id() -> u64 {
-    BLOCK_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+    BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 // ─── Cursor Shape ─────────────────────────────────────────────────────────────
@@ -678,25 +678,20 @@ fn drain_pager_snapshots(snapshots: &Rc<RefCell<Vec<String>>>) -> String {
 
 fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
-    let mut lines: Vec<Vec<String>> = vec![Vec::new()];
+    let mut lines: Vec<Vec<char>> = vec![Vec::new()];
     let mut cursor = 0usize;
     let mut i = 0;
     let mut should_clear = false;
+    let mut param_buf: Vec<u8> = Vec::with_capacity(16);
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'[' => {
                     i += 2;
-                    let mut params = Vec::new();
+                    param_buf.clear();
                     while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                        if bytes[i] == b';' {
-                            params.push(String::new());
-                        } else if let Some(last) = params.last_mut() {
-                            last.push(bytes[i] as char);
-                        } else {
-                            params.push(String::from(bytes[i] as char));
-                        }
+                        param_buf.push(bytes[i]);
                         i += 1;
                     }
                     if i < bytes.len() {
@@ -706,21 +701,19 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                         let cells = lines.last_mut().unwrap();
                         match final_byte {
                             b'J' => {
-                                let param_str: String = params.concat();
-                                if param_str == "2" || param_str == "3" {
+                                if param_buf == b"2" || param_buf == b"3" {
                                     should_clear = true;
                                 }
                             }
                             b'K' => {
-                                let mode = params.first().map(String::as_str).unwrap_or("0");
-                                match mode {
-                                    "" | "0" => cells.truncate(cursor),
-                                    "1" => {
+                                match param_buf.as_slice() {
+                                    b"" | b"0" => cells.truncate(cursor),
+                                    b"1" => {
                                         for c in cells.iter_mut().take(cursor) {
-                                            *c = " ".to_string();
+                                            *c = ' ';
                                         }
                                     }
-                                    "2" => {
+                                    b"2" => {
                                         cells.clear();
                                         cursor = 0;
                                     }
@@ -728,15 +721,15 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                                 }
                             }
                             b'C' => {
-                                let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                let count = parse_param_first(&param_buf, 1);
                                 cursor = (cursor + count).min(cells.len());
                             }
                             b'D' => {
-                                let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                let count = parse_param_first(&param_buf, 1);
                                 cursor = cursor.saturating_sub(count);
                             }
                             b'G' => {
-                                let col = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                                let col = parse_param_first(&param_buf, 1);
                                 cursor = col.saturating_sub(1).min(cells.len());
                             }
                             _ => {}
@@ -761,13 +754,8 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
             cursor = cursor.saturating_sub(1);
             i += 1;
         } else {
-            let ch_start = i;
-            i += input[i..]
-                .chars()
-                .next()
-                .map(|ch| ch.len_utf8())
-                .unwrap_or(1);
-            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
             let cells = lines.last_mut().unwrap();
             if cursor < cells.len() {
                 cells[cursor] = ch;
@@ -777,11 +765,67 @@ fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
             cursor += 1;
         }
     }
-    let result = lines.iter()
-        .map(|cells| cells.concat())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut result = String::with_capacity(input.len());
+    for (line_idx, cells) in lines.iter().enumerate() {
+        if line_idx > 0 {
+            result.push('\n');
+        }
+        for &ch in cells {
+            result.push(ch);
+        }
+    }
     (result, should_clear)
+}
+
+fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let first = needle[0];
+    let finder = memchr::memchr_iter(first, haystack);
+    for pos in finder {
+        if pos + needle.len() > haystack.len() {
+            return false;
+        }
+        let candidate = &haystack[pos..pos + needle.len()];
+        if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
+            return true;
+        }
+    }
+    // Also check uppercase variant of first byte
+    let first_upper = first.to_ascii_uppercase();
+    if first_upper != first {
+        let finder = memchr::memchr_iter(first_upper, haystack);
+        for pos in finder {
+            if pos + needle.len() > haystack.len() {
+                return false;
+            }
+            let candidate = &haystack[pos..pos + needle.len()];
+            if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_param_first(buf: &[u8], default: usize) -> usize {
+    let end = buf.iter().position(|&b| b == b';').unwrap_or(buf.len());
+    if end == 0 {
+        return default;
+    }
+    let mut val = 0usize;
+    for &b in &buf[..end] {
+        if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as usize;
+        } else {
+            return default;
+        }
+    }
+    if val == 0 { default } else { val }
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -852,7 +896,7 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
 
 fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, String) {
     struct Cell {
-        text: String,
+        ch: char,
         in_dim: bool,
     }
 
@@ -861,20 +905,15 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
     let mut i = 0;
     let mut in_dim = false;
     let mut cursor = 0usize;
+    let mut param_buf: Vec<u8> = Vec::with_capacity(16);
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
             i += 2;
-            let mut params = Vec::new();
+            param_buf.clear();
 
             while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                if bytes[i] == b';' {
-                    params.push(String::new());
-                } else if let Some(last) = params.last_mut() {
-                    last.push(bytes[i] as char);
-                } else {
-                    params.push(String::from(bytes[i] as char));
-                }
+                param_buf.push(bytes[i]);
                 i += 1;
             }
 
@@ -884,37 +923,29 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
 
                 match final_byte {
                     b'm' => {
-                        if params.is_empty() || params.iter().any(|p| p.is_empty()) {
+                        if param_buf.is_empty() {
                             in_dim = false;
-                        }
-
-                        for param in &params {
-                            match param.as_str() {
-                                "0" | "22" => in_dim = false,
-                                "2" => in_dim = true,
-                                _ => {}
+                        } else {
+                            for param in param_buf.split(|&b| b == b';') {
+                                match param {
+                                    b"0" | b"22" => in_dim = false,
+                                    b"2" => in_dim = true,
+                                    b"" => in_dim = false,
+                                    _ => {}
+                                }
                             }
                         }
                     }
                     b'D' => {
-                        let count = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = cursor.saturating_sub(count);
                     }
                     b'C' => {
-                        let count = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = (cursor + count).min(cells.len());
                     }
                     b'G' => {
-                        let col = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let col = parse_param_first(&param_buf, 1);
                         cursor = if column_offset == 0 {
                             col.saturating_sub(1)
                         } else {
@@ -923,14 +954,13 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
                         .min(cells.len());
                     }
                     b'K' => {
-                        let mode = params.first().map(String::as_str).unwrap_or("0");
-                        match mode {
-                            "" | "0" => cells.truncate(cursor),
-                            "1" => {
+                        match param_buf.as_slice() {
+                            b"" | b"0" => cells.truncate(cursor),
+                            b"1" => {
                                 cells.drain(..cursor);
                                 cursor = 0;
                             }
-                            "2" => {
+                            b"2" => {
                                 cells.clear();
                                 cursor = 0;
                             }
@@ -949,18 +979,12 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
             cursor = cursor.saturating_sub(1);
             i += 1;
         } else {
-            let ch_start = i;
-            i += input[i..]
-                .chars()
-                .next()
-                .map(|ch| ch.len_utf8())
-                .unwrap_or(1);
-
-            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
             if cursor < cells.len() {
-                cells[cursor] = Cell { text: ch, in_dim };
+                cells[cursor] = Cell { ch, in_dim };
             } else {
-                cells.push(Cell { text: ch, in_dim });
+                cells.push(Cell { ch, in_dim });
             }
             cursor += 1;
         }
@@ -978,9 +1002,9 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
 
     for (idx, cell) in cells.into_iter().enumerate() {
         if idx < split {
-            user_input.push_str(&cell.text);
+            user_input.push(cell.ch);
         } else {
-            suggestion.push_str(&cell.text);
+            suggestion.push(cell.ch);
         }
     }
 
@@ -988,24 +1012,19 @@ fn separate_input_and_suggestion(input: &str, column_offset: usize) -> (String, 
 }
 
 fn command_line_plain_text(input: &str) -> String {
-    let mut cells: Vec<String> = Vec::new();
+    let mut cells: Vec<char> = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
     let mut cursor = 0usize;
+    let mut param_buf: Vec<u8> = Vec::with_capacity(16);
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
             i += 2;
-            let mut params = Vec::new();
+            param_buf.clear();
 
             while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                if bytes[i] == b';' {
-                    params.push(String::new());
-                } else if let Some(last) = params.last_mut() {
-                    last.push(bytes[i] as char);
-                } else {
-                    params.push(String::from(bytes[i] as char));
-                }
+                param_buf.push(bytes[i]);
                 i += 1;
             }
 
@@ -1015,35 +1034,25 @@ fn command_line_plain_text(input: &str) -> String {
 
                 match final_byte {
                     b'D' => {
-                        let count = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = cursor.saturating_sub(count);
                     }
                     b'C' => {
-                        let count = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = (cursor + count).min(cells.len());
                     }
                     b'G' => {
-                        let col = params
-                            .first()
-                            .and_then(|param| param.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let col = parse_param_first(&param_buf, 1);
                         cursor = col.saturating_sub(1).min(cells.len());
                     }
                     b'K' => {
-                        let mode = params.first().map(String::as_str).unwrap_or("0");
-                        match mode {
-                            "" | "0" => cells.truncate(cursor),
-                            "1" => {
+                        match param_buf.as_slice() {
+                            b"" | b"0" => cells.truncate(cursor),
+                            b"1" => {
                                 cells.drain(..cursor);
                                 cursor = 0;
                             }
-                            "2" => {
+                            b"2" => {
                                 cells.clear();
                                 cursor = 0;
                             }
@@ -1062,14 +1071,8 @@ fn command_line_plain_text(input: &str) -> String {
             cursor = cursor.saturating_sub(1);
             i += 1;
         } else {
-            let ch_start = i;
-            i += input[i..]
-                .chars()
-                .next()
-                .map(|ch| ch.len_utf8())
-                .unwrap_or(1);
-
-            let ch = String::from_utf8_lossy(&bytes[ch_start..i]).to_string();
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
             if cursor < cells.len() {
                 cells[cursor] = ch;
             } else {
@@ -1079,7 +1082,7 @@ fn command_line_plain_text(input: &str) -> String {
         }
     }
 
-    cells.concat()
+    cells.into_iter().collect()
 }
 
 fn plain_text_from_ansi(input: &str) -> String {
@@ -1418,23 +1421,17 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
     let mut runs: Vec<AnsiTextRun> = Vec::new();
     let mut current_style = AnsiStyleState::default();
 
-    // Track cells with their styles (like command_line_plain_text but with colors)
-    let mut cells: Vec<(String, AnsiStyleState)> = Vec::new();
+    let mut cells: Vec<(char, AnsiStyleState)> = Vec::new();
     let mut cursor = 0usize;
     let mut i = 0;
+    let mut param_buf: Vec<u8> = Vec::with_capacity(32);
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
             i += 2;
-            let mut params = Vec::new();
+            param_buf.clear();
             while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                if bytes[i] == b';' {
-                    params.push(String::new());
-                } else if let Some(last) = params.last_mut() {
-                    last.push(bytes[i] as char);
-                } else {
-                    params.push(String::from(bytes[i] as char));
-                }
+                param_buf.push(bytes[i]);
                 i += 1;
             }
 
@@ -1444,37 +1441,38 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
 
                 match final_byte {
                     b'm' => {
-                        // Color change
-                        if params.is_empty() || params[0].is_empty() {
-                            params = vec!["0".to_string()];
-                        }
-                        parse_sgr_params(&mut current_style, &params, palette);
+                        let params_str: Vec<String> = if param_buf.is_empty() {
+                            vec!["0".to_string()]
+                        } else {
+                            param_buf.split(|&b| b == b';')
+                                .map(|p| {
+                                    if p.is_empty() { "0".to_string() }
+                                    else { String::from_utf8_lossy(p).into_owned() }
+                                })
+                                .collect()
+                        };
+                        parse_sgr_params(&mut current_style, &params_str, palette);
                     }
                     b'D' => {
-                        // Cursor left
-                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = cursor.saturating_sub(count);
                     }
                     b'C' => {
-                        // Cursor right
-                        let count = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        let count = parse_param_first(&param_buf, 1);
                         cursor = (cursor + count).min(cells.len());
                     }
                     b'G' => {
-                        // Cursor to column
-                        let col = params.first().and_then(|p| p.parse::<usize>().ok()).unwrap_or(1);
+                        let col = parse_param_first(&param_buf, 1);
                         cursor = col.saturating_sub(1).min(cells.len());
                     }
                     b'K' => {
-                        // Erase in line
-                        let mode = params.first().map(String::as_str).unwrap_or("0");
-                        match mode {
-                            "" | "0" => cells.truncate(cursor),
-                            "1" => {
+                        match param_buf.as_slice() {
+                            b"" | b"0" => cells.truncate(cursor),
+                            b"1" => {
                                 cells.drain(..cursor);
                                 cursor = 0;
                             }
-                            "2" => {
+                            b"2" => {
                                 cells.clear();
                                 cursor = 0;
                             }
@@ -1515,19 +1513,17 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
             cursor = 0;
             i += 1;
         } else if bytes[i] == b'\n' {
-            // Newline - flush current line's cells to runs, add newline, start new line
-            // Convert current cells to runs
-            for (ch, style) in cells.drain(..) {
-                if runs.is_empty() || runs.last().unwrap().style != style {
+            for &(ch, ref style) in &cells {
+                if runs.is_empty() || runs.last().unwrap().style != *style {
                     runs.push(AnsiTextRun {
-                        text: ch,
+                        text: String::from(ch),
                         style: style.clone(),
                     });
                 } else {
-                    runs.last_mut().unwrap().text.push_str(&ch);
+                    runs.last_mut().unwrap().text.push(ch);
                 }
             }
-            // Add newline as a separate run
+            cells.clear();
             runs.push(AnsiTextRun {
                 text: "\n".to_string(),
                 style: current_style.clone(),
@@ -1535,24 +1531,11 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
             cursor = 0;
             i += 1;
         } else if bytes[i] == b'\x08' {
-            // Backspace
             cursor = cursor.saturating_sub(1);
             i += 1;
         } else {
-            // Regular character - write to cell with current style
-            let ch_len = if bytes[i] & 0x80 == 0 {
-                1
-            } else if bytes[i] & 0xe0 == 0xc0 {
-                2
-            } else if bytes[i] & 0xf0 == 0xe0 {
-                3
-            } else if bytes[i] & 0xf8 == 0xf0 {
-                4
-            } else {
-                1
-            };
-            let end = (i + ch_len).min(bytes.len());
-            let ch = String::from_utf8_lossy(&bytes[i..end]).to_string();
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
 
             if cursor < cells.len() {
                 cells[cursor] = (ch, current_style.clone());
@@ -1560,30 +1543,29 @@ fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
                 cells.push((ch, current_style.clone()));
             }
             cursor += 1;
-            i = end;
         }
     }
 
-    // Convert cells to runs by merging adjacent cells with the same style
+    // Convert remaining cells to runs by merging adjacent cells with the same style
     let mut current_run_text = String::new();
     let mut current_run_style = AnsiStyleState::default();
     let mut first = true;
 
     for (ch, style) in cells {
         if first {
-            current_run_text = ch;
+            current_run_text.push(ch);
             current_run_style = style;
             first = false;
         } else if style == current_run_style {
-            current_run_text.push_str(&ch);
+            current_run_text.push(ch);
         } else {
             if !current_run_text.is_empty() {
                 runs.push(AnsiTextRun {
-                    text: current_run_text.clone(),
+                    text: std::mem::take(&mut current_run_text),
                     style: current_run_style.clone(),
                 });
             }
-            current_run_text = ch;
+            current_run_text.push(ch);
             current_run_style = style;
         }
     }
@@ -2580,6 +2562,7 @@ struct ActiveBlock {
     cursor_foreground: RGBA,
     running_label: gtk4::Label,
     running_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
+    blink_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
 }
 
 impl ActiveBlock {
@@ -2658,6 +2641,7 @@ impl ActiveBlock {
         let pending_preedit = Rc::new(RefCell::new(String::new()));
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
 
+        let blink_timer_handle = Rc::new(RefCell::new(None::<glib::SourceId>));
         {
             // Manual cursor blink animation (both editor and non-editor modes)
             let cursor_visible_clone = cursor_visible.clone();
@@ -2669,7 +2653,7 @@ impl ActiveBlock {
             let cursor_color_for_timer = config.cursor;
             let cursor_foreground_for_timer = config.cursor_foreground;
 
-            glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
+            let handle = glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
                 cursor_visible_clone.set(!cursor_visible_clone.get());
 
                 let cmd = pending_cmd_clone.borrow();
@@ -2693,6 +2677,7 @@ impl ActiveBlock {
 
                 glib::ControlFlow::Continue
             });
+            *blink_timer_handle.borrow_mut() = Some(handle);
 
             set_active_command_buffer_at(
                 &command_buffer,
@@ -2722,6 +2707,13 @@ impl ActiveBlock {
             cursor_foreground: config.cursor_foreground,
             running_label,
             running_timer_handle: Rc::new(RefCell::new(None)),
+            blink_timer_handle,
+        }
+    }
+
+    fn cancel_blink_timer(&self) {
+        if let Some(handle) = self.blink_timer_handle.borrow_mut().take() {
+            handle.remove();
         }
     }
 
@@ -3020,7 +3012,6 @@ pub struct TermView {
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
-    search_cache: Rc<std::sync::Mutex<std::collections::HashMap<String, Vec<usize>>>>, // Cache search results
     selected_block_id: Rc<Cell<Option<u64>>>,
     current_cwd: Rc<RefCell<String>>,
 }
@@ -3216,6 +3207,7 @@ impl TermView {
             let current_cwd_for_cb = current_cwd.clone();
 
             let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
+            let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
             pty.start_reader(
                 move |data: Vec<u8>| {
                     log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
@@ -3235,9 +3227,11 @@ impl TermView {
                             }
                         }
                     }
-                    let events = parser.borrow_mut().feed(&data);
+                    let mut events = event_buf.borrow_mut();
+                    events.clear();
+                    parser.borrow_mut().feed(&data, &mut events);
 
-                    for event in &events {
+                    for event in events.iter() {
                         let state = bstate_rc.get();
                         log::debug!("ParserEvent: {:?} (state={:?})", event, state);
                         match event {
@@ -3249,81 +3243,126 @@ impl TermView {
                                     }
                                 }
 
-                                // Check for OSC title sequences (OSC 0/2 title)
-                                let bytes_str = String::from_utf8_lossy(bytes);
-                                if bytes_str.contains("\x1b]0;") || bytes_str.contains("\x1b]2;") {
-                                    // Simple extraction: look for title between \x1b]<n>; and \x07 or \x1b\\
-                                    if let Some(start_idx) = bytes_str.find(';') {
-                                        if let Some(end_idx) = bytes_str[start_idx..].find('\x07')
-                                            .or_else(|| bytes_str[start_idx..].find("\x1b\\"))
-                                        {
-                                            let title = &bytes_str[start_idx + 1..start_idx + end_idx];
-                                            if !title.is_empty() {
-                                                for cb in title_cbs.borrow().iter() {
-                                                    cb(title);
+                                // Single-pass byte scan for control sequences
+                                {
+                                    let mut i = 0;
+                                    while i < bytes.len() {
+                                        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+                                            match bytes[i + 1] {
+                                                b']' => {
+                                                    // OSC: check for title (OSC 0; or OSC 2;)
+                                                    if i + 3 < bytes.len()
+                                                        && (bytes[i + 2] == b'0' || bytes[i + 2] == b'2')
+                                                        && bytes[i + 3] == b';'
+                                                    {
+                                                        let title_start = i + 4;
+                                                        let mut title_end = title_start;
+                                                        while title_end < bytes.len() {
+                                                            if bytes[title_end] == 0x07 {
+                                                                break;
+                                                            }
+                                                            if bytes[title_end] == 0x1b
+                                                                && title_end + 1 < bytes.len()
+                                                                && bytes[title_end + 1] == b'\\'
+                                                            {
+                                                                break;
+                                                            }
+                                                            title_end += 1;
+                                                        }
+                                                        if title_end > title_start {
+                                                            if let Ok(title) = std::str::from_utf8(&bytes[title_start..title_end]) {
+                                                                for cb in title_cbs.borrow().iter() {
+                                                                    cb(title);
+                                                                }
+                                                            }
+                                                        }
+                                                        i = title_end;
+                                                    }
                                                 }
+                                                b'[' => {
+                                                    // CSI: check for mode sequences
+                                                    if i + 2 < bytes.len() && bytes[i + 2] == b'?' {
+                                                        let seq_start = i + 3;
+                                                        let mut seq_end = seq_start;
+                                                        while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b';') {
+                                                            seq_end += 1;
+                                                        }
+                                                        if seq_end < bytes.len() {
+                                                            let final_byte = bytes[seq_end];
+                                                            let param_slice = &bytes[seq_start..seq_end];
+                                                            match (param_slice, final_byte) {
+                                                                (b"2004", b'h') => {
+                                                                    bracketed_paste_rc.set(true);
+                                                                }
+                                                                (b"2004", b'l') => {
+                                                                    bracketed_paste_rc.set(false);
+                                                                }
+                                                                (b"1", b'h') => {
+                                                                    application_cursor_rc.set(true);
+                                                                }
+                                                                (b"1", b'l') => {
+                                                                    application_cursor_rc.set(false);
+                                                                }
+                                                                (b"1000", b'h') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::Click);
+                                                                }
+                                                                (b"1000", b'l') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                                (b"1002", b'h') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::Button);
+                                                                }
+                                                                (b"1002", b'l') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                                (b"1003", b'h') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::Motion);
+                                                                }
+                                                                (b"1003", b'l') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                                (b"1006", b'h') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::SGR);
+                                                                }
+                                                                (b"1006", b'l') => {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                                _ => {}
+                                                            }
+                                                            i = seq_end;
+                                                        }
+                                                    } else {
+                                                        // Non-? CSI: check for DECSCUSR (cursor shape: CSI Ps SP q)
+                                                        let seq_start = i + 2;
+                                                        let mut seq_end = seq_start;
+                                                        while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b' ') {
+                                                            seq_end += 1;
+                                                        }
+                                                        if seq_end < bytes.len() && bytes[seq_end] == b'q' {
+                                                            // DECSCUSR: extract parameter digit
+                                                            let param_slice = &bytes[seq_start..seq_end];
+                                                            let param_str = param_slice.iter()
+                                                                .filter(|b| b.is_ascii_digit())
+                                                                .copied()
+                                                                .collect::<Vec<u8>>();
+                                                            match param_str.as_slice() {
+                                                                b"0" | b"1" | b"2" => cursor_shape_rc.set(TermCursorShape::Block),
+                                                                b"3" | b"4" => cursor_shape_rc.set(TermCursorShape::Underline),
+                                                                b"5" | b"6" => cursor_shape_rc.set(TermCursorShape::Bar),
+                                                                _ => {}
+                                                            }
+                                                            i = seq_end;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
                                             }
                                         }
+                                        i += 1;
                                     }
                                 }
 
-                                // Check for bracketed paste mode (CSI ?2004h = enable, CSI ?2004l = disable)
-                                if bytes_str.contains("\x1b[?2004h") {
-                                    bracketed_paste_rc.set(true);
-                                    log::info!("Bracketed paste mode ENABLED");
-                                }
-                                if bytes_str.contains("\x1b[?2004l") {
-                                    bracketed_paste_rc.set(false);
-                                    log::info!("Bracketed paste mode DISABLED");
-                                }
-
-                                // Git's default pager options often keep less on the main screen
-                                // while still enabling application cursor keys for navigation.
-                                if bytes_str.contains("\x1b[?1h") {
-                                    application_cursor_rc.set(true);
-                                } else if bytes_str.contains("\x1b[?1l") {
-                                    application_cursor_rc.set(false);
-                                }
-
-                                // Check for mouse reporting mode changes
-                                if bytes_str.contains("\x1b[?1000h") {
-                                    mouse_reporting_rc.set(MouseReportingMode::Click);
-                                } else if bytes_str.contains("\x1b[?1000l") {
-                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                } else if bytes_str.contains("\x1b[?1002h") {
-                                    mouse_reporting_rc.set(MouseReportingMode::Button);
-                                } else if bytes_str.contains("\x1b[?1002l") {
-                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                } else if bytes_str.contains("\x1b[?1003h") {
-                                    mouse_reporting_rc.set(MouseReportingMode::Motion);
-                                } else if bytes_str.contains("\x1b[?1003l") {
-                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                } else if bytes_str.contains("\x1b[?1006h") {
-                                    mouse_reporting_rc.set(MouseReportingMode::SGR);
-                                } else if bytes_str.contains("\x1b[?1006l") {
-                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                }
-
-                                // Check for cursor shape changes (DECSCUSR: CSI Ps SP q)
-                                if let Some(pos) = bytes_str.find("\x1b[") {
-                                    if let Some(end_pos) = bytes_str[pos+2..].find('q') {
-                                        let shape_str = bytes_str[pos+2..pos+2+end_pos].trim_end_matches(' ');
-                                        match shape_str {
-                                            "0" | "1" => cursor_shape_rc.set(TermCursorShape::Block),
-                                            "3" | "4" => cursor_shape_rc.set(TermCursorShape::Underline),
-                                            "5" | "6" => cursor_shape_rc.set(TermCursorShape::Bar),
-                                            _ => {}
-                                        }
-                                    }
-                                }
-
-                                // Check for Sixel graphics (DCS: ESC P)
-                                // These will be handled by VTE in alt-screen mode
-                                if bytes_str.contains("\x1bP") {
-                                    log::debug!("Sixel graphics detected (displayed in VTE/alt-screen mode)");
-                                }
-
-                                let text = String::from_utf8_lossy(bytes).to_string();
+                                let text = String::from_utf8_lossy(bytes).into_owned();
                                 match state {
                                     BlockState::CollectingPrompt => {
                                         prompt_buf_rc.borrow_mut().push_str(&text);
@@ -4956,7 +4995,6 @@ impl TermView {
             })),
             widget_pool,
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
-            search_cache: Rc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             selected_block_id,
             current_cwd: current_cwd.clone(),
         };
@@ -5157,6 +5195,7 @@ impl TermView {
 
     /// Kill the child process.
     pub fn kill(&self) {
+        self.active.borrow().cancel_blink_timer();
         self.pty.kill();
     }
 
@@ -5390,6 +5429,7 @@ impl TermView {
     /// Search blocks with optional filters
     pub fn search_blocks_with_filters(&self, query: &str, filters: &BlockFilters) -> Vec<usize> {
         let q = query.to_lowercase();
+        let q_bytes = q.as_bytes();
 
         let re = if filters.use_regex && !query.is_empty() {
             regex::RegexBuilder::new(query)
@@ -5413,9 +5453,9 @@ impl TermView {
                         || re.is_match(&b.cmd)
                         || re.is_match(&b.output)
                 } else {
-                    b.prompt.to_lowercase().contains(&q)
-                        || b.cmd.to_lowercase().contains(&q)
-                        || b.output.to_lowercase().contains(&q)
+                    contains_case_insensitive(b.prompt.as_bytes(), q_bytes)
+                        || contains_case_insensitive(b.cmd.as_bytes(), q_bytes)
+                        || contains_case_insensitive(b.output.as_bytes(), q_bytes)
                 };
 
                 if !text_match {
@@ -5572,6 +5612,8 @@ impl TermView {
 
     /// Save block history to file (if configured).
     pub fn save_history(&self) -> std::io::Result<()> {
+        use std::io::Write;
+
         let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
         if path_opt.is_none() {
             return Ok(());
@@ -5580,29 +5622,25 @@ impl TermView {
         let path = path_opt.unwrap();
         let blocks = self.block_data.borrow();
 
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
 
+        let compress = self.config.borrow().block_history_compress;
+
         for block in blocks.iter() {
-            log::debug!("Saving block to history: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                &block.prompt, &block.cmd, block.output.len(), block.exit_code);
             let serialized = rkyv::to_bytes::<_, 256>(block)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-            if self.config.borrow().block_history_compress {
+            if compress {
                 let compressed = zstd::encode_all(serialized.as_slice(), 3)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                use std::io::Write;
-                let mut f = file.try_clone()?;
-                f.write_all(&(compressed.len() as u32).to_le_bytes())?;
-                f.write_all(&compressed)?;
+                file.write_all(&(compressed.len() as u32).to_le_bytes())?;
+                file.write_all(&compressed)?;
             } else {
-                use std::io::Write;
-                let mut f = file.try_clone()?;
-                f.write_all(&(serialized.len() as u32).to_le_bytes())?;
-                f.write_all(&serialized)?;
+                file.write_all(&(serialized.len() as u32).to_le_bytes())?;
+                file.write_all(&serialized)?;
             }
         }
 
@@ -5975,13 +6013,26 @@ fn install_block_css(config: &Config) {
         "#,
     );
 
+    thread_local! {
+        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = RefCell::new(None);
+    }
+
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(&css);
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().unwrap(),
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    let display = gtk4::gdk::Display::default().unwrap();
+
+    BLOCK_CSS_PROVIDER.with(|cell| {
+        let mut prev = cell.borrow_mut();
+        if let Some(old) = prev.take() {
+            gtk4::style_context_remove_provider_for_display(&display, &old);
+        }
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *prev = Some(provider);
+    });
 }
 
 #[cfg(test)]

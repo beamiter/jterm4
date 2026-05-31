@@ -45,6 +45,7 @@ enum State {
 
 pub struct Parser {
     state: State,
+    passthrough: Vec<u8>,
 }
 
 fn is_alt_screen_mode(params: &[u8]) -> bool {
@@ -53,17 +54,19 @@ fn is_alt_screen_mode(params: &[u8]) -> bool {
 
 impl Parser {
     pub fn new() -> Self {
-        Parser { state: State::default() }
+        Parser {
+            state: State::default(),
+            passthrough: Vec::with_capacity(4096),
+        }
     }
 
-    pub fn feed(&mut self, data: &[u8]) -> Vec<ParserEvent> {
-        let mut events: Vec<ParserEvent> = Vec::new();
-        let mut passthrough: Vec<u8> = Vec::new();
+    pub fn feed(&mut self, data: &[u8], events: &mut Vec<ParserEvent>) {
+        self.passthrough.clear();
 
         macro_rules! flush {
             () => {
-                if !passthrough.is_empty() {
-                    events.push(ParserEvent::Bytes(std::mem::take(&mut passthrough)));
+                if !self.passthrough.is_empty() {
+                    events.push(ParserEvent::Bytes(std::mem::take(&mut self.passthrough)));
                 }
             };
         }
@@ -75,14 +78,14 @@ impl Parser {
                         self.state = State::Esc;
                     }
                     _ => {
-                        passthrough.push(b);
+                        self.passthrough.push(b);
                     }
                 },
 
                 State::Esc => match b {
                     b'[' => {
-                        passthrough.push(0x1b);
-                        passthrough.push(b'[');
+                        self.passthrough.push(0x1b);
+                        self.passthrough.push(b'[');
                         self.state = State::Csi { buf: Vec::new() };
                     }
                     b']' => {
@@ -95,8 +98,8 @@ impl Parser {
                         self.state = State::Ignore;
                     }
                     _ => {
-                        passthrough.push(0x1b);
-                        passthrough.push(b);
+                        self.passthrough.push(0x1b);
+                        self.passthrough.push(b);
                         self.state = State::Ground;
                     }
                 },
@@ -106,20 +109,20 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
-                        passthrough.push(b);
+                        self.passthrough.push(b);
                         if b == b'h' && is_alt_screen_mode(&params) {
-                            let len = passthrough.len();
-                            passthrough.truncate(len.saturating_sub(params.len() + 3));
+                            let len = self.passthrough.len();
+                            self.passthrough.truncate(len.saturating_sub(params.len() + 3));
                             flush!();
                             events.push(ParserEvent::AltScreenEnter);
                         } else if b == b'l' && is_alt_screen_mode(&params) {
-                            let len = passthrough.len();
-                            passthrough.truncate(len.saturating_sub(params.len() + 3));
+                            let len = self.passthrough.len();
+                            self.passthrough.truncate(len.saturating_sub(params.len() + 3));
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
                         }
                     } else {
-                        passthrough.push(b);
+                        self.passthrough.push(b);
                         buf.push(b);
                     }
                 }
@@ -129,9 +132,8 @@ impl Parser {
                         0x07 => {
                             let payload = std::mem::take(buf);
                             self.state = State::Ground;
-                            log::debug!("OSC terminated by BEL, payload length: {}", payload.len());
                             flush!();
-                            handle_osc(&payload, &mut events);
+                            handle_osc(&payload, events);
                         }
                         0x1b => {
                             let payload = std::mem::take(buf);
@@ -146,12 +148,10 @@ impl Parser {
                 State::OscEsc { payload } => {
                     let payload = std::mem::take(payload);
                     self.state = State::Ground;
-                    log::debug!("OSC terminated by ESC\\, payload length: {}", payload.len());
                     flush!();
-                    handle_osc(&payload, &mut events);
+                    handle_osc(&payload, events);
                     if b != b'\\' {
-                        // Not ST — re-process this byte in Ground
-                        passthrough.push(b);
+                        self.passthrough.push(b);
                     }
                 }
 
@@ -182,7 +182,7 @@ impl Parser {
                     } else {
                         flush!();
                         events.push(ParserEvent::ApcSequence(payload));
-                        passthrough.push(b);
+                        self.passthrough.push(b);
                     }
                 }
 
@@ -195,58 +195,34 @@ impl Parser {
         }
 
         flush!();
-        events
     }
 }
 
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     let s = match std::str::from_utf8(payload) {
         Ok(s) => s,
-        Err(_) => {
-            log::debug!("OSC payload not UTF-8: {:?}", payload);
-            return;
-        }
+        Err(_) => return,
     };
-
-    log::debug!("OSC received: {:?}", s);
 
     // OSC 133 ; <mark> — shell integration
     if let Some(rest) = s.strip_prefix("133;") {
-        log::debug!("OSC 133 matched, rest={:?}", rest);
         match rest {
-            "A" => {
-                log::debug!("Emitting PromptStart");
-                events.push(ParserEvent::PromptStart);
-            }
-            "B" => {
-                log::debug!("Emitting PromptEnd");
-                events.push(ParserEvent::PromptEnd);
-            }
-            "C" => {
-                log::debug!("Emitting CommandStart");
-                events.push(ParserEvent::CommandStart);
-            }
+            "A" => events.push(ParserEvent::PromptStart),
+            "B" => events.push(ParserEvent::PromptEnd),
+            "C" => events.push(ParserEvent::CommandStart),
             _ if rest.starts_with("D;") => {
                 let code = rest[2..].parse::<i32>().unwrap_or(0);
-                log::debug!("Emitting CommandEnd({})", code);
                 events.push(ParserEvent::CommandEnd(code));
             }
-            "D" => {
-                log::debug!("Emitting CommandEnd(0)");
-                events.push(ParserEvent::CommandEnd(0));
-            }
-            _ => {
-                log::debug!("OSC 133 unrecognized marker: {:?}", rest);
-            }
+            "D" => events.push(ParserEvent::CommandEnd(0)),
+            _ => {}
         }
         return;
     }
 
     // OSC 7 ; file://host/path — CWD update
     if let Some(rest) = s.strip_prefix("7;") {
-        // rest is a file:// URI or just a path
         let path = if let Some(uri) = rest.strip_prefix("file://") {
-            // strip host component (up to first '/')
             if let Some(idx) = uri.find('/') { &uri[idx..] } else { uri }
         } else {
             rest
@@ -272,8 +248,7 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // All other OSC sequences (e.g. OSC 0 for window title, OSC 8 for hyperlinks):
-    // reconstruct and pass through so the VTE fallback can handle them
+    // All other OSC sequences: reconstruct and pass through
     let mut bytes = Vec::with_capacity(payload.len() + 4);
     bytes.push(0x1b);
     bytes.push(b']');

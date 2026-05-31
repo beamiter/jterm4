@@ -355,18 +355,23 @@ pub(crate) fn terminate_terminal_process(pid: i32) {
         return;
     }
 
+    // Send initial SIGHUP immediately (non-blocking)
     signal_pid_and_group(pid, nix::libc::SIGHUP);
-    if wait_for_process_exit(pid, Duration::from_millis(120)) {
-        return;
-    }
 
-    signal_pid_and_group(pid, nix::libc::SIGTERM);
-    if wait_for_process_exit(pid, Duration::from_millis(250)) {
-        return;
-    }
+    // Spawn background thread for escalation to avoid blocking the GTK main thread
+    std::thread::spawn(move || {
+        if wait_for_process_exit(pid, Duration::from_millis(120)) {
+            return;
+        }
 
-    signal_pid_and_group(pid, nix::libc::SIGKILL);
-    let _ = wait_for_process_exit(pid, Duration::from_millis(150));
+        signal_pid_and_group(pid, nix::libc::SIGTERM);
+        if wait_for_process_exit(pid, Duration::from_millis(250)) {
+            return;
+        }
+
+        signal_pid_and_group(pid, nix::libc::SIGKILL);
+        let _ = wait_for_process_exit(pid, Duration::from_millis(150));
+    });
 }
 
 pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {

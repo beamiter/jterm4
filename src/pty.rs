@@ -2,8 +2,8 @@ use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
-use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, Read as _};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc;
 use gtk4::glib;
 
@@ -17,6 +17,55 @@ enum PtyMsg {
 pub struct OwnedPty {
     master: std::sync::Arc<std::sync::Mutex<Option<OwnedFd>>>,
     pid: Pid,
+}
+
+// Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs 0.22)
+extern "C" {
+    fn g_unix_fd_add_full(
+        priority: i32,
+        fd: i32,
+        condition: u32,
+        function: extern "C" fn(fd: i32, condition: u32, user_data: *mut std::ffi::c_void) -> i32,
+        user_data: *mut std::ffi::c_void,
+        notify: extern "C" fn(data: *mut std::ffi::c_void),
+    ) -> u32;
+}
+
+const G_IO_IN: u32 = 1;
+const G_PRIORITY_DEFAULT: i32 = 0;
+
+struct FdWatchData<F: FnMut() -> bool> {
+    callback: F,
+}
+
+extern "C" fn fd_watch_callback<F: FnMut() -> bool>(
+    _fd: i32,
+    _condition: u32,
+    user_data: *mut std::ffi::c_void,
+) -> i32 {
+    let data = unsafe { &mut *(user_data as *mut FdWatchData<F>) };
+    if (data.callback)() { 1 } else { 0 }
+}
+
+extern "C" fn fd_watch_destroy<F: FnMut() -> bool>(user_data: *mut std::ffi::c_void) {
+    unsafe {
+        drop(Box::from_raw(user_data as *mut FdWatchData<F>));
+    }
+}
+
+fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
+    let data = Box::new(FdWatchData { callback: func });
+    let ptr = Box::into_raw(data) as *mut std::ffi::c_void;
+    unsafe {
+        g_unix_fd_add_full(
+            G_PRIORITY_DEFAULT,
+            fd,
+            G_IO_IN,
+            fd_watch_callback::<F>,
+            ptr,
+            fd_watch_destroy::<F>,
+        );
+    }
 }
 
 impl OwnedPty {
@@ -90,10 +139,10 @@ impl OwnedPty {
     pub fn write_bytes(&self, data: &[u8]) {
         if let Ok(guard) = self.master.lock() {
             if let Some(fd) = guard.as_ref() {
-                let fd = fd.as_raw_fd();
-                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-                let _ = file.write_all(data);
-                std::mem::forget(file);
+                let raw = fd.as_raw_fd();
+                unsafe {
+                    libc::write(raw, data.as_ptr() as *const libc::c_void, data.len());
+                }
             }
         }
     }
@@ -120,7 +169,7 @@ impl OwnedPty {
     }
 
     /// Start an async reader: spawns a background thread reading with 64KB buffer,
-    /// delivers data via mpsc channel polled at 1ms on the GLib main thread.
+    /// delivers data via eventfd-signaled mpsc channel on the GLib main thread.
     pub fn start_reader<F, E>(&self, mut callback: F, on_exit: E)
     where
         F: FnMut(Vec<u8>) + 'static,
@@ -135,8 +184,114 @@ impl OwnedPty {
 
         let child_pid = self.pid;
         let (tx, rx) = mpsc::channel::<PtyMsg>();
-        let rx = std::cell::RefCell::new(rx);
 
+        // Create an eventfd for signaling data availability to the main thread
+        let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if efd < 0 {
+            // Fallback to 1ms polling if eventfd creation fails
+            self.start_reader_polling(fd, child_pid, tx, rx, callback, on_exit);
+            return;
+        }
+
+        let efd_for_thread = efd;
+
+        std::thread::spawn(move || {
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let mut buf = [0u8; 65536];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        std::mem::forget(file);
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
+                            std::mem::forget(file);
+                            break;
+                        }
+                        signal_eventfd(efd_for_thread);
+                    }
+                }
+            }
+
+            let max_wait_secs = 5;
+            for _ in 0..(max_wait_secs * 10) {
+                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                        let _ = tx.send(PtyMsg::Exit(code));
+                        signal_eventfd(efd_for_thread);
+                        return;
+                    }
+                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                        let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
+                        signal_eventfd(efd_for_thread);
+                        return;
+                    }
+                    Err(_) | Ok(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+
+            match nix::sys::wait::waitpid(child_pid, None) {
+                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
+                    let _ = tx.send(PtyMsg::Exit(code));
+                }
+                Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
+                    let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
+                }
+                _ => {
+                    let _ = tx.send(PtyMsg::Exit(1));
+                }
+            }
+            signal_eventfd(efd_for_thread);
+        });
+
+        let on_exit = std::cell::Cell::new(Some(on_exit));
+
+        unix_fd_add_local(efd, move || {
+            // Drain the eventfd counter
+            let mut val: u64 = 0;
+            unsafe {
+                libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
+            }
+
+            loop {
+                match rx.try_recv() {
+                    Ok(PtyMsg::Data(data)) => {
+                        callback(data);
+                    }
+                    Ok(PtyMsg::Exit(code)) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        unsafe { libc::close(efd); }
+                        return false; // Remove source
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        return true; // Keep watching
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        unsafe { libc::close(efd); }
+                        return false;
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_reader_polling<F, E>(
+        &self,
+        fd: RawFd,
+        child_pid: Pid,
+        tx: mpsc::Sender<PtyMsg>,
+        rx: mpsc::Receiver<PtyMsg>,
+        mut callback: F,
+        on_exit: E,
+    ) where
+        F: FnMut(Vec<u8>) + 'static,
+        E: FnOnce(i32) + 'static,
+    {
         std::thread::spawn(move || {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
             let mut buf = [0u8; 65536];
@@ -186,6 +341,7 @@ impl OwnedPty {
         });
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
+        let rx = std::cell::RefCell::new(rx);
 
         glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
             loop {
@@ -208,6 +364,13 @@ impl OwnedPty {
                 }
             }
         });
+    }
+}
+
+fn signal_eventfd(efd: RawFd) {
+    let val: u64 = 1;
+    unsafe {
+        libc::write(efd, &val as *const u64 as *const libc::c_void, 8);
     }
 }
 
