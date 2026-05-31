@@ -218,10 +218,9 @@ impl ScrollDebouncer {
     }
 
     fn mark_dirty(&self, scroll: &ScrolledWindow) {
-        if self.dirty.get() || self.user_scrolled_up.get() {
+        if self.user_scrolled_up.get() {
             return;
         }
-        self.dirty.set(true);
 
         let scroll = scroll.clone();
         let dirty = self.dirty.clone();
@@ -229,19 +228,36 @@ impl ScrollDebouncer {
         let programmatic = self.programmatic_scroll.clone();
 
         if let Some(handle) = pending.borrow_mut().take() {
-            let _ = handle.remove();
+            handle.remove();
         }
+
+        dirty.set(true);
 
         let pending_for_clear = pending.clone();
         let handle =
-            glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-                let adj = scroll.vadjustment();
-                let target = adj.upper() - adj.page_size();
-                if adj.value() < target {
-                    programmatic.set(true);
-                    adj.set_value(target);
-                    programmatic.set(false);
-                }
+            glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+                let scroll_to_end = |sw: &ScrolledWindow| {
+                    let adj = sw.vadjustment();
+                    let target = adj.upper() - adj.page_size();
+                    if target > 0.0 && adj.value() < target - 1.0 {
+                        programmatic.set(true);
+                        adj.set_value(target);
+                        programmatic.set(false);
+                    }
+                };
+                scroll_to_end(&scroll);
+                // Second scroll after layout fully settles
+                let scroll2 = scroll.clone();
+                let programmatic2 = programmatic.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+                    let adj = scroll2.vadjustment();
+                    let target = adj.upper() - adj.page_size();
+                    if target > 0.0 && adj.value() < target - 1.0 {
+                        programmatic2.set(true);
+                        adj.set_value(target);
+                        programmatic2.set(false);
+                    }
+                });
                 dirty.set(false);
                 pending_for_clear.borrow_mut().take();
             });
