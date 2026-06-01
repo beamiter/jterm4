@@ -4797,6 +4797,23 @@ impl TermView {
                         }
                     }
 
+                    // Let bare modifier keys propagate for input method switching (e.g. Shift toggles Chinese/English in fcitx5/ibus)
+                    match keyval {
+                        v if v == gtk4::gdk::Key::Shift_L
+                            || v == gtk4::gdk::Key::Shift_R
+                            || v == gtk4::gdk::Key::Control_L
+                            || v == gtk4::gdk::Key::Control_R
+                            || v == gtk4::gdk::Key::Alt_L
+                            || v == gtk4::gdk::Key::Alt_R
+                            || v == gtk4::gdk::Key::Super_L
+                            || v == gtk4::gdk::Key::Super_R
+                            || v == gtk4::gdk::Key::Meta_L
+                            || v == gtk4::gdk::Key::Meta_R => {
+                            return glib::Propagation::Proceed;
+                        }
+                        _ => {}
+                    }
+
                     // Unhandled keys: consume to prevent interference
                     return glib::Propagation::Stop;
                 }
