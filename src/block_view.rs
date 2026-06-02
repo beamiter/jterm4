@@ -492,6 +492,31 @@ mod interactive_screen_tests {
 }
 
 #[cfg(test)]
+mod alt_screen_pty_size_tests {
+    use super::alt_screen_pty_size;
+
+    // Regression guard: the PTY must be sized from VTE's OWN grid
+    // (column_count/row_count), passed through unchanged. If someone reverts to
+    // pixel math (vte_w / char_w), the grid values would no longer pass through
+    // and these assertions would fail. A mismatch between PTY size and the grid
+    // VTE renders corrupts box-drawing characters on sidebar toggle.
+    #[test]
+    fn passes_grid_dimensions_through_unchanged() {
+        assert_eq!(alt_screen_pty_size(212, 50), Some((212, 50)));
+        assert_eq!(alt_screen_pty_size(80, 24), Some((80, 24)));
+    }
+
+    #[test]
+    fn returns_none_when_grid_not_ready() {
+        assert_eq!(alt_screen_pty_size(0, 24), None);
+        assert_eq!(alt_screen_pty_size(80, 0), None);
+        assert_eq!(alt_screen_pty_size(0, 0), None);
+        assert_eq!(alt_screen_pty_size(-1, 24), None);
+        assert_eq!(alt_screen_pty_size(80, -5), None);
+    }
+}
+
+#[cfg(test)]
 mod pager_snapshot_tests {
     use super::{merge_pager_snapshots, normalize_pager_snapshot};
 
@@ -526,6 +551,23 @@ mod pager_snapshot_tests {
     }
 }
 
+/// Decide the PTY size for the alt-screen VTE from VTE's OWN grid
+/// (`column_count`/`row_count`) — never from pixel math (vte_w / char_w).
+///
+/// VTE derives its grid from its allocation minus internal padding/border with
+/// its own rounding, so a pixel-derived count can disagree by a column or two.
+/// Feeding the PTY a size that differs from the grid VTE actually renders makes
+/// the child (e.g. Claude Code) draw box-border lines at the wrong width, which
+/// wrap and corrupt the box-drawing characters when the sidebar toggles.
+///
+/// Returns `None` when the grid is not ready yet (non-positive dimensions).
+fn alt_screen_pty_size(grid_cols: i64, grid_rows: i64) -> Option<(u16, u16)> {
+    if grid_cols <= 0 || grid_rows <= 0 {
+        return None;
+    }
+    Some((grid_cols as u16, grid_rows as u16))
+}
+
 fn show_alt_screen(
     block_scroll: &ScrolledWindow,
     vte_box: &gtk4::Box,
@@ -541,16 +583,11 @@ fn show_alt_screen(
     let pty_resize = pty.clone();
     let vte_for_resize = vte.clone();
     glib::idle_add_local_once(move || {
-        // Resize the PTY to VTE's OWN grid (column_count/row_count), not a
-        // pixel-derived count. The two can differ by a column/row because VTE
-        // accounts for internal padding/border, and any mismatch makes the
-        // child draw box borders at the wrong width — corrupting box-drawing
-        // characters. The resize tick callback uses the same source of truth.
-        let cols = vte_for_resize.column_count();
-        let rows = vte_for_resize.row_count();
-        if cols > 0 && rows > 0 {
+        if let Some((cols, rows)) =
+            alt_screen_pty_size(vte_for_resize.column_count(), vte_for_resize.row_count())
+        {
             log::debug!("Resizing PTY to {}x{} (VTE grid)", cols, rows);
-            pty_resize.resize(cols as u16, rows as u16);
+            pty_resize.resize(cols, rows);
         }
     });
 
@@ -5285,18 +5322,15 @@ impl TermView {
                 last_alloc_h.set(height);
                 let (cols, rows) = if vte_box_for_resize.is_visible() {
                     // Use VTE's OWN grid as the source of truth, not pixel math.
-                    // VTE derives column_count/row_count from its allocation minus
-                    // internal padding/border with its own rounding; (vte_w/char_w)
-                    // can disagree by a column or two. Feeding the PTY a width that
-                    // differs from the grid VTE actually renders makes the child
-                    // (e.g. Claude Code) draw box-border lines sized to the wrong
-                    // width, which wrap and corrupt the box-drawing characters.
-                    let c = vte_for_resize.column_count();
-                    let r = vte_for_resize.row_count();
-                    if c <= 0 || r <= 0 {
-                        return glib::ControlFlow::Continue;
+                    // See alt_screen_pty_size for why pixel-derived counts corrupt
+                    // box-drawing characters on sidebar toggle.
+                    match alt_screen_pty_size(
+                        vte_for_resize.column_count(),
+                        vte_for_resize.row_count(),
+                    ) {
+                        Some(size) => size,
+                        None => return glib::ControlFlow::Continue,
                     }
-                    (c as u16, r as u16)
                 } else {
                     let Ok(active) = active_for_resize.try_borrow() else {
                         return glib::ControlFlow::Continue;
