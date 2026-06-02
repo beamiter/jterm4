@@ -541,25 +541,16 @@ fn show_alt_screen(
     let pty_resize = pty.clone();
     let vte_for_resize = vte.clone();
     glib::idle_add_local_once(move || {
-        let width = vte_for_resize.allocated_width() as i64;
-        let height = vte_for_resize.allocated_height() as i64;
-        if width > 0 && height > 0 {
-            let char_width = vte_for_resize.char_width();
-            let char_height = vte_for_resize.char_height();
-            if char_width > 0 && char_height > 0 {
-                let cols = (width / char_width) as u16;
-                let rows = (height / char_height) as u16;
-                log::debug!(
-                    "Resizing PTY to {}x{} (widget {}x{}, char {}x{})",
-                    cols,
-                    rows,
-                    width,
-                    height,
-                    char_width,
-                    char_height
-                );
-                pty_resize.resize(cols, rows);
-            }
+        // Resize the PTY to VTE's OWN grid (column_count/row_count), not a
+        // pixel-derived count. The two can differ by a column/row because VTE
+        // accounts for internal padding/border, and any mismatch makes the
+        // child draw box borders at the wrong width — corrupting box-drawing
+        // characters. The resize tick callback uses the same source of truth.
+        let cols = vte_for_resize.column_count();
+        let rows = vte_for_resize.row_count();
+        if cols > 0 && rows > 0 {
+            log::debug!("Resizing PTY to {}x{} (VTE grid)", cols, rows);
+            pty_resize.resize(cols as u16, rows as u16);
         }
     });
 
@@ -5293,17 +5284,19 @@ impl TermView {
                 last_alloc_w.set(width);
                 last_alloc_h.set(height);
                 let (cols, rows) = if vte_box_for_resize.is_visible() {
-                    let char_w = vte_for_resize.char_width();
-                    let char_h = vte_for_resize.char_height();
-                    if char_w <= 0 || char_h <= 0 {
+                    // Use VTE's OWN grid as the source of truth, not pixel math.
+                    // VTE derives column_count/row_count from its allocation minus
+                    // internal padding/border with its own rounding; (vte_w/char_w)
+                    // can disagree by a column or two. Feeding the PTY a width that
+                    // differs from the grid VTE actually renders makes the child
+                    // (e.g. Claude Code) draw box-border lines sized to the wrong
+                    // width, which wrap and corrupt the box-drawing characters.
+                    let c = vte_for_resize.column_count();
+                    let r = vte_for_resize.row_count();
+                    if c <= 0 || r <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    let vte_w = vte_for_resize.allocated_width() as i64;
-                    let vte_h = vte_for_resize.allocated_height() as i64;
-                    if vte_w <= 0 || vte_h <= 0 {
-                        return glib::ControlFlow::Continue;
-                    }
-                    ((vte_w / char_w) as u16, (vte_h / char_h) as u16)
+                    (c as u16, r as u16)
                 } else {
                     let Ok(active) = active_for_resize.try_borrow() else {
                         return glib::ControlFlow::Continue;
@@ -5330,7 +5323,17 @@ impl TermView {
                     last_rows.set(rows);
                     pty_for_resize.resize(cols, rows);
                     if vte_box_for_resize.is_visible() {
-                        vte_for_resize.set_size(cols as i64, rows as i64);
+                        // Do NOT call vte.set_size() here. The VTE widget already
+                        // re-derives its grid (column_count/row_count) from its own
+                        // allocation on every size_allocate. Forcing a pixel-computed
+                        // size on top of that fights VTE's auto-sizing: the values
+                        // disagree by the integer-division remainder / scrollbar /
+                        // padding, so the grid VTE draws into no longer matches the
+                        // size the child (e.g. Claude Code) redraws for after the
+                        // SIGWINCH from pty.resize — producing the overlapping
+                        // "historical frame" artifact when the sidebar toggles.
+                        // Resizing only the PTY mirrors the known-good initial path
+                        // in show_alt_screen and keeps everything consistent.
                     } else if let Ok(active) = active_for_resize.try_borrow() {
                         let current_rows = active.output_vte.row_count();
                         active.output_vte.set_size(cols as i64, current_rows.max(rows as i64));
