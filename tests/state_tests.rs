@@ -25,13 +25,14 @@ fn test_pane_layout_leaf_serialization() {
         dir: "/tmp".to_string(),
         sid: "123-456".to_string(),
         cmds: None,
+        pinned: None,
     };
 
     let json = serde_json::to_string(&layout).expect("Serialization failed");
     let deserialized: PaneLayout = serde_json::from_str(&json).expect("Deserialization failed");
 
     match deserialized {
-        PaneLayout::Leaf { dir, sid, cmds } => {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
             assert_eq!(cmds, None);
@@ -46,13 +47,14 @@ fn test_pane_layout_leaf_with_commands() {
         dir: "/home".to_string(),
         sid: "789-012".to_string(),
         cmds: Some("nix develop".to_string()),
+        pinned: None,
     };
 
     let json = serde_json::to_string(&layout).expect("Serialization failed");
     let deserialized: PaneLayout = serde_json::from_str(&json).expect("Deserialization failed");
 
     match deserialized {
-        PaneLayout::Leaf { dir, sid, cmds } => {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/home");
             assert_eq!(sid, "789-012");
             assert_eq!(cmds, Some("nix develop".to_string()));
@@ -70,11 +72,13 @@ fn test_pane_layout_split_serialization() {
             dir: "/tmp".to_string(),
             sid: "123-456".to_string(),
             cmds: None,
+            pinned: None,
         }),
         end: Box::new(PaneLayout::Leaf {
             dir: "/home".to_string(),
             sid: "789-012".to_string(),
             cmds: Some("nix develop".to_string()),
+            pinned: None,
         }),
     };
 
@@ -100,7 +104,7 @@ fn test_pane_layout_split_serialization() {
             }
 
             match *end {
-                PaneLayout::Leaf { ref dir, ref sid, ref cmds } => {
+                PaneLayout::Leaf { ref dir, ref sid, ref cmds, .. } => {
                     assert_eq!(dir, "/home");
                     assert_eq!(sid, "789-012");
                     assert_eq!(cmds, &Some("nix develop".to_string()));
@@ -121,6 +125,7 @@ fn test_pane_layout_nested_splits() {
             dir: "/tmp".to_string(),
             sid: "123-456".to_string(),
             cmds: None,
+            pinned: None,
         }),
         end: Box::new(PaneLayout::Split {
             orientation: 'v',
@@ -129,11 +134,13 @@ fn test_pane_layout_nested_splits() {
                 dir: "/home".to_string(),
                 sid: "789-012".to_string(),
                 cmds: None,
+                pinned: None,
             }),
             end: Box::new(PaneLayout::Leaf {
                 dir: "/var".to_string(),
                 sid: "345-678".to_string(),
                 cmds: None,
+                pinned: None,
             }),
         }),
     };
@@ -163,7 +170,7 @@ tab=Terminal 2	/home	789-012"#;
 
     // First tab
     match &tabs[0].1 {
-        PaneLayout::Leaf { dir, sid, cmds } => {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
             assert_eq!(cmds, &Some("nix develop".to_string()));
@@ -173,7 +180,7 @@ tab=Terminal 2	/home	789-012"#;
 
     // Second tab
     match &tabs[1].1 {
-        PaneLayout::Leaf { dir, sid, cmds } => {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/home");
             assert_eq!(sid, "789-012");
             assert_eq!(cmds, &None);
@@ -203,7 +210,7 @@ tab=Terminal 1	{}"#,
     assert_eq!(tabs.len(), 1);
 
     match &tabs[0].1 {
-        PaneLayout::Leaf { dir, sid, cmds } => {
+        PaneLayout::Leaf { dir, sid, cmds, .. } => {
             assert_eq!(dir, "/tmp");
             assert_eq!(sid, "123-456");
             assert_eq!(cmds, &Some("nix develop".to_string()));

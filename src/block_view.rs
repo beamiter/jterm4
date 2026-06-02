@@ -100,6 +100,11 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Upper bound on rows for the inline per-command output VTE. Matches the output
+/// VTE scrollback (build_output_vte) so we never size the widget taller than the
+/// content it can actually retain. Bounds resource use for runaway output.
+const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
+
 // ─── Cursor Shape ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +402,63 @@ fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
     }
 
     false
+}
+
+/// Detect a readline reverse/forward incremental-search prompt in already
+/// ANSI-stripped text. Ctrl-R/Ctrl-S put the shell into a search mode whose
+/// echoed line bears no relation to the normal prompt, so the custom
+/// command-line renderer cannot parse it. When this returns true we route the
+/// raw bytes to the output VTE instead (same fallback as the completion menu).
+///
+/// Covers bash/readline `(reverse-i-search)`/`(i-search)`/`(failed ...)` and
+/// zsh `bck-i-search:`/`fwd-i-search:` forms.
+fn detect_isearch_marker(stripped: &str) -> bool {
+    stripped.contains("reverse-i-search")
+        || stripped.contains("i-search)`")
+        || stripped.contains("bck-i-search:")
+        || stripped.contains("fwd-i-search:")
+        || stripped.contains("failed reverse-i-search")
+        || stripped.contains("failed i-search")
+}
+
+#[cfg(test)]
+mod isearch_tests {
+    use super::detect_isearch_marker;
+
+    #[test]
+    fn detects_bash_reverse_isearch() {
+        assert!(detect_isearch_marker("(reverse-i-search)`gi': git status"));
+    }
+
+    #[test]
+    fn detects_bash_forward_isearch() {
+        assert!(detect_isearch_marker("(i-search)`gi': git status"));
+    }
+
+    #[test]
+    fn detects_failed_reverse_isearch() {
+        assert!(detect_isearch_marker("(failed reverse-i-search)`zzz': "));
+    }
+
+    #[test]
+    fn detects_zsh_bck_isearch() {
+        assert!(detect_isearch_marker("bck-i-search: git status"));
+    }
+
+    #[test]
+    fn detects_zsh_fwd_isearch() {
+        assert!(detect_isearch_marker("fwd-i-search: git status"));
+    }
+
+    #[test]
+    fn ignores_normal_prompt() {
+        assert!(!detect_isearch_marker("user@host ~/projects ❯ git status"));
+    }
+
+    #[test]
+    fn ignores_command_containing_search_word() {
+        assert!(!detect_isearch_marker("❯ grep -r search ."));
+    }
 }
 
 #[cfg(test)]
@@ -2553,6 +2615,10 @@ struct ActiveBlock {
     command_buffer: gtk4::TextBuffer,
     output_vte: Terminal,
     raw_output: Rc<RefCell<Vec<u8>>>,
+    // Incremental counters mirroring raw_output, so feed_output never rescans the
+    // whole accumulated buffer (which made large outputs quadratic).
+    output_newlines: Rc<Cell<i64>>,
+    output_bytes: Rc<Cell<i64>>,
     pending_cmd: Rc<RefCell<String>>,        // User input only
     pending_preedit: Rc<RefCell<String>>,    // IME composing text
     pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
@@ -2647,6 +2713,7 @@ impl ActiveBlock {
             let cursor_visible_clone = cursor_visible.clone();
             let cursor_offset_clone = cursor_offset.clone();
             let command_buffer_clone = command_buffer.clone();
+            let command_view_for_timer = command_view.clone();
             let pending_cmd_clone = pending_cmd.clone();
             let pending_preedit_clone = pending_preedit.clone();
             let pending_suggestion_clone = pending_suggestion.clone();
@@ -2654,7 +2721,22 @@ impl ActiveBlock {
             let cursor_foreground_for_timer = config.cursor_foreground;
 
             let handle = glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
-                cursor_visible_clone.set(!cursor_visible_clone.get());
+                // Match VTE: when the toplevel window is not focused, show a steady
+                // (non-blinking) cursor and skip the buffer rebuild entirely once it's
+                // solid — no point burning redraws on a blink nobody can see.
+                let window_active = command_view_for_timer
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok())
+                    .map(|w| w.is_active())
+                    .unwrap_or(true);
+                if !window_active {
+                    if cursor_visible_clone.get() {
+                        return glib::ControlFlow::Continue;
+                    }
+                    cursor_visible_clone.set(true);
+                } else {
+                    cursor_visible_clone.set(!cursor_visible_clone.get());
+                }
 
                 let cmd = pending_cmd_clone.borrow();
                 let preedit = pending_preedit_clone.borrow();
@@ -2698,6 +2780,8 @@ impl ActiveBlock {
             command_buffer,
             output_vte,
             raw_output: Rc::new(RefCell::new(Vec::new())),
+            output_newlines: Rc::new(Cell::new(0)),
+            output_bytes: Rc::new(Cell::new(0)),
             pending_cmd,
             pending_preedit,
             pending_suggestion,
@@ -2799,19 +2883,27 @@ impl ActiveBlock {
                 cols = actual_cols;
             }
         }
-        // Accumulate raw bytes first so we can estimate from total content
+        // Accumulate raw bytes first so we can estimate from total content.
+        // Track newline/byte totals incrementally — only scan the NEW chunk — so this
+        // stays O(chunk) instead of O(total) on every feed (was quadratic for big output).
         self.raw_output.borrow_mut().extend_from_slice(raw_bytes);
-        // Estimate rows needed from ALL accumulated output (not just current chunk).
-        // This prevents underestimation when data arrives in multiple small chunks.
-        let raw = self.raw_output.borrow();
-        let total_newlines = raw.iter().filter(|&&b| b == b'\n').count() as i64;
+        let new_newlines = raw_bytes.iter().filter(|&&b| b == b'\n').count() as i64;
+        let total_newlines = self.output_newlines.get() + new_newlines;
+        self.output_newlines.set(total_newlines);
+        let total_bytes = self.output_bytes.get() + raw_bytes.len() as i64;
+        self.output_bytes.set(total_bytes);
         let wrap_extra = if cols > 0 {
-            (raw.len() as i64) / cols
+            total_bytes / cols
         } else {
             0
         };
-        drop(raw);
-        let needed_rows = total_newlines + wrap_extra + 2;
+        // Cap the inline VTE height. The output VTE only retains a bounded scrollback
+        // (see build_output_vte), so growing set_size beyond that just produces blank
+        // rows for content VTE no longer holds — and a runaway command (`yes`, a giant
+        // build log) would otherwise try to make the widget millions of rows tall,
+        // choking layout where a real terminal stays smooth. Normal-sized output is far
+        // below this cap, so this is a no-op for typical commands.
+        let needed_rows = (total_newlines + wrap_extra + 2).min(MAX_INLINE_OUTPUT_ROWS);
         let current_rows = self.output_vte.row_count();
         if needed_rows > current_rows || cols != self.output_vte.column_count() {
             self.output_vte.set_size(cols, needed_rows.max(current_rows));
@@ -2855,8 +2947,19 @@ impl ActiveBlock {
         self.feed_output(text.as_bytes());
     }
 
+    /// Clear the accumulated output buffer and its incremental counters without
+    /// touching the VTE widget. Use when discarding transient content (e.g. a
+    /// completion menu) that was fed to output_vte but isn't real command output.
+    fn reset_output_buffer(&self) {
+        self.raw_output.borrow_mut().clear();
+        self.output_newlines.set(0);
+        self.output_bytes.set(0);
+    }
+
     fn clear_output(&self) {
         self.raw_output.borrow_mut().clear();
+        self.output_newlines.set(0);
+        self.output_bytes.set(0);
         self.output_vte.feed(b"\x1b[2J\x1b[H\x1b[3J");
         self.output_vte.reset(true, true);
         let cols = self.output_vte.column_count().max(80);
@@ -3139,6 +3242,7 @@ impl TermView {
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let isearch_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
@@ -3189,6 +3293,7 @@ impl TermView {
             let tab_pending_rc = tab_pending.clone();
             let pty_synced_rc = pty_synced.clone();
             let completion_active_rc = completion_active.clone();
+            let isearch_active_rc = isearch_active.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -3412,7 +3517,7 @@ impl TermView {
                                                     }
                                                     // Hide completion output
                                                     active_rc.borrow().output_vte.set_visible(false);
-                                                    active_rc.borrow().raw_output.borrow_mut().clear();
+                                                    active_rc.borrow().reset_output_buffer();
                                                     completion_active_rc.set(false);
                                                     tab_pending_rc.set(false);
                                                     *active_rc.borrow().pending_suggestion.borrow_mut() = String::new();
@@ -3422,10 +3527,47 @@ impl TermView {
                                                 continue;
                                             }
 
+                                            if isearch_active_rc.get() {
+                                                // Reverse/forward incremental search active: render in output VTE
+                                                active_rc.borrow().feed_output(bytes);
+
+                                                // Search ended when readline redraws a normal line w/o the marker
+                                                if !detect_isearch_marker(&stripped) && !stripped.is_empty()
+                                                    && (prompt_clean.is_empty() || stripped.contains(prompt_clean))
+                                                {
+                                                    let cmd_part = if !prompt_clean.is_empty() {
+                                                        after_prompt.trim()
+                                                    } else {
+                                                        stripped.trim()
+                                                    };
+                                                    if !cmd_part.is_empty() {
+                                                        *active_rc.borrow().pending_cmd.borrow_mut() = cmd_part.to_string();
+                                                        active_rc.borrow().cursor_offset.set(cmd_part.chars().count());
+                                                        pty_synced_rc.set(true);
+                                                    }
+                                                    active_rc.borrow().output_vte.set_visible(false);
+                                                    active_rc.borrow().reset_output_buffer();
+                                                    isearch_active_rc.set(false);
+                                                    *active_rc.borrow().pending_suggestion.borrow_mut() = String::new();
+                                                    active_rc.borrow().update_content_view();
+                                                }
+                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                                continue;
+                                            }
+
+                                            // Entering incremental search (Ctrl-R / Ctrl-S)
+                                            if detect_isearch_marker(&stripped) {
+                                                isearch_active_rc.set(true);
+                                                active_rc.borrow().reset_output_buffer();
+                                                active_rc.borrow().feed_output(bytes);
+                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                                continue;
+                                            }
+
                                             if tab_pending_rc.get() && has_menu_content {
                                                 // Tab triggered a completion menu — show it in output VTE
                                                 completion_active_rc.set(true);
-                                                active_rc.borrow().raw_output.borrow_mut().clear();
+                                                active_rc.borrow().reset_output_buffer();
                                                 active_rc.borrow().feed_output(bytes);
                                                 scroll_debouncer.mark_dirty(&block_scroll_rc);
                                                 continue;
@@ -3655,11 +3797,12 @@ impl TermView {
                                     // Use raw_output for finalization — it's always correct
                                     // (properly cleared between commands). VTE text_range can
                                     // include stale scrollback content causing duplication.
-                                    let output_plain = {
-                                        let raw = active_rc.borrow().output_text();
-                                        let raw_stripped = strip_ansi(&raw);
+                                    let raw_output_text = active_rc.borrow().output_text();
+
+                                    // Preserve ANSI codes for colored display, only handle \r overwrites
+                                    let output_with_ansi = {
                                         let mut result = String::new();
-                                        for line in raw_stripped.lines() {
+                                        for line in raw_output_text.lines() {
                                             if let Some(pos) = line.rfind('\r') {
                                                 result.push_str(&line[pos + 1..]);
                                             } else {
@@ -3669,6 +3812,9 @@ impl TermView {
                                         }
                                         result.trim().to_string()
                                     };
+
+                                    let output_plain = strip_ansi(&output_with_ansi).to_string();
+
                                     let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
                                     let output_trimmed = {
                                         let trimmed = output_plain.trim();
@@ -3680,7 +3826,6 @@ impl TermView {
                                             trimmed.to_string()
                                         }
                                     };
-                                    let output_display = output_trimmed.clone();
                                     log::debug!("Finalize block: cmd={:?}, output_len={}, first_20_chars={:?}",
                                         cmd, output_trimmed.len(), output_plain.chars().take(20).collect::<String>());
 
@@ -3721,7 +3866,7 @@ impl TermView {
 
                                     let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                     let finished = FinishedBlock::new_with_pool(
-                                        &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_display, exit_code, &config_for_cb.borrow(),
+                                        &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_with_ansi, exit_code, &config_for_cb.borrow(),
                                         duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                     );
 
@@ -3895,10 +4040,11 @@ impl TermView {
                                 active_rc.borrow().set_cmd("");
                                 pty_synced_rc.set(false);
                                 tab_pending_rc.set(false);
-                                if completion_active_rc.get() {
+                                if completion_active_rc.get() || isearch_active_rc.get() {
                                     active_rc.borrow().output_vte.set_visible(false);
-                                    active_rc.borrow().raw_output.borrow_mut().clear();
+                                    active_rc.borrow().reset_output_buffer();
                                     completion_active_rc.set(false);
+                                    isearch_active_rc.set(false);
                                 }
 
                                 if editor_input_for_cb {
@@ -4173,6 +4319,7 @@ impl TermView {
             let pty_synced_for_key = pty_synced.clone();
             let tab_pending_for_key = tab_pending.clone();
             let completion_active_for_key = completion_active.clone();
+            let isearch_active_for_key = isearch_active.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let block_list_for_key = block_list.clone();
             let user_scrolled_up_for_key = user_scrolled_up.clone();
@@ -4190,7 +4337,7 @@ impl TermView {
 
                 // Editor mode: when awaiting command input, handle editing locally
                 // During completion menu, forward keys directly to PTY (pass-through)
-                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand && !completion_active_for_key.get() {
+                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand && !completion_active_for_key.get() && !isearch_active_for_key.get() {
                     // Ctrl+Shift+V/C: always handle clipboard ourselves
                     if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
                         let clipboard = root_for_key.clipboard();
@@ -4718,6 +4865,14 @@ impl TermView {
                             block_list_for_key.remove(block.widget());
                         }
                         pty_for_key.write_bytes(b"\x0c");
+                        return glib::Propagation::Stop;
+                    }
+
+                    // Ctrl+R: reverse incremental history search. Forward to the
+                    // shell; its echoed search prompt is detected by the PTY
+                    // reader, which routes the search UI to the output VTE.
+                    if ctrl && !shift && !alt && (keyval == gtk4::gdk::Key::r || keyval == gtk4::gdk::Key::R) {
+                        pty_for_key.write_bytes(b"\x12");
                         return glib::Propagation::Stop;
                     }
 
@@ -5767,7 +5922,7 @@ fn build_output_vte(config: &Config) -> Terminal {
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
-        .scrollback_lines(10000)
+        .scrollback_lines(MAX_INLINE_OUTPUT_ROWS as u32)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
@@ -5805,6 +5960,16 @@ fn install_block_css(config: &Config) {
     let cursor_hex = rgba_to_hex(&config.cursor);
     // Accent color for active chevron (use palette color 2 = green-ish)
     let accent = rgba_to_hex(&config.palette[2]);
+    // Error color for bad exit codes — use the theme's red (palette 1) so it
+    // matches what VTE would render, instead of a hard-coded swatch.
+    let err = &config.palette[1];
+    let err_hex = rgba_to_hex(err);
+    let err_bg = format!(
+        "rgba({},{},{},0.18)",
+        (err.red() * 255.0) as u8,
+        (err.green() * 255.0) as u8,
+        (err.blue() * 255.0) as u8,
+    );
 
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
@@ -5993,8 +6158,8 @@ fn install_block_css(config: &Config) {
             background-color: {bg_hex};
         }}
         .block-exit-bad {{
-            color: #ff5555;
-            background-color: rgba(255,85,85,0.18);
+            color: {err_hex};
+            background-color: {err_bg};
             border-radius: 3px;
             font-size: 0.8em;
         }}
