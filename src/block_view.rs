@@ -572,7 +572,6 @@ fn show_alt_screen(
     block_scroll: &ScrolledWindow,
     vte_box: &gtk4::Box,
     vte: &Terminal,
-    pty: Rc<OwnedPty>,
     initial_bytes: Option<&[u8]>,
 ) {
     block_scroll.set_visible(false);
@@ -580,16 +579,11 @@ fn show_alt_screen(
     vte_box.set_vexpand(true);
     vte_box.set_visible(true);
 
-    let pty_resize = pty.clone();
-    let vte_for_resize = vte.clone();
-    glib::idle_add_local_once(move || {
-        if let Some((cols, rows)) =
-            alt_screen_pty_size(vte_for_resize.column_count(), vte_for_resize.row_count())
-        {
-            log::debug!("Resizing PTY to {}x{} (VTE grid)", cols, rows);
-            pty_resize.resize(cols, rows);
-        }
-    });
+    // The PTY is resized to match the VTE grid by the root tick callback once
+    // the freshly-shown VTE has been allocated. We deliberately do NOT resize
+    // here: tick callbacks run in the frame clock's UPDATE phase, before the
+    // LAYOUT phase that allocates the just-shown VTE, so column_count/row_count
+    // are still 0 (first entry) or stale (re-entry) at this point.
 
     if let Some(bytes) = initial_bytes {
         vte.feed(bytes);
@@ -3788,7 +3782,6 @@ impl TermView {
                                                 &block_scroll_rc,
                                                 &vte_box_rc,
                                                 &vte_for_alt,
-                                                pty_for_resize.clone(),
                                                 Some(bytes),
                                             );
                                             record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
@@ -4217,7 +4210,6 @@ impl TermView {
                                     &block_scroll_rc,
                                     &vte_box_rc,
                                     &vte_for_alt,
-                                    pty_for_resize.clone(),
                                     None,
                                 );
                             }
@@ -5339,6 +5331,7 @@ impl TermView {
             let last_rows: Rc<Cell<u16>> = Rc::new(Cell::new(0));
             let last_alloc_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+            let last_vte_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
             term_view.root.add_tick_callback(move |widget, _clock| {
                 let width = widget.allocated_width();
@@ -5346,12 +5339,26 @@ impl TermView {
                 if width <= 0 || height <= 0 {
                     return glib::ControlFlow::Continue;
                 }
-                if width == last_alloc_w.get() && height == last_alloc_h.get() {
+                let vte_visible = vte_box_for_resize.is_visible();
+                let visibility_changed = vte_visible != last_vte_visible.get();
+                let alloc_changed =
+                    width != last_alloc_w.get() || height != last_alloc_h.get();
+                // While the alt screen is shown we must re-check VTE's grid every
+                // frame. Entering the alt screen does not change the root
+                // allocation, and the VTE's row/column counts only settle a frame
+                // or two after it becomes visible (tick callbacks run in the frame
+                // clock's UPDATE phase, before the LAYOUT phase that allocates the
+                // just-shown VTE). Without this poll the child keeps the stale
+                // pre-alt-screen row count and leaves blank space at the bottom of
+                // the window. In block mode we still only react to allocation
+                // changes.
+                if !vte_visible && !alloc_changed && !visibility_changed {
                     return glib::ControlFlow::Continue;
                 }
+                last_vte_visible.set(vte_visible);
                 last_alloc_w.set(width);
                 last_alloc_h.set(height);
-                let (cols, rows) = if vte_box_for_resize.is_visible() {
+                let (cols, rows) = if vte_visible {
                     // Use VTE's OWN grid as the source of truth, not pixel math.
                     // See alt_screen_pty_size for why pixel-derived counts corrupt
                     // box-drawing characters on sidebar toggle.
@@ -5968,7 +5975,13 @@ fn build_vte(config: &Config) -> Terminal {
         .can_focus(true)
         .allow_hyperlink(true)
         .bold_is_bright(true)
-        .input_enabled(true)
+        // Display-only: all keystrokes are intercepted by the root key controller
+        // and written to the PTY ourselves (see comment at the IM setup). Leaving
+        // input enabled makes the VTE activate its own IMContext when it grabs
+        // focus in show_alt_screen, stealing the fcitx/ibus input focus from our
+        // IMMulticontext — which broke the Shift Chinese/English toggle inside
+        // alt-screen apps like Claude Code.
+        .input_enabled(false)
         .scrollback_lines(config.terminal_scrollback_lines)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
