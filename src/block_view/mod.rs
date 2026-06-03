@@ -2233,18 +2233,26 @@ impl TermView {
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
-        {
-            let pty_for_resize = term_view.pty.clone();
-            let active_for_resize = term_view.active.clone();
-            let vte_for_resize = term_view.vte.clone();
-            let vte_box_for_resize = term_view.vte_box.clone();
+        term_view.install_resize_tick();
+
+        // Give initial focus to ActiveBlock's TextView for cursor blinking
+        term_view.active.borrow().command_view.grab_focus();
+
+        term_view
+    }
+
+    fn install_resize_tick(&self) {
+            let pty_for_resize = self.pty.clone();
+            let active_for_resize = self.active.clone();
+            let vte_for_resize = self.vte.clone();
+            let vte_box_for_resize = self.vte_box.clone();
             let last_cols: Rc<Cell<u16>> = Rc::new(Cell::new(0));
             let last_rows: Rc<Cell<u16>> = Rc::new(Cell::new(0));
             let last_alloc_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_vte_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-            term_view.root.add_tick_callback(move |widget, _clock| {
+            self.root.add_tick_callback(move |widget, _clock| {
                 let width = widget.allocated_width();
                 let height = widget.allocated_height();
                 if width <= 0 || height <= 0 {
@@ -2333,12 +2341,6 @@ impl TermView {
                 }
                 glib::ControlFlow::Continue
             });
-        }
-
-        // Give initial focus to ActiveBlock's TextView for cursor blinking
-        term_view.active.borrow().command_view.grab_focus();
-
-        term_view
     }
 
     /// Root GTK widget to embed in the notebook page.
