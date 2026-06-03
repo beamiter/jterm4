@@ -3372,11 +3372,17 @@ impl TermView {
                     if data.len() < 512 {
                         log::debug!("PTY hex: {:02x?}", &data);
                     }
-                    // Sync PTY columns with output VTE's actual widget width
+                    // Sync PTY columns with the visible content width. Derive it
+                    // from the always-visible command line, NOT the per-block output
+                    // VTE: that VTE is hidden/auto-sized while idle, so its width
+                    // collapses the PTY to the 40-col floor and makes `ls` print one
+                    // entry per line. The command line is a full-width sibling of the
+                    // output area; subtract its text margins (left 12 + right 8).
+                    // Mirrors the tick-callback resize so the two never disagree.
                     {
                         let active = active_rc.borrow();
                         let char_w = active.output_vte.char_width();
-                        let widget_w = active.output_vte.allocated_width() as i64;
+                        let widget_w = active.command_view.allocated_width() as i64 - 20;
                         if char_w > 0 && widget_w > 0 {
                             let new_cols = (widget_w / char_w).max(40) as u16;
                             if new_cols != last_pty_cols.get() {
