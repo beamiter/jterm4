@@ -1,0 +1,314 @@
+//! css — extracted from block_view (mechanical split, no logic changes)
+use gtk4::gdk::RGBA;
+use std::cell::RefCell;
+use crate::config::Config;
+
+
+pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (c.red() * 255.0) as u8,
+        (c.green() * 255.0) as u8,
+        (c.blue() * 255.0) as u8,
+    )
+}
+
+pub(crate) fn shorten_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let display = if !home.is_empty() && path.starts_with(&home) {
+        format!("~{}", &path[home.len()..])
+    } else {
+        path.to_string()
+    };
+    let parts: Vec<&str> = display.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 3 {
+        display
+    } else {
+        format!("…/{}", parts[parts.len()-2..].join("/"))
+    }
+}
+
+pub(crate) fn chrono_local_offset_secs() -> i64 {
+    use nix::libc;
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm.tm_gmtoff
+    }
+}
+
+// ─── CSS ──────────────────────────────────────────────────────────────────────
+
+pub(crate) fn install_block_css(config: &Config) {
+    let fg = &config.foreground;
+    let bg = &config.background;
+    let bg_hex = rgba_to_hex(bg);
+    let fg_hex = rgba_to_hex(fg);
+    let dim_fg = format!(
+        "rgba({},{},{},0.55)",
+        (fg.red() * 255.0) as u8,
+        (fg.green() * 255.0) as u8,
+        (fg.blue() * 255.0) as u8,
+    );
+    let cursor_hex = rgba_to_hex(&config.cursor);
+    // Accent color for active chevron (use palette color 2 = green-ish)
+    let accent = rgba_to_hex(&config.palette[2]);
+    // Error color for bad exit codes — use the theme's red (palette 1) so it
+    // matches what VTE would render, instead of a hard-coded swatch.
+    let err = &config.palette[1];
+    let err_hex = rgba_to_hex(err);
+    let err_bg = format!(
+        "rgba({},{},{},0.18)",
+        (err.red() * 255.0) as u8,
+        (err.green() * 255.0) as u8,
+        (err.blue() * 255.0) as u8,
+    );
+
+    let fg_r = (fg.red() * 255.0) as u8;
+    let fg_g = (fg.green() * 255.0) as u8;
+    let fg_b = (fg.blue() * 255.0) as u8;
+
+    // Slightly different background for finished blocks (3% toward fg)
+    let bg_r = (bg.red() * 255.0) as u8;
+    let bg_g = (bg.green() * 255.0) as u8;
+    let bg_b = (bg.blue() * 255.0) as u8;
+    let block_bg_hex = format!(
+        "#{:02x}{:02x}{:02x}",
+        (bg_r as f32 + (fg_r as f32 - bg_r as f32) * 0.03) as u8,
+        (bg_g as f32 + (fg_g as f32 - bg_g as f32) * 0.03) as u8,
+        (bg_b as f32 + (fg_b as f32 - bg_b as f32) * 0.03) as u8,
+    );
+
+    // Parse font description to extract font family and size
+    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Regular 14"
+    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
+    let (font_family, base_size) = if parts.len() >= 2 {
+        // Last part is usually the size
+        if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
+            let family = parts[..parts.len() - 1].join(" ");
+            (family, size)
+        } else {
+            (config.font_desc.clone(), 14)
+        }
+    } else {
+        (config.font_desc.clone(), 14)
+    };
+
+    // Apply font scale to the base size
+    let scaled_size = (base_size as f64 * config.default_font_scale).round() as i32;
+    let font_size = format!("{}pt", scaled_size);
+
+    let css = format!(
+        r#"
+        .block-scroll {{
+            background-color: {bg_hex};
+        }}
+        .block-list {{
+            background-color: {bg_hex};
+        }}
+        .block-finished {{
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 6px;
+            background-color: {block_bg_hex};
+            min-height: 40px;
+            transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+        }}
+        .block-hovered {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
+            border-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+        }}
+        .block-selected {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            box-shadow: inset 3px 0 0 0 {accent};
+        }}
+        .block-active {{
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 6px;
+            margin: 4px 8px;
+            padding-top: 4px;
+            background-color: {block_bg_hex};
+            min-height: 40px;
+        }}
+        .block-header {{
+            border-radius: 6px 6px 0 0;
+        }}
+        .block-header-label {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .block-collapse-btn {{
+            color: {dim_fg};
+            font-size: 0.75em;
+            min-width: 20px;
+            min-height: 20px;
+            padding: 0;
+        }}
+        .block-prompt {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            line-height: 1.0;
+            margin: 0;
+        }}
+        .block-prompt-view {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.2;
+            margin: 0;
+            background-color: {bg_hex};
+            min-height: 48px;
+        }}
+        .block-prompt-view text {{
+            color: {dim_fg};
+            background-color: {bg_hex};
+        }}
+        .block-command-view {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.2;
+            margin: 0;
+            background-color: {bg_hex};
+            min-height: 24px;
+            caret-color: {cursor_hex};
+        }}
+        .block-command-view text {{
+            color: {fg_hex};
+            background-color: {bg_hex};
+            caret-color: {cursor_hex};
+        }}
+        .block-output-view {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.2;
+            margin: 0;
+            background-color: {bg_hex};
+            min-height: 0;
+        }}
+        .block-output-view text {{
+            color: {fg_hex};
+            background-color: {bg_hex};
+        }}
+        .block-finished .block-command-view {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-command-view text {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-output-view {{
+            background-color: {block_bg_hex};
+        }}
+        .block-finished .block-output-view text {{
+            background-color: {block_bg_hex};
+        }}
+        .block-cmd {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+        }}
+        .block-cmd-active {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+            caret-color: {fg_hex};
+        }}
+        .block-cmd-active text {{
+            background-color: {bg_hex};
+            caret-color: {fg_hex};
+        }}
+        @keyframes blink {{
+            0%, 49% {{ opacity: 1; }}
+            50%, 100% {{ opacity: 0; }}
+        }}
+        .block-cmd-active text selection {{
+            background-color: transparent;
+        }}
+        .block-cmd-finished {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            padding: 0;
+            line-height: 1.0;
+            margin: 0;
+            min-height: 0;
+            background-color: {bg_hex};
+        }}
+        .block-cmd-finished text {{
+            background-color: {bg_hex};
+        }}
+        .block-exit-bad {{
+            color: {err_hex};
+            background-color: {err_bg};
+            border-radius: 4px;
+            font-size: 0.8em;
+            padding: 1px 6px;
+        }}
+        .block-meta-badge {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
+            border-radius: 4px;
+            font-size: 0.8em;
+            padding: 1px 6px;
+        }}
+        .block-running-label {{
+            color: {dim_fg};
+            font-size: 0.85em;
+            padding-right: 8px;
+        }}
+        .block-output {{
+            background-color: {bg_hex};
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            min-height: 0;
+            line-height: 1.0;
+            padding: 0;
+            margin: 0;
+        }}
+        .block-show-more {{
+            color: {accent};
+            margin-left: 12px;
+            margin-top: 4px;
+            margin-bottom: 4px;
+            font-size: 0.85em;
+            padding: 2px 8px;
+        }}
+        "#,
+    );
+
+    thread_local! {
+        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
+    }
+
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_data(&css);
+    let display = gtk4::gdk::Display::default().unwrap();
+
+    BLOCK_CSS_PROVIDER.with(|cell| {
+        let mut prev = cell.borrow_mut();
+        if let Some(old) = prev.take() {
+            gtk4::style_context_remove_provider_for_display(&display, &old);
+        }
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *prev = Some(provider);
+    });
+}
