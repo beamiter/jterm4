@@ -5339,7 +5339,16 @@ impl TermView {
                     if char_w <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    let widget_w = active.output_vte.allocated_width() as i64;
+                    // The live output VTE is hidden while idle, so its
+                    // allocated_width() is 0 — using it here clamped the PTY to
+                    // the 40-column floor, which made programs like `ls` collapse
+                    // their multi-column layout to one entry per line. Derive the
+                    // width from the always-visible command line instead: it is a
+                    // sibling of the output area and spans the same content width.
+                    // Subtract the TextView text margins (left 12 + right 8) so
+                    // the column count matches what actually fits without wrapping.
+                    let view_w = active.command_view.allocated_width() as i64;
+                    let widget_w = view_w - 20;
                     if widget_w <= 0 {
                         return glib::ControlFlow::Continue;
                     }
