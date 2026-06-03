@@ -73,203 +73,107 @@ pub struct TermView {
     current_cwd: Rc<RefCell<String>>,
 }
 
-#[allow(dead_code)]
-impl TermView {
-    pub fn new(
-        config: &Config,
-        shell_argv: &[String],
-        cwd: Option<&str>,
-        session_id: Option<&str>,
-        initial_commands: Option<&str>,
-    ) -> Self {
-        // ── Build widget tree ──────────────────────────────────────────────
-        let root = gtk4::Box::new(Orientation::Vertical, 0);
-        root.set_hexpand(true);
-        root.set_vexpand(true);
-        root.add_css_class("term-view-root");
+/// Captures the ~46 shared handles the PTY reader/exit callbacks need, so
+/// `TermView::new` does not carry an 800-line closure inline.
+struct ReaderCtx {
+    active_rc: Rc<RefCell<ActiveBlock>>,
+    bstate_rc: Rc<Cell<BlockState>>,
+    osc133_depth_rc: Rc<Cell<u32>>,
+    prompt_buf_rc: Rc<RefCell<String>>,
+    cmd_buf_rc: Rc<RefCell<String>>,
+    cmd_display_raw_rc: Rc<RefCell<String>>,
+    cmd_display_markup_rc: Rc<RefCell<String>>,
+    last_nonempty_cmd_raw_rc: Rc<RefCell<String>>,
+    last_nonempty_cmd_markup_rc: Rc<RefCell<String>>,
+    executing_cmd_raw_rc: Rc<RefCell<String>>,
+    executing_cmd_markup_rc: Rc<RefCell<String>>,
+    block_list_rc: gtk4::Box,
+    block_scroll_rc: ScrolledWindow,
+    vte_for_alt: Terminal,
+    vte_box_rc: gtk4::Box,
+    pty_for_resize: Rc<OwnedPty>,
+    cwd_cbs: StrCallbacks,
+    exited_cbs: IntCallbacks,
+    bell_cbs: VoidCallbacks,
+    title_cbs: StrCallbacks,
+    activity_cbs: VoidCallbacks,
+    bracketed_paste_rc: Rc<Cell<bool>>,
+    application_cursor_rc: Rc<Cell<bool>>,
+    mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
+    cursor_shape_rc: Rc<Cell<TermCursorShape>>,
+    config_for_cb: Rc<RefCell<Config>>,
+    parser: Rc<RefCell<Parser>>,
+    block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
+    finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    pager_snapshots_rc: Rc<RefCell<Vec<String>>>,
+    pager_snapshot_generation_rc: Rc<Cell<u64>>,
+    scroll_debouncer: ScrollDebouncer,
+    ansi_cache_for_cb: Rc<RefCell<LruCache<String, String>>>,
+    widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
+    editor_input_for_cb: bool,
+    tab_pending_rc: Rc<Cell<bool>>,
+    pty_synced_rc: Rc<Cell<bool>>,
+    completion_active_rc: Rc<Cell<bool>>,
+    isearch_active_rc: Rc<Cell<bool>>,
+    init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
+    pty_for_init: Rc<OwnedPty>,
+    block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
+    pending_exit_code_rc: Rc<Cell<i32>>,
+    current_cwd_for_cb: Rc<RefCell<String>>,
+    last_pty_cols: Rc<Cell<u16>>,
+    event_buf: Rc<RefCell<Vec<ParserEvent>>>,
+}
 
-        // Block list inside a scrolled window
-        let block_list = gtk4::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(false); // Don't expand - only take space needed
-        block_list.set_valign(gtk4::Align::Start); // Align to top
-        block_list.set_margin_bottom(8);
-        block_list.add_css_class("block-list");
-
-        let block_scroll = ScrolledWindow::new();
-        block_scroll.set_hexpand(true);
-        block_scroll.set_vexpand(true);
-        block_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
-        block_scroll.set_child(Some(&block_list));
-        block_scroll.add_css_class("block-scroll");
-
-        // Active block always at bottom
-        let active = Rc::new(RefCell::new(ActiveBlock::new(
-            config.output_batch_min_ms,
-            config.output_batch_max_ms,
-            config,
-        )));
-        if let Some(initial_cwd) = cwd {
-            active.borrow().update_cwd(initial_cwd);
-        }
-        // Active block is pinned outside the scroll area (appended to root below)
-
-        // VTE fallback for alt-screen mode
-        let vte = build_vte(config);
-        let vte_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, vte.vadjustment().as_ref());
-        let vte_box = gtk4::Box::new(Orientation::Horizontal, 0);
-        vte_box.set_hexpand(true);
-        vte_box.set_vexpand(true);
-        vte_box.add_css_class("terminal-box"); // Allow find_first_terminal to discover the VTE inside
-        vte_box.append(&vte);
-        vte_box.append(&vte_scrollbar);
-        vte_box.set_visible(false); // hidden until alt-screen
-
-        block_list.append(active.borrow().widget());
-        root.append(&block_scroll);
-        root.append(&vte_box);
-
-        // ── PTY ───────────────────────────────────────────────────────────
-        // Detect rsh shell for session_id passing
-        let is_rsh = shell_argv.first()
-            .and_then(|s| std::path::Path::new(s).file_name())
-            .and_then(|f| f.to_str())
-            .map(|name| name == "rsh")
-            .unwrap_or(false);
-
-        // Build argv with optional --session for rsh
-        let mut argv_vec: Vec<String> = shell_argv.to_vec();
-        if let Some(sid) = session_id {
-            if is_rsh {
-                argv_vec.push("--session".to_string());
-                argv_vec.push(sid.to_string());
-            }
-        }
-        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
-
-        let mut env_extra: Vec<(&str, &str)> = vec![];
-        let session_id_owned = session_id.map(|s| s.to_string());
-        if let Some(ref sid) = session_id_owned {
-            if is_rsh {
-                env_extra.push(("RSH_SESSION_ID", sid.as_str()));
-            }
-        }
-
-        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
-
-        // Store child PID on VTE widget so kill_all_terminal_children can find it
-        unsafe {
-            vte.set_data::<i32>("child-pid", pty.pid_i32());
-        }
-
-        // ── Register CSS ──────────────────────────────────────────────────
-        install_block_css(config);
-
-        // ── Shared state ──────────────────────────────────────────────────
-        let bstate = Rc::new(Cell::new(BlockState::Idle));
-        let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-        let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_display_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let last_nonempty_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let last_nonempty_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let executing_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
-        let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
-        let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
-        let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
-        let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
-        let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let application_cursor_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
-        let cursor_shape: Rc<Cell<TermCursorShape>> = Rc::new(Cell::new(TermCursorShape::Block));
-        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
-            Rc::new(RefCell::new(VecDeque::new()));
-        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
-        let pager_snapshots: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let pager_snapshot_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
-            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
-        ));
-
-        let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-
-        let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
-        let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let isearch_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
-            cwd.unwrap_or("").to_string()
-        ));
-
-        // ── Wire PTY → parser → block events ─────────────────────────────
-        {
-            let active_rc = active.clone();
-            let bstate_rc = bstate.clone();
-            let osc133_depth_rc = osc133_depth.clone();
-            let prompt_buf_rc = prompt_buf.clone();
-            let cmd_buf_rc = cmd_buf.clone();
-            let cmd_display_raw_rc = cmd_display_raw.clone();
-            let cmd_display_markup_rc = cmd_display_markup.clone();
-            let last_nonempty_cmd_raw_rc = last_nonempty_cmd_raw.clone();
-            let last_nonempty_cmd_markup_rc = last_nonempty_cmd_markup.clone();
-            let executing_cmd_raw_rc = executing_cmd_raw.clone();
-            let executing_cmd_markup_rc = executing_cmd_markup.clone();
-            let block_list_rc = block_list.clone();
-            let block_scroll_rc = block_scroll.clone();
-            let vte_for_alt = vte.clone();
-            let vte_box_rc = vte_box.clone();
-            let pty_for_resize = pty.clone();
-            let cwd_cbs = cwd_callbacks.clone();
-            let exited_cbs = exited_callbacks.clone();
-            let bell_cbs = bell_callbacks.clone();
-            let title_cbs = title_callbacks.clone();
-            let activity_cbs = activity_callbacks.clone();
-            let bracketed_paste_rc = bracketed_paste_mode.clone();
-            let application_cursor_rc = application_cursor_mode.clone();
-            let mouse_reporting_rc = mouse_reporting_mode.clone();
-            let cursor_shape_rc = cursor_shape.clone();
-            let config_for_cb = Rc::new(RefCell::new(config.clone()));
-            let parser = Rc::new(RefCell::new(Parser::new()));
-            let block_data_for_cb = block_data_rc.clone();
-            let finished_blocks_for_cb = finished_blocks_rc.clone();
-            let pager_snapshots_rc = pager_snapshots.clone();
-            let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
-            let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
-                user_scrolled_up.clone(),
-                programmatic_scroll.clone(),
-            );
-            let ansi_cache_for_cb = ansi_cache.clone();
-            let widget_pool_for_cb = widget_pool.clone();
-            let editor_input_for_cb = config.editor_input;
-            let tab_pending_rc = tab_pending.clone();
-            let pty_synced_rc = pty_synced.clone();
-            let completion_active_rc = completion_active.clone();
-            let isearch_active_rc = isearch_active.clone();
-
-            // Command queue for replaying initial_commands on PromptEnd events
-            let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
-                initial_commands
-                    .map(|s| s.split(", ")
-                        .map(|c| c.trim().to_string())
-                        .filter(|c| !c.is_empty())
-                        .collect())
-                    .unwrap_or_default()
-            ));
-            let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
-            let pty_for_init = Rc::clone(&pty);
-            let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
-            let block_start_time_for_cb = block_start_time.clone();
-            let pending_exit_code_rc = pending_exit_code.clone();
-            let current_cwd_for_cb = current_cwd.clone();
-
-            let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
-            let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
+impl ReaderCtx {
+    fn install(self, pty: &Rc<OwnedPty>) {
+        let ReaderCtx {
+            active_rc,
+            bstate_rc,
+            osc133_depth_rc,
+            prompt_buf_rc,
+            cmd_buf_rc,
+            cmd_display_raw_rc,
+            cmd_display_markup_rc,
+            last_nonempty_cmd_raw_rc,
+            last_nonempty_cmd_markup_rc,
+            executing_cmd_raw_rc,
+            executing_cmd_markup_rc,
+            block_list_rc,
+            block_scroll_rc,
+            vte_for_alt,
+            vte_box_rc,
+            pty_for_resize,
+            cwd_cbs,
+            exited_cbs,
+            bell_cbs,
+            title_cbs,
+            activity_cbs,
+            bracketed_paste_rc,
+            application_cursor_rc,
+            mouse_reporting_rc,
+            cursor_shape_rc,
+            config_for_cb,
+            parser,
+            block_data_for_cb,
+            finished_blocks_for_cb,
+            pager_snapshots_rc,
+            pager_snapshot_generation_rc,
+            scroll_debouncer,
+            ansi_cache_for_cb,
+            widget_pool_for_cb,
+            editor_input_for_cb,
+            tab_pending_rc,
+            pty_synced_rc,
+            completion_active_rc,
+            isearch_active_rc,
+            init_cmds_queue_for_cb,
+            pty_for_init,
+            block_start_time_for_cb,
+            pending_exit_code_rc,
+            current_cwd_for_cb,
+            last_pty_cols,
+            event_buf,
+        } = self;
             pty.start_reader(
                 move |data: Vec<u8>| {
                     log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
@@ -1171,6 +1075,255 @@ impl TermView {
                     }
                 },
             );
+    }
+}
+
+#[allow(dead_code)]
+impl TermView {
+    pub fn new(
+        config: &Config,
+        shell_argv: &[String],
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
+    ) -> Self {
+        // ── Build widget tree ──────────────────────────────────────────────
+        let root = gtk4::Box::new(Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.add_css_class("term-view-root");
+
+        // Block list inside a scrolled window
+        let block_list = gtk4::Box::new(Orientation::Vertical, 0);
+        block_list.set_vexpand(false); // Don't expand - only take space needed
+        block_list.set_valign(gtk4::Align::Start); // Align to top
+        block_list.set_margin_bottom(8);
+        block_list.add_css_class("block-list");
+
+        let block_scroll = ScrolledWindow::new();
+        block_scroll.set_hexpand(true);
+        block_scroll.set_vexpand(true);
+        block_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+        block_scroll.set_child(Some(&block_list));
+        block_scroll.add_css_class("block-scroll");
+
+        // Active block always at bottom
+        let active = Rc::new(RefCell::new(ActiveBlock::new(
+            config.output_batch_min_ms,
+            config.output_batch_max_ms,
+            config,
+        )));
+        if let Some(initial_cwd) = cwd {
+            active.borrow().update_cwd(initial_cwd);
+        }
+        // Active block is pinned outside the scroll area (appended to root below)
+
+        // VTE fallback for alt-screen mode
+        let vte = build_vte(config);
+        let vte_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, vte.vadjustment().as_ref());
+        let vte_box = gtk4::Box::new(Orientation::Horizontal, 0);
+        vte_box.set_hexpand(true);
+        vte_box.set_vexpand(true);
+        vte_box.add_css_class("terminal-box"); // Allow find_first_terminal to discover the VTE inside
+        vte_box.append(&vte);
+        vte_box.append(&vte_scrollbar);
+        vte_box.set_visible(false); // hidden until alt-screen
+
+        block_list.append(active.borrow().widget());
+        root.append(&block_scroll);
+        root.append(&vte_box);
+
+        // ── PTY ───────────────────────────────────────────────────────────
+        // Detect rsh shell for session_id passing
+        let is_rsh = shell_argv.first()
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .and_then(|f| f.to_str())
+            .map(|name| name == "rsh")
+            .unwrap_or(false);
+
+        // Build argv with optional --session for rsh
+        let mut argv_vec: Vec<String> = shell_argv.to_vec();
+        if let Some(sid) = session_id {
+            if is_rsh {
+                argv_vec.push("--session".to_string());
+                argv_vec.push(sid.to_string());
+            }
+        }
+        let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
+
+        let mut env_extra: Vec<(&str, &str)> = vec![];
+        let session_id_owned = session_id.map(|s| s.to_string());
+        if let Some(ref sid) = session_id_owned {
+            if is_rsh {
+                env_extra.push(("RSH_SESSION_ID", sid.as_str()));
+            }
+        }
+
+        let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
+
+        // Store child PID on VTE widget so kill_all_terminal_children can find it
+        unsafe {
+            vte.set_data::<i32>("child-pid", pty.pid_i32());
+        }
+
+        // ── Register CSS ──────────────────────────────────────────────────
+        install_block_css(config);
+
+        // ── Shared state ──────────────────────────────────────────────────
+        let bstate = Rc::new(Cell::new(BlockState::Idle));
+        let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+        let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cmd_display_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let last_nonempty_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let last_nonempty_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let executing_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
+        let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let application_cursor_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
+        let cursor_shape: Rc<Cell<TermCursorShape>> = Rc::new(Cell::new(TermCursorShape::Block));
+        let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
+            Rc::new(RefCell::new(VecDeque::new()));
+        let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
+        let pager_snapshots: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let pager_snapshot_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
+            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
+        ));
+
+        let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+
+        let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
+        let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let isearch_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
+            cwd.unwrap_or("").to_string()
+        ));
+
+        // ── Wire PTY → parser → block events ─────────────────────────────
+        {
+            let active_rc = active.clone();
+            let bstate_rc = bstate.clone();
+            let osc133_depth_rc = osc133_depth.clone();
+            let prompt_buf_rc = prompt_buf.clone();
+            let cmd_buf_rc = cmd_buf.clone();
+            let cmd_display_raw_rc = cmd_display_raw.clone();
+            let cmd_display_markup_rc = cmd_display_markup.clone();
+            let last_nonempty_cmd_raw_rc = last_nonempty_cmd_raw.clone();
+            let last_nonempty_cmd_markup_rc = last_nonempty_cmd_markup.clone();
+            let executing_cmd_raw_rc = executing_cmd_raw.clone();
+            let executing_cmd_markup_rc = executing_cmd_markup.clone();
+            let block_list_rc = block_list.clone();
+            let block_scroll_rc = block_scroll.clone();
+            let vte_for_alt = vte.clone();
+            let vte_box_rc = vte_box.clone();
+            let pty_for_resize = pty.clone();
+            let cwd_cbs = cwd_callbacks.clone();
+            let exited_cbs = exited_callbacks.clone();
+            let bell_cbs = bell_callbacks.clone();
+            let title_cbs = title_callbacks.clone();
+            let activity_cbs = activity_callbacks.clone();
+            let bracketed_paste_rc = bracketed_paste_mode.clone();
+            let application_cursor_rc = application_cursor_mode.clone();
+            let mouse_reporting_rc = mouse_reporting_mode.clone();
+            let cursor_shape_rc = cursor_shape.clone();
+            let config_for_cb = Rc::new(RefCell::new(config.clone()));
+            let parser = Rc::new(RefCell::new(Parser::new()));
+            let block_data_for_cb = block_data_rc.clone();
+            let finished_blocks_for_cb = finished_blocks_rc.clone();
+            let pager_snapshots_rc = pager_snapshots.clone();
+            let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
+            let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
+                user_scrolled_up.clone(),
+                programmatic_scroll.clone(),
+            );
+            let ansi_cache_for_cb = ansi_cache.clone();
+            let widget_pool_for_cb = widget_pool.clone();
+            let editor_input_for_cb = config.editor_input;
+            let tab_pending_rc = tab_pending.clone();
+            let pty_synced_rc = pty_synced.clone();
+            let completion_active_rc = completion_active.clone();
+            let isearch_active_rc = isearch_active.clone();
+
+            // Command queue for replaying initial_commands on PromptEnd events
+            let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
+                initial_commands
+                    .map(|s| s.split(", ")
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect())
+                    .unwrap_or_default()
+            ));
+            let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
+            let pty_for_init = Rc::clone(&pty);
+            let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
+            let block_start_time_for_cb = block_start_time.clone();
+            let pending_exit_code_rc = pending_exit_code.clone();
+            let current_cwd_for_cb = current_cwd.clone();
+
+            let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
+            let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
+            ReaderCtx {
+                active_rc,
+                bstate_rc,
+                osc133_depth_rc,
+                prompt_buf_rc,
+                cmd_buf_rc,
+                cmd_display_raw_rc,
+                cmd_display_markup_rc,
+                last_nonempty_cmd_raw_rc,
+                last_nonempty_cmd_markup_rc,
+                executing_cmd_raw_rc,
+                executing_cmd_markup_rc,
+                block_list_rc,
+                block_scroll_rc,
+                vte_for_alt,
+                vte_box_rc,
+                pty_for_resize,
+                cwd_cbs,
+                exited_cbs,
+                bell_cbs,
+                title_cbs,
+                activity_cbs,
+                bracketed_paste_rc,
+                application_cursor_rc,
+                mouse_reporting_rc,
+                cursor_shape_rc,
+                config_for_cb,
+                parser,
+                block_data_for_cb,
+                finished_blocks_for_cb,
+                pager_snapshots_rc,
+                pager_snapshot_generation_rc,
+                scroll_debouncer,
+                ansi_cache_for_cb,
+                widget_pool_for_cb,
+                editor_input_for_cb,
+                tab_pending_rc,
+                pty_synced_rc,
+                completion_active_rc,
+                isearch_active_rc,
+                init_cmds_queue_for_cb,
+                pty_for_init,
+                block_start_time_for_cb,
+                pending_exit_code_rc,
+                current_cwd_for_cb,
+                last_pty_cols,
+                event_buf,
+            }
+            .install(&pty);
         }
 
         // ── Scroll lock: detect user scrolling up ─────────────────────────
