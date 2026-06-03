@@ -278,6 +278,11 @@ pub(crate) fn separate_input_and_suggestion(input: &str, column_offset: usize) -
     let mut in_dim = false;
     let mut cursor = 0usize;
     let mut param_buf: Vec<u8> = Vec::with_capacity(16);
+    // Cursor save/restore (ESC 7 / ESC 8). Shells draw a right-aligned prompt
+    // (e.g. rsh's command-duration "2.5s") inside a save/restore bracket so it
+    // doesn't disturb the logical input line. Skip everything in that bracket.
+    let mut saved_cursor: Option<usize> = None;
+    let mut in_transient = false;
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
@@ -292,6 +297,10 @@ pub(crate) fn separate_input_and_suggestion(input: &str, column_offset: usize) -
             if i < bytes.len() {
                 let final_byte = bytes[i];
                 i += 1;
+
+                if in_transient {
+                    continue;
+                }
 
                 match final_byte {
                     b'm' => {
@@ -342,8 +351,22 @@ pub(crate) fn separate_input_and_suggestion(input: &str, column_offset: usize) -
                     _ => {}
                 }
             }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'7' {
+            saved_cursor = Some(cursor);
+            in_transient = true;
+            i += 2;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'8' {
+            if let Some(c) = saved_cursor.take() {
+                cursor = c.min(cells.len());
+            }
+            in_transient = false;
+            i += 2;
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
+        } else if in_transient {
+            // Discard any printable output drawn inside the save/restore bracket.
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
         } else if bytes[i] == b'\r' {
             cursor = 0;
             i += 1;
@@ -389,6 +412,10 @@ pub(crate) fn command_line_plain_text(input: &str) -> String {
     let mut i = 0;
     let mut cursor = 0usize;
     let mut param_buf: Vec<u8> = Vec::with_capacity(16);
+    // See separate_input_and_suggestion: skip right-prompt drawn inside an
+    // ESC 7 / ESC 8 (save/restore cursor) bracket.
+    let mut saved_cursor: Option<usize> = None;
+    let mut in_transient = false;
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
@@ -403,6 +430,10 @@ pub(crate) fn command_line_plain_text(input: &str) -> String {
             if i < bytes.len() {
                 let final_byte = bytes[i];
                 i += 1;
+
+                if in_transient {
+                    continue;
+                }
 
                 match final_byte {
                     b'D' => {
@@ -434,8 +465,21 @@ pub(crate) fn command_line_plain_text(input: &str) -> String {
                     _ => {}
                 }
             }
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'7' {
+            saved_cursor = Some(cursor);
+            in_transient = true;
+            i += 2;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'8' {
+            if let Some(c) = saved_cursor.take() {
+                cursor = c.min(cells.len());
+            }
+            in_transient = false;
+            i += 2;
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
+        } else if in_transient {
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
         } else if bytes[i] == b'\r' {
             cursor = 0;
             i += 1;
