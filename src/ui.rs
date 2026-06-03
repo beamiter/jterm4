@@ -331,7 +331,7 @@ impl UiState {
     ) -> bool {
         let dialog = adw::MessageDialog::builder()
             .heading("Close tab with running process?")
-            .body(&format!(
+            .body(format!(
                 "This tab has a running process:\n\n{}\n\nClosing will terminate it.",
                 process_info
             ))
@@ -904,7 +904,7 @@ impl UiState {
             if let Some(widget) = self.notebook.nth_page(Some(page)) {
                 let working_directory = find_first_terminal(&widget)
                     .as_ref()
-                    .and_then(|t| terminal_working_directory(t));
+                    .and_then(terminal_working_directory);
                 self.add_new_tab(working_directory, None, None, None);
             }
         }
@@ -1160,7 +1160,7 @@ impl UiState {
             .filter(|f| f.is_monospace())
             .map(|f| f.name().to_string())
             .collect();
-        mono_fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        mono_fonts.sort_by_key(|a| a.to_lowercase());
 
         let current_font_desc = FontDescription::from_string(&config.font_desc);
         let current_family = current_font_desc.family()

@@ -95,7 +95,7 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
 
         // Check if this tab is pinned
         let pinned = unsafe {
-            widget.data::<bool>("pinned").map(|p| p.as_ref().clone())
+            widget.data::<bool>("pinned").map(|p| *p.as_ref())
         };
 
         PaneLayout::Leaf { dir, sid, cmds, pinned }

@@ -60,16 +60,21 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 
 // ─── VteTerminalView ──────────────────────────────────────────────────────
 
+/// Shared lists of observer callbacks, keyed by the payload they receive.
+type StrCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>;
+type IntCallbacks = Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>;
+type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
+
 #[allow(dead_code)]
 pub struct VteTerminalView {
     root: gtk4::Box,
     terminal: Terminal,
     config: Rc<RefCell<Config>>,
-    cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
-    exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
-    bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
-    title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
-    activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    cwd_callbacks: StrCallbacks,
+    exited_callbacks: IntCallbacks,
+    bell_callbacks: VoidCallbacks,
+    title_callbacks: StrCallbacks,
+    activity_callbacks: VoidCallbacks,
 }
 
 #[allow(dead_code)]

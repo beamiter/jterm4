@@ -87,7 +87,7 @@ impl OwnedPty {
             ws_ypixel: 0,
         };
         let OpenptyResult { master, slave } =
-            openpty(Some(&initial_size), None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            openpty(Some(&initial_size), None).map_err(io::Error::other)?;
 
         match unsafe { unistd::fork() } {
             Ok(ForkResult::Child) => {
@@ -128,7 +128,7 @@ impl OwnedPty {
                     pid: child,
                 })
             }
-            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            Err(e) => Err(io::Error::other(e)),
         }
     }
 

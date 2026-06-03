@@ -570,8 +570,8 @@ fn main() -> glib::ExitCode {
                 // Debounce: editors may write multiple events in rapid succession.
                 let reload_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
                 monitor.connect_changed(move |_, _, _, event| {
-                    if matches!(event, gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::Created) {
-                        if !reload_pending.get() {
+                    if matches!(event, gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::Created)
+                        && !reload_pending.get() {
                             reload_pending.set(true);
                             let ui_reload = ui_for_reload.clone();
                             let pending = reload_pending.clone();
@@ -583,7 +583,6 @@ fn main() -> glib::ExitCode {
                                 },
                             );
                         }
-                    }
                 });
                 // Keep monitor alive by storing it on the window
                 unsafe { window.set_data("config-monitor", monitor); }

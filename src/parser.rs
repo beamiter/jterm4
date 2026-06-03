@@ -52,6 +52,12 @@ fn is_alt_screen_mode(params: &[u8]) -> bool {
     matches!(params, b"?47" | b"?1047" | b"?1049")
 }
 
+impl Default for Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Parser {
     pub fn new() -> Self {
         Parser {

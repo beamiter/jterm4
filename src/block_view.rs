@@ -108,23 +108,22 @@ const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 // ─── Cursor Shape ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TermCursorShape {
+    #[default]
     Block,      // 0 or 1: block cursor
     Underline,  // 3 or 4: underline cursor
     Bar,        // 5 or 6: bar/vertical cursor
 }
 
-impl Default for TermCursorShape {
-    fn default() -> Self {
-        TermCursorShape::Block
-    }
-}
 
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 enum MouseReportingMode {
     /// No mouse reporting (CSI ?1000l, etc.)
+    #[default]
     None,
     /// Basic click reporting (CSI ?1000h)
     Click,
@@ -133,14 +132,9 @@ enum MouseReportingMode {
     /// All mouse motion (CSI ?1003h)
     Motion,
     /// SGR-style reporting (CSI ?1006h) - modern format
-    SGR,
+    Sgr,
 }
 
-impl Default for MouseReportingMode {
-    fn default() -> Self {
-        MouseReportingMode::None
-    }
-}
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -154,8 +148,8 @@ fn get_url_bounds_at_position(
     buffer: &TextBuffer,
     iter: &gtk4::TextIter,
 ) -> Option<(gtk4::TextIter, gtk4::TextIter, String)> {
-    let mut start = iter.clone();
-    let mut end = iter.clone();
+    let mut start = *iter;
+    let mut end = *iter;
 
     // Expand backwards to find URL start
     while !start.starts_line() {
@@ -304,7 +298,7 @@ fn chrono_local_offset_secs() -> i64 {
         let now = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&now, &mut tm);
-        tm.tm_gmtoff as i64
+        tm.tm_gmtoff
     }
 }
 
@@ -652,11 +646,10 @@ fn is_pager_chrome_line(line: &str) -> bool {
 fn overlap_line_count(existing: &[String], next: &[String]) -> usize {
     let max_overlap = existing.len().min(next.len());
     for count in (1..=max_overlap).rev() {
-        if existing[existing.len() - count..] == next[..count] {
-            if count > 1 || !existing[existing.len() - count].trim().is_empty() {
+        if existing[existing.len() - count..] == next[..count]
+            && (count > 1 || !existing[existing.len() - count].trim().is_empty()) {
                 return count;
             }
-        }
     }
     0
 }
@@ -970,9 +963,7 @@ fn skip_ansi_visible_chars(input: &str, mut count: usize) -> String {
                 1
             };
             i += ch_len;
-            if count > 0 {
-                count -= 1;
-            }
+            count = count.saturating_sub(1);
         }
     }
     input[i..].to_string()
@@ -1703,6 +1694,7 @@ fn set_active_prompt_buffer(buffer: &TextBuffer, prompt: &str) {
 }
 
 
+#[allow(clippy::too_many_arguments)]
 fn set_active_command_buffer_at(
     buffer: &TextBuffer,
     cmd: &str,
@@ -1910,7 +1902,7 @@ fn set_active_output_buffer(
     let output_no_ansi = strip_ansi(output);
     let output_plain = output_no_ansi
         .lines()
-        .map(|line| command_line_plain_text(line))
+        .map(command_line_plain_text)
         .collect::<Vec<_>>()
         .join("\n");
     buffer.set_text(&output_plain);
@@ -2287,6 +2279,7 @@ impl Clone for FinishedBlock {
 }
 
 impl FinishedBlock {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         prompt: &str,
         cmd: &str,
@@ -2301,6 +2294,7 @@ impl FinishedBlock {
         Self::new_with_pool(prompt, cmd, _cmd_markup, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_pool(
         prompt: &str,
         cmd: &str,
@@ -3161,6 +3155,11 @@ impl WidgetPool {
 
 // ─── TermView ─────────────────────────────────────────────────────────────────
 
+/// Shared lists of observer callbacks, keyed by the payload they receive.
+type StrCallbacks = Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>;
+type IntCallbacks = Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>;
+type VoidCallbacks = Rc<RefCell<Vec<Box<dyn Fn()>>>>;
+
 #[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
@@ -3173,11 +3172,11 @@ pub struct TermView {
     prompt_buf: Rc<RefCell<String>>,
     cmd_buf: Rc<RefCell<String>>,
     pty: Rc<OwnedPty>,
-    cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
-    exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>>,
-    bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
-    title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>>,
-    activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    cwd_callbacks: StrCallbacks,
+    exited_callbacks: IntCallbacks,
+    bell_callbacks: VoidCallbacks,
+    title_callbacks: StrCallbacks,
+    activity_callbacks: VoidCallbacks,
     bracketed_paste_mode: Rc<Cell<bool>>,
     application_cursor_mode: Rc<Cell<bool>>,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
@@ -3295,11 +3294,11 @@ impl TermView {
         let last_nonempty_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let executing_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cwd_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
-        let exited_callbacks: Rc<RefCell<Vec<Box<dyn Fn(i32)>>>> = Rc::new(RefCell::new(vec![]));
-        let bell_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>> = Rc::new(RefCell::new(vec![]));
-        let title_callbacks: Rc<RefCell<Vec<Box<dyn Fn(&str)>>>> = Rc::new(RefCell::new(vec![]));
-        let activity_callbacks: Rc<RefCell<Vec<Box<dyn Fn()>>>> = Rc::new(RefCell::new(vec![]));
+        let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
+        let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let application_cursor_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
@@ -3510,7 +3509,7 @@ impl TermView {
                                                                     mouse_reporting_rc.set(MouseReportingMode::None);
                                                                 }
                                                                 (b"1006", b'h') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::SGR);
+                                                                    mouse_reporting_rc.set(MouseReportingMode::Sgr);
                                                                 }
                                                                 (b"1006", b'l') => {
                                                                     mouse_reporting_rc.set(MouseReportingMode::None);
@@ -4221,9 +4220,9 @@ impl TermView {
 
                             ParserEvent::CwdUpdate(path) => {
                                 *current_cwd_for_cb.borrow_mut() = path.clone();
-                                active_rc.borrow().update_cwd(&path);
+                                active_rc.borrow().update_cwd(path);
                                 for cb in cwd_cbs.borrow().iter() {
-                                    cb(&path);
+                                    cb(path);
                                 }
                             }
 
@@ -4261,7 +4260,7 @@ impl TermView {
                             ParserEvent::ClipboardSet(text) => {
                                 if let Some(display) = gtk4::gdk::Display::default() {
                                     let clipboard = display.clipboard();
-                                    clipboard.set_text(&text);
+                                    clipboard.set_text(text);
                                     log::info!("OSC 52: clipboard set ({} chars)", text.len());
                                 }
                             }
@@ -4274,7 +4273,7 @@ impl TermView {
                                         let mut seq = Vec::with_capacity(payload.len() + 4);
                                         seq.push(0x1b);
                                         seq.push(b'_');
-                                        seq.extend_from_slice(&payload);
+                                        seq.extend_from_slice(payload);
                                         seq.push(0x1b);
                                         seq.push(b'\\');
                                         vte_for_alt.feed(&seq);
@@ -5918,11 +5917,11 @@ impl TermView {
 
         for block in blocks.iter() {
             let serialized = rkyv::to_bytes::<_, 256>(block)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             if compress {
                 let compressed = zstd::encode_all(serialized.as_slice(), 3)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 file.write_all(&(compressed.len() as u32).to_le_bytes())?;
                 file.write_all(&compressed)?;
             } else {
@@ -5964,7 +5963,7 @@ impl TermView {
 
             let decoded = if self.config.borrow().block_history_compress {
                 zstd::decode_all(data.as_slice())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
             } else {
                 data
             };
@@ -6319,7 +6318,7 @@ fn install_block_css(config: &Config) {
     );
 
     thread_local! {
-        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = RefCell::new(None);
+        static BLOCK_CSS_PROVIDER: RefCell<Option<gtk4::CssProvider>> = const { RefCell::new(None) };
     }
 
     let provider = gtk4::CssProvider::new();
