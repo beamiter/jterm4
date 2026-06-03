@@ -2652,6 +2652,10 @@ struct ActiveBlock {
     pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
     cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
     cursor_offset: Rc<Cell<usize>>, // Cursor position in chars (editor mode)
+    // True while a command is executing. The live cursor then belongs to the
+    // output VTE, so the input line's blinking cursor is suppressed to match
+    // VTE's single-cursor behaviour (otherwise two cursors show at once).
+    command_running: Rc<Cell<bool>>,
     cursor_color: RGBA,
     cursor_foreground: RGBA,
     running_label: gtk4::Label,
@@ -2731,6 +2735,7 @@ impl ActiveBlock {
 
         let cursor_visible = Rc::new(Cell::new(true));
         let cursor_offset: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let command_running = Rc::new(Cell::new(false));
         let pending_cmd = Rc::new(RefCell::new(String::new()));
         let pending_preedit = Rc::new(RefCell::new(String::new()));
         let pending_suggestion = Rc::new(RefCell::new(String::new()));
@@ -2740,6 +2745,7 @@ impl ActiveBlock {
             // Manual cursor blink animation (both editor and non-editor modes)
             let cursor_visible_clone = cursor_visible.clone();
             let cursor_offset_clone = cursor_offset.clone();
+            let command_running_clone = command_running.clone();
             let command_buffer_clone = command_buffer.clone();
             let command_view_for_timer = command_view.clone();
             let pending_cmd_clone = pending_cmd.clone();
@@ -2749,21 +2755,33 @@ impl ActiveBlock {
             let cursor_foreground_for_timer = config.cursor_foreground;
 
             let handle = glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
-                // Match VTE: when the toplevel window is not focused, show a steady
-                // (non-blinking) cursor and skip the buffer rebuild entirely once it's
-                // solid — no point burning redraws on a blink nobody can see.
-                let window_active = command_view_for_timer
-                    .root()
-                    .and_then(|r| r.downcast::<gtk4::Window>().ok())
-                    .map(|w| w.is_active())
-                    .unwrap_or(true);
-                if !window_active {
-                    if cursor_visible_clone.get() {
+                // While a command is executing the live cursor lives in the output
+                // VTE. Match VTE's single-cursor behaviour by hiding the input
+                // cursor: draw the command text once without a cursor, then idle
+                // until the command finishes (cursor_visible is restored by
+                // reset_for_next_prompt).
+                if command_running_clone.get() {
+                    if !cursor_visible_clone.get() {
                         return glib::ControlFlow::Continue;
                     }
-                    cursor_visible_clone.set(true);
+                    cursor_visible_clone.set(false);
                 } else {
-                    cursor_visible_clone.set(!cursor_visible_clone.get());
+                    // Match VTE: when the toplevel window is not focused, show a steady
+                    // (non-blinking) cursor and skip the buffer rebuild entirely once it's
+                    // solid — no point burning redraws on a blink nobody can see.
+                    let window_active = command_view_for_timer
+                        .root()
+                        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+                        .map(|w| w.is_active())
+                        .unwrap_or(true);
+                    if !window_active {
+                        if cursor_visible_clone.get() {
+                            return glib::ControlFlow::Continue;
+                        }
+                        cursor_visible_clone.set(true);
+                    } else {
+                        cursor_visible_clone.set(!cursor_visible_clone.get());
+                    }
                 }
 
                 let cmd = pending_cmd_clone.borrow();
@@ -2815,6 +2833,7 @@ impl ActiveBlock {
             pending_suggestion,
             cursor_visible,
             cursor_offset,
+            command_running,
             cursor_color: config.cursor,
             cursor_foreground: config.cursor_foreground,
             running_label,
@@ -2885,11 +2904,15 @@ impl ActiveBlock {
             None
         };
 
+        // Suppress the input cursor while a command runs: the live cursor then
+        // belongs to the output VTE (see command_running).
+        let cursor_visible = self.cursor_visible.get() && !self.command_running.get();
+
         set_active_command_buffer_at(
             &self.command_buffer,
             &cmd,
             &preedit,
-            self.cursor_visible.get(),
+            cursor_visible,
             &suggestion,
             &self.cursor_color,
             &self.cursor_foreground,
@@ -2999,6 +3022,7 @@ impl ActiveBlock {
         *self.pending_cmd.borrow_mut() = command.to_string();
         self.pending_preedit.borrow_mut().clear();
         self.pending_suggestion.borrow_mut().clear();
+        self.command_running.set(true);
         self.clear_output();
         self.command_buffer.set_text("");
     }
@@ -3038,6 +3062,7 @@ impl ActiveBlock {
         *self.pending_cmd.borrow_mut() = String::new();
         self.pending_preedit.borrow_mut().clear();
         self.pending_suggestion.borrow_mut().clear();
+        self.command_running.set(false);
         self.clear_output();
         self.cursor_visible.set(true);
         self.cursor_offset.set(0);
