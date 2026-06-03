@@ -2652,6 +2652,7 @@ struct ActiveBlock {
     command_running: Rc<Cell<bool>>,
     cursor_color: RGBA,
     cursor_foreground: RGBA,
+    cwd_label: gtk4::Label,
     running_label: gtk4::Label,
     running_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
     blink_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
@@ -2704,20 +2705,36 @@ impl ActiveBlock {
         let running_label = gtk4::Label::new(None);
         running_label.add_css_class("block-running-label");
         running_label.set_halign(gtk4::Align::End);
-        running_label.set_hexpand(true);
+        running_label.set_hexpand(false);
         running_label.set_visible(false);
 
-        // Prompt row: prompt_view + running_label
-        let prompt_row = gtk4::Box::new(Orientation::Horizontal, 4);
-        prompt_row.append(&prompt_view);
-        prompt_row.append(&running_label);
+        // Header row: cwd on the left, running timer on the right — mirrors the
+        // finished block header so the active block reads consistently.
+        let cwd_label = gtk4::Label::new(None);
+        cwd_label.add_css_class("block-header-label");
+        cwd_label.set_halign(gtk4::Align::Start);
+        cwd_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        cwd_label.set_max_width_chars(40);
+
+        let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
+        header_row.add_css_class("block-header");
+        header_row.set_margin_start(12);
+        header_row.set_margin_end(8);
+        header_row.set_margin_top(6);
+        header_row.set_margin_bottom(2);
+        header_row.append(&cwd_label);
+        let header_spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+        header_spacer.set_hexpand(true);
+        header_row.append(&header_spacer);
+        header_row.append(&running_label);
 
         // Output: use VTE widget for full terminal compatibility
         let output_vte = build_output_vte(config);
         output_vte.set_visible(false); // Hidden until there's output
 
         // Append to widget
-        widget.append(&prompt_row);
+        widget.append(&header_row);
+        widget.append(&prompt_view);
         widget.append(&command_view);
         widget.append(&output_vte);
 
@@ -2830,6 +2847,7 @@ impl ActiveBlock {
             command_running,
             cursor_color: config.cursor,
             cursor_foreground: config.cursor_foreground,
+            cwd_label,
             running_label,
             running_timer_handle: Rc::new(RefCell::new(None)),
             blink_timer_handle,
@@ -2844,6 +2862,15 @@ impl ActiveBlock {
 
     fn set_prompt(&self, text: &str) {
         set_active_prompt_buffer(&self.prompt_buffer, text);
+    }
+
+    fn update_cwd(&self, cwd: &str) {
+        if cwd.is_empty() {
+            self.cwd_label.set_visible(false);
+        } else {
+            self.cwd_label.set_text(&shorten_path(cwd));
+            self.cwd_label.set_visible(true);
+        }
     }
 
     fn set_cmd(&self, text: &str) {
@@ -3201,6 +3228,9 @@ impl TermView {
             config.output_batch_max_ms,
             config,
         )));
+        if let Some(initial_cwd) = cwd {
+            active.borrow().update_cwd(initial_cwd);
+        }
         // Active block is pinned outside the scroll area (appended to root below)
 
         // VTE fallback for alt-screen mode
@@ -4191,6 +4221,7 @@ impl TermView {
 
                             ParserEvent::CwdUpdate(path) => {
                                 *current_cwd_for_cb.borrow_mut() = path.clone();
+                                active_rc.borrow().update_cwd(&path);
                                 for cb in cwd_cbs.borrow().iter() {
                                     cb(&path);
                                 }
@@ -6108,6 +6139,7 @@ fn install_block_css(config: &Config) {
             border-radius: 6px;
             background-color: {block_bg_hex};
             min-height: 40px;
+            transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
@@ -6115,8 +6147,7 @@ fn install_block_css(config: &Config) {
         }}
         .block-selected {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
-            border-left: 3px solid {fg_hex};
-            padding-left: 9px;
+            box-shadow: inset 3px 0 0 0 {accent};
         }}
         .block-active {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
@@ -6250,14 +6281,16 @@ fn install_block_css(config: &Config) {
         .block-exit-bad {{
             color: {err_hex};
             background-color: {err_bg};
-            border-radius: 3px;
+            border-radius: 4px;
             font-size: 0.8em;
+            padding: 1px 6px;
         }}
         .block-meta-badge {{
             color: {dim_fg};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
-            border-radius: 3px;
+            border-radius: 4px;
             font-size: 0.8em;
+            padding: 1px 6px;
         }}
         .block-running-label {{
             color: {dim_fg};
