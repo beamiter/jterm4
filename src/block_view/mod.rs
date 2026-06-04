@@ -1311,6 +1311,20 @@ impl KeyCtx {
                         return glib::Propagation::Stop;
                     }
 
+                    // Shift+Tab (backtab): send CSI Z instead of being swallowed
+                    if keyval == gtk4::gdk::Key::ISO_Left_Tab
+                        || (shift && keyval == gtk4::gdk::Key::Tab)
+                    {
+                        if !pty_synced_for_key.get() {
+                            let active = active_for_key.borrow();
+                            let cmd = active.pending_cmd.borrow().clone();
+                            pty_for_key.write_bytes(cmd.as_bytes());
+                            pty_synced_for_key.set(true);
+                        }
+                        pty_for_key.write_bytes(b"\x1b[Z");
+                        return glib::Propagation::Stop;
+                    }
+
                     // Tab: trigger shell completion
                     if keyval == gtk4::gdk::Key::Tab {
                         if !pty_synced_for_key.get() {
@@ -1902,6 +1916,11 @@ impl KeyCtx {
                         Some(b"\r".to_vec())
                     }
                     v if v == gtk4::gdk::Key::BackSpace => Some(b"\x7f".to_vec()),
+                    // Shift+Tab (backtab): GTK delivers it as ISO_Left_Tab, but some
+                    // layouts send Tab + SHIFT. Both must encode as CSI Z so TUIs
+                    // (e.g. Claude CLI plan-mode toggle) receive the backtab.
+                    v if v == gtk4::gdk::Key::ISO_Left_Tab => Some(b"\x1b[Z".to_vec()),
+                    v if v == gtk4::gdk::Key::Tab && shift => Some(b"\x1b[Z".to_vec()),
                     v if v == gtk4::gdk::Key::Tab => Some(b"\t".to_vec()),
                     v if v == gtk4::gdk::Key::Escape => Some(b"\x1b".to_vec()),
                     v if v == gtk4::gdk::Key::Up && application_cursor_for_key.get() => Some(b"\x1bOA".to_vec()),
@@ -2029,10 +2048,22 @@ impl TermView {
         let breadcrumb_target: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
 
         let scroll_overlay = gtk4::Overlay::new();
-        scroll_overlay.set_hexpand(true);
-        scroll_overlay.set_vexpand(true);
+        // Inherit expand from block_scroll (don't pin it): in alt-screen mode the
+        // alt-screen code sets block_scroll vexpand=false + invisible, and the
+        // overlay must collapse with it instead of leaving a blank gap.
         scroll_overlay.set_child(Some(&block_scroll));
         scroll_overlay.add_overlay(&breadcrumb);
+
+        // The breadcrumb is an overlay child, so it would otherwise float over the
+        // alt-screen VTE. Hide it whenever the block scroll itself is hidden.
+        {
+            let breadcrumb_for_vis = breadcrumb.clone();
+            block_scroll.connect_visible_notify(move |bs| {
+                if !bs.is_visible() {
+                    breadcrumb_for_vis.set_visible(false);
+                }
+            });
+        }
 
         root.append(&scroll_overlay);
         root.append(&vte_box);
