@@ -109,6 +109,9 @@ pub(crate) struct FinishedBlock {
     pub(crate) show_more_btn: Option<gtk4::Button>,
     pub(crate) full_output: Rc<RefCell<String>>,
     pub(crate) cmd_text: String,
+    pub(crate) copy_cmd_btn: gtk4::Button,
+    pub(crate) copy_output_btn: gtk4::Button,
+    pub(crate) rerun_btn: gtk4::Button,
 }
 
 impl Clone for FinishedBlock {
@@ -125,6 +128,9 @@ impl Clone for FinishedBlock {
             show_more_btn: self.show_more_btn.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
+            copy_cmd_btn: self.copy_cmd_btn.clone(),
+            copy_output_btn: self.copy_output_btn.clone(),
+            rerun_btn: self.rerun_btn.clone(),
         }
     }
 }
@@ -134,7 +140,7 @@ impl FinishedBlock {
     pub(crate) fn new(
         prompt: &str,
         cmd: &str,
-        _cmd_markup: Option<&str>,
+        cmd_ansi: Option<&str>,
         output: &str,
         exit_code: i32,
         config: &Config,
@@ -142,14 +148,14 @@ impl FinishedBlock {
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
     ) -> Self {
-        Self::new_with_pool(prompt, cmd, _cmd_markup, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
+        Self::new_with_pool(prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_pool(
         prompt: &str,
         cmd: &str,
-        _cmd_markup: Option<&str>,
+        cmd_ansi: Option<&str>,
         output: &str,
         exit_code: i32,
         config: &Config,
@@ -166,6 +172,9 @@ impl FinishedBlock {
                 reused.remove(&child);
             }
             reused.remove_css_class("block-hovered");
+            reused.remove_css_class("block-selected");
+            reused.remove_css_class("block-success");
+            reused.remove_css_class("block-failed");
             reused
         } else {
             let b = gtk4::Box::new(Orientation::Vertical, 0);
@@ -177,17 +186,13 @@ impl FinishedBlock {
             b
         };
 
-        // Add hover highlighting to show block is interactive
+        // Status stripe: green left border on success, red on failure.
+        outer.add_css_class(if exit_code == 0 { "block-success" } else { "block-failed" });
+
+        // Add hover highlighting to show block is interactive (and reveal the
+        // quick-action buttons). The action box is created below; it's wired into
+        // these handlers after construction.
         let hover_ctrl = gtk4::EventControllerMotion::new();
-        let outer_for_enter = outer.clone();
-        hover_ctrl.connect_enter(move |_, _, _| {
-            outer_for_enter.add_css_class("block-hovered");
-        });
-        let outer_for_leave = outer.clone();
-        hover_ctrl.connect_leave(move |_| {
-            outer_for_leave.remove_css_class("block-hovered");
-        });
-        outer.add_controller(hover_ctrl);
 
         // ── Header row ──────────────────────────────────────────────────────
         let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
@@ -196,6 +201,12 @@ impl FinishedBlock {
         header_row.set_margin_end(8);
         header_row.set_margin_top(6);
         header_row.set_margin_bottom(2);
+
+        // Status icon: ✓ for success, ✗ for failure.
+        let status_icon = gtk4::Label::new(Some(if exit_code == 0 { "\u{2713}" } else { "\u{2717}" }));
+        status_icon.add_css_class(if exit_code == 0 { "block-status-ok" } else { "block-status-bad" });
+        status_icon.set_halign(gtk4::Align::Start);
+        header_row.append(&status_icon);
 
         // CWD label (shortened to last 2 segments)
         if let Some(cwd_path) = cwd {
@@ -249,6 +260,37 @@ impl FinishedBlock {
             header_row.append(&badge);
         }
 
+        // Quick-action buttons (hidden until the block is hovered). Handlers are
+        // wired by the caller, which has access to the clipboard + active block.
+        let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
+        action_box.set_visible(false);
+        let copy_cmd_btn = gtk4::Button::with_label("\u{29C9}"); // ⧉ copy command
+        copy_cmd_btn.set_tooltip_text(Some("Copy command"));
+        let copy_output_btn = gtk4::Button::with_label("\u{2630}"); // ☰ copy output
+        copy_output_btn.set_tooltip_text(Some("Copy output"));
+        let rerun_btn = gtk4::Button::with_label("\u{21BB}"); // ↻ re-run
+        rerun_btn.set_tooltip_text(Some("Re-run command"));
+        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn] {
+            btn.add_css_class("block-action-btn");
+            btn.add_css_class("flat");
+            action_box.append(btn);
+        }
+        header_row.append(&action_box);
+
+        let outer_for_enter = outer.clone();
+        let action_box_for_enter = action_box.clone();
+        hover_ctrl.connect_enter(move |_, _, _| {
+            outer_for_enter.add_css_class("block-hovered");
+            action_box_for_enter.set_visible(true);
+        });
+        let outer_for_leave = outer.clone();
+        let action_box_for_leave = action_box.clone();
+        hover_ctrl.connect_leave(move |_| {
+            outer_for_leave.remove_css_class("block-hovered");
+            action_box_for_leave.set_visible(false);
+        });
+        outer.add_controller(hover_ctrl);
+
         // Collapse toggle button
         let collapse_btn = gtk4::Button::with_label("\u{25BC}"); // ▼
         collapse_btn.add_css_class("block-collapse-btn");
@@ -287,8 +329,17 @@ impl FinishedBlock {
         // Populate buffers
         set_active_prompt_buffer(&prompt_buffer, prompt);
 
-        let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
-        command_buffer.set_text(cmd_display);
+        // Render the command line with the shell's own ANSI syntax highlighting
+        // when it's available; otherwise fall back to plain text.
+        match cmd_ansi {
+            Some(ansi) if !ansi.is_empty() && !cmd.is_empty() => {
+                set_active_output_buffer(&command_buffer, ansi, &config.palette, None);
+            }
+            _ => {
+                let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
+                command_buffer.set_text(cmd_display);
+            }
+        }
 
         // Explicitly remove any cursor tags from finished block command buffer
         let tag_table = command_buffer.tag_table();
@@ -465,11 +516,61 @@ impl FinishedBlock {
             show_more_btn,
             full_output,
             cmd_text: cmd.to_string(),
+            copy_cmd_btn,
+            copy_output_btn,
+            rerun_btn,
         }
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Wire the hover quick-action buttons (copy command, copy output, re-run).
+    /// Kept separate from construction because handlers need the clipboard, PTY,
+    /// and active block, which only the owning `TermView` has.
+    pub(crate) fn connect_actions(
+        &self,
+        vte: &Terminal,
+        pty: &Rc<crate::pty::OwnedPty>,
+        pty_synced: &Rc<Cell<bool>>,
+        active: &Rc<RefCell<ActiveBlock>>,
+    ) {
+        let vte_for_cmd = vte.clone();
+        let cmd_for_copy = self.cmd_text.clone();
+        self.copy_cmd_btn.connect_clicked(move |_| {
+            vte_for_cmd.clipboard().set_text(&cmd_for_copy);
+        });
+
+        let vte_for_out = vte.clone();
+        let output_buffer_for_copy = self.output_buffer.clone();
+        self.copy_output_btn.connect_clicked(move |_| {
+            let text = output_buffer_for_copy.text(
+                &output_buffer_for_copy.start_iter(),
+                &output_buffer_for_copy.end_iter(),
+                true,
+            );
+            vte_for_out.clipboard().set_text(&text);
+        });
+
+        let pty_for_rerun = Rc::clone(pty);
+        let pty_synced_for_rerun = pty_synced.clone();
+        let active_for_rerun = active.clone();
+        let cmd_for_rerun = self.cmd_text.clone();
+        self.rerun_btn.connect_clicked(move |_| {
+            let active = active_for_rerun.borrow();
+            *active.pending_cmd.borrow_mut() = cmd_for_rerun.clone();
+            active.cursor_offset.set(cmd_for_rerun.chars().count());
+            if pty_synced_for_rerun.get() {
+                pty_for_rerun.write_bytes(b"\x15");
+            }
+            pty_for_rerun.write_bytes(cmd_for_rerun.as_bytes());
+            pty_synced_for_rerun.set(true);
+            *active.pending_suggestion.borrow_mut() = String::new();
+            active.cursor_visible.set(true);
+            active.update_content_view();
+            active.command_view.grab_focus();
+        });
     }
 }
 

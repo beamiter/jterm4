@@ -680,14 +680,15 @@ impl ReaderCtx {
                                     let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
 
                                     let mut raw_cmd_with_ansi = executing_cmd_raw_rc.borrow().clone();
-                                    let mut cmd_markup = executing_cmd_markup_rc.borrow().clone();
                                     if raw_cmd_with_ansi.trim().is_empty()
                                         && !last_nonempty_cmd_raw_rc.borrow().trim().is_empty()
                                     {
                                         raw_cmd_with_ansi = last_nonempty_cmd_raw_rc.borrow().clone();
-                                        cmd_markup = last_nonempty_cmd_markup_rc.borrow().clone();
                                     }
                                     let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
+                                    // Persist the raw-ANSI command so finished blocks (and restored
+                                    // history) can render the shell's own syntax highlighting.
+                                    let cmd_ansi_trimmed = raw_cmd_with_ansi.trim().to_string();
 
                                     // Use raw_output for finalization — it's always correct
                                     // (properly cleared between commands). VTE text_range can
@@ -746,7 +747,7 @@ impl ReaderCtx {
                                         id: next_block_id(),
                                         prompt: prompt.clone(),
                                         cmd: cmd.clone(),
-                                        cmd_markup: if cmd_markup.is_empty() { None } else { Some(cmd_markup.clone()) },
+                                        cmd_markup: if cmd_ansi_trimmed.is_empty() { None } else { Some(cmd_ansi_trimmed.clone()) },
                                         output: output_trimmed.clone(),
                                         exit_code,
                                         estimated_height,
@@ -761,7 +762,7 @@ impl ReaderCtx {
 
                                     let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                     let finished = FinishedBlock::new_with_pool(
-                                        &prompt, &cmd, if cmd_markup.is_empty() { None } else { Some(&cmd_markup) }, &output_with_ansi, exit_code, &config_for_cb.borrow(),
+                                        &prompt, &cmd, if cmd_ansi_trimmed.is_empty() { None } else { Some(&cmd_ansi_trimmed) }, &output_with_ansi, exit_code, &config_for_cb.borrow(),
                                         duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                     );
 
@@ -770,6 +771,9 @@ impl ReaderCtx {
                                     let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                     let finished_clone = finished.clone();
                                     let finished_widget = finished_clone.widget().clone();
+
+                                    finished_clone.connect_actions(&vte_for_alt, &pty_for_init, &pty_synced_rc, &active_rc);
+
                                     finished_blocks_for_cb.borrow_mut().push(finished);
 
                                     // Setup right-click context menu
@@ -2009,7 +2013,28 @@ impl TermView {
         vte_box.set_visible(false); // hidden until alt-screen
 
         block_list.append(active.borrow().widget());
-        root.append(&block_scroll);
+
+        // Floating breadcrumb: names the command whose output currently fills the
+        // top of the viewport while scrolling a long block (IDE "sticky header").
+        let breadcrumb = gtk4::Button::with_label("");
+        breadcrumb.add_css_class("block-breadcrumb");
+        breadcrumb.set_halign(gtk4::Align::Fill);
+        breadcrumb.set_valign(gtk4::Align::Start);
+        breadcrumb.set_can_target(true);
+        breadcrumb.set_visible(false);
+        if let Some(lbl) = breadcrumb.child().and_downcast::<gtk4::Label>() {
+            lbl.set_halign(gtk4::Align::Start);
+            lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        }
+        let breadcrumb_target: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+
+        let scroll_overlay = gtk4::Overlay::new();
+        scroll_overlay.set_hexpand(true);
+        scroll_overlay.set_vexpand(true);
+        scroll_overlay.set_child(Some(&block_scroll));
+        scroll_overlay.add_overlay(&breadcrumb);
+
+        root.append(&scroll_overlay);
         root.append(&vte_box);
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -2225,6 +2250,74 @@ impl TermView {
             });
         }
 
+        // ── Floating breadcrumb: track which block fills the viewport top ──────
+        {
+            let block_scroll_for_bc = block_scroll.clone();
+            let finished_blocks_for_bc = finished_blocks_rc.clone();
+            let breadcrumb_for_bc = breadcrumb.clone();
+            let target_for_bc = breadcrumb_target.clone();
+            block_scroll.vadjustment().connect_value_changed(move |adj| {
+                let scroll_top = adj.value();
+                // Near the top there's nothing useful to pin — hide the breadcrumb.
+                if scroll_top <= 8.0 {
+                    breadcrumb_for_bc.set_visible(false);
+                    target_for_bc.set(None);
+                    return;
+                }
+                let finished = finished_blocks_for_bc.borrow();
+                // Blocks are ordered top→bottom; find the last one whose top edge is
+                // at or above the current viewport top.
+                let mut current: Option<(usize, &FinishedBlock)> = None;
+                for (idx, block) in finished.iter().enumerate() {
+                    if let Some(p) = block.widget().compute_point(
+                        &block_scroll_for_bc,
+                        &gtk4::graphene::Point::new(0.0, 0.0),
+                    ) {
+                        // p.y() is the block top relative to the viewport; <= 0 means
+                        // its top has scrolled above the visible area.
+                        if p.y() as f64 <= 0.0 {
+                            current = Some((idx, block));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                match current {
+                    Some((idx, block)) => {
+                        let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
+                        breadcrumb_for_bc.set_label(&format!("\u{25B8} {}", cmd));
+                        target_for_bc.set(Some(idx));
+                        breadcrumb_for_bc.set_visible(true);
+                    }
+                    None => {
+                        breadcrumb_for_bc.set_visible(false);
+                        target_for_bc.set(None);
+                    }
+                }
+            });
+        }
+
+        // Clicking the breadcrumb jumps to the top of the block it names.
+        {
+            let block_scroll_for_click = block_scroll.clone();
+            let finished_blocks_for_click = finished_blocks_rc.clone();
+            let target_for_click = breadcrumb_target.clone();
+            breadcrumb.connect_clicked(move |_| {
+                if let Some(idx) = target_for_click.get() {
+                    let finished = finished_blocks_for_click.borrow();
+                    if let Some(block) = finished.get(idx) {
+                        let adj = block_scroll_for_click.vadjustment();
+                        if let Some(value) = block.widget().compute_point(
+                            &block_scroll_for_click,
+                            &gtk4::graphene::Point::new(0.0, 0.0),
+                        ) {
+                            adj.set_value(adj.value() + value.y() as f64);
+                        }
+                    }
+                }
+            });
+        }
+
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
 
@@ -2419,6 +2512,7 @@ impl TermView {
                     block.cwd.as_deref(),
                 );
                 finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
+                finished.connect_actions(&term_view.vte, &term_view.pty, &pty_synced, &term_view.active);
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
         }

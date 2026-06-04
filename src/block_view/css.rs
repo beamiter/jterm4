@@ -65,6 +65,24 @@ pub(crate) fn install_block_css(config: &Config) {
         (err.blue() * 255.0) as u8,
     );
 
+    // Status-stripe colors derived from the theme palette: green (palette 2) for
+    // success, red (palette 1) for failure. Kept semi-transparent so the stripe
+    // reads as an accent rather than a hard bar.
+    let ok = &config.palette[2];
+    let ok_stripe = format!(
+        "rgba({},{},{},0.55)",
+        (ok.red() * 255.0) as u8,
+        (ok.green() * 255.0) as u8,
+        (ok.blue() * 255.0) as u8,
+    );
+    let ok_hex = rgba_to_hex(ok);
+    let err_stripe = format!(
+        "rgba({},{},{},0.70)",
+        (err.red() * 255.0) as u8,
+        (err.green() * 255.0) as u8,
+        (err.blue() * 255.0) as u8,
+    );
+
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
@@ -109,14 +127,24 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-finished {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
-            border-radius: 6px;
+            border-left: 3px solid transparent;
+            border-radius: 8px;
             background-color: {block_bg_hex};
             min-height: 40px;
             transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
         }}
+        .block-success {{
+            border-left-color: {ok_stripe};
+        }}
+        .block-failed {{
+            border-left-color: {err_stripe};
+        }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
-            border-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-top-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-right-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-bottom-color: rgba({fg_r},{fg_g},{fg_b},0.18);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.18);
         }}
         .block-selected {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
@@ -124,11 +152,47 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-active {{
             border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
-            border-radius: 6px;
+            border-left: 3px solid {accent};
+            border-radius: 8px;
             margin: 4px 8px;
             padding-top: 4px;
             background-color: {block_bg_hex};
             min-height: 40px;
+        }}
+        .block-status-ok {{
+            color: {ok_hex};
+            font-size: 0.9em;
+            font-weight: bold;
+        }}
+        .block-status-bad {{
+            color: {err_hex};
+            font-size: 0.9em;
+            font-weight: bold;
+        }}
+        .block-action-btn {{
+            color: {dim_fg};
+            min-width: 22px;
+            min-height: 22px;
+            padding: 0 4px;
+            font-size: 0.85em;
+        }}
+        .block-action-btn:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+        }}
+        .block-breadcrumb {{
+            color: {dim_fg};
+            background-color: {block_bg_hex};
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-radius: 6px;
+            margin: 6px 12px;
+            padding: 3px 10px;
+            font-size: 0.85em;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+        }}
+        .block-breadcrumb:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.06);
         }}
         .block-header {{
             border-radius: 6px 6px 0 0;
