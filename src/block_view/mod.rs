@@ -78,6 +78,7 @@ pub struct TermView {
 struct ReaderCtx {
     active_rc: Rc<RefCell<ActiveBlock>>,
     bstate_rc: Rc<Cell<BlockState>>,
+    cursor_hide_pending_rc: Rc<Cell<bool>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
     cmd_buf_rc: Rc<RefCell<String>>,
@@ -129,6 +130,7 @@ impl ReaderCtx {
         let ReaderCtx {
             active_rc,
             bstate_rc,
+            cursor_hide_pending_rc,
             osc133_depth_rc,
             prompt_buf_rc,
             cmd_buf_rc,
@@ -581,7 +583,34 @@ impl ReaderCtx {
                                             cb();
                                         }
 
-                                        if contains_interactive_screen_enter(bytes) {
+                                        // Decide whether this command is a
+                                        // full-screen TUI. Alt-screen / app-cursor
+                                        // sequences are definitive. A bare cursor
+                                        // hide (ESC[?25l) is ambiguous — git, npm
+                                        // and cargo hide the cursor for progress
+                                        // bars too — so it only counts once paired
+                                        // with a full-screen redraw, which may
+                                        // arrive in a later chunk.
+                                        let mut enter_alt = contains_interactive_screen_enter(bytes);
+                                        if !enter_alt {
+                                            let redraw = contains_full_screen_redraw(bytes);
+                                            if cursor_hide_pending_rc.get() {
+                                                if redraw {
+                                                    enter_alt = true;
+                                                } else if contains_cursor_show(bytes) {
+                                                    cursor_hide_pending_rc.set(false);
+                                                }
+                                            } else if contains_cursor_hide(bytes) {
+                                                if redraw {
+                                                    enter_alt = true;
+                                                } else {
+                                                    cursor_hide_pending_rc.set(true);
+                                                }
+                                            }
+                                        }
+
+                                        if enter_alt {
+                                            cursor_hide_pending_rc.set(false);
                                             bstate_rc.set(BlockState::AltScreen);
                                             pager_snapshots_rc.borrow_mut().clear();
                                             pager_snapshot_generation_rc.set(
@@ -941,6 +970,7 @@ impl ReaderCtx {
                                     continue;
                                 }
                                 osc133_depth_rc.set(0);
+                                cursor_hide_pending_rc.set(false);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 block_start_time_for_cb.set(Some(SystemTime::now()));
                                 let raw_cmd = cmd_display_raw_rc.borrow().clone();
@@ -974,6 +1004,7 @@ impl ReaderCtx {
                                     continue;
                                 }
                                 active_rc.borrow().stop_timer();
+                                cursor_hide_pending_rc.set(false);
                                 if state == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
@@ -2019,6 +2050,11 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+        // Set when the running command hides the cursor (ESC[?25l) but has not
+        // yet shown a full-screen redraw. A bare cursor-hide is ambiguous —
+        // git/npm/cargo hide it for progress bars — so we wait for a redraw
+        // before treating the command as a TUI and switching to alt-screen.
+        let cursor_hide_pending = Rc::new(Cell::new(false));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -2064,6 +2100,7 @@ impl TermView {
         {
             let active_rc = active.clone();
             let bstate_rc = bstate.clone();
+            let cursor_hide_pending_rc = cursor_hide_pending.clone();
             let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
             let cmd_buf_rc = cmd_buf.clone();
@@ -2126,6 +2163,7 @@ impl TermView {
             ReaderCtx {
                 active_rc,
                 bstate_rc,
+                cursor_hide_pending_rc,
                 osc133_depth_rc,
                 prompt_buf_rc,
                 cmd_buf_rc,

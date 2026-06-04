@@ -67,10 +67,6 @@ pub(crate) fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
                 {
                     return true;
                 }
-                // ESC[?25l — cursor hide, strong indicator of TUI app (Claude CLI, etc.)
-                if final_byte == b'l' && params == b"?25" {
-                    return true;
-                }
             }
             _ => {
                 i = skip_escape_sequence(bytes, i);
@@ -78,6 +74,75 @@ pub(crate) fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
         }
     }
 
+    false
+}
+
+/// Detect a CSI sequence that repaints the screen using absolute positioning:
+/// cursor-position (`H`/`f`) or erase-display (`J`). Full-screen TUIs (vim,
+/// htop, Claude CLI) use these; line-oriented progress output (git, npm, cargo)
+/// only uses `\r` + erase-line (`K`) + cursor-up (`A`), so it does NOT match.
+/// This is the signal that separates a real TUI from a cursor-hiding progress
+/// bar — see [`contains_cursor_hide`].
+pub(crate) fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            if matches!(bytes[i], b'H' | b'f' | b'J') {
+                return true;
+            }
+            i += 1;
+        } else {
+            i = skip_escape_sequence(bytes, i);
+        }
+    }
+    false
+}
+
+/// True if the byte stream contains `ESC[?25l` (hide cursor).
+pub(crate) fn contains_cursor_hide(bytes: &[u8]) -> bool {
+    contains_private_mode(bytes, b'l')
+}
+
+/// True if the byte stream contains `ESC[?25h` (show cursor).
+pub(crate) fn contains_cursor_show(bytes: &[u8]) -> bool {
+    contains_private_mode(bytes, b'h')
+}
+
+fn contains_private_mode(bytes: &[u8], want_final: u8) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b'[' {
+            i += 2;
+            let params_start = i;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i] == want_final && &bytes[params_start..i] == b"?25" {
+                return true;
+            }
+            i += 1;
+        } else {
+            i = skip_escape_sequence(bytes, i);
+        }
+    }
     false
 }
 
@@ -153,8 +218,11 @@ mod interactive_screen_tests {
     }
 
     #[test]
-    fn detects_cursor_hide() {
-        assert!(contains_interactive_screen_enter(b"\x1b[?25l"));
+    fn cursor_hide_alone_is_not_interactive() {
+        // A bare cursor-hide is ambiguous (git/npm/cargo progress all hide the
+        // cursor). It must be paired with a full-screen redraw — handled
+        // statefully by the caller — so it does NOT trigger on its own.
+        assert!(!contains_interactive_screen_enter(b"\x1b[?25l"));
     }
 
     #[test]
@@ -165,6 +233,37 @@ mod interactive_screen_tests {
     #[test]
     fn ignores_leave_sequences() {
         assert!(!contains_interactive_screen_enter(b"\x1b[?1049l\x1b[?1l\x1b>"));
+    }
+}
+
+#[cfg(test)]
+mod cursor_and_redraw_tests {
+    use super::{contains_cursor_hide, contains_cursor_show, contains_full_screen_redraw};
+
+    #[test]
+    fn detects_cursor_hide_and_show() {
+        assert!(contains_cursor_hide(b"\x1b[?25l"));
+        assert!(contains_cursor_show(b"\x1b[?25h"));
+        assert!(!contains_cursor_hide(b"\x1b[?25h"));
+        assert!(!contains_cursor_show(b"\x1b[?25l"));
+    }
+
+    #[test]
+    fn full_screen_redraw_detects_positioning_and_erase_display() {
+        assert!(contains_full_screen_redraw(b"\x1b[2J"));
+        assert!(contains_full_screen_redraw(b"\x1b[H"));
+        assert!(contains_full_screen_redraw(b"\x1b[10;5H"));
+        assert!(contains_full_screen_redraw(b"\x1b[3;1f"));
+    }
+
+    #[test]
+    fn git_progress_is_not_a_full_screen_redraw() {
+        // git push: hide cursor, rewrite a line with \r + erase-to-line-end (K),
+        // optional cursor-up (A). None of these are full-screen positioning.
+        let git = b"\x1b[?25lCompressing objects:  50% (10/20)\r\x1b[KCompressing objects: 100% (20/20), done.\n";
+        assert!(contains_cursor_hide(git));
+        assert!(!contains_full_screen_redraw(git));
+        assert!(!contains_full_screen_redraw(b"\x1b[A\x1b[K"));
     }
 }
 
