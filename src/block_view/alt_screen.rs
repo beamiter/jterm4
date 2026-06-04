@@ -38,6 +38,18 @@ pub(crate) fn is_application_cursor_mode(params: &[u8]) -> bool {
     params == b"?1"
 }
 
+/// Private modes that only a full-screen / interactive TUI sets, and that
+/// line-oriented progress output (git, npm, cargo) never does. Modern TUIs such
+/// as the Claude CLI never enter the alt-screen and never use absolute cursor
+/// positioning — they repaint in place — so the alt-screen / app-cursor checks
+/// miss them. These extra DECSET modes are the reliable tell:
+///   ?2026 — synchronized output (atomic frame begin)
+///   ?1004 — focus-event reporting
+///   ?2031 — color-scheme / theme change notifications
+pub(crate) fn is_interactive_app_mode(params: &[u8]) -> bool {
+    matches!(params, b"?2026" | b"?1004" | b"?2031")
+}
+
 pub(crate) fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
     let mut i = 0;
 
@@ -63,7 +75,9 @@ pub(crate) fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
                 i += 1;
 
                 if final_byte == b'h'
-                    && (is_alt_screen_mode(params) || is_application_cursor_mode(params))
+                    && (is_alt_screen_mode(params)
+                        || is_application_cursor_mode(params)
+                        || is_interactive_app_mode(params))
                 {
                     return true;
                 }
@@ -215,6 +229,19 @@ mod interactive_screen_tests {
     #[test]
     fn detects_less_application_cursor_enter() {
         assert!(contains_interactive_screen_enter(b"\x1b[?1h\x1b="));
+    }
+
+    #[test]
+    fn detects_modern_tui_private_modes() {
+        // The Claude CLI never enters the alt-screen; it announces itself with
+        // synchronized-output / focus / theme DECSET modes instead.
+        assert!(contains_interactive_screen_enter(b"\x1b[?2026h"));
+        assert!(contains_interactive_screen_enter(b"\x1b[?1004h"));
+        assert!(contains_interactive_screen_enter(b"\x1b[?2031h"));
+        // Claude's actual startup preamble.
+        assert!(contains_interactive_screen_enter(
+            b"\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?1004h\x1b[?2031h\x1b[?2026h"
+        ));
     }
 
     #[test]
