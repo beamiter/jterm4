@@ -83,6 +83,21 @@ pub(crate) fn install_block_css(config: &Config) {
         (err.blue() * 255.0) as u8,
     );
 
+    // Per-channel components for the success/error/accent colors, used to build
+    // tinted backgrounds and focus glows directly in the CSS template.
+    let ok_r = (ok.red() * 255.0) as u8;
+    let ok_g = (ok.green() * 255.0) as u8;
+    let ok_b = (ok.blue() * 255.0) as u8;
+    let err_r = (err.red() * 255.0) as u8;
+    let err_g = (err.green() * 255.0) as u8;
+    let err_b = (err.blue() * 255.0) as u8;
+    // Accent == palette[2] (same green as success); reused for the active-card
+    // focus ring and prompt chevron.
+    let acc = &config.palette[2];
+    let acc_r = (acc.red() * 255.0) as u8;
+    let acc_g = (acc.green() * 255.0) as u8;
+    let acc_b = (acc.blue() * 255.0) as u8;
+
     let fg_r = (fg.red() * 255.0) as u8;
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
@@ -126,12 +141,12 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
         }}
         .block-finished {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.08);
             border-left: 3px solid transparent;
-            border-radius: 8px;
+            border-radius: 10px;
             background-color: {block_bg_hex};
             min-height: 40px;
-            transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+            transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
         }}
         .block-success {{
             border-left-color: {ok_stripe};
@@ -140,59 +155,91 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: {err_stripe};
         }}
         .block-hovered {{
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.04);
-            border-top-color: rgba({fg_r},{fg_g},{fg_b},0.18);
-            border-right-color: rgba({fg_r},{fg_g},{fg_b},0.18);
-            border-bottom-color: rgba({fg_r},{fg_g},{fg_b},0.18);
-            box-shadow: 0 1px 3px rgba(0,0,0,0.18);
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
+            border-top-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+            border-right-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+            border-bottom-color: rgba({fg_r},{fg_g},{fg_b},0.16);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.22);
         }}
         .block-selected {{
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
-            box-shadow: inset 3px 0 0 0 {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.07);
+            box-shadow: inset 3px 0 0 0 {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.35);
         }}
         .block-active {{
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
             border-left: 3px solid {accent};
-            border-radius: 8px;
-            margin: 4px 8px;
+            border-radius: 10px;
+            margin: 6px 8px;
             padding-top: 4px;
+            padding-bottom: 4px;
             background-color: {block_bg_hex};
             min-height: 40px;
+            transition: box-shadow 140ms ease, border-color 140ms ease;
+        }}
+        .block-active:focus-within {{
+            border-color: {accent};
+            box-shadow: 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.45), 0 6px 18px rgba(0,0,0,0.30);
+        }}
+        .block-prompt-chevron {{
+            color: {accent};
+            font-family: "{font_family}";
+            font-size: {font_size};
+            font-weight: bold;
+            margin-left: 12px;
+            margin-right: 2px;
         }}
         .block-status-ok {{
             color: {ok_hex};
-            font-size: 0.9em;
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.16);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
             font-weight: bold;
         }}
         .block-status-bad {{
             color: {err_hex};
-            font-size: 0.9em;
+            background-color: rgba({err_r},{err_g},{err_b},0.18);
+            border-radius: 999px;
+            min-width: 16px;
+            min-height: 16px;
+            padding: 1px 5px;
+            font-family: "{font_family}";
+            font-size: 0.82em;
             font-weight: bold;
         }}
         .block-action-btn {{
             color: {dim_fg};
-            min-width: 22px;
-            min-height: 22px;
+            min-width: 24px;
+            min-height: 24px;
             padding: 0 4px;
-            font-size: 0.85em;
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.9em;
+            transition: background-color 120ms ease, color 120ms ease;
         }}
         .block-action-btn:hover {{
             color: {fg_hex};
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.10);
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
         .block-breadcrumb {{
             color: {dim_fg};
             background-color: {block_bg_hex};
-            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
-            border-radius: 6px;
-            margin: 6px 12px;
-            padding: 3px 10px;
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.28);
+            border-left: 3px solid {accent};
+            border-radius: 999px;
+            margin: 8px 14px;
+            padding: 4px 14px;
+            font-family: "{font_family}";
             font-size: 0.85em;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.32);
+            transition: background-color 120ms ease, color 120ms ease;
         }}
         .block-breadcrumb:hover {{
             color: {fg_hex};
-            background-color: rgba({fg_r},{fg_g},{fg_b},0.06);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
         }}
         .block-header {{
             border-radius: 6px 6px 0 0;
@@ -203,10 +250,17 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-collapse-btn {{
             color: {dim_fg};
-            font-size: 0.75em;
-            min-width: 20px;
-            min-height: 20px;
+            font-family: "{font_family}";
+            font-size: 0.8em;
+            min-width: 24px;
+            min-height: 24px;
             padding: 0;
+            border-radius: 999px;
+            transition: background-color 120ms ease, color 120ms ease;
+        }}
+        .block-collapse-btn:hover {{
+            color: {fg_hex};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
         .block-prompt {{
             color: {dim_fg};
@@ -318,16 +372,20 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-exit-bad {{
             color: {err_hex};
             background-color: {err_bg};
-            border-radius: 4px;
-            font-size: 0.8em;
-            padding: 1px 6px;
+            border: 1px solid rgba({err_r},{err_g},{err_b},0.35);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            font-weight: bold;
+            padding: 1px 8px;
         }}
         .block-meta-badge {{
             color: {dim_fg};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.08);
-            border-radius: 4px;
-            font-size: 0.8em;
-            padding: 1px 6px;
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 8px;
         }}
         .block-running-label {{
             color: {dim_fg};
@@ -346,11 +404,18 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-show-more {{
             color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.25);
+            border-radius: 999px;
             margin-left: 12px;
-            margin-top: 4px;
+            margin-top: 6px;
             margin-bottom: 4px;
-            font-size: 0.85em;
-            padding: 2px 8px;
+            font-size: 0.82em;
+            padding: 2px 12px;
+            transition: background-color 120ms ease;
+        }}
+        .block-show-more:hover {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
         }}
         "#,
     );

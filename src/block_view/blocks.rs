@@ -203,7 +203,8 @@ impl FinishedBlock {
         header_row.set_margin_bottom(2);
 
         // Status icon: ✓ for success, ✗ for failure.
-        let status_icon = gtk4::Label::new(Some(if exit_code == 0 { "\u{2713}" } else { "\u{2717}" }));
+        // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
+        let status_icon = gtk4::Label::new(Some(if exit_code == 0 { "\u{f00c}" } else { "\u{f00d}" }));
         status_icon.add_css_class(if exit_code == 0 { "block-status-ok" } else { "block-status-bad" });
         status_icon.set_halign(gtk4::Align::Start);
         header_row.append(&status_icon);
@@ -264,11 +265,11 @@ impl FinishedBlock {
         // wired by the caller, which has access to the clipboard + active block.
         let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
         action_box.set_visible(false);
-        let copy_cmd_btn = gtk4::Button::with_label("\u{29C9}"); // ⧉ copy command
+        let copy_cmd_btn = gtk4::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
-        let copy_output_btn = gtk4::Button::with_label("\u{2630}"); // ☰ copy output
+        let copy_output_btn = gtk4::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
         copy_output_btn.set_tooltip_text(Some("Copy output"));
-        let rerun_btn = gtk4::Button::with_label("\u{21BB}"); // ↻ re-run
+        let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
         rerun_btn.set_tooltip_text(Some("Re-run command"));
         for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn] {
             btn.add_css_class("block-action-btn");
@@ -292,7 +293,7 @@ impl FinishedBlock {
         outer.add_controller(hover_ctrl);
 
         // Collapse toggle button
-        let collapse_btn = gtk4::Button::with_label("\u{25BC}"); // ▼
+        let collapse_btn = gtk4::Button::with_label("\u{f078}"); // nf-fa-chevron_down
         collapse_btn.add_css_class("block-collapse-btn");
         collapse_btn.add_css_class("flat");
         header_row.append(&collapse_btn);
@@ -498,10 +499,10 @@ impl FinishedBlock {
             if let Some(ref smb) = show_more_for_collapse {
                 smb.set_visible(!visible);
             }
-            btn.set_label(if visible { "\u{25B6}" } else { "\u{25BC}" }); // ▶ / ▼
+            btn.set_label(if visible { "\u{f054}" } else { "\u{f078}" }); // chevron right / down
         });
         if !has_output {
-            collapse_btn.set_label("\u{25B6}"); // ▶
+            collapse_btn.set_label("\u{f054}"); // nf-fa-chevron_right
         }
 
         FinishedBlock {
@@ -646,6 +647,17 @@ impl ActiveBlock {
 
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view", false);
         let (command_view, command_buffer) = create_textview("block-command-view", false);
+        // The input row gets its leading indent from the accent prompt chevron, so
+        // drop the command view's own left margin to avoid a double indent.
+        command_view.set_left_margin(2);
+
+        // Accent prompt chevron (❯), Warp-style, marking the live input line.
+        let prompt_chevron = gtk4::Label::new(Some("\u{276f}"));
+        prompt_chevron.add_css_class("block-prompt-chevron");
+        prompt_chevron.set_valign(gtk4::Align::Start);
+        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        cmd_row.append(&prompt_chevron);
+        cmd_row.append(&command_view);
 
         // Running timer label (shown during command execution)
         let running_label = gtk4::Label::new(None);
@@ -681,7 +693,7 @@ impl ActiveBlock {
         // Append to widget
         widget.append(&header_row);
         widget.append(&prompt_view);
-        widget.append(&command_view);
+        widget.append(&cmd_row);
         widget.append(&output_vte);
 
         // Grab focus on command_view when realized

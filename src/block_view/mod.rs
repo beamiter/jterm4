@@ -2316,7 +2316,7 @@ impl TermView {
                 match current {
                     Some((idx, block)) => {
                         let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
-                        breadcrumb_for_bc.set_label(&format!("\u{25B8} {}", cmd));
+                        breadcrumb_for_bc.set_label(&format!("\u{f054}  {}", cmd));
                         target_for_bc.set(Some(idx));
                         breadcrumb_for_bc.set_visible(true);
                     }
