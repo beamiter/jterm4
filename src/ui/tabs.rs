@@ -823,16 +823,24 @@ impl UiState {
                 }
                 notebook_for_select.set_current_page(Some(idx));
                 ui_for_select.sync_tab_strip_active(Some(idx));
-                // The ToggleButton also flips its own `active` state when the
-                // press is released, which would undo the :checked styling we
-                // just set. Re-assert the correct state after that completes.
-                let ui_for_resync = ui_for_select.clone();
-                glib::idle_add_local_once(move || {
-                    ui_for_resync.sync_tab_strip_active(None);
-                });
             }
         });
         strip_btn.add_controller(click_gesture);
+
+        // A ToggleButton flips its own `active` state when clicked (on release),
+        // which fights the notebook-driven selection: clicking a tab would set
+        // it active via switch-page, then the release toggle would clear it,
+        // dropping the :checked styling. Re-assert the correct state after the
+        // toggle settles. Scheduling on idle lets the in-progress toggle finish
+        // first; sync only emits `toggled` for buttons that actually change, so
+        // this converges instead of looping.
+        let ui_for_toggle = self.clone();
+        strip_btn.connect_toggled(move |_| {
+            let ui_for_idle = ui_for_toggle.clone();
+            glib::idle_add_local_once(move || {
+                ui_for_idle.sync_tab_strip_active(None);
+            });
+        });
 
         // Drag source: carry the widget name so we can identify the dragged button
         let drag_source = gtk4::DragSource::new();
