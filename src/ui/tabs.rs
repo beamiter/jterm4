@@ -823,6 +823,13 @@ impl UiState {
                 }
                 notebook_for_select.set_current_page(Some(idx));
                 ui_for_select.sync_tab_strip_active(Some(idx));
+                // The ToggleButton also flips its own `active` state when the
+                // press is released, which would undo the :checked styling we
+                // just set. Re-assert the correct state after that completes.
+                let ui_for_resync = ui_for_select.clone();
+                glib::idle_add_local_once(move || {
+                    ui_for_resync.sync_tab_strip_active(None);
+                });
             }
         });
         strip_btn.add_controller(click_gesture);
