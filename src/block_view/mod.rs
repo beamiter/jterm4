@@ -59,6 +59,13 @@ fn next_block_id() -> u64 {
 /// content it can actually retain. Bounds resource use for runaway output.
 const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 
+/// Erase the alt VTE before a new full-screen command reuses it: erase display
+/// (`2J`), erase scrollback (`3J`), and home the cursor (`H`). Fed through VTE's
+/// data pipeline rather than `Terminal::reset`, because reset only clears modes
+/// and scrollback — it leaves the visible grid intact, so the previous command's
+/// screen would leak into the next block's captured output.
+const ALT_VTE_CLEAR: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
+
 #[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
@@ -126,6 +133,7 @@ struct ReaderCtx {
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
     pager_snapshots_rc: Rc<RefCell<Vec<String>>>,
     pager_snapshot_generation_rc: Rc<Cell<u64>>,
+    pager_pre_clear_rc: Rc<RefCell<String>>,
     scroll_debouncer: ScrollDebouncer,
     ansi_cache_for_cb: Rc<RefCell<LruCache<String, String>>>,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
@@ -178,6 +186,7 @@ impl ReaderCtx {
             finished_blocks_for_cb,
             pager_snapshots_rc,
             pager_snapshot_generation_rc,
+            pager_pre_clear_rc,
             scroll_debouncer,
             ansi_cache_for_cb,
             widget_pool_for_cb,
@@ -638,7 +647,10 @@ impl ReaderCtx {
                                             pager_snapshot_generation_rc.set(
                                                 pager_snapshot_generation_rc.get().wrapping_add(1),
                                             );
+                                            *pager_pre_clear_rc.borrow_mut() =
+                                                normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
                                             vte_for_alt.reset(true, true);
+                                            vte_for_alt.feed(ALT_VTE_CLEAR);
                                             let prior = active_rc.borrow().raw_output.borrow().clone();
                                             if !prior.is_empty() {
                                                 vte_for_alt.feed(&prior);
@@ -649,11 +661,11 @@ impl ReaderCtx {
                                                 &vte_for_alt,
                                                 Some(bytes),
                                             );
-                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
                                             schedule_pager_snapshot(
                                                 &vte_for_alt,
                                                 &pager_snapshots_rc,
                                                 &pager_snapshot_generation_rc,
+                                                &pager_pre_clear_rc,
                                             );
                                             continue;
                                         }
@@ -666,7 +678,7 @@ impl ReaderCtx {
                                         // If bytes contain clear screen, record current page BEFORE clearing
                                         if contains_clear_screen(bytes) {
                                             log::debug!("Detected clear screen in pager, recording current page first");
-                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                         }
 
                                         // Feed raw bytes directly to VTE
@@ -677,6 +689,7 @@ impl ReaderCtx {
                                             &vte_for_alt,
                                             &pager_snapshots_rc,
                                             &pager_snapshot_generation_rc,
+                                            &pager_pre_clear_rc,
                                         );
                                     }
                                     BlockState::PostCommand => {
@@ -693,6 +706,7 @@ impl ReaderCtx {
                             ParserEvent::PromptStart => {
                                 let state = bstate_rc.get();
                                 if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                    log::debug!("[altdiag] PromptStart SKIPPED (state={:?}, osc133_depth={})", state, osc133_depth_rc.get());
                                     continue;
                                 }
                                 // Finalize the previous block if we're in PostCommand state
@@ -996,9 +1010,11 @@ impl ReaderCtx {
                                 let state = bstate_rc.get();
                                 if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
                                     osc133_depth_rc.set(osc133_depth_rc.get() + 1);
+                                    log::debug!("[altdiag] CommandStart NESTED (state={:?}, osc133_depth->{})", state, osc133_depth_rc.get());
                                     continue;
                                 }
                                 if state != BlockState::AwaitingCommand {
+                                    log::debug!("[altdiag] CommandStart IGNORED (state={:?})", state);
                                     continue;
                                 }
                                 osc133_depth_rc.set(0);
@@ -1029,16 +1045,18 @@ impl ReaderCtx {
                             ParserEvent::CommandEnd(code) => {
                                 let state = bstate_rc.get();
                                 if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+                                    log::debug!("[altdiag] CommandEnd IGNORED (state={:?})", state);
                                     continue;
                                 }
                                 if osc133_depth_rc.get() > 0 {
                                     osc133_depth_rc.set(osc133_depth_rc.get() - 1);
+                                    log::debug!("[altdiag] CommandEnd SWALLOWED by nesting (osc133_depth->{})", osc133_depth_rc.get());
                                     continue;
                                 }
                                 active_rc.borrow().stop_timer();
                                 cursor_hide_pending_rc.set(false);
                                 if state == BlockState::AltScreen || vte_box_rc.is_visible() {
-                                    record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                    record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                     let active_for_idle = active_rc.clone();
                                     glib::idle_add_local_once(move || {
@@ -1076,6 +1094,7 @@ impl ReaderCtx {
 
                             ParserEvent::AltScreenEnter => {
                                 if bstate_rc.get() != BlockState::CollectingOutput {
+                                    log::debug!("[altdiag] AltScreenEnter REJECTED (state={:?}, osc133_depth={})", bstate_rc.get(), osc133_depth_rc.get());
                                     continue;
                                 }
                                 bstate_rc.set(BlockState::AltScreen);
@@ -1083,7 +1102,10 @@ impl ReaderCtx {
                                 pager_snapshot_generation_rc.set(
                                     pager_snapshot_generation_rc.get().wrapping_add(1),
                                 );
+                                *pager_pre_clear_rc.borrow_mut() =
+                                    normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
                                 vte_for_alt.reset(true, true);
+                                vte_for_alt.feed(ALT_VTE_CLEAR);
                                 show_alt_screen(
                                     &block_scroll_rc,
                                     &vte_box_rc,
@@ -1094,9 +1116,10 @@ impl ReaderCtx {
 
                             ParserEvent::AltScreenLeave => {
                                 if bstate_rc.get() != BlockState::AltScreen {
+                                    log::debug!("[altdiag] AltScreenLeave REJECTED (state={:?})", bstate_rc.get());
                                     continue;
                                 }
-                                record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc);
+                                record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 let active_for_idle = active_rc.clone();
@@ -2165,6 +2188,12 @@ impl TermView {
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
         let pager_snapshots: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let pager_snapshot_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Normalized text of the shared alt VTE captured *before* we reset/clear
+        // it on a new alt-screen entry. VTE feeds (reset + clear + new content)
+        // render asynchronously, so idle snapshots scheduled right after entry can
+        // read the *previous* command's still-rendered frame. Any snapshot equal
+        // to this baseline is a stale read and must be dropped.
+        let pager_pre_clear: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
             LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
         ));
@@ -2217,6 +2246,7 @@ impl TermView {
             let finished_blocks_for_cb = finished_blocks_rc.clone();
             let pager_snapshots_rc = pager_snapshots.clone();
             let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
+            let pager_pre_clear_rc = pager_pre_clear.clone();
             let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
                 user_scrolled_up.clone(),
                 programmatic_scroll.clone(),
@@ -2280,6 +2310,7 @@ impl TermView {
                 finished_blocks_for_cb,
                 pager_snapshots_rc,
                 pager_snapshot_generation_rc,
+                pager_pre_clear_rc,
                 scroll_debouncer,
                 ansi_cache_for_cb,
                 widget_pool_for_cb,

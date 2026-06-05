@@ -514,7 +514,11 @@ pub(crate) fn contains_clear_screen(bytes: &[u8]) -> bool {
     false
 }
 
-pub(crate) fn record_pager_snapshot(vte: &Terminal, snapshots: &Rc<RefCell<Vec<String>>>) {
+pub(crate) fn record_pager_snapshot(
+    vte: &Terminal,
+    snapshots: &Rc<RefCell<Vec<String>>>,
+    pre_clear: &Rc<RefCell<String>>,
+) {
     let raw_text = visible_vte_text(vte);
     log::debug!("record_pager_snapshot: raw_text len={}, first 100 chars: {:?}",
                raw_text.len(), raw_text.chars().take(100).collect::<String>());
@@ -525,6 +529,15 @@ pub(crate) fn record_pager_snapshot(vte: &Terminal, snapshots: &Rc<RefCell<Vec<S
         return;
     }
 
+    // The shared alt VTE is reset+cleared asynchronously on each new alt-screen
+    // entry. Until that clear actually renders, the VTE still shows the previous
+    // command's last frame. Drop any snapshot that matches that baseline so the
+    // previous command's content cannot leak into this command's block.
+    if pre_clear.borrow().as_str() == snapshot {
+        log::debug!("record_pager_snapshot: snapshot matches pre-clear baseline (stale render), skipping");
+        return;
+    }
+
     let mut snapshots = snapshots.borrow_mut();
     if snapshots.last().map(|last| last == &snapshot).unwrap_or(false) {
         log::debug!("record_pager_snapshot: snapshot is duplicate, skipping");
@@ -532,21 +545,26 @@ pub(crate) fn record_pager_snapshot(vte: &Terminal, snapshots: &Rc<RefCell<Vec<S
     }
     log::debug!("record_pager_snapshot: adding snapshot #{}, len={}", snapshots.len() + 1, snapshot.len());
     snapshots.push(snapshot);
+    // A genuine new-content frame has rendered; the baseline is no longer needed
+    // and keeping it could wrongly drop a legitimately recurring frame.
+    pre_clear.borrow_mut().clear();
 }
 
 pub(crate) fn schedule_pager_snapshot(
     vte: &Terminal,
     snapshots: &Rc<RefCell<Vec<String>>>,
     generation: &Rc<Cell<u64>>,
+    pre_clear: &Rc<RefCell<String>>,
 ) {
     let token = generation.get();
 
     let vte = vte.clone();
     let snapshots = snapshots.clone();
     let generation = generation.clone();
+    let pre_clear = pre_clear.clone();
     glib::idle_add_local_once(move || {
         if generation.get() == token {
-            record_pager_snapshot(&vte, &snapshots);
+            record_pager_snapshot(&vte, &snapshots, &pre_clear);
         }
     });
 }
