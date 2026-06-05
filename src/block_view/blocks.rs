@@ -24,6 +24,46 @@ pub enum TermCursorShape {
 }
 
 
+/// Reserve the correct height on a finished block's output TextView *before* it is
+/// realized. A freshly appended GtkTextView reports a too-small natural height
+/// (~1 line) until its layout is validated on a later frame, which made multi-line
+/// output visibly "expand" row by row after the block appeared. Setting an explicit
+/// height request makes the natural height correct from the first measure, so the
+/// block snaps to full size in one shot.
+fn fit_output_height(view: &TextView, display_output: &str, config: &Config) {
+    let line_count = display_output.lines().count().max(1) as i32;
+
+    // Mirror css.rs: derive the scaled font (family + size) used for these views.
+    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
+    let (family, base_size) = if parts.len() >= 2 {
+        if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
+            (parts[..parts.len() - 1].join(" "), size)
+        } else {
+            (config.font_desc.clone(), 14)
+        }
+    } else {
+        (config.font_desc.clone(), 14)
+    };
+    let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
+    let mut font_desc = gtk4::pango::FontDescription::from_string(&family);
+    font_desc.set_size(scaled_size * gtk4::pango::SCALE);
+
+    // Measure via a private context that inherits the widget's resolution/DPI.
+    let metrics = view.create_pango_context().metrics(Some(&font_desc), None);
+    let line_units = if metrics.height() > 0 {
+        metrics.height()
+    } else {
+        metrics.ascent() + metrics.descent()
+    };
+    // CSS line-height: 1.2 on .block-output-view.
+    let per_line = ((line_units as f64 / gtk4::pango::SCALE as f64) * 1.2).ceil() as i32;
+    let per_line = per_line.max(1);
+
+    // top + bottom view margins, plus 1px slack against rounding.
+    let height = per_line * line_count + 4 + 1;
+    view.set_size_request(-1, height);
+}
+
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
 /// Data for a finished command block (decoupled from widget representation)
@@ -363,6 +403,7 @@ impl FinishedBlock {
             output.to_string()
         };
         set_active_output_buffer(&output_buffer, &display_output, &config.palette, None);
+        fit_output_height(&output_view, &display_output, config);
 
         // Add Ctrl+Click handler to open URLs in command and output views
         for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
@@ -459,6 +500,8 @@ impl FinishedBlock {
 
             let is_expanded = Rc::new(Cell::new(false));
             let output_buffer_clone = output_buffer.clone();
+            let output_view_clone = output_view.clone();
+            let config_clone = config.clone();
             let palette = config.palette;
             let full_output_clone = full_output.clone();
             let is_expanded_clone = is_expanded.clone();
@@ -470,12 +513,14 @@ impl FinishedBlock {
                     let lines: Vec<&str> = full.lines().collect();
                     let truncated = lines[..threshold].join("\n");
                     set_active_output_buffer(&output_buffer_clone, &truncated, &palette, None);
+                    fit_output_height(&output_view_clone, &truncated, &config_clone);
                     let remaining = lines.len() - threshold;
                     btn.set_label(&format!("Show more ({} more lines)", remaining));
                     is_expanded_clone.set(false);
                 } else {
                     let full = full_output_clone.borrow();
                     set_active_output_buffer(&output_buffer_clone, &full, &palette, None);
+                    fit_output_height(&output_view_clone, &full, &config_clone);
                     btn.set_label("Show less");
                     is_expanded_clone.set(true);
                 }
