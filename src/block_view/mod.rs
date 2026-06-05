@@ -66,6 +66,19 @@ const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 /// screen would leak into the next block's captured output.
 const ALT_VTE_CLEAR: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
 
+/// Force the shared alt VTE back to its pre-allocation default grid before a new
+/// full-screen command reuses it. The widget renders fed data into its grid only
+/// when a `size_allocate` flushes the pending feed: on the very first alt-screen
+/// entry the widget grows from this 80x24 default to the real grid when shown,
+/// and that resize is what processes the feed. On later entries the widget keeps
+/// the previous alt grid, so showing it triggers no resize and the fed frame is
+/// never processed — leaving an empty block. Resetting the size here reinstates
+/// the known-good grow-on-show path for every entry. The transient size is
+/// immediately overridden by the next allocation, so it never reaches the user.
+fn reset_alt_vte_grid(vte: &Terminal) {
+    vte.set_size(80, 24);
+}
+
 #[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
@@ -650,6 +663,7 @@ impl ReaderCtx {
                                             *pager_pre_clear_rc.borrow_mut() =
                                                 normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
                                             vte_for_alt.reset(true, true);
+                                            reset_alt_vte_grid(&vte_for_alt);
                                             vte_for_alt.feed(ALT_VTE_CLEAR);
                                             let prior = active_rc.borrow().raw_output.borrow().clone();
                                             if !prior.is_empty() {
@@ -1058,6 +1072,13 @@ impl ReaderCtx {
                                 if state == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                    // Blank the shared alt VTE now that we've captured its final
+                                    // frame. Leaving the frame on the grid would make the *next*
+                                    // alt-screen command's pre-clear baseline equal to this frame,
+                                    // and a near-identical re-run (e.g. `top` twice) would then be
+                                    // dropped as a stale read, producing an empty block.
+                                    vte_for_alt.reset(true, true);
+                                    vte_for_alt.feed(ALT_VTE_CLEAR);
                                     let active_for_idle = active_rc.clone();
                                     glib::idle_add_local_once(move || {
                                         active_for_idle.borrow().grab_focus();
@@ -1105,6 +1126,7 @@ impl ReaderCtx {
                                 *pager_pre_clear_rc.borrow_mut() =
                                     normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
                                 vte_for_alt.reset(true, true);
+                                reset_alt_vte_grid(&vte_for_alt);
                                 vte_for_alt.feed(ALT_VTE_CLEAR);
                                 show_alt_screen(
                                     &block_scroll_rc,
@@ -1121,6 +1143,12 @@ impl ReaderCtx {
                                 }
                                 record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                 hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                // Blank the shared alt VTE so the next alt-screen command's
+                                // pre-clear baseline starts empty. Otherwise this frame lingers and
+                                // a near-identical re-run (e.g. `top` twice) is dropped as a stale
+                                // read, leaving an empty block.
+                                vte_for_alt.reset(true, true);
+                                vte_for_alt.feed(ALT_VTE_CLEAR);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 let active_for_idle = active_rc.clone();
                                 glib::idle_add_local_once(move || {
