@@ -29,6 +29,24 @@ pub(crate) use scroll::*;
 pub(crate) use url::*;
 
 
+// ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
+pub(crate) fn prof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JTERM_PROF").is_ok())
+}
+fn prof_now_us() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros()
+}
+macro_rules! prof {
+    ($($arg:tt)*) => {
+        if prof_enabled() {
+            eprintln!("[PROF {:>10}us] {}", prof_now_us(), format!($($arg)*));
+        }
+    };
+}
+pub(crate) use prof;
+
 // Global block ID counter
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -178,6 +196,8 @@ impl ReaderCtx {
         } = self;
             pty.start_reader(
                 move |data: Vec<u8>| {
+                    let _prof_cb_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
+                    prof!("CB enter: {} bytes, state={:?}", data.len(), bstate_rc.get());
                     log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
                     if data.len() < 512 {
                         log::debug!("PTY hex: {:02x?}", &data);
@@ -201,9 +221,11 @@ impl ReaderCtx {
                             }
                         }
                     }
+                    prof!("CB after-resize-sync");
                     let mut events = event_buf.borrow_mut();
                     events.clear();
                     parser.borrow_mut().feed(&data, &mut events);
+                    prof!("CB after-parse: {} events", events.len());
 
                     for event in events.iter() {
                         let state = bstate_rc.get();
@@ -675,6 +697,7 @@ impl ReaderCtx {
                                 }
                                 // Finalize the previous block if we're in PostCommand state
                                 if state == BlockState::PostCommand {
+                                    let _pf_fin = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
                                     active_rc.borrow().flush_output();
 
                                     let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
@@ -760,13 +783,17 @@ impl ReaderCtx {
 
                                     block_data_for_cb.borrow_mut().push_back(block_data);
 
+                                    let _pf_new = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
                                     let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                     let finished = FinishedBlock::new_with_pool(
                                         &prompt, &cmd, if cmd_ansi_trimmed.is_empty() { None } else { Some(&cmd_ansi_trimmed) }, &output_with_ansi, exit_code, &config_for_cb.borrow(),
                                         duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                     );
+                                    if let Some(t) = _pf_new { prof!("  FinishedBlock::new {}us (blocks={})", t.elapsed().as_micros(), finished_blocks_for_cb.borrow().len()); }
 
+                                    let _pf_ins = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
                                     finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                    if let Some(t) = _pf_ins { prof!("  insert_before {}us", t.elapsed().as_micros()); }
 
                                     let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                     let finished_clone = finished.clone();
@@ -921,6 +948,7 @@ impl ReaderCtx {
                                     last_nonempty_cmd_markup_rc.borrow_mut().clear();
 
                                     scroll_debouncer.reset_scroll_lock();
+                                    if let Some(t) = _pf_fin { prof!("  finalize TOTAL {}us", t.elapsed().as_micros()); }
                                 }
                                 bstate_rc.set(BlockState::CollectingPrompt);
                                 prompt_buf_rc.borrow_mut().clear();
@@ -1101,6 +1129,9 @@ impl ReaderCtx {
                                 }
                             }
                         }
+                    }
+                    if let Some(t) = _prof_cb_start {
+                        prof!("CB exit: total {}us", t.elapsed().as_micros());
                     }
                 },
                 move |exit_code| {
@@ -2643,7 +2674,17 @@ impl TermView {
             let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_vte_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
+            let _last_frame = Rc::new(Cell::new(std::time::Instant::now()));
+            let last_frame_for_tick = _last_frame.clone();
             self.root.add_tick_callback(move |widget, _clock| {
+                if prof_enabled() {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(last_frame_for_tick.get()).as_micros();
+                    last_frame_for_tick.set(now);
+                    if dt > 50_000 {
+                        prof!("FRAME gap {}us (>50ms — main loop stalled)", dt);
+                    }
+                }
                 let width = widget.allocated_width();
                 let height = widget.allocated_height();
                 if width <= 0 || height <= 0 {

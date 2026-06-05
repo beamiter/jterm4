@@ -900,6 +900,7 @@ impl ActiveBlock {
     }
 
     pub(crate) fn feed_output(&self, raw_bytes: &[u8]) {
+        let _pf = if super::prof_enabled() { Some(std::time::Instant::now()) } else { None };
         if !self.output_vte.is_visible() {
             self.output_vte.set_visible(true);
         }
@@ -940,6 +941,10 @@ impl ActiveBlock {
             self.output_vte.queue_resize();
         }
         self.output_vte.feed(raw_bytes);
+        if let Some(t) = _pf {
+            super::prof!("    feed_output: {} bytes in {}us (newlines={}, rows={})",
+                raw_bytes.len(), t.elapsed().as_micros(), total_newlines, needed_rows);
+        }
     }
 
     pub(crate) fn flush_output(&self) {
