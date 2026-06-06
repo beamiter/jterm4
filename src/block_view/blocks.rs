@@ -633,6 +633,11 @@ pub(crate) struct ActiveBlock {
     // whole accumulated buffer (which made large outputs quadratic).
     pub(crate) output_newlines: Rc<Cell<i64>>,
     pub(crate) output_bytes: Rc<Cell<i64>>,
+    // High-water mark of grid rows the output has actually occupied (from VTE's
+    // cursor row). Drives the exact widget height so the running block is flush
+    // with its content like a normal terminal, instead of the byte-estimate that
+    // over-grows (badly so for carriage-return progress bars with no newlines).
+    pub(crate) output_max_row: Rc<Cell<i64>>,
     pub(crate) pending_cmd: Rc<RefCell<String>>,        // User input only
     pub(crate) pending_preedit: Rc<RefCell<String>>,    // IME composing text
     pub(crate) pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
@@ -842,6 +847,7 @@ impl ActiveBlock {
             raw_output: Rc::new(RefCell::new(Vec::new())),
             output_newlines: Rc::new(Cell::new(0)),
             output_bytes: Rc::new(Cell::new(0)),
+            output_max_row: Rc::new(Cell::new(0)),
             pending_cmd,
             pending_preedit,
             pending_suggestion,
@@ -973,22 +979,40 @@ impl ActiveBlock {
         } else {
             0
         };
-        // Cap the inline VTE height. The output VTE only retains a bounded scrollback
-        // (see build_output_vte), so growing set_size beyond that just produces blank
-        // rows for content VTE no longer holds — and a runaway command (`yes`, a giant
-        // build log) would otherwise try to make the widget millions of rows tall,
-        // choking layout where a real terminal stays smooth. Normal-sized output is far
-        // below this cap, so this is a no-op for typical commands.
-        let needed_rows = (total_newlines + wrap_extra + 2).min(MAX_INLINE_OUTPUT_ROWS);
+        // Pre-size the grid to a GENEROUS upper bound before feeding. Because bytes
+        // include ANSI escapes and UTF-8 continuation bytes, total_bytes/cols can
+        // only ever over-count the real number of wrapped rows, so this guarantees
+        // all freshly fed content lands in the visible grid (never in scrollback) —
+        // which is what makes the cursor-row read below an accurate height. Capped
+        // at MAX_INLINE_OUTPUT_ROWS (the output VTE's scrollback bound) so a runaway
+        // command can't try to make the widget millions of rows tall.
+        let upper = (total_newlines + wrap_extra + 2).min(MAX_INLINE_OUTPUT_ROWS);
         let current_rows = self.output_vte.row_count();
-        if needed_rows > current_rows || cols != self.output_vte.column_count() {
-            self.output_vte.set_size(cols, needed_rows.max(current_rows));
-            self.output_vte.queue_resize();
+        if upper > current_rows || cols != self.output_vte.column_count() {
+            self.output_vte.set_size(cols, upper.max(current_rows));
         }
         self.output_vte.feed(raw_bytes);
+
+        // Trim to the ACTUAL content height. VTE parses feed() synchronously, and
+        // since the grid was sized to `upper` >= content, the whole output is in the
+        // grid and the cursor row is the high-water mark of rows used. A real
+        // terminal shows output flush with no trailing blank rows; the byte estimate
+        // over-grows the block (badly for carriage-return progress bars that emit
+        // megabytes with no newlines), so collapse the grid back to what's used.
+        let (_ccol, crow) = self.output_vte.cursor_position();
+        let high = self.output_max_row.get().max(crow + 1);
+        self.output_max_row.set(high);
+        // Floor at the newline count (a hard lower bound for line-oriented output) so
+        // a program that parks the cursor higher up can't shrink the grid under real
+        // content. Wrapped output exceeds this floor and is captured by `high`.
+        let needed_rows = high.max(total_newlines + 1).min(MAX_INLINE_OUTPUT_ROWS);
+        if needed_rows != self.output_vte.row_count() {
+            self.output_vte.set_size(cols, needed_rows);
+        }
+        self.output_vte.queue_resize();
         if let Some(t) = _pf {
-            super::prof!("    feed_output: {} bytes in {}us (newlines={}, rows={})",
-                raw_bytes.len(), t.elapsed().as_micros(), total_newlines, needed_rows);
+            super::prof!("    feed_output: {} bytes in {}us (newlines={}, rows={}, cursor_row={})",
+                raw_bytes.len(), t.elapsed().as_micros(), total_newlines, needed_rows, crow);
         }
     }
 
@@ -1034,12 +1058,14 @@ impl ActiveBlock {
         self.raw_output.borrow_mut().clear();
         self.output_newlines.set(0);
         self.output_bytes.set(0);
+        self.output_max_row.set(0);
     }
 
     pub(crate) fn clear_output(&self) {
         self.raw_output.borrow_mut().clear();
         self.output_newlines.set(0);
         self.output_bytes.set(0);
+        self.output_max_row.set(0);
         self.output_vte.feed(b"\x1b[2J\x1b[H\x1b[3J");
         self.output_vte.reset(true, true);
         let cols = self.output_vte.column_count().max(80);

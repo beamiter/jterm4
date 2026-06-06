@@ -130,7 +130,6 @@ struct ReaderCtx {
     block_scroll_rc: ScrolledWindow,
     vte_for_alt: Terminal,
     vte_box_rc: gtk4::Box,
-    pty_for_resize: Rc<OwnedPty>,
     cwd_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     bell_cbs: VoidCallbacks,
@@ -160,7 +159,6 @@ struct ReaderCtx {
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
     pending_exit_code_rc: Rc<Cell<i32>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
-    last_pty_cols: Rc<Cell<u16>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
 }
 
@@ -183,7 +181,6 @@ impl ReaderCtx {
             block_scroll_rc,
             vte_for_alt,
             vte_box_rc,
-            pty_for_resize,
             cwd_cbs,
             exited_cbs,
             bell_cbs,
@@ -213,7 +210,6 @@ impl ReaderCtx {
             block_start_time_for_cb,
             pending_exit_code_rc,
             current_cwd_for_cb,
-            last_pty_cols,
             event_buf,
         } = self;
             pty.start_reader(
@@ -224,26 +220,14 @@ impl ReaderCtx {
                     if data.len() < 512 {
                         log::debug!("PTY hex: {:02x?}", &data);
                     }
-                    // Sync PTY columns with the visible content width. Derive it
-                    // from the always-visible command line, NOT the per-block output
-                    // VTE: that VTE is hidden/auto-sized while idle, so its width
-                    // collapses the PTY to the 40-col floor and makes `ls` print one
-                    // entry per line. The command line is a full-width sibling of the
-                    // output area; subtract its text margins (left 12 + right 8).
-                    // Mirrors the tick-callback resize so the two never disagree.
-                    {
-                        let active = active_rc.borrow();
-                        let char_w = active.output_vte.char_width();
-                        let widget_w = active.command_view.allocated_width() as i64 - 20;
-                        if char_w > 0 && widget_w > 0 {
-                            let new_cols = (widget_w / char_w).max(40) as u16;
-                            if new_cols != last_pty_cols.get() {
-                                last_pty_cols.set(new_cols);
-                                pty_for_resize.resize(new_cols, 24);
-                            }
-                        }
-                    }
-                    prof!("CB after-resize-sync");
+                    // PTY sizing is owned solely by the resize tick callback
+                    // (install_resize_tick), which keeps cols == the output grid
+                    // width and rows == the visible viewport height, updating only
+                    // on real allocation changes — exactly like a normal terminal.
+                    // The old per-chunk resize here hardcoded rows=24, fighting the
+                    // tick callback and leaving the shell on a 24-row terminal
+                    // (breaking `tput lines`, `clear`, and any non-alt TUI) plus
+                    // firing spurious SIGWINCHs the program had to react to.
                     let mut events = event_buf.borrow_mut();
                     events.clear();
                     parser.borrow_mut().feed(&data, &mut events);
@@ -2258,7 +2242,6 @@ impl TermView {
             let block_scroll_rc = block_scroll.clone();
             let vte_for_alt = vte.clone();
             let vte_box_rc = vte_box.clone();
-            let pty_for_resize = pty.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
             let bell_cbs = bell_callbacks.clone();
@@ -2303,7 +2286,6 @@ impl TermView {
             let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
 
-            let last_pty_cols: Rc<Cell<u16>> = Rc::new(Cell::new(80));
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
             ReaderCtx {
                 active_rc,
@@ -2322,7 +2304,6 @@ impl TermView {
                 block_scroll_rc,
                 vte_for_alt,
                 vte_box_rc,
-                pty_for_resize,
                 cwd_cbs,
                 exited_cbs,
                 bell_cbs,
@@ -2352,7 +2333,6 @@ impl TermView {
                 block_start_time_for_cb,
                 pending_exit_code_rc,
                 current_cwd_for_cb,
-                last_pty_cols,
                 event_buf,
             }
             .install(&pty);
@@ -2787,20 +2767,28 @@ impl TermView {
                     if char_w <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    // The live output VTE is hidden while idle, so its
-                    // allocated_width() is 0 — using it here clamped the PTY to
-                    // the 40-column floor, which made programs like `ls` collapse
-                    // their multi-column layout to one entry per line. Derive the
-                    // width from the always-visible command line instead: it is a
-                    // sibling of the output area and spans the same content width.
-                    // Subtract the TextView text margins (left 12 + right 8) so
-                    // the column count matches what actually fits without wrapping.
-                    let view_w = active.command_view.allocated_width() as i64;
-                    let widget_w = view_w - 20;
-                    if widget_w <= 0 {
+                    // The PTY column count must equal the OUTPUT grid width so the
+                    // shell wraps exactly where the displayed output wraps — that is
+                    // what a real terminal does (its PTY width == its grid width).
+                    // The output VTE spans the full block content width; while it is
+                    // hidden (idle) its own allocated_width() collapses to 0, so fall
+                    // back to the block container, which is the same width. (The old
+                    // command_view-minus-margins estimate under-counted by ~5 cols,
+                    // wrapping output early and leaving a ragged right edge.)
+                    let grid_w = if active.output_vte.is_visible()
+                        && active.output_vte.allocated_width() > 0
+                    {
+                        active.output_vte.allocated_width() as i64
+                    } else {
+                        // Block container's content area minus its .block-active
+                        // border (3px left + 1px right, see css.rs) equals the output
+                        // VTE's own width, so the count matches feed_output's grid.
+                        active.widget().allocated_width() as i64 - 4
+                    };
+                    if grid_w <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    let c = (widget_w / char_w).max(40) as u16;
+                    let c = (grid_w / char_w).max(40) as u16;
                     let char_h = active.output_vte.char_height();
                     let r = if char_h > 0 {
                         (height as i64 / char_h).max(1) as u16
