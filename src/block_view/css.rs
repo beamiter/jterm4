@@ -114,7 +114,7 @@ pub(crate) fn install_block_css(config: &Config) {
     );
 
     // Parse font description to extract font family and size
-    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Regular 14"
+    // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Mono 14"
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
     let (font_family, base_size) = if parts.len() >= 2 {
         // Last part is usually the size

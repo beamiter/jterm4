@@ -314,7 +314,11 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .clamp(0.1, 10.0);
     let font_desc = env_string("JTERM4_FONT")
         .or(fc.font)
-        .unwrap_or_else(|| "SauceCodePro Nerd Font Regular 14".to_string());
+        // Use the "Mono" (NFM) Nerd Font variant: the plain "Nerd Font" (NF)
+        // variant renders proportionally in VTE (glyphs draw at non-cell widths)
+        // even though fontconfig reports it spacing=100, so output never aligns
+        // like a real terminal. NFM forces single-cell glyphs.
+        .unwrap_or_else(|| "SauceCodePro Nerd Font Mono 14".to_string());
 
     let foreground = env_rgba("JTERM4_FG")
         .or_else(|| fc.foreground.as_deref().and_then(|v| RGBA::parse(v).ok()))
