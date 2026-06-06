@@ -2712,6 +2712,16 @@ impl TermView {
             let last_alloc_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
             let last_vte_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let last_out_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+            // Horizontal chrome (px) between the block container's allocation and the
+            // output grid: .block-active margin (8+8) + border (3 left + 1 right) = 20px
+            // (see css.rs). Seeded to that CSS value so the FIRST command already wraps
+            // at the true grid width, then self-calibrated from any realized output VTE
+            // so it tracks CSS/font changes automatically. Deriving cols from the always
+            // realized container (minus this chrome) — instead of the output VTE's own
+            // allocation — means the right width is known BEFORE the first byte is fed,
+            // not a frame or two later once the just-shown VTE finally gets laid out.
+            let out_chrome: Rc<Cell<i32>> = Rc::new(Cell::new(20));
 
             let _last_frame = Rc::new(Cell::new(std::time::Instant::now()));
             let last_frame_for_tick = _last_frame.clone();
@@ -2731,6 +2741,17 @@ impl TermView {
                 }
                 let vte_visible = vte_box_for_resize.is_visible();
                 let visibility_changed = vte_visible != last_vte_visible.get();
+                // Also watch the inline output VTE's OWN width. It starts at ~2px
+                // (hidden) and only gets its real allocation a frame or two after
+                // the first output makes it visible — and that transition does NOT
+                // change the root allocation. Without reacting to it the PTY keeps
+                // the coarse widget-width estimate (off by a couple cols from the
+                // VTE's true grid), so the shell wraps a hair wider than the screen.
+                let out_w = active_for_resize
+                    .try_borrow()
+                    .map(|a| a.output_vte.allocated_width())
+                    .unwrap_or(0);
+                let out_w_changed = out_w != last_out_w.get();
                 let alloc_changed =
                     width != last_alloc_w.get() || height != last_alloc_h.get();
                 // While the alt screen is shown we must re-check VTE's grid every
@@ -2742,12 +2763,13 @@ impl TermView {
                 // pre-alt-screen row count and leaves blank space at the bottom of
                 // the window. In block mode we still only react to allocation
                 // changes.
-                if !vte_visible && !alloc_changed && !visibility_changed {
+                if !vte_visible && !alloc_changed && !visibility_changed && !out_w_changed {
                     return glib::ControlFlow::Continue;
                 }
                 last_vte_visible.set(vte_visible);
                 last_alloc_w.set(width);
                 last_alloc_h.set(height);
+                last_out_w.set(out_w);
                 let (cols, rows) = if vte_visible {
                     // Use VTE's OWN grid as the source of truth, not pixel math.
                     // See alt_screen_pty_size for why pixel-derived counts corrupt
@@ -2770,25 +2792,27 @@ impl TermView {
                     // The PTY column count must equal the OUTPUT grid width so the
                     // shell wraps exactly where the displayed output wraps — that is
                     // what a real terminal does (its PTY width == its grid width).
-                    // The output VTE spans the full block content width; while it is
-                    // hidden (idle) its own allocated_width() collapses to 0, so fall
-                    // back to the block container, which is the same width. (The old
-                    // command_view-minus-margins estimate under-counted by ~5 cols,
-                    // wrapping output early and leaving a ragged right edge.)
-                    let grid_w = if active.output_vte.is_visible()
-                        && active.output_vte.allocated_width() > 0
-                    {
-                        active.output_vte.allocated_width() as i64
-                    } else {
-                        // Block container's content area minus its .block-active
-                        // border (3px left + 1px right, see css.rs) equals the output
-                        // VTE's own width, so the count matches feed_output's grid.
-                        active.widget().allocated_width() as i64 - 4
-                    };
-                    if grid_w <= 0 {
+                    //
+                    // Derive it from the BLOCK CONTAINER, which is realized and stable
+                    // from the start, minus the fixed horizontal chrome between it and
+                    // the output grid (out_chrome). The output VTE's own allocation is
+                    // NOT usable as the source here: it stays ~2px for a frame or two
+                    // after feed_output makes it visible, so the entire burst of a short
+                    // command gets fed before the VTE ever reports its real width — the
+                    // shell would wrap a couple cols wide and the tail would be clipped.
+                    // Container-minus-chrome is correct on the very first byte.
+                    let widget_w = active.widget().allocated_width() as i64;
+                    if widget_w <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    let c = (grid_w / char_w).max(40) as u16;
+                    // Self-calibrate the chrome whenever the output VTE is realized at a
+                    // real width, so a CSS/font change can't desync the two.
+                    let vte_w = active.output_vte.allocated_width() as i64;
+                    if active.output_vte.is_visible() && vte_w >= char_w * 40 {
+                        out_chrome.set((widget_w - vte_w).max(0) as i32);
+                    }
+                    let grid_w = widget_w - out_chrome.get() as i64;
+                    let c = ((grid_w / char_w).max(20)) as u16;
                     let char_h = active.output_vte.char_height();
                     let r = if char_h > 0 {
                         (height as i64 / char_h).max(1) as u16
@@ -2797,9 +2821,19 @@ impl TermView {
                     };
                     (c, r)
                 };
+                if std::env::var("JT_WDBG2").is_ok() {
+                    eprintln!("[WDBG tick] computed cols={} rows={} (last_cols={} last_rows={}) out_w={} out_w_changed={} alloc_changed={} vte_visible={} last_real={}",
+                        cols, rows, last_cols.get(), last_rows.get(), out_w, out_w_changed, alloc_changed, vte_visible, out_chrome.get());
+                }
                 if cols != last_cols.get() || rows != last_rows.get() {
                     last_cols.set(cols);
                     last_rows.set(rows);
+                    if std::env::var("JT_WDBG").is_ok() {
+                        if let Ok(a) = active_for_resize.try_borrow() {
+                            eprintln!("[WDBG resize] PTY <- cols={} rows={} | widget_w={} out_vte: col_count={} alloc_w={} char_w={} visible={}",
+                                cols, rows, a.widget().allocated_width(), a.output_vte.column_count(), a.output_vte.allocated_width(), a.output_vte.char_width(), a.output_vte.is_visible());
+                        }
+                    }
                     pty_for_resize.resize(cols, rows);
                     if vte_box_for_resize.is_visible() {
                         // Do NOT call vte.set_size() here. The VTE widget already

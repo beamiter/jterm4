@@ -958,12 +958,25 @@ impl ActiveBlock {
         // Sync column count with actual widget width to avoid line wrap mismatch
         let char_width = self.output_vte.char_width();
         let widget_width = self.output_vte.allocated_width() as i64;
+        // column_count() is kept in lockstep with the PTY width by the resize
+        // tick (which calls output_vte.set_size(pty_cols, ..) every time the PTY
+        // is resized), so it is the authoritative grid width and matches what the
+        // shell was told. Only refine it from the pixel allocation when the VTE
+        // is genuinely realized at a real width — right after set_visible(true)
+        // the allocation is still ~0px, and the old (alloc/char_w).max(40) forced
+        // a bogus 40-column grid, wrapping the first output of every block far
+        // too early (and modern VTE does not reflow on later resize, so it stuck).
         let mut cols = self.output_vte.column_count();
-        if char_width > 0 && widget_width > 0 {
-            let actual_cols = (widget_width / char_width).max(40);
-            if actual_cols != cols {
+        let _dbg_colcount = cols;
+        if char_width > 0 {
+            let actual_cols = widget_width / char_width;
+            if actual_cols >= 40 && actual_cols != cols {
                 cols = actual_cols;
             }
+        }
+        if std::env::var("JT_WDBG").is_ok() {
+            eprintln!("[WDBG feed] column_count={} char_w={} alloc_w={} -> cols={} (first={})",
+                _dbg_colcount, char_width, widget_width, cols, raw_bytes.len() < 4000 && self.output_bytes.get()==0);
         }
         // Accumulate raw bytes first so we can estimate from total content.
         // Track newline/byte totals incrementally — only scan the NEW chunk — so this
