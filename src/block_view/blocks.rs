@@ -955,28 +955,27 @@ impl ActiveBlock {
         if !self.output_vte.is_visible() {
             self.output_vte.set_visible(true);
         }
-        // Sync column count with actual widget width to avoid line wrap mismatch
+        // Derive the wrap width from the BLOCK CONTAINER's allocation, NOT the
+        // output VTE's own. feed_output runs in the PTY reader callback, before
+        // the layout pass that allocates the just-shown VTE, so the output VTE
+        // still reports its pre-realization ~2px allocation here — and its
+        // column_count stays pinned at VTE's 80-column default. Sizing the grid
+        // from that stale 80 made every long line wrap at 80 while the shell was
+        // told the real (narrower) PTY width by the resize tick, so raw output
+        // wider than the screen wrapped in the wrong place. The block container
+        // is realized and stable, so (container_w - chrome) / char_w yields the
+        // SAME column count the tick sends to the PTY — keeping grid == PTY, the
+        // way a real terminal does.
         let char_width = self.output_vte.char_width();
-        let widget_width = self.output_vte.allocated_width() as i64;
-        // column_count() is kept in lockstep with the PTY width by the resize
-        // tick (which calls output_vte.set_size(pty_cols, ..) every time the PTY
-        // is resized), so it is the authoritative grid width and matches what the
-        // shell was told. Only refine it from the pixel allocation when the VTE
-        // is genuinely realized at a real width — right after set_visible(true)
-        // the allocation is still ~0px, and the old (alloc/char_w).max(40) forced
-        // a bogus 40-column grid, wrapping the first output of every block far
-        // too early (and modern VTE does not reflow on later resize, so it stuck).
+        let container_width = self.widget.allocated_width() as i64;
         let mut cols = self.output_vte.column_count();
         let _dbg_colcount = cols;
-        if char_width > 0 {
-            let actual_cols = widget_width / char_width;
-            if actual_cols >= 40 && actual_cols != cols {
-                cols = actual_cols;
-            }
+        if char_width > 0 && container_width > char_width * 40 {
+            cols = ((container_width - super::OUTPUT_GRID_CHROME_PX) / char_width).max(20);
         }
         if std::env::var("JT_WDBG").is_ok() {
-            eprintln!("[WDBG feed] column_count={} char_w={} alloc_w={} -> cols={} (first={})",
-                _dbg_colcount, char_width, widget_width, cols, raw_bytes.len() < 4000 && self.output_bytes.get()==0);
+            eprintln!("[WDBG feed] column_count={} char_w={} container_w={} -> cols={} (first={})",
+                _dbg_colcount, char_width, container_width, cols, raw_bytes.len() < 4000 && self.output_bytes.get()==0);
         }
         // Accumulate raw bytes first so we can estimate from total content.
         // Track newline/byte totals incrementally — only scan the NEW chunk — so this

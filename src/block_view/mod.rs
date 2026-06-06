@@ -59,6 +59,14 @@ fn next_block_id() -> u64 {
 /// content it can actually retain. Bounds resource use for runaway output.
 const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 
+/// Horizontal pixels between the block container's allocation and the output
+/// text grid: `.block-active` margin (8+8) + border (3 left + 1 right) = 20px
+/// (see css.rs). Both the resize tick (which derives the PTY column count) and
+/// `feed_output` (which sizes the output VTE grid) subtract this from the block
+/// container width so the shell is told EXACTLY the column count the grid wraps
+/// at — a real terminal guarantees PTY width == grid width.
+pub(crate) const OUTPUT_GRID_CHROME_PX: i64 = 20;
+
 /// Erase the alt VTE before a new full-screen command reuses it: erase display
 /// (`2J`), erase scrollback (`3J`), and home the cursor (`H`). Fed through VTE's
 /// data pipeline rather than `Terminal::reset`, because reset only clears modes
@@ -2721,7 +2729,7 @@ impl TermView {
             // realized container (minus this chrome) — instead of the output VTE's own
             // allocation — means the right width is known BEFORE the first byte is fed,
             // not a frame or two later once the just-shown VTE finally gets laid out.
-            let out_chrome: Rc<Cell<i32>> = Rc::new(Cell::new(20));
+            let out_chrome: Rc<Cell<i32>> = Rc::new(Cell::new(OUTPUT_GRID_CHROME_PX as i32));
 
             let _last_frame = Rc::new(Cell::new(std::time::Instant::now()));
             let last_frame_for_tick = _last_frame.clone();
