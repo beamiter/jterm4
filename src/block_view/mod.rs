@@ -803,10 +803,16 @@ impl ReaderCtx {
 
                                     block_data_for_cb.borrow_mut().push_back(block_data);
 
+                                    // Pre-wrap the finished output at the SAME column the live
+                                    // output VTE just wrapped at, so the completed block keeps
+                                    // the identical line breaks (no reflow jump on completion).
+                                    let wrap_cols = active_rc.borrow().output_grid_cols();
+                                    let display_output_ansi = blocks::wrap_ansi_at(&output_with_ansi, wrap_cols);
+
                                     let _pf_new = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
                                     let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                     let finished = FinishedBlock::new_with_pool(
-                                        &prompt, &cmd, if cmd_ansi_trimmed.is_empty() { None } else { Some(&cmd_ansi_trimmed) }, &output_with_ansi, exit_code, &config_for_cb.borrow(),
+                                        &prompt, &cmd, if cmd_ansi_trimmed.is_empty() { None } else { Some(&cmd_ansi_trimmed) }, &display_output_ansi, exit_code, &config_for_cb.borrow(),
                                         duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                     );
                                     if let Some(t) = _pf_new { prof!("  FinishedBlock::new {}us (blocks={})", t.elapsed().as_micros(), finished_blocks_for_cb.borrow().len()); }
@@ -2821,6 +2827,10 @@ impl TermView {
                     }
                     let grid_w = widget_w - out_chrome.get() as i64;
                     let c = ((grid_w / char_w).max(20)) as u16;
+                    // Publish the committed PTY width so the live output VTE sizes its
+                    // grid to it and finished blocks pre-wrap at it — keeping the grid,
+                    // the PTY, and completed renders all on the same column.
+                    active.pty_cols.set(c);
                     let char_h = active.output_vte.char_height();
                     let r = if char_h > 0 {
                         (height as i64 / char_h).max(1) as u16

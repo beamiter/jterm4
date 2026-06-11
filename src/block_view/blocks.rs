@@ -24,6 +24,127 @@ pub enum TermCursorShape {
 }
 
 
+/// Display width of a single character in terminal cells. Coarse but covers the
+/// common cases: zero-width combining marks / joiners, double-width CJK & emoji,
+/// everything else single-width. Used only to reproduce the terminal's wrap column.
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp == 0 {
+        return 0;
+    }
+    if (0x0300..=0x036F).contains(&cp)      // combining diacriticals
+        || (0x200B..=0x200F).contains(&cp)  // zero-width space .. RLM
+        || cp == 0x200D                      // zero-width joiner
+        || (0xFE00..=0xFE0F).contains(&cp)  // variation selectors
+    {
+        return 0;
+    }
+    if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
+        || (0x2E80..=0xA4CF).contains(&cp)   // CJK radicals .. Yi
+        || (0xAC00..=0xD7A3).contains(&cp)   // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&cp)   // CJK compatibility ideographs
+        || (0xFE30..=0xFE4F).contains(&cp)   // CJK compatibility forms
+        || (0xFF00..=0xFF60).contains(&cp)   // fullwidth forms
+        || (0xFFE0..=0xFFE6).contains(&cp)   // fullwidth signs
+        || (0x1F300..=0x1FAFF).contains(&cp) // emoji & symbols
+        || (0x20000..=0x3FFFD).contains(&cp) // CJK ext B+
+    {
+        return 2;
+    }
+    1
+}
+
+/// Soft-wrap ANSI-bearing text at `cols` display columns, inserting a hard newline
+/// at each wrap point. ANSI/OSC escape sequences pass through untouched and don't
+/// count toward the column, tabs expand to 8-column stops, and double-width glyphs
+/// count as two — exactly matching how the live output VTE (and a real terminal)
+/// wrapped the same bytes. The result is rendered in the finished block's TextView
+/// with no further reflow, so a completed command keeps the identical line breaks
+/// the user just watched, instead of the TextView's own pixel-based wrap column.
+pub(crate) fn wrap_ansi_at(input: &str, cols: usize) -> String {
+    if cols == 0 {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + input.len() / cols + 8);
+    let mut col = 0usize;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                out.push(c);
+                match chars.peek() {
+                    Some('[') => {
+                        out.push(chars.next().unwrap());
+                        // CSI: consume until a final byte in 0x40..=0x7E.
+                        while let Some(&p) = chars.peek() {
+                            out.push(chars.next().unwrap());
+                            if ('\x40'..='\x7e').contains(&p) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        out.push(chars.next().unwrap());
+                        // OSC: consume until BEL or ST (ESC \).
+                        while let Some(&p) = chars.peek() {
+                            if p == '\x07' {
+                                out.push(chars.next().unwrap());
+                                break;
+                            }
+                            if p == '\x1b' {
+                                out.push(chars.next().unwrap());
+                                if let Some('\\') = chars.peek() {
+                                    out.push(chars.next().unwrap());
+                                }
+                                break;
+                            }
+                            out.push(chars.next().unwrap());
+                        }
+                    }
+                    Some(_) => {
+                        out.push(chars.next().unwrap());
+                    }
+                    None => {}
+                }
+            }
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            '\r' => {
+                out.push('\r');
+                col = 0;
+            }
+            '\t' => {
+                let next_stop = (col / 8 + 1) * 8;
+                if next_stop > cols {
+                    out.push('\n');
+                    col = 0;
+                } else {
+                    for _ in col..next_stop {
+                        out.push(' ');
+                    }
+                    col = next_stop;
+                }
+            }
+            _ => {
+                let w = char_display_width(c);
+                if w == 0 {
+                    out.push(c);
+                } else {
+                    if col + w > cols {
+                        out.push('\n');
+                        col = 0;
+                    }
+                    out.push(c);
+                    col += w;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Reserve the correct height on a finished block's output TextView *before* it is
 /// realized. A freshly appended GtkTextView reports a too-small natural height
 /// (~1 line) until its layout is validated on a later frame, which made multi-line
@@ -366,6 +487,20 @@ impl FinishedBlock {
         let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
         let (command_view, command_buffer) = create_textview("block-command-view");
         let (output_view, output_buffer) = create_textview("block-output-view");
+        // The live output is rendered in a VTE appended flush to the block's left
+        // edge (no indent), while prompt/command keep the 12px indent. Match that
+        // here so a finished block's output starts at the same x the user just saw
+        // and gets the full container width — its lines are already pre-wrapped at
+        // the live grid's column count, so the wider area prevents the TextView's
+        // own pixel wrap from re-breaking them.
+        output_view.set_left_margin(2);
+        output_view.set_right_margin(2);
+        // The text is already wrapped at the live grid's exact column, so the view
+        // must NOT re-wrap: GtkTextView's pixel-based Char wrap breaks a hair earlier
+        // than the VTE cell grid (its glyph advance is slightly wider), which would
+        // re-break each full-width line one column early. Disabling wrap keeps the
+        // identical line structure the user saw live.
+        output_view.set_wrap_mode(gtk4::WrapMode::None);
 
         // Populate buffers
         set_active_prompt_buffer(&prompt_buffer, prompt);
@@ -653,6 +788,11 @@ pub(crate) struct ActiveBlock {
     pub(crate) running_label: gtk4::Label,
     pub(crate) running_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
     pub(crate) blink_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
+    // The exact column count last pushed to the PTY by the resize tick — the single
+    // source of truth the running program (and a real terminal) wraps at. The live
+    // output VTE is sized to this, and finished blocks are pre-wrapped at it, so the
+    // grid, the PTY, and the completed render all agree. 0 until the first tick.
+    pub(crate) pty_cols: Rc<Cell<u16>>,
 }
 
 impl ActiveBlock {
@@ -860,6 +1000,7 @@ impl ActiveBlock {
             running_label,
             running_timer_handle: Rc::new(RefCell::new(None)),
             blink_timer_handle,
+            pty_cols: Rc::new(Cell::new(0)),
         }
     }
 
@@ -970,7 +1111,13 @@ impl ActiveBlock {
         let container_width = self.widget.allocated_width() as i64;
         let mut cols = self.output_vte.column_count();
         let _dbg_colcount = cols;
-        if char_width > 0 && container_width > char_width * 40 {
+        // Use the exact PTY width the resize tick committed, so the live grid wraps
+        // where the program (and a real terminal) does. Before the first tick, fall
+        // back to the container-derived estimate.
+        let pty_cols = self.pty_cols.get() as i64;
+        if pty_cols >= 20 {
+            cols = pty_cols;
+        } else if char_width > 0 && container_width > char_width * 40 {
             cols = ((container_width - super::OUTPUT_GRID_CHROME_PX) / char_width).max(20);
         }
         if std::env::var("JT_WDBG").is_ok() {
@@ -1030,6 +1177,28 @@ impl ActiveBlock {
 
     pub(crate) fn flush_output(&self) {
         // VTE renders immediately on feed(), no flush needed
+    }
+
+    /// The column count the live output VTE is wrapping at — computed exactly the
+    /// way `feed_output` derives the grid width (and the way the resize tick sizes
+    /// the PTY), so a finished block can be pre-wrapped at the SAME column the user
+    /// just watched the running command wrap at. Keeps the finished render byte-for-
+    /// byte aligned with the live one (and with a real terminal).
+    pub(crate) fn output_grid_cols(&self) -> usize {
+        // Prefer the exact PTY width the resize tick last sent — what the program
+        // actually wrapped at. Fall back to the container-derived estimate only
+        // before the first tick has run.
+        let pty_cols = self.pty_cols.get();
+        if pty_cols >= 20 {
+            return pty_cols as usize;
+        }
+        let char_width = self.output_vte.char_width();
+        let container_width = self.widget.allocated_width() as i64;
+        let mut cols = self.output_vte.column_count();
+        if char_width > 0 && container_width > char_width * 40 {
+            cols = ((container_width - super::OUTPUT_GRID_CHROME_PX) / char_width).max(20);
+        }
+        cols.max(20) as usize
     }
 
     pub(crate) fn output_text(&self) -> String {
