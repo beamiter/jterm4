@@ -2365,6 +2365,51 @@ impl TermView {
             });
         }
 
+        // ── Follow bottom on layout reflow ────────────────────────────────
+        // The `changed` signal fires whenever the scrollable extent (upper /
+        // page_size) updates — i.e. exactly when GTK finishes (re)laying out
+        // newly added blocks. Timer-based scroll snapshots race with this async
+        // reflow and can read a stale `upper`, leaving the view stuck partway up
+        // after a tall block lands. Re-pinning here is authoritative: it tracks
+        // the real content height no matter how late the reflow settles.
+        //
+        // The re-pin is deferred to an idle tick rather than done inline: calling
+        // set_value() from inside the adjustment's own `changed` handler re-enters
+        // layout (scroll → re-allocate child → VTE height-for-width re-measure →
+        // extent recomputed → `changed` again), thrashing the main loop and
+        // starving the PTY reader so streaming output stalls for seconds. A
+        // coalesced idle runs after the current layout pass settles, breaking the
+        // reentrancy while still reading the final, correct `upper`.
+        {
+            let user_scrolled = user_scrolled_up.clone();
+            let programmatic = programmatic_scroll.clone();
+            let follow_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let scroll_for_follow = block_scroll.clone();
+            block_scroll.vadjustment().connect_changed(move |_| {
+                if user_scrolled.get() || follow_pending.get() {
+                    return;
+                }
+                follow_pending.set(true);
+                let user_scrolled = user_scrolled.clone();
+                let programmatic = programmatic.clone();
+                let follow_pending = follow_pending.clone();
+                let scroll = scroll_for_follow.clone();
+                glib::idle_add_local_once(move || {
+                    follow_pending.set(false);
+                    if user_scrolled.get() {
+                        return;
+                    }
+                    let adj = scroll.vadjustment();
+                    let target = adj.upper() - adj.page_size();
+                    if target > 0.0 && (adj.value() - target).abs() > 1.0 {
+                        programmatic.set(true);
+                        adj.set_value(target);
+                        programmatic.set(false);
+                    }
+                });
+            });
+        }
+
         // ── Floating breadcrumb: track which block fills the viewport top ──────
         {
             let block_scroll_for_bc = block_scroll.clone();
