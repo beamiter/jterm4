@@ -234,6 +234,102 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
+    pub(crate) fn toggle_debug_dashboard(&self) {
+        let dialog_to_close = self.debug_dashboard_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
+            dialog.force_close();
+            return;
+        }
+
+        let dialog = adw::Dialog::builder()
+            .title("Debug Dashboard")
+            .content_width(480)
+            .content_height(560)
+            .build();
+
+        let header_bar = adw::HeaderBar::new();
+        let refresh_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
+        refresh_btn.set_tooltip_text(Some("Refresh"));
+        header_bar.pack_start(&refresh_btn);
+
+        let content = gtk4::Box::new(Orientation::Vertical, 18);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+
+        // Populate `content` from the current block-mode view's debug snapshot.
+        let ui_for_populate = self.clone();
+        let populate = Rc::new(move |content: &gtk4::Box| {
+            while let Some(child) = content.first_child() {
+                content.remove(&child);
+            }
+            let Some(term_view) = ui_for_populate.current_term_view() else {
+                let label = Label::new(Some("Debug dashboard is only available in block mode."));
+                label.add_css_class("dim-label");
+                label.set_wrap(true);
+                content.append(&label);
+                return;
+            };
+            for (section, rows) in term_view.debug_info() {
+                let group = adw::PreferencesGroup::new();
+                group.set_title(section);
+                for (key, value) in rows {
+                    let row = adw::ActionRow::builder().title(key.as_str()).build();
+                    let value_label = Label::new(Some(&value));
+                    value_label.add_css_class("dim-label");
+                    value_label.set_selectable(true);
+                    value_label.set_xalign(1.0);
+                    row.add_suffix(&value_label);
+                    group.add(&row);
+                }
+                content.append(&group);
+            }
+        });
+        populate(&content);
+
+        let content_for_refresh = content.clone();
+        let populate_for_refresh = populate.clone();
+        refresh_btn.connect_clicked(move |_| {
+            populate_for_refresh(&content_for_refresh);
+        });
+
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&content)
+            .build();
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&scrolled));
+        dialog.set_child(Some(&toolbar_view));
+
+        // Escape or F12 closes the dashboard.
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref = self.debug_dashboard_dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == Key::Escape || keyval == Key::F12 {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
+                    d.force_close();
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        let dialog_ref = self.debug_dashboard_dialog.clone();
+        dialog.connect_closed(move |_| {
+            *dialog_ref.borrow_mut() = None;
+        });
+
+        *self.debug_dashboard_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+    }
+
     pub(crate) fn toggle_settings_panel(&self) {
         let dialog_to_close = self.settings_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {

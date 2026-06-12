@@ -549,20 +549,33 @@ impl FinishedBlock {
             let buffer_clone = buffer.clone();
             let view_clone = view.clone();
             click_controller.connect_pressed(move |controller, n_press, x, y| {
+                let (bx, by) = view_clone.window_to_buffer_coords(
+                    gtk4::TextWindowType::Widget,
+                    x as i32,
+                    y as i32,
+                );
+                let iter = view_clone.iter_at_location(bx, by);
                 if n_press == 1 {
                     let state = controller.current_event_state();
                     if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                        let (bx, by) = view_clone.window_to_buffer_coords(
-                            gtk4::TextWindowType::Widget,
-                            x as i32,
-                            y as i32,
-                        );
-                        if let Some(iter) = view_clone.iter_at_location(bx, by) {
+                        if let Some(iter) = iter {
                             if let Some(url) = get_url_at_position(&buffer_clone, &iter) {
                                 open_uri(&url);
                                 controller.set_state(gtk4::EventSequenceState::Claimed);
                                 return;
                             }
+                        }
+                    }
+                } else if n_press == 2 {
+                    // Smart selection: grab the whole semantic token (path, URL,
+                    // file:line, …) instead of GTK's default plain-word select.
+                    if let Some(iter) = iter {
+                        if let Some((start, end)) =
+                            get_semantic_bounds_at_position(&buffer_clone, &iter)
+                        {
+                            buffer_clone.select_range(&start, &end);
+                            controller.set_state(gtk4::EventSequenceState::Claimed);
+                            return;
                         }
                     }
                 }

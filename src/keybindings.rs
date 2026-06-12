@@ -47,6 +47,7 @@ pub(crate) enum Action {
     FilterFailedBlocks,
     FilterSlowBlocks,
     ClearBlockFilter,
+    ToggleDebugDashboard,
 }
 
 impl Action {
@@ -104,6 +105,7 @@ impl Action {
             Action::FilterFailedBlocks => "Filter failed blocks",
             Action::FilterSlowBlocks => "Filter slow blocks",
             Action::ClearBlockFilter => "Clear block filter",
+            Action::ToggleDebugDashboard => "Toggle debug dashboard",
         }
     }
 
@@ -150,6 +152,7 @@ impl Action {
             Action::FilterFailedBlocks => Some("filter_failed_blocks"),
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
+            Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
         }
     }
 
@@ -195,6 +198,7 @@ impl Action {
             Action::FilterFailedBlocks,
             Action::FilterSlowBlocks,
             Action::ClearBlockFilter,
+            Action::ToggleDebugDashboard,
         ]
     }
 }
@@ -411,6 +415,7 @@ impl KeybindingMap {
         bind("Alt+Shift+Down", Action::ResizePaneDown);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
+        bind("F12", Action::ToggleDebugDashboard);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
         bind("Alt+Up", Action::FocusPaneUp);

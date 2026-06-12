@@ -20,12 +20,14 @@ mod alt_screen;
 mod blocks;
 mod css;
 mod scroll;
+mod select;
 mod url;
 pub(crate) use ansi::*;
 pub(crate) use alt_screen::*;
 pub(crate) use blocks::*;
 pub(crate) use css::*;
 pub(crate) use scroll::*;
+pub(crate) use select::*;
 pub(crate) use url::*;
 
 
@@ -3261,6 +3263,93 @@ impl TermView {
             ..Default::default()
         };
         self.search_blocks_with_filters("", &filters)
+    }
+
+    /// Collect a snapshot of internal runtime state for the debug dashboard.
+    /// Returns labelled sections, each a list of (key, value) rows.
+    pub fn debug_info(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
+        let active = self.active.borrow();
+        let out_cols = active.output_vte.column_count();
+        let out_rows = active.output_vte.row_count();
+        drop(active);
+
+        let finished_len = self.finished_blocks.borrow().len();
+        let block_data_len = self.block_data.borrow().len();
+        let failed = self.get_failed_blocks().len();
+        let slow = self.get_slow_blocks(1000).len();
+        let total_output_bytes: usize = self
+            .block_data
+            .borrow()
+            .iter()
+            .map(|b| b.output.len())
+            .sum();
+        let viewport = self.viewport.borrow().clone();
+        let visible = self.visible_indices.borrow().len();
+        let ansi_cache_len = self.ansi_cache.borrow().len();
+        let selected = self
+            .selected_block_id
+            .get()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        vec![
+            (
+                "State",
+                vec![
+                    ("Block state".to_string(), format!("{:?}", self.bstate.get())),
+                    (
+                        "Bracketed paste".to_string(),
+                        self.bracketed_paste_mode.get().to_string(),
+                    ),
+                    (
+                        "Application cursor".to_string(),
+                        self.application_cursor_mode.get().to_string(),
+                    ),
+                    (
+                        "Mouse reporting".to_string(),
+                        format!("{:?}", self.mouse_reporting_mode.get()),
+                    ),
+                    (
+                        "Cursor shape".to_string(),
+                        format!("{:?}", self.cursor_shape.get()),
+                    ),
+                    (
+                        "Alt screen visible".to_string(),
+                        self.vte_box.is_visible().to_string(),
+                    ),
+                ],
+            ),
+            (
+                "PTY",
+                vec![
+                    ("PID".to_string(), self.pty.pid_i32().to_string()),
+                    ("CWD".to_string(), self.current_cwd.borrow().clone()),
+                    ("Output grid".to_string(), format!("{out_cols} × {out_rows}")),
+                ],
+            ),
+            (
+                "Blocks",
+                vec![
+                    ("Finished blocks".to_string(), finished_len.to_string()),
+                    ("Block data entries".to_string(), block_data_len.to_string()),
+                    ("Failed blocks".to_string(), failed.to_string()),
+                    ("Slow blocks (>1s)".to_string(), slow.to_string()),
+                    ("Total output bytes".to_string(), total_output_bytes.to_string()),
+                    ("Selected block id".to_string(), selected),
+                ],
+            ),
+            (
+                "Viewport",
+                vec![
+                    ("First visible".to_string(), viewport.first_visible.to_string()),
+                    ("Last visible".to_string(), viewport.last_visible.to_string()),
+                    ("Total height".to_string(), format!("{}px", viewport.total_height)),
+                    ("Realized widgets".to_string(), visible.to_string()),
+                    ("ANSI cache entries".to_string(), ansi_cache_len.to_string()),
+                    ("Profiling".to_string(), prof_enabled().to_string()),
+                ],
+            ),
+        ]
     }
 
     /// Export a block by ID to JSON format

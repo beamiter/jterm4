@@ -53,6 +53,7 @@ pub(crate) struct UiState {
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
+    pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,

@@ -229,6 +229,10 @@ impl UiState {
                     term_view.scroll_to_block(0);
                 }
             }
+            Action::ToggleDebugDashboard => {
+                log::debug!("Toggle debug dashboard");
+                self.toggle_debug_dashboard();
+            }
         }
     }
 
