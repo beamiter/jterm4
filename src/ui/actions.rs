@@ -39,24 +39,24 @@ impl UiState {
                 self.close_focused_pane_or_tab();
             }
             Action::Copy => {
-                log::warn!(">>> UI Action::Copy triggered");
+                log::debug!(">>> UI Action::Copy triggered");
                 if let Some(term_view) = self.current_term_view() {
-                    log::warn!(">>> UI Copy: calling term_view.copy_to_clipboard");
+                    log::debug!(">>> UI Copy: calling term_view.copy_to_clipboard");
                     term_view.copy_to_clipboard();
                 } else {
-                    log::warn!(">>> UI Copy: no current term_view, falling back to VTE");
+                    log::debug!(">>> UI Copy: no current term_view, falling back to VTE");
                     if let Some(ref term) = current_terminal {
                         term.copy_clipboard_format(Format::Text);
                     }
                 }
             }
             Action::Paste => {
-                log::warn!(">>> UI Action::Paste triggered");
+                log::debug!(">>> UI Action::Paste triggered");
                 if let Some(term_view) = self.current_term_view() {
-                    log::warn!(">>> UI Paste: calling term_view.paste_from_clipboard");
+                    log::debug!(">>> UI Paste: calling term_view.paste_from_clipboard");
                     term_view.paste_from_clipboard();
                 } else {
-                    log::warn!(">>> UI Paste: no current term_view, falling back to VTE");
+                    log::debug!(">>> UI Paste: no current term_view, falling back to VTE");
                     if let Some(ref term) = current_terminal {
                         term.paste_clipboard();
                     }

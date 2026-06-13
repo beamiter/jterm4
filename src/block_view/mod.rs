@@ -61,6 +61,21 @@ fn next_block_id() -> u64 {
 /// content it can actually retain. Bounds resource use for runaway output.
 const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 
+/// Cap on the retained raw output buffer for a single running command. The inline
+/// output VTE already bounds its scrollback (MAX_INLINE_OUTPUT_ROWS), but the raw
+/// byte buffer used to re-render the finished block grew without bound — a runaway
+/// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
+/// buffer exceeds this, the oldest bytes are dropped, keeping the most recent tail
+/// (the part a finished block actually shows). 8 MiB comfortably covers any normal
+/// command's output.
+const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Cap on bytes buffered in the Idle pre-prompt grace window. Without shell
+/// integration, PromptStart never arrives and these bytes accumulate until the
+/// 500ms fallback timer fires; a chatty startup could balloon this. Past the cap
+/// we just stop buffering — the fallback replays what we have.
+const MAX_IDLE_BUFFER_BYTES: usize = 256 * 1024;
+
 /// Horizontal pixels between the block container's allocation and the output
 /// text grid: `.block-active` margin (8+8) + border (3 left + 1 right) = 20px
 /// (see css.rs). Both the resize tick (which derives the PTY column count) and
@@ -126,6 +141,11 @@ pub struct TermView {
 struct ReaderCtx {
     active_rc: Rc<RefCell<ActiveBlock>>,
     bstate_rc: Rc<Cell<BlockState>>,
+    /// True while the alt-screen was entered from `AwaitingCommand` (an
+    /// interactive widget at the prompt, e.g. fzf, rather than a submitted
+    /// command). On leave we return to `AwaitingCommand` instead of
+    /// `CollectingOutput`.
+    alt_from_awaiting_rc: Rc<Cell<bool>>,
     cursor_hide_pending_rc: Rc<Cell<bool>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
@@ -180,6 +200,7 @@ impl ReaderCtx {
         let ReaderCtx {
             active_rc,
             bstate_rc,
+            alt_from_awaiting_rc,
             cursor_hide_pending_rc,
             osc133_depth_rc,
             prompt_buf_rc,
@@ -324,26 +345,38 @@ impl ReaderCtx {
                                                                 (b"1000", b'h') => {
                                                                     mouse_reporting_rc.set(MouseReportingMode::Click);
                                                                 }
-                                                                (b"1000", b'l') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
                                                                 (b"1002", b'h') => {
                                                                     mouse_reporting_rc.set(MouseReportingMode::Button);
-                                                                }
-                                                                (b"1002", b'l') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
                                                                 }
                                                                 (b"1003", b'h') => {
                                                                     mouse_reporting_rc.set(MouseReportingMode::Motion);
                                                                 }
-                                                                (b"1003", b'l') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
                                                                 (b"1006", b'h') => {
                                                                     mouse_reporting_rc.set(MouseReportingMode::Sgr);
                                                                 }
+                                                                // A reset (`l`) only disables reporting when it
+                                                                // targets the mode that is actually active. This
+                                                                // prevents e.g. `?1000l` from clearing reporting
+                                                                // when a different mode (`?1006h`) is still on.
+                                                                (b"1000", b'l') => {
+                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Click {
+                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                    }
+                                                                }
+                                                                (b"1002", b'l') => {
+                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Button {
+                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                    }
+                                                                }
+                                                                (b"1003", b'l') => {
+                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Motion {
+                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                    }
+                                                                }
                                                                 (b"1006", b'l') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Sgr {
+                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                    }
                                                                 }
                                                                 _ => {}
                                                             }
@@ -393,6 +426,42 @@ impl ReaderCtx {
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
                                     BlockState::AwaitingCommand => {
+                                        // An interactive widget can take over the
+                                        // alt-screen straight from the prompt (e.g. fzf
+                                        // bound to a key) without a command ever being
+                                        // submitted, so no CommandStart arrives. Detect a
+                                        // definitive alt-screen enter here and switch; on
+                                        // leave we return to AwaitingCommand. Only the
+                                        // unambiguous ?47/?1047/?1049 sequences count —
+                                        // the app-cursor heuristic would false-positive on
+                                        // ordinary line editing.
+                                        if contains_alt_screen_enter(bytes) {
+                                            alt_from_awaiting_rc.set(true);
+                                            cursor_hide_pending_rc.set(false);
+                                            bstate_rc.set(BlockState::AltScreen);
+                                            pager_snapshots_rc.borrow_mut().clear();
+                                            pager_snapshot_generation_rc.set(
+                                                pager_snapshot_generation_rc.get().wrapping_add(1),
+                                            );
+                                            *pager_pre_clear_rc.borrow_mut() =
+                                                normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
+                                            vte_for_alt.reset(true, true);
+                                            reset_alt_vte_grid(&vte_for_alt);
+                                            vte_for_alt.feed(ALT_VTE_CLEAR);
+                                            show_alt_screen(
+                                                &block_scroll_rc,
+                                                &vte_box_rc,
+                                                &vte_for_alt,
+                                                Some(bytes),
+                                            );
+                                            schedule_pager_snapshot(
+                                                &vte_for_alt,
+                                                &pager_snapshots_rc,
+                                                &pager_snapshot_generation_rc,
+                                                &pager_pre_clear_rc,
+                                            );
+                                            continue;
+                                        }
                                         if editor_input_for_cb {
                                             let raw_text = text.clone();
                                             let stripped = strip_ansi(&raw_text);
@@ -610,7 +679,19 @@ impl ReaderCtx {
                                         // Save the full command (user input + suggestion) for CommandEnd
                                         // This ensures commands accepted via autocomplete are properly recorded
                                         let full_cmd_raw = display.to_string();
-                                        let full_cmd_markup = ansi_to_pango(&full_cmd_raw, &config_for_cb.borrow().palette);
+                                        // Reuse the LRU cache for the ANSI→Pango conversion so an
+                                        // unchanged command line (the common case while editing) is
+                                        // not re-rendered on every keystroke.
+                                        let full_cmd_markup = {
+                                            let mut cache = ansi_cache_for_cb.borrow_mut();
+                                            if let Some(cached) = cache.get(&full_cmd_raw) {
+                                                cached.clone()
+                                            } else {
+                                                let result = ansi_to_pango(&full_cmd_raw, &config_for_cb.borrow().palette);
+                                                cache.put(full_cmd_raw.clone(), result.clone());
+                                                result
+                                            }
+                                        };
 
                                         if !strip_ansi(&full_cmd_raw).trim().is_empty() {
                                             *last_nonempty_cmd_raw_rc.borrow_mut() = full_cmd_raw.clone();
@@ -722,7 +803,12 @@ impl ReaderCtx {
                                         // one-shot grace timer; if no FTCS event arrives before it
                                         // fires, switch to the raw VTE and replay the buffer so the
                                         // user never sees a black screen.
-                                        idle_buf_rc.borrow_mut().extend_from_slice(bytes);
+                                        {
+                                            let mut buf = idle_buf_rc.borrow_mut();
+                                            if buf.len() < MAX_IDLE_BUFFER_BYTES {
+                                                buf.extend_from_slice(bytes);
+                                            }
+                                        }
                                         if !fallback_armed_rc.get() && !ftcs_seen_rc.get() {
                                             fallback_armed_rc.set(true);
                                             let bstate_t = bstate_rc.clone();
@@ -823,7 +909,22 @@ impl ReaderCtx {
                                         cmd, output_trimmed.len(), output_plain.chars().take(20).collect::<String>());
 
                                     let line_count = output_trimmed.lines().count();
-                                    let estimated_height = (line_count as i32 * 20).max(60);
+                                    let estimated_height = {
+                                        // Virtual-scroll placeholder height (no widget/pango context
+                                        // available here, so approximate the per-line height from the
+                                        // configured font point size at 96 DPI × CSS line-height 1.2,
+                                        // mirroring blocks::fit_output_height so the estimate tracks
+                                        // the font scale instead of a fixed 20px).
+                                        let cfg = config_for_cb.borrow();
+                                        let parts: Vec<&str> = cfg.font_desc.split_whitespace().collect();
+                                        let base_size = parts
+                                            .last()
+                                            .and_then(|s| s.parse::<i32>().ok())
+                                            .unwrap_or(14);
+                                        let scaled_pt = (base_size as f64 * cfg.default_font_scale).max(1.0);
+                                        let per_line = (scaled_pt * (96.0 / 72.0) * 1.2).ceil() as i32;
+                                        (line_count as i32 * per_line.max(1)).max(60)
+                                    };
 
                                     let start_time = block_start_time_for_cb.get();
                                     let now = SystemTime::now();
@@ -1090,6 +1191,7 @@ impl ReaderCtx {
                                 }
                                 osc133_depth_rc.set(0);
                                 cursor_hide_pending_rc.set(false);
+                                alt_from_awaiting_rc.set(false);
                                 bstate_rc.set(BlockState::CollectingOutput);
                                 block_start_time_for_cb.set(Some(SystemTime::now()));
                                 let raw_cmd = cmd_display_raw_rc.borrow().clone();
@@ -1126,6 +1228,9 @@ impl ReaderCtx {
                                 }
                                 active_rc.borrow().stop_timer();
                                 cursor_hide_pending_rc.set(false);
+                                // A command actually finished, so any prompt-level
+                                // alt-screen bookkeeping no longer applies.
+                                alt_from_awaiting_rc.set(false);
                                 if state == BlockState::AltScreen || vte_box_rc.is_visible() {
                                     record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
                                     hide_alt_screen(&block_scroll_rc, &vte_box_rc);
@@ -1171,10 +1276,14 @@ impl ReaderCtx {
                             }
 
                             ParserEvent::AltScreenEnter => {
-                                if bstate_rc.get() != BlockState::CollectingOutput {
-                                    log::debug!("[altdiag] AltScreenEnter REJECTED (state={:?}, osc133_depth={})", bstate_rc.get(), osc133_depth_rc.get());
+                                let from_state = bstate_rc.get();
+                                if from_state != BlockState::CollectingOutput
+                                    && from_state != BlockState::AwaitingCommand
+                                {
+                                    log::debug!("[altdiag] AltScreenEnter REJECTED (state={:?}, osc133_depth={})", from_state, osc133_depth_rc.get());
                                     continue;
                                 }
+                                alt_from_awaiting_rc.set(from_state == BlockState::AwaitingCommand);
                                 bstate_rc.set(BlockState::AltScreen);
                                 pager_snapshots_rc.borrow_mut().clear();
                                 pager_snapshot_generation_rc.set(
@@ -1206,7 +1315,14 @@ impl ReaderCtx {
                                 // read, leaving an empty block.
                                 vte_for_alt.reset(true, true);
                                 vte_for_alt.feed(ALT_VTE_CLEAR);
-                                bstate_rc.set(BlockState::CollectingOutput);
+                                // If the alt-screen was a prompt-level widget (fzf etc.),
+                                // no command ran — return to AwaitingCommand so the next
+                                // PromptStart/CommandStart sequencing stays correct.
+                                if alt_from_awaiting_rc.replace(false) {
+                                    bstate_rc.set(BlockState::AwaitingCommand);
+                                } else {
+                                    bstate_rc.set(BlockState::CollectingOutput);
+                                }
                                 let active_for_idle = active_rc.clone();
                                 glib::idle_add_local_once(move || {
                                     active_for_idle.borrow().grab_focus();
@@ -1977,62 +2093,62 @@ impl KeyCtx {
                 if ctrl && shift {
                     match keyval {
                         v if v == gtk4::gdk::Key::c || v == gtk4::gdk::Key::C => {
-                            log::warn!(">>> COPY: Ctrl+Shift+C pressed");
+                            log::debug!(">>> COPY: Ctrl+Shift+C pressed");
                             // Copy selected text to clipboard
                             // First try VTE (for alt-screen mode)
                             if let Some(text) = vte_for_key.text_selected(vte4::Format::Text) {
-                                log::warn!(">>> Copy: got {} chars from VTE", text.len());
+                                log::debug!(">>> Copy: got {} chars from VTE", text.len());
                                 if !text.is_empty() {
                                     let clipboard = vte_for_key.clipboard();
                                     clipboard.set_text(&text);
-                                    log::warn!(">>> Copy: set VTE text to clipboard");
+                                    log::debug!(">>> Copy: set VTE text to clipboard");
                                 } else {
-                                    log::warn!(">>> Copy: VTE text empty, trying PRIMARY");
+                                    log::debug!(">>> Copy: VTE text empty, trying PRIMARY");
                                     // Fall back to PRIMARY clipboard (selected text in labels)
                                     let display = root_for_key.display();
                                     let primary = display.primary_clipboard();
-                                    log::warn!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
+                                    log::debug!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
                                     let clipboard = display.clipboard();
                                     primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
-                                        log::warn!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+                                        log::debug!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
                                         match result {
                                             Ok(text_opt) => {
                                                 if let Some(text_str) = text_opt {
                                                     if !text_str.is_empty() {
-                                                        log::warn!(">>> Copy: got {} chars from PRIMARY", text_str.len());
+                                                        log::debug!(">>> Copy: got {} chars from PRIMARY", text_str.len());
                                                         clipboard.set_text(&text_str);
-                                                        log::warn!(">>> Copy: copied to regular clipboard");
+                                                        log::debug!(">>> Copy: copied to regular clipboard");
                                                     } else {
-                                                        log::warn!(">>> Copy: PRIMARY is empty");
+                                                        log::debug!(">>> Copy: PRIMARY is empty");
                                                     }
                                                 } else {
-                                                    log::warn!(">>> Copy: PRIMARY is None");
+                                                    log::debug!(">>> Copy: PRIMARY is None");
                                                 }
                                             }
                                             Err(e) => {
-                                                log::warn!(">>> Copy: error reading PRIMARY: {}", e);
+                                                log::debug!(">>> Copy: error reading PRIMARY: {}", e);
                                             }
                                         }
                                     });
                                 }
                             } else {
-                                log::warn!(">>> Copy: VTE returned None");
+                                log::debug!(">>> Copy: VTE returned None");
                             }
                             return glib::Propagation::Stop;
                         }
                         v if v == gtk4::gdk::Key::v || v == gtk4::gdk::Key::V => {
-                            log::warn!(">>> PASTE: Ctrl+Shift+V pressed");
+                            log::debug!(">>> PASTE: Ctrl+Shift+V pressed");
                             // Paste: read clipboard and write to PTY
                             let clipboard = vte_for_key.clipboard();
                             let pty_for_paste = pty_for_key.clone();
                             let bracketed_paste = bracketed_paste_for_key.get();
-                            log::warn!(">>> Paste: got clipboard, bracketed_paste={}, calling read_text_async", bracketed_paste);
+                            log::debug!(">>> Paste: got clipboard, bracketed_paste={}, calling read_text_async", bracketed_paste);
                             clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                                log::warn!(">>> Paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
+                                log::debug!(">>> Paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
                                 match result {
                                     Ok(text_opt) => {
                                         if let Some(text_str) = text_opt {
-                                            log::warn!(">>> Paste: got {} chars from clipboard", text_str.len());
+                                            log::debug!(">>> Paste: got {} chars from clipboard", text_str.len());
                                             // Wrap paste with bracketed paste mode if enabled
                                             if bracketed_paste {
                                                 pty_for_paste.write_bytes(b"\x1b[200~");
@@ -2041,9 +2157,9 @@ impl KeyCtx {
                                             } else {
                                                 pty_for_paste.write_bytes(text_str.as_bytes());
                                             }
-                                            log::warn!(">>> Paste: wrote {} bytes to PTY", text_str.len());
+                                            log::debug!(">>> Paste: wrote {} bytes to PTY", text_str.len());
                                         } else {
-                                            log::warn!(">>> Paste: clipboard is None");
+                                            log::debug!(">>> Paste: clipboard is None");
                                         }
                                     }
                                     Err(e) => {
@@ -2258,6 +2374,7 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+        let alt_from_awaiting = Rc::new(Cell::new(false));
         // Set when the running command hides the cursor (ESC[?25l) but has not
         // yet shown a full-screen redraw. A bare cursor-hide is ambiguous —
         // git/npm/cargo hide it for progress bars — so we wait for a redraw
@@ -2320,6 +2437,7 @@ impl TermView {
         {
             let active_rc = active.clone();
             let bstate_rc = bstate.clone();
+            let alt_from_awaiting_rc = alt_from_awaiting.clone();
             let cursor_hide_pending_rc = cursor_hide_pending.clone();
             let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
@@ -2385,6 +2503,7 @@ impl TermView {
             ReaderCtx {
                 active_rc,
                 bstate_rc,
+                alt_from_awaiting_rc,
                 cursor_hide_pending_rc,
                 osc133_depth_rc,
                 prompt_buf_rc,
@@ -2509,10 +2628,13 @@ impl TermView {
                     return;
                 }
                 let finished = finished_blocks_for_bc.borrow();
-                // Blocks are ordered top→bottom; find the last one whose top edge is
-                // at or above the current viewport top.
+                // Blocks are ordered top→bottom, so "top edge scrolled above the
+                // viewport" (p.y() <= 0) is true for a prefix of the list; we want
+                // the LAST such block. Scan from the end and stop at the first match:
+                // when scrolled down (the common case) this terminates almost
+                // immediately, instead of the forward scan's O(blocks-above-viewport).
                 let mut current: Option<(usize, &FinishedBlock)> = None;
-                for (idx, block) in finished.iter().enumerate() {
+                for (idx, block) in finished.iter().enumerate().rev() {
                     if let Some(p) = block.widget().compute_point(
                         &block_scroll_for_bc,
                         &gtk4::graphene::Point::new(0.0, 0.0),
@@ -2521,7 +2643,6 @@ impl TermView {
                         // its top has scrolled above the visible area.
                         if p.y() as f64 <= 0.0 {
                             current = Some((idx, block));
-                        } else {
                             break;
                         }
                     }
@@ -3052,24 +3173,24 @@ impl TermView {
     /// In block mode: tries to copy from GTK's selection (PRIMARY clipboard).
     /// In alt-screen mode: copies from VTE terminal.
     pub fn copy_to_clipboard(&self) {
-        log::warn!(">>> TermView::copy_to_clipboard called");
+        log::debug!(">>> TermView::copy_to_clipboard called");
         // First try VTE (for alt-screen mode)
         let vte_text = self.vte.text_selected(vte4::Format::Text);
         let has_vte_text = vte_text.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
 
         if has_vte_text {
             let text = vte_text.unwrap();
-            log::warn!(">>> TermView copy: got {} chars from VTE", text.len());
+            log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
             let clipboard = self.vte.clipboard();
             clipboard.set_text(&text);
-            log::warn!(">>> TermView copy: set VTE text to clipboard");
+            log::debug!(">>> TermView copy: set VTE text to clipboard");
         } else {
-            log::warn!(">>> TermView copy: VTE text empty or None, trying PRIMARY");
+            log::debug!(">>> TermView copy: VTE text empty or None, trying PRIMARY");
             // Fall back to PRIMARY clipboard (selected text in labels)
             let display = self.root.display();
             let root_clone = self.root.clone();
             let primary = display.primary_clipboard();
-            log::warn!(">>> TermView copy: got PRIMARY clipboard, calling read_text_async");
+            log::debug!(">>> TermView copy: got PRIMARY clipboard, calling read_text_async");
             primary.read_text_async(
                 None::<&gtk4::gio::Cancellable>,
                 move |result: Result<Option<gtk4::glib::GString>, _>| {
@@ -3092,16 +3213,16 @@ impl TermView {
                                     let display2 = root_clone.display();
                                     let cb = display2.clipboard();
                                     cb.set_text(&text_str);
-                                    log::warn!(">>> TermView copy: copied to CLIPBOARD");
+                                    log::debug!(">>> TermView copy: copied to CLIPBOARD");
                                 } else {
-                                    log::warn!(">>> TermView copy: PRIMARY text is empty");
+                                    log::debug!(">>> TermView copy: PRIMARY text is empty");
                                 }
                             } else {
-                                log::warn!(">>> TermView copy: PRIMARY is None - no text selected");
+                                log::debug!(">>> TermView copy: PRIMARY is None - no text selected");
                             }
                         }
                         Err(e) => {
-                            log::warn!(">>> TermView copy: error reading PRIMARY: {}", e);
+                            log::debug!(">>> TermView copy: error reading PRIMARY: {}", e);
                         }
                     }
                 },
@@ -3111,11 +3232,11 @@ impl TermView {
 
     /// Paste from clipboard to PTY.
     pub fn paste_from_clipboard(&self) {
-        log::warn!(">>> TermView::paste_from_clipboard called");
+        log::debug!(">>> TermView::paste_from_clipboard called");
         let clipboard = self.vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste_mode.get();
-        log::warn!(">>> TermView paste: got clipboard, calling read_text_async");
+        log::debug!(">>> TermView paste: got clipboard, calling read_text_async");
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             log::warn!(
                 ">>> TermView paste callback: result={:?}",
@@ -3136,9 +3257,9 @@ impl TermView {
                         } else {
                             pty.write_bytes(text_str.as_bytes());
                         }
-                        log::warn!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
+                        log::debug!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
                     } else {
-                        log::warn!(">>> TermView paste: clipboard is None");
+                        log::debug!(">>> TermView paste: clipboard is None");
                     }
                 }
                 Err(e) => {

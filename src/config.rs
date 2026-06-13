@@ -336,7 +336,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     // Block view optimization settings
     let ansi_cache_capacity = env_u32("JTERM4_ANSI_CACHE_CAP")
         .or(fc.ansi_cache_capacity)
-        .unwrap_or(256);
+        .unwrap_or(256)
+        .max(1);
     let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200);

@@ -91,6 +91,40 @@ pub(crate) fn contains_interactive_screen_enter(bytes: &[u8]) -> bool {
     false
 }
 
+/// True only for a *definitive* alt-screen enter (`?47h` / `?1047h` / `?1049h`).
+/// Unlike [`contains_interactive_screen_enter`], this excludes the app-cursor and
+/// synchronized-output heuristics, which a shell line editor legitimately toggles
+/// while the user is still editing the command. Use this when in a state where a
+/// false positive (e.g. treating prompt editing as a TUI) must be avoided.
+pub(crate) fn contains_alt_screen_enter(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b'[' {
+            i += 2;
+            let params_start = i;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let final_byte = bytes[i];
+            let params = &bytes[params_start..i];
+            i += 1;
+            if final_byte == b'h' && is_alt_screen_mode(params) {
+                return true;
+            }
+        } else {
+            i = skip_escape_sequence(bytes, i);
+        }
+    }
+    false
+}
+
 /// Detect a CSI sequence that repaints the screen using absolute positioning:
 /// cursor-position (`H`/`f`) or erase-display (`J`). Full-screen TUIs (vim,
 /// htop, Claude CLI) use these; line-oriented progress output (git, npm, cargo)
@@ -477,9 +511,16 @@ pub(crate) fn merge_pager_snapshots(pages: Vec<String>) -> String {
             continue;
         }
 
-        if merged
-            .windows(page_lines.len())
-            .any(|window| window == page_lines.as_slice())
+        // A page can only be a contiguous sub-window of `merged` if its first
+        // line already appears in `merged`. Testing that membership first turns
+        // the common forward-scroll case (genuinely new content) from an
+        // O(merged_len * page_len) windows scan into an O(merged_len) lookup,
+        // while preserving the exact dedup result.
+        let first_line = &page_lines[0];
+        if merged.iter().any(|line| line == first_line)
+            && merged
+                .windows(page_lines.len())
+                .any(|window| window == page_lines.as_slice())
         {
             continue;
         }

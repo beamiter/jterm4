@@ -129,7 +129,7 @@ pub(crate) fn install_block_css(config: &Config) {
     };
 
     // Apply font scale to the base size
-    let scaled_size = (base_size as f64 * config.default_font_scale).round() as i32;
+    let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
     let font_size = format!("{}pt", scaled_size);
 
     let css = format!(
@@ -426,7 +426,10 @@ pub(crate) fn install_block_css(config: &Config) {
 
     let provider = gtk4::CssProvider::new();
     provider.load_from_data(&css);
-    let display = gtk4::gdk::Display::default().unwrap();
+    let Some(display) = gtk4::gdk::Display::default() else {
+        // No display (headless / CI). Nothing to style.
+        return;
+    };
 
     BLOCK_CSS_PROVIDER.with(|cell| {
         let mut prev = cell.borrow_mut();

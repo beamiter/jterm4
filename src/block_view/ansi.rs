@@ -1103,6 +1103,11 @@ pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextR
                             }
                         }
                     }
+                    // SU/SD (scroll up/down) and DECSTBM (set scrolling region)
+                    // are deliberately ignored: this is an ever-growing canvas
+                    // with no fixed viewport or scroll region, so faithfully
+                    // emulating them would mangle inline output rather than help.
+                    b'S' | b'T' | b'r' => {}
                     _ => {}
                 }
             }
@@ -1137,6 +1142,22 @@ pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextR
             let slot = (bytes[i + 1] == b')') as usize;
             charset_g[slot] = bytes.get(i + 2) == Some(&b'0');
             i += 3;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'M' {
+            // RI (reverse index): move up one row. `less` emits this when
+            // redrawing inline; without it the line lands one row too low.
+            row = row.saturating_sub(1);
+            i += 2;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'D' {
+            // IND (index): move down one row.
+            row += 1;
+            grid_ensure_row(&mut grid, row);
+            i += 2;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'E' {
+            // NEL (next line): CR + LF.
+            row += 1;
+            col = 0;
+            grid_ensure_row(&mut grid, row);
+            i += 2;
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
         } else if bytes[i] == 0x0e {
@@ -1568,8 +1589,15 @@ pub(crate) fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 open_spans += 1;
                             }
                             Ok(7) => {
-                                // Reverse video - for now use background/foreground swap via CSS
-                                out.push_str("<span style=\"reverse\">");
+                                // Reverse video: Pango has no reverse attribute, so
+                                // approximate by swapping default fg/bg from the palette
+                                // (index 0 = background, 7 = foreground).
+                                let (br, bg, bb) = ansi256_to_rgb(0, palette);
+                                let (fr, fg, fb) = ansi256_to_rgb(7, palette);
+                                out.push_str(&format!(
+                                    "<span foreground=\"#{:02x}{:02x}{:02x}\" background=\"#{:02x}{:02x}{:02x}\">",
+                                    br, bg, bb, fr, fg, fb
+                                ));
                                 open_spans += 1;
                             }
                             Ok(8) => {
@@ -1578,12 +1606,16 @@ pub(crate) fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 open_spans += 1;
                             }
                             Ok(27) => {
-                                out.push_str("</span>");
-                                if open_spans > 0 { open_spans -= 1; }
+                                if open_spans > 0 {
+                                    out.push_str("</span>");
+                                    open_spans -= 1;
+                                }
                             }
                             Ok(28) => {
-                                out.push_str("</span>");
-                                if open_spans > 0 { open_spans -= 1; }
+                                if open_spans > 0 {
+                                    out.push_str("</span>");
+                                    open_spans -= 1;
+                                }
                             }
                             Ok(53) => {
                                 // Overline - use overline attribute (if supported)

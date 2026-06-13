@@ -1150,7 +1150,15 @@ impl ActiveBlock {
         // Accumulate raw bytes first so we can estimate from total content.
         // Track newline/byte totals incrementally — only scan the NEW chunk — so this
         // stays O(chunk) instead of O(total) on every feed (was quadratic for big output).
-        self.raw_output.borrow_mut().extend_from_slice(raw_bytes);
+        {
+            let mut buf = self.raw_output.borrow_mut();
+            buf.extend_from_slice(raw_bytes);
+            // Bound memory for runaway output: keep only the most recent tail.
+            if buf.len() > super::MAX_RAW_OUTPUT_BYTES {
+                let drop = buf.len() - super::MAX_RAW_OUTPUT_BYTES;
+                buf.drain(..drop);
+            }
+        }
         let new_newlines = raw_bytes.iter().filter(|&&b| b == b'\n').count() as i64;
         let total_newlines = self.output_newlines.get() + new_newlines;
         self.output_newlines.set(total_newlines);
