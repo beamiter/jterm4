@@ -164,6 +164,9 @@ struct ReaderCtx {
     pty_synced_rc: Rc<Cell<bool>>,
     completion_active_rc: Rc<Cell<bool>>,
     isearch_active_rc: Rc<Cell<bool>>,
+    ftcs_seen_rc: Rc<Cell<bool>>,
+    idle_buf_rc: Rc<RefCell<Vec<u8>>>,
+    fallback_armed_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
@@ -215,6 +218,9 @@ impl ReaderCtx {
             pty_synced_rc,
             completion_active_rc,
             isearch_active_rc,
+            ftcs_seen_rc,
+            idle_buf_rc,
+            fallback_armed_rc,
             init_cmds_queue_for_cb,
             pty_for_init,
             block_start_time_for_cb,
@@ -705,17 +711,63 @@ impl ReaderCtx {
                                         active_rc.borrow().feed_output(bytes);
                                         scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     }
+                                    BlockState::RawFallback => {
+                                        // No shell integration: stream straight to the raw VTE.
+                                        vte_for_alt.feed(bytes);
+                                    }
                                     BlockState::Idle => {
-                                        // Bytes before first prompt — ignore (pre-prompt noise)
+                                        // Bytes before the first prompt. With shell integration
+                                        // these are pre-prompt noise dropped at PromptStart. Without
+                                        // it, PromptStart never comes — so buffer the bytes and arm a
+                                        // one-shot grace timer; if no FTCS event arrives before it
+                                        // fires, switch to the raw VTE and replay the buffer so the
+                                        // user never sees a black screen.
+                                        idle_buf_rc.borrow_mut().extend_from_slice(bytes);
+                                        if !fallback_armed_rc.get() && !ftcs_seen_rc.get() {
+                                            fallback_armed_rc.set(true);
+                                            let bstate_t = bstate_rc.clone();
+                                            let ftcs_t = ftcs_seen_rc.clone();
+                                            let idle_t = idle_buf_rc.clone();
+                                            let vte_t = vte_for_alt.clone();
+                                            let vte_box_t = vte_box_rc.clone();
+                                            let block_scroll_t = block_scroll_rc.clone();
+                                            glib::timeout_add_local_once(
+                                                std::time::Duration::from_millis(500),
+                                                move || {
+                                                    if ftcs_t.get()
+                                                        || bstate_t.get() != BlockState::Idle
+                                                    {
+                                                        return;
+                                                    }
+                                                    bstate_t.set(BlockState::RawFallback);
+                                                    let buffered = idle_t.borrow().clone();
+                                                    show_alt_screen(
+                                                        &block_scroll_t,
+                                                        &vte_box_t,
+                                                        &vte_t,
+                                                        Some(&buffered),
+                                                    );
+                                                    idle_t.borrow_mut().clear();
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }
 
                             ParserEvent::PromptStart => {
+                                ftcs_seen_rc.set(true);
                                 let state = bstate_rc.get();
                                 if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
                                     log::debug!("[altdiag] PromptStart SKIPPED (state={:?}, osc133_depth={})", state, osc133_depth_rc.get());
                                     continue;
+                                }
+                                // Late-loading shell integration: a PromptStart arrived after we
+                                // had already fallen back to the raw VTE. Recover to block mode so
+                                // the user gets proper command blocks from here on.
+                                if state == BlockState::RawFallback {
+                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
+                                    idle_buf_rc.borrow_mut().clear();
                                 }
                                 // Finalize the previous block if we're in PostCommand state
                                 if state == BlockState::PostCommand {
@@ -793,7 +845,11 @@ impl ReaderCtx {
                                         prompt: prompt.clone(),
                                         cmd: cmd.clone(),
                                         cmd_markup: if cmd_ansi_trimmed.is_empty() { None } else { Some(cmd_ansi_trimmed.clone()) },
-                                        output: output_trimmed.clone(),
+                                        // Store the FULL output: the widget already renders the
+                                        // complete text (display_output_ansi), and export / search /
+                                        // session restore must not silently lose truncated lines.
+                                        // `output_trimmed` is only an in-memory display estimate.
+                                        output: output_plain.trim().to_string(),
                                         exit_code,
                                         estimated_height,
                                         line_count,
@@ -1021,6 +1077,7 @@ impl ReaderCtx {
                             }
 
                             ParserEvent::CommandStart => {
+                                ftcs_seen_rc.set(true);
                                 let state = bstate_rc.get();
                                 if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
                                     osc133_depth_rc.set(osc133_depth_rc.get() + 1);
@@ -1250,6 +1307,19 @@ impl KeyCtx {
                 let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
 
                 log::debug!("KEY: keyval={:?}, ctrl={}, shift={}, alt={}", keyval, ctrl, shift, alt);
+
+                // Shift+PageUp/PageDown: scroll the block history locally instead of
+                // forwarding to the PTY. The vadjustment value_changed handler keeps
+                // the scroll-lock (user_scrolled_up) in sync, so paging up engages it
+                // and paging back to the bottom releases it automatically.
+                if shift && (keyval == gtk4::gdk::Key::Page_Up || keyval == gtk4::gdk::Key::Page_Down) {
+                    let adj = block_scroll_for_key.vadjustment();
+                    let step = (adj.page_size() * 0.9).max(1.0);
+                    let delta = if keyval == gtk4::gdk::Key::Page_Up { -step } else { step };
+                    let target = (adj.value() + delta).clamp(adj.lower(), adj.upper() - adj.page_size());
+                    adj.set_value(target);
+                    return glib::Propagation::Stop;
+                }
 
                 // Editor mode: when awaiting command input, handle editing locally
                 // During completion menu, forward keys directly to PTY (pass-through)
@@ -2236,6 +2306,12 @@ impl TermView {
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        // No-shell-integration fallback: set once any OSC-133 (FTCS) event is seen.
+        // While false, pre-prompt output is buffered; if the grace timer fires with
+        // FTCS still unseen, the view auto-switches to the raw VTE so nothing drops.
+        let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let idle_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let fallback_armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
             cwd.unwrap_or("").to_string()
         ));
@@ -2285,6 +2361,9 @@ impl TermView {
             let pty_synced_rc = pty_synced.clone();
             let completion_active_rc = completion_active.clone();
             let isearch_active_rc = isearch_active.clone();
+            let ftcs_seen_rc = ftcs_seen.clone();
+            let idle_buf_rc = idle_buf.clone();
+            let fallback_armed_rc = fallback_armed.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -2344,6 +2423,9 @@ impl TermView {
                 pty_synced_rc,
                 completion_active_rc,
                 isearch_active_rc,
+                ftcs_seen_rc,
+                idle_buf_rc,
+                fallback_armed_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 block_start_time_for_cb,
@@ -3432,11 +3514,8 @@ impl TermView {
                 &block.command_buffer.end_iter(),
                 true,
             );
-            let output_text = block.output_buffer.text(
-                &block.output_buffer.start_iter(),
-                &block.output_buffer.end_iter(),
-                true,
-            );
+            // Use the full output (ANSI stripped), not the collapsed buffer.
+            let output_text = strip_ansi(&block.full_output.borrow());
 
             let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
             let clipboard = self.vte.clipboard();
@@ -3586,6 +3665,99 @@ mod tests {
         assert!(runs
             .iter()
             .any(|run| run.text == "red" && run.style.foreground.is_some()));
+    }
+
+    fn render(input: &str) -> String {
+        ansi_text_runs(input, &palette())
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn carriage_return_overwrites_from_column_zero() {
+        assert_eq!(render("Loading...\r50%"), "50%ding...");
+    }
+
+    #[test]
+    fn cursor_up_repaints_previous_row() {
+        // aaa\n bbb, back 2, up 1, write Z → row0 col1 = Z.
+        assert_eq!(render("aaa\nbbb\u{1b}[2D\u{1b}[AZ"), "aZa\nbbb");
+    }
+
+    #[test]
+    fn cursor_up_count_and_column_address() {
+        // Three rows; CUU 2 then CHA col1 then write X overwrites row0 col0.
+        assert_eq!(render("r0\nr1\nr2\u{1b}[2A\u{1b}[1GX"), "X0\nr1\nr2");
+    }
+
+    #[test]
+    fn double_width_chars_round_trip() {
+        assert_eq!(render("日本"), "日本");
+    }
+
+    #[test]
+    fn double_width_advances_two_columns() {
+        // After a wide char (cols 0-1), CHA to col3 (0-based 2) writes adjacent.
+        assert_eq!(render("日\u{1b}[3GX"), "日X");
+    }
+
+    #[test]
+    fn tab_pads_to_next_stop() {
+        assert_eq!(render("a\tb"), format!("a{}b", " ".repeat(7)));
+    }
+
+    #[test]
+    fn erase_chars_blanks_in_place() {
+        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[2X"), "abc  f");
+    }
+
+    #[test]
+    fn delete_chars_shifts_left() {
+        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[2P"), "abcf");
+    }
+
+    #[test]
+    fn insert_chars_shifts_right() {
+        assert_eq!(render("abc\u{1b}[1G\u{1b}[2@"), "  abc");
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_base() {
+        assert_eq!(render("e\u{0301}"), "e\u{0301}");
+    }
+
+    #[test]
+    fn repeat_last_char() {
+        assert_eq!(render("a\u{1b}[3b"), "aaaa");
+    }
+
+    #[test]
+    fn erase_line_to_end() {
+        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[0K"), "abc");
+    }
+
+    #[test]
+    fn newline_starts_fresh_row() {
+        assert_eq!(render("ab\ncd"), "ab\ncd");
+    }
+
+    #[test]
+    fn dec_line_drawing_maps_box_chars() {
+        // ESC(0 selects line-drawing G0; lqk → ┌─┐ ; ESC(B restores ASCII.
+        assert_eq!(render("\u{1b}(0lqk\u{1b}(B"), "┌─┐");
+    }
+
+    #[test]
+    fn dec_line_drawing_restored_by_ascii_charset() {
+        // After ESC(B, lqk are plain letters again.
+        assert_eq!(render("\u{1b}(0l\u{1b}(Blqk"), "┌lqk");
+    }
+
+    #[test]
+    fn shift_in_out_toggle_line_drawing() {
+        // SO (0x0e) selects G1; designate G1 as line-drawing; SI (0x0f) back to G0.
+        assert_eq!(render("\u{1b})0\u{0e}x\u{0f}x"), "│x");
     }
 
     #[test]

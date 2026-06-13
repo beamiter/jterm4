@@ -6,9 +6,18 @@ use gtk4::TextBuffer;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-/// Simple URL detection regex (http/https/file URLs)
+/// URL detection: common schemes plus bare `www.` hosts.
 pub(crate) fn is_url(text: &str) -> bool {
-    text.starts_with("http://") || text.starts_with("https://") || text.starts_with("file://")
+    const SCHEMES: [&str; 7] = [
+        "http://", "https://", "file://", "ftp://", "git://", "ssh://", "mailto:",
+    ];
+    SCHEMES.iter().any(|s| text.starts_with(s))
+}
+
+/// Trailing characters that are almost always sentence punctuation rather than
+/// part of a URL (e.g. `see http://x.com.` → drop the period).
+fn trim_trailing(text: &str) -> &str {
+    text.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"'))
 }
 
 /// Extract URL at cursor position in a TextView's buffer, returning bounds and text
@@ -42,12 +51,19 @@ pub(crate) fn get_url_bounds_at_position(
         }
     }
 
-    let text = buffer.text(&start, &end, false).to_string();
-    if is_url(&text) {
-        Some((start, end, text))
-    } else {
-        None
+    let raw = buffer.text(&start, &end, false).to_string();
+    let trimmed = trim_trailing(&raw);
+    if !is_url(trimmed) {
+        return None;
     }
+    // Pull `end` back over any trailing punctuation we stripped, so the hover
+    // highlight and click target match the actual URL.
+    let trimmed_chars = trimmed.chars().count();
+    let raw_chars = raw.chars().count();
+    for _ in 0..(raw_chars - trimmed_chars) {
+        end.backward_char();
+    }
+    Some((start, end, trimmed.to_string()))
 }
 
 pub(crate) fn get_url_at_position(buffer: &TextBuffer, iter: &gtk4::TextIter) -> Option<String> {

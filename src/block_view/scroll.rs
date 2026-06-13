@@ -37,6 +37,7 @@ impl ScrollDebouncer {
         let dirty = self.dirty.clone();
         let pending = self.pending_handle.clone();
         let programmatic = self.programmatic_scroll.clone();
+        let user_up = self.user_scrolled_up.clone();
 
         if let Some(handle) = pending.borrow_mut().take() {
             handle.remove();
@@ -45,9 +46,15 @@ impl ScrollDebouncer {
         dirty.set(true);
 
         let pending_for_clear = pending.clone();
+        let user_up_inner = user_up.clone();
         let handle =
             glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
                 let scroll_to_end = |sw: &ScrolledWindow| {
+                    // The user may have grabbed the scrollbar between mark_dirty
+                    // and this deferred fire — never fight them back to bottom.
+                    if user_up_inner.get() {
+                        return;
+                    }
                     let adj = sw.vadjustment();
                     let target = adj.upper() - adj.page_size();
                     if target > 0.0 && adj.value() < target - 1.0 {
@@ -60,7 +67,11 @@ impl ScrollDebouncer {
                 // Second scroll after layout fully settles
                 let scroll2 = scroll.clone();
                 let programmatic2 = programmatic.clone();
+                let user_up2 = user_up_inner.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+                    if user_up2.get() {
+                        return;
+                    }
                     let adj = scroll2.vadjustment();
                     let target = adj.upper() - adj.page_size();
                     if target > 0.0 && adj.value() < target - 1.0 {

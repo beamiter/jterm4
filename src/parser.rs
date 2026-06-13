@@ -210,31 +210,40 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         Err(_) => return,
     };
 
-    // OSC 133 ; <mark> — shell integration
+    // OSC 133 ; <mark> [; params...] — shell integration (FTCS).
+    // Real shells emit extra `;`-separated params, e.g. "A;cl=m;k=i" or
+    // "D;1;aid=7", so match only the leading mark field and treat the rest
+    // as parameters.
     if let Some(rest) = s.strip_prefix("133;") {
-        match rest {
-            "A" => events.push(ParserEvent::PromptStart),
-            "B" => events.push(ParserEvent::PromptEnd),
-            "C" => events.push(ParserEvent::CommandStart),
-            _ if rest.starts_with("D;") => {
-                let code = rest[2..].parse::<i32>().unwrap_or(0);
+        let mut fields = rest.split(';');
+        match fields.next() {
+            Some("A") => events.push(ParserEvent::PromptStart),
+            Some("B") => events.push(ParserEvent::PromptEnd),
+            Some("C") => events.push(ParserEvent::CommandStart),
+            Some("D") => {
+                // Exit code is the first param after D (if any); ignore trailing
+                // fields like aid=. A non-numeric/absent code means "unknown" → 0.
+                let code = fields
+                    .next()
+                    .and_then(|f| f.parse::<i32>().ok())
+                    .unwrap_or(0);
                 events.push(ParserEvent::CommandEnd(code));
             }
-            "D" => events.push(ParserEvent::CommandEnd(0)),
             _ => {}
         }
         return;
     }
 
-    // OSC 7 ; file://host/path — CWD update
+    // OSC 7 ; file://host/path — CWD update (path is percent-encoded per RFC 3986).
     if let Some(rest) = s.strip_prefix("7;") {
-        let path = if let Some(uri) = rest.strip_prefix("file://") {
+        let raw = if let Some(uri) = rest.strip_prefix("file://") {
             if let Some(idx) = uri.find('/') { &uri[idx..] } else { uri }
         } else {
             rest
         };
+        let path = percent_decode(raw);
         if !path.is_empty() {
-            events.push(ParserEvent::CwdUpdate(path.to_string()));
+            events.push(ParserEvent::CwdUpdate(path));
         }
         return;
     }
@@ -261,6 +270,29 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     bytes.extend_from_slice(payload);
     bytes.push(0x07);
     events.push(ParserEvent::Bytes(bytes));
+}
+
+/// Percent-decode an OSC 7 path (e.g. "/home/me/My%20Docs" → "/home/me/My Docs").
+/// Decoded bytes are interpreted as UTF-8; invalid sequences fall back to the
+/// raw input unchanged.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }
 
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {

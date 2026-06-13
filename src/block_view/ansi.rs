@@ -587,7 +587,7 @@ pub(crate) fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
     };
 
     Some(format!(
-        "ansi-run-fg:{}-bg:{}-b{}-i{}-u{}-uc:{}-s{}-d{}-lk:{}",
+        "ansi-run-fg:{}-bg:{}-b{}-i{}-u{}-uc:{}-s{}-d{}-rv{}-hd{}-ov{}-lk:{}",
         rgba_key(style.foreground.as_ref()),
         rgba_key(style.background.as_ref()),
         style.bold as u8,
@@ -596,6 +596,9 @@ pub(crate) fn ansi_tag_name(style: &AnsiStyleState) -> Option<String> {
         rgba_key(style.underline_color.as_ref()),
         style.strikethrough as u8,
         style.dim as u8,
+        style.reverse as u8,
+        style.hidden as u8,
+        style.overline as u8,
         link_key,
     ))
 }
@@ -609,17 +612,32 @@ pub(crate) fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) 
     }
 
     let tag = gtk4::TextTag::new(Some(&tag_name));
-    if let Some(mut foreground) = style.foreground {
+    // SGR 7 (reverse): swap explicit fg/bg. For the default-on-default case we
+    // leave colors untouched since the theme defaults aren't available here.
+    let (eff_fg, eff_bg) = if style.reverse {
+        (style.background, style.foreground)
+    } else {
+        (style.foreground, style.background)
+    };
+    if let Some(mut foreground) = eff_fg {
         if style.dim {
             foreground.set_alpha(0.7);
         }
         tag.set_foreground_rgba(Some(&foreground));
     }
-    if style.hyperlink.is_some() && style.foreground.is_none() {
+    if style.hyperlink.is_some() && eff_fg.is_none() {
         tag.set_foreground_rgba(Some(&RGBA::new(0.4, 0.6, 1.0, 1.0)));
     }
-    if let Some(background) = style.background {
+    if let Some(background) = eff_bg {
         tag.set_background_rgba(Some(&background));
+    }
+    // SGR 8 (conceal): render text invisible.
+    if style.hidden {
+        tag.set_foreground_rgba(Some(&RGBA::new(0.0, 0.0, 0.0, 0.0)));
+    }
+    // SGR 53 (overline).
+    if style.overline {
+        tag.set_overline(gtk4::pango::Overline::Single);
     }
     if style.bold {
         tag.set_weight(gtk4::pango::Weight::Bold.into_glib());
@@ -651,6 +669,34 @@ pub(crate) fn ensure_ansi_text_tag(buffer: &TextBuffer, style: &AnsiStyleState) 
 }
 
 
+/// Parse the ISO colon-subparam color forms shared by 38:/48:/58:
+/// `[base, "5", n]` (256-color) or `[base, "2", (cs,) r, g, b]` (truecolor).
+fn parse_colon_color(sub_parts: &[&str], palette: &[RGBA; 16]) -> Option<RGBA> {
+    let mode = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok())?;
+    match mode {
+        5 => {
+            let idx = sub_parts.get(2).and_then(|s| s.parse::<u8>().ok())?;
+            let (r, g, b) = ansi256_to_rgb(idx, palette);
+            Some(RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0))
+        }
+        2 => {
+            // Take the last three numeric fields so an optional colorspace-id
+            // field (38:2:<cs>:r:g:b) is skipped transparently.
+            let nums: Vec<u8> = sub_parts[2..]
+                .iter()
+                .filter_map(|s| s.parse::<u8>().ok())
+                .collect();
+            if nums.len() >= 3 {
+                let (r, g, b) = (nums[nums.len() - 3], nums[nums.len() - 2], nums[nums.len() - 1]);
+                Some(RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], palette: &[RGBA; 16]) {
     let mut index = 0;
     while index < params.len() {
@@ -671,25 +717,14 @@ pub(crate) fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], pa
                         _ => UnderlineStyle::Single,
                     };
                 }
-                58 => {
-                    // 58:2:r:g:b or 58:5:n (underline color)
-                    let mode = sub_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                    if mode == 5 && sub_parts.len() >= 3 {
-                        if let Ok(idx) = sub_parts[2].parse::<u8>() {
-                            let (r, g, b) = ansi256_to_rgb(idx, palette);
-                            style.underline_color = Some(RGBA::new(
-                                r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
-                            ));
-                        }
-                    } else if mode == 2 && sub_parts.len() >= 5 {
-                        if let (Ok(r), Ok(g), Ok(b)) = (
-                            sub_parts[2].parse::<u8>(),
-                            sub_parts[3].parse::<u8>(),
-                            sub_parts[4].parse::<u8>(),
-                        ) {
-                            style.underline_color = Some(RGBA::new(
-                                r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0,
-                            ));
+                38 | 48 | 58 => {
+                    // ISO colon form: 38:5:n / 38:2:r:g:b / 38:2::r:g:b
+                    // (the empty field after mode 2 is an optional colorspace id).
+                    if let Some(color) = parse_colon_color(&sub_parts, palette) {
+                        match base {
+                            38 => style.foreground = Some(color),
+                            48 => style.background = Some(color),
+                            _ => style.underline_color = Some(color),
                         }
                     }
                 }
@@ -706,7 +741,13 @@ pub(crate) fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], pa
         };
 
         match param {
-            0 => *style = AnsiStyleState::default(),
+            0 => {
+                // SGR reset clears visual attributes but NOT the active OSC 8
+                // hyperlink, whose lifetime is governed solely by OSC 8 itself.
+                let link = style.hyperlink.take();
+                *style = AnsiStyleState::default();
+                style.hyperlink = link;
+            }
             1 => style.bold = true,
             2 => style.dim = true,
             3 => style.italic = true,
@@ -830,17 +871,108 @@ pub(crate) fn parse_sgr_params(style: &mut AnsiStyleState, params: &[String], pa
     }
 }
 
-/// Parse ANSI text with proper cursor movement handling
-/// This ensures colors align with the final text after \r and cursor movements
+/// A single terminal cell. `text` holds the base grapheme plus any trailing
+/// combining marks; the empty string marks the right half of a double-width
+/// glyph (skipped on serialization).
+type GridCell = (String, AnsiStyleState);
+
+#[inline]
+fn blank_cell() -> GridCell {
+    (" ".to_string(), AnsiStyleState::default())
+}
+
+/// Map a byte in the DEC Special Graphics charset (ESC ( 0) to its Unicode
+/// box-drawing / symbol glyph. Only 0x60..=0x7e differ from ASCII.
+fn dec_special_graphics(ch: char) -> char {
+    match ch {
+        '`' => '\u{25C6}', 'a' => '\u{2592}', 'f' => '\u{00B0}', 'g' => '\u{00B1}',
+        'j' => '\u{2518}', 'k' => '\u{2510}', 'l' => '\u{250C}', 'm' => '\u{2514}',
+        'n' => '\u{253C}', 'o' => '\u{23BA}', 'p' => '\u{23BB}', 'q' => '\u{2500}',
+        'r' => '\u{23BC}', 's' => '\u{23BD}', 't' => '\u{251C}', 'u' => '\u{2524}',
+        'v' => '\u{2534}', 'w' => '\u{252C}', 'x' => '\u{2502}', 'y' => '\u{2264}',
+        'z' => '\u{2265}', '{' => '\u{03C0}', '|' => '\u{2260}', '}' => '\u{00A3}',
+        '~' => '\u{00B7}',
+        _ => ch,
+    }
+}
+
+fn grid_ensure_row(grid: &mut Vec<Vec<GridCell>>, row: usize) {
+    while grid.len() <= row {
+        grid.push(Vec::new());
+    }
+}
+
+/// Pad `grid[row]` with blank cells up to (but not including) `col`.
+fn grid_ensure_col(grid: &mut [Vec<GridCell>], row: usize, col: usize) {
+    let r = &mut grid[row];
+    while r.len() < col {
+        r.push(blank_cell());
+    }
+}
+
+fn grid_set(grid: &mut Vec<Vec<GridCell>>, row: usize, col: usize, cell: GridCell) {
+    grid_ensure_row(grid, row);
+    grid_ensure_col(grid, row, col);
+    if col < grid[row].len() {
+        grid[row][col] = cell;
+    } else {
+        grid[row].push(cell);
+    }
+}
+
+/// Parse ANSI text into styled runs using a real (multi-row) cursor grid.
+///
+/// The input has already been soft-wrapped to the grid width by `wrap_ansi_at`,
+/// so this stage faithfully replays the cursor movements the program emitted —
+/// `\r`/`\b` over-strikes, vertical motion (CUU/CUD/…) used by multi-line
+/// progress bars (docker/cargo/pip), line edits (EL/ED/ICH/DCH/IL/DL), and
+/// double-width (CJK/emoji) advance — producing the same final frame a real
+/// terminal would show. Full-screen TUIs use the alt-screen path, not this one.
 pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextRun> {
     let bytes = input.as_bytes();
-    let mut runs: Vec<AnsiTextRun> = Vec::new();
     let mut current_style = AnsiStyleState::default();
 
-    let mut cells: Vec<(char, AnsiStyleState)> = Vec::new();
-    let mut cursor = 0usize;
+    let mut grid: Vec<Vec<GridCell>> = vec![Vec::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    // Last printed grapheme + width, for REP (CSI b).
+    let mut last_print: Option<(char, usize)> = None;
+    // DEC charset designation: g[0]=G0, g[1]=G1, true = special graphics.
+    // `gl` selects which is invoked into GL (toggled by SI/SO).
+    let mut charset_g = [false; 2];
+    let mut gl = 0usize;
     let mut i = 0;
     let mut param_buf: Vec<u8> = Vec::with_capacity(32);
+
+    // Print a single character at the cursor, honoring display width.
+    fn print_char(
+        grid: &mut Vec<Vec<GridCell>>,
+        row: usize,
+        col: &mut usize,
+        ch: char,
+        style: &AnsiStyleState,
+    ) {
+        let w = super::blocks::char_display_width(ch);
+        if w == 0 {
+            // Combining mark: attach to the nearest preceding non-tail cell.
+            grid_ensure_row(grid, row);
+            let r = &grid[row];
+            let mut j = (*col).min(r.len());
+            while j > 0 {
+                j -= 1;
+                if !r[j].0.is_empty() {
+                    grid[row][j].0.push(ch);
+                    return;
+                }
+            }
+            return;
+        }
+        grid_set(grid, row, *col, (ch.to_string(), style.clone()));
+        if w == 2 {
+            grid_set(grid, row, *col + 1, (String::new(), style.clone()));
+        }
+        *col += w;
+    }
 
     while i < bytes.len() {
         if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
@@ -854,6 +986,20 @@ pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextR
             if i < bytes.len() {
                 let final_byte = bytes[i];
                 i += 1;
+
+                // Numeric params split on ';' (empty → 0). Private-marker bytes
+                // ('?', '>') and intermediates are tolerated by parse fallbacks.
+                let nums: Vec<usize> = param_buf
+                    .split(|&b| b == b';')
+                    .map(|p| {
+                        std::str::from_utf8(p)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                let p0 = nums.first().copied().unwrap_or(0);
+                let n1 = p0.max(1); // count params default to 1
 
                 match final_byte {
                     b'm' => {
@@ -869,30 +1015,92 @@ pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextR
                         };
                         parse_sgr_params(&mut current_style, &params_str, palette);
                     }
-                    b'D' => {
-                        let count = parse_param_first(&param_buf, 1);
-                        cursor = cursor.saturating_sub(count);
+                    b'A' => row = row.saturating_sub(n1),                     // CUU
+                    b'B' | b'e' => { row += n1; grid_ensure_row(&mut grid, row); } // CUD/VPR
+                    b'C' | b'a' => col += n1,                                 // CUF/HPR
+                    b'D' => col = col.saturating_sub(n1),                     // CUB
+                    b'E' => { row += n1; col = 0; grid_ensure_row(&mut grid, row); } // CNL
+                    b'F' => { row = row.saturating_sub(n1); col = 0; }        // CPL
+                    b'G' | b'`' => col = n1 - 1,                              // CHA/HPA
+                    b'd' => { row = n1 - 1; grid_ensure_row(&mut grid, row); } // VPA (best-effort)
+                    b'H' | b'f' => {                                          // CUP (best-effort)
+                        row = nums.first().copied().unwrap_or(1).max(1) - 1;
+                        col = nums.get(1).copied().unwrap_or(1).max(1) - 1;
+                        grid_ensure_row(&mut grid, row);
                     }
-                    b'C' => {
-                        let count = parse_param_first(&param_buf, 1);
-                        cursor = (cursor + count).min(cells.len());
-                    }
-                    b'G' => {
-                        let col = parse_param_first(&param_buf, 1);
-                        cursor = col.saturating_sub(1).min(cells.len());
-                    }
-                    b'K' => {
-                        match param_buf.as_slice() {
-                            b"" | b"0" => cells.truncate(cursor),
-                            b"1" => {
-                                cells.drain(..cursor);
-                                cursor = 0;
+                    b'K' => {                                                 // EL
+                        if row < grid.len() {
+                            match p0 {
+                                0 => { grid[row].truncate(col); }
+                                1 => {
+                                    grid_ensure_col(&mut grid, row, col + 1);
+                                    for c in 0..=col.min(grid[row].len().saturating_sub(1)) {
+                                        grid[row][c] = blank_cell();
+                                    }
+                                }
+                                2 => grid[row].clear(),
+                                _ => {}
                             }
-                            b"2" => {
-                                cells.clear();
-                                cursor = 0;
+                        }
+                    }
+                    b'J' => {                                                 // ED
+                        match p0 {
+                            0 => {
+                                if row < grid.len() { grid[row].truncate(col); }
+                                grid.truncate(row + 1);
                             }
+                            1 => {
+                                for rr in 0..row.min(grid.len()) { grid[rr].clear(); }
+                                if row < grid.len() {
+                                    grid_ensure_col(&mut grid, row, col + 1);
+                                    for c in 0..=col.min(grid[row].len().saturating_sub(1)) {
+                                        grid[row][c] = blank_cell();
+                                    }
+                                }
+                            }
+                            2 | 3 => { grid = vec![Vec::new()]; row = 0; col = 0; }
                             _ => {}
+                        }
+                    }
+                    b'X' => {                                                 // ECH
+                        if row < grid.len() {
+                            grid_ensure_col(&mut grid, row, col + n1);
+                            for c in col..(col + n1).min(grid[row].len()) {
+                                grid[row][c] = blank_cell();
+                            }
+                        }
+                    }
+                    b'@' => {                                                 // ICH
+                        if row < grid.len() {
+                            grid_ensure_col(&mut grid, row, col);
+                            for _ in 0..n1 {
+                                let at = col.min(grid[row].len());
+                                grid[row].insert(at, blank_cell());
+                            }
+                        }
+                    }
+                    b'P' => {                                                 // DCH
+                        if row < grid.len() {
+                            for _ in 0..n1 {
+                                if col < grid[row].len() { grid[row].remove(col); }
+                            }
+                        }
+                    }
+                    b'L' => {                                                 // IL
+                        grid_ensure_row(&mut grid, row);
+                        for _ in 0..n1 { grid.insert(row.min(grid.len()), Vec::new()); }
+                    }
+                    b'M' => {                                                 // DL
+                        for _ in 0..n1 {
+                            if row < grid.len() { grid.remove(row); }
+                        }
+                        if grid.is_empty() { grid.push(Vec::new()); }
+                    }
+                    b'b' => {                                                 // REP
+                        if let Some((ch, _)) = last_print {
+                            for _ in 0..n1 {
+                                print_char(&mut grid, row, &mut col, ch, &current_style);
+                            }
                         }
                     }
                     _ => {}
@@ -923,74 +1131,92 @@ pub(crate) fn ansi_text_runs(input: &str, palette: &[RGBA; 16]) -> Vec<AnsiTextR
                 }
             }
             i = osc_end;
+        } else if bytes[i] == 0x1b && i + 1 < bytes.len() && (bytes[i + 1] == b'(' || bytes[i + 1] == b')') {
+            // Charset designation: ESC ( <f> (G0) or ESC ) <f> (G1).
+            // '0' selects DEC Special Graphics; anything else (B, A, …) is ASCII.
+            let slot = (bytes[i + 1] == b')') as usize;
+            charset_g[slot] = bytes.get(i + 2) == Some(&b'0');
+            i += 3;
         } else if bytes[i] == 0x1b && i + 1 < bytes.len() {
             i = skip_escape_sequence(bytes, i);
+        } else if bytes[i] == 0x0e {
+            gl = 1; // SO — invoke G1
+            i += 1;
+        } else if bytes[i] == 0x0f {
+            gl = 0; // SI — invoke G0
+            i += 1;
         } else if bytes[i] == b'\r' {
-            cursor = 0;
+            col = 0;
             i += 1;
         } else if bytes[i] == b'\n' {
-            for &(ch, ref style) in &cells {
-                if runs.is_empty() || runs.last().unwrap().style != *style {
-                    runs.push(AnsiTextRun {
-                        text: String::from(ch),
-                        style: style.clone(),
-                    });
-                } else {
-                    runs.last_mut().unwrap().text.push(ch);
-                }
-            }
-            cells.clear();
-            runs.push(AnsiTextRun {
-                text: "\n".to_string(),
-                style: current_style.clone(),
-            });
-            cursor = 0;
+            row += 1;
+            col = 0;
+            grid_ensure_row(&mut grid, row);
             i += 1;
         } else if bytes[i] == b'\x08' {
-            cursor = cursor.saturating_sub(1);
+            col = col.saturating_sub(1);
+            i += 1;
+        } else if bytes[i] == b'\t' {
+            // Advance to the next 8-column tab stop, padding with blanks.
+            let next_stop = (col / 8 + 1) * 8;
+            grid_ensure_row(&mut grid, row);
+            grid_ensure_col(&mut grid, row, next_stop);
+            col = next_stop;
             i += 1;
         } else {
-            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            let mut ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
             i += ch.len_utf8();
+            if charset_g[gl] && ('`'..='~').contains(&ch) {
+                ch = dec_special_graphics(ch);
+            }
+            print_char(&mut grid, row, &mut col, ch, &current_style);
+            let w = super::blocks::char_display_width(ch);
+            if w > 0 {
+                last_print = Some((ch, w));
+            }
+        }
+    }
 
-            if cursor < cells.len() {
-                cells[cursor] = (ch, current_style.clone());
+    grid_to_runs(&grid)
+}
+
+/// Serialize a cursor grid into styled runs, joining rows with newline runs and
+/// dropping trailing blank (default-styled) padding from each row.
+fn grid_to_runs(grid: &[Vec<GridCell>]) -> Vec<AnsiTextRun> {
+    let mut runs: Vec<AnsiTextRun> = Vec::new();
+    let default_style = AnsiStyleState::default();
+
+    let push = |runs: &mut Vec<AnsiTextRun>, text: &str, style: &AnsiStyleState| {
+        if let Some(last) = runs.last_mut() {
+            if &last.style == style {
+                last.text.push_str(text);
+                return;
+            }
+        }
+        runs.push(AnsiTextRun { text: text.to_string(), style: style.clone() });
+    };
+
+    for (ri, line) in grid.iter().enumerate() {
+        // Trim trailing blank cells that are mere padding (a space with no
+        // styling), but keep styled blanks (e.g. colored background runs).
+        let mut end = line.len();
+        while end > 0 {
+            let (ref t, ref s) = line[end - 1];
+            if (t == " " || t.is_empty()) && *s == default_style {
+                end -= 1;
             } else {
-                cells.push((ch, current_style.clone()));
+                break;
             }
-            cursor += 1;
         }
-    }
-
-    // Convert remaining cells to runs by merging adjacent cells with the same style
-    let mut current_run_text = String::new();
-    let mut current_run_style = AnsiStyleState::default();
-    let mut first = true;
-
-    for (ch, style) in cells {
-        if first {
-            current_run_text.push(ch);
-            current_run_style = style;
-            first = false;
-        } else if style == current_run_style {
-            current_run_text.push(ch);
-        } else {
-            if !current_run_text.is_empty() {
-                runs.push(AnsiTextRun {
-                    text: std::mem::take(&mut current_run_text),
-                    style: current_run_style.clone(),
-                });
+        for (ref text, ref style) in &line[..end] {
+            if text.is_empty() {
+                continue; // right half of a wide glyph
             }
-            current_run_text.push(ch);
-            current_run_style = style;
+            push(&mut runs, text, style);
         }
-    }
-
-    if !current_run_text.is_empty() {
-        runs.push(AnsiTextRun {
-            text: current_run_text,
-            style: current_run_style,
-        });
+        if ri + 1 < grid.len() {
+            push(&mut runs, "\n", &default_style);
+        }
     }
 
     runs

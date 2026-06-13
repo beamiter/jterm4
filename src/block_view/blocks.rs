@@ -27,7 +27,7 @@ pub enum TermCursorShape {
 /// Display width of a single character in terminal cells. Coarse but covers the
 /// common cases: zero-width combining marks / joiners, double-width CJK & emoji,
 /// everything else single-width. Used only to reproduce the terminal's wrap column.
-fn char_display_width(c: char) -> usize {
+pub(crate) fn char_display_width(c: char) -> usize {
     let cp = c as u32;
     if cp == 0 {
         return 0;
@@ -101,11 +101,23 @@ pub(crate) fn wrap_ansi_at(input: &str, cols: usize) -> String {
                             out.push(chars.next().unwrap());
                         }
                     }
+                    Some('(') | Some(')') => {
+                        // Charset designation ESC(<f> / ESC)<f>: two more bytes,
+                        // zero display width.
+                        out.push(chars.next().unwrap());
+                        if let Some(f) = chars.next() {
+                            out.push(f);
+                        }
+                    }
                     Some(_) => {
                         out.push(chars.next().unwrap());
                     }
                     None => {}
                 }
+            }
+            // SI / SO (charset shift): zero width.
+            '\x0e' | '\x0f' => {
+                out.push(c);
             }
             '\n' => {
                 out.push('\n');
@@ -737,13 +749,11 @@ impl FinishedBlock {
         });
 
         let vte_for_out = vte.clone();
-        let output_buffer_for_copy = self.output_buffer.clone();
+        // Copy the FULL output (ANSI stripped), not just the collapsed first-N
+        // lines shown in output_buffer before "Show more" is clicked.
+        let full_output_for_copy = self.full_output.clone();
         self.copy_output_btn.connect_clicked(move |_| {
-            let text = output_buffer_for_copy.text(
-                &output_buffer_for_copy.start_iter(),
-                &output_buffer_for_copy.end_iter(),
-                true,
-            );
+            let text = strip_ansi(&full_output_for_copy.borrow());
             vte_for_out.clipboard().set_text(&text);
         });
 
@@ -1343,4 +1353,9 @@ pub(crate) enum BlockState {
     AltScreen,
     /// Between CommandEnd and next PromptStart — still collecting late output
     PostCommand,
+    /// Shell has no OSC-133 integration: route all bytes to the raw VTE so output
+    /// is never dropped. Entered from Idle when output arrives but no FTCS event
+    /// has been seen within the startup grace window. Recovered to block mode if a
+    /// PromptStart ever arrives (late-loading integration).
+    RawFallback,
 }
