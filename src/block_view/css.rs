@@ -117,16 +117,20 @@ pub(crate) fn install_block_css(config: &Config) {
     // Format: "FontName Style Size" e.g. "SauceCodePro Nerd Font Mono 14"
     let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
     let (font_family, base_size) = if parts.len() >= 2 {
-        // Last part is usually the size
-        if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
+        // Last part is usually the size. Pango allows float sizes ("Fira Code 12.5"),
+        // so parse as f64 and round rather than rejecting non-integer sizes.
+        if let Ok(size) = parts[parts.len() - 1].parse::<f64>() {
             let family = parts[..parts.len() - 1].join(" ");
-            (family, size)
+            (family, size.round().max(1.0) as i32)
         } else {
             (config.font_desc.clone(), 14)
         }
     } else {
         (config.font_desc.clone(), 14)
     };
+    // Escape the family name so a quote/backslash in the font name can't break the
+    // surrounding CSS string and silently disable the whole stylesheet.
+    let font_family = font_family.replace('\\', "\\\\").replace('"', "\\\"");
 
     // Apply font scale to the base size
     let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;

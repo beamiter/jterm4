@@ -11,6 +11,7 @@ use std::rc::Rc;
 pub(crate) struct ScrollDebouncer {
     pub(crate) dirty: Rc<Cell<bool>>,
     pub(crate) pending_handle: Rc<RefCell<Option<glib::source::SourceId>>>,
+    pub(crate) pending_inner: Rc<RefCell<Option<glib::source::SourceId>>>,
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,
 }
@@ -23,6 +24,7 @@ impl ScrollDebouncer {
         Self {
             dirty: Rc::new(Cell::new(false)),
             pending_handle: Rc::new(RefCell::new(None)),
+            pending_inner: Rc::new(RefCell::new(None)),
             user_scrolled_up,
             programmatic_scroll,
         }
@@ -36,16 +38,23 @@ impl ScrollDebouncer {
         let scroll = scroll.clone();
         let dirty = self.dirty.clone();
         let pending = self.pending_handle.clone();
+        let pending_inner = self.pending_inner.clone();
         let programmatic = self.programmatic_scroll.clone();
         let user_up = self.user_scrolled_up.clone();
 
         if let Some(handle) = pending.borrow_mut().take() {
             handle.remove();
         }
+        // Cancel any still-in-flight inner (80ms) timer from a previous burst so
+        // they don't accumulate under rapid output, each holding Rc/GLib handles.
+        if let Some(handle) = pending_inner.borrow_mut().take() {
+            handle.remove();
+        }
 
         dirty.set(true);
 
         let pending_for_clear = pending.clone();
+        let pending_inner_for_set = pending_inner.clone();
         let user_up_inner = user_up.clone();
         let handle =
             glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
@@ -68,7 +77,9 @@ impl ScrollDebouncer {
                 let scroll2 = scroll.clone();
                 let programmatic2 = programmatic.clone();
                 let user_up2 = user_up_inner.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+                let pending_inner_for_clear = pending_inner_for_set.clone();
+                let inner = glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+                    pending_inner_for_clear.borrow_mut().take();
                     if user_up2.get() {
                         return;
                     }
@@ -80,6 +91,7 @@ impl ScrollDebouncer {
                         programmatic2.set(false);
                     }
                 });
+                pending_inner_for_set.borrow_mut().replace(inner);
                 dirty.set(false);
                 pending_for_clear.borrow_mut().take();
             });

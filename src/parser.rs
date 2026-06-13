@@ -90,8 +90,10 @@ impl Parser {
 
                 State::Esc => match b {
                     b'[' => {
-                        self.passthrough.push(0x1b);
-                        self.passthrough.push(b'[');
+                        // Do NOT emit "ESC[" yet. Buffer the whole CSI in state so a
+                        // read boundary falling mid-sequence cannot split it across
+                        // two Bytes events — downstream scanners (interactive-mode
+                        // detection) rely on seeing each CSI whole.
                         self.state = State::Csi { buf: Vec::new() };
                     }
                     b']' => {
@@ -115,21 +117,32 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
-                        self.passthrough.push(b);
                         if b == b'h' && is_alt_screen_mode(&params) {
-                            let len = self.passthrough.len();
-                            self.passthrough.truncate(len.saturating_sub(params.len() + 3));
+                            // Recognized alt-screen enter: drop the sequence bytes
+                            // (never passed through) and emit the semantic event.
                             flush!();
                             events.push(ParserEvent::AltScreenEnter);
                         } else if b == b'l' && is_alt_screen_mode(&params) {
-                            let len = self.passthrough.len();
-                            self.passthrough.truncate(len.saturating_sub(params.len() + 3));
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
+                        } else {
+                            // Pass the complete sequence through as one contiguous run.
+                            self.passthrough.push(0x1b);
+                            self.passthrough.push(b'[');
+                            self.passthrough.extend_from_slice(&params);
+                            self.passthrough.push(b);
                         }
                     } else {
-                        self.passthrough.push(b);
                         buf.push(b);
+                        // Guard against an unterminated CSI growing without bound
+                        // (malformed stream). Dump what we have and recover.
+                        if buf.len() > 4096 {
+                            let params = std::mem::take(buf);
+                            self.state = State::Ground;
+                            self.passthrough.push(0x1b);
+                            self.passthrough.push(b'[');
+                            self.passthrough.extend_from_slice(&params);
+                        }
                     }
                 }
 
@@ -342,4 +355,90 @@ fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concatenate all Bytes events into one buffer (what downstream sees).
+    fn collect_bytes(events: &[ParserEvent]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for e in events {
+            if let ParserEvent::Bytes(b) = e {
+                out.extend_from_slice(b);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn csi_not_split_across_feeds() {
+        // A CSI sequence arriving in two reads (split mid-sequence) must surface
+        // as a single contiguous run in ONE Bytes event, so interactive-mode
+        // scanners see each CSI whole.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[3", &mut events); // first half: no complete sequence yet
+        p.feed(b"1m", &mut events); // second half: completes ESC[31m
+
+        // The whole CSI lands in a single Bytes event, never fragmented.
+        let bytes_events: Vec<&Vec<u8>> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::Bytes(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bytes_events.len(), 1, "CSI must not be split into pieces");
+        assert_eq!(bytes_events[0].as_slice(), b"\x1b[31m");
+    }
+
+    #[test]
+    fn text_around_csi_passes_through() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"ab\x1b[1mcd", &mut events);
+        assert_eq!(collect_bytes(&events), b"ab\x1b[1mcd");
+    }
+
+    #[test]
+    fn alt_screen_enter_leave_emitted_and_stripped() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?1049h\x1b[?1049l", &mut events);
+        // Both semantic events fire and the raw mode bytes are NOT passed through.
+        assert!(matches!(events[0], ParserEvent::AltScreenEnter));
+        assert!(matches!(events[1], ParserEvent::AltScreenLeave));
+        assert!(collect_bytes(&events).is_empty());
+    }
+
+    #[test]
+    fn alt_screen_enter_split_across_feeds() {
+        // The mode sequence split across reads still emits the semantic event
+        // (parser state persists), and never leaks bytes downstream.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?10", &mut events);
+        p.feed(b"49h", &mut events);
+        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenEnter)));
+        assert!(collect_bytes(&events).is_empty());
+    }
+
+    #[test]
+    fn osc133_command_lifecycle() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07", &mut events);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| match e {
+                ParserEvent::PromptStart => "A",
+                ParserEvent::CommandStart => "C",
+                ParserEvent::CommandEnd(_) => "D",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["A", "C", "D"]);
+    }
 }

@@ -134,6 +134,18 @@ pub struct TermView {
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     selected_block_id: Rc<Cell<Option<u64>>>,
     current_cwd: Rc<RefCell<String>>,
+    /// Per-frame resize tick installed on `root`. Held so it can be removed on
+    /// Drop — otherwise the callback runs forever and keeps its Rc captures
+    /// (pty/active/vte/vte_box) alive past tab close.
+    resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+}
+
+impl Drop for TermView {
+    fn drop(&mut self) {
+        if let Some(id) = self.resize_tick_id.borrow_mut().take() {
+            id.remove();
+        }
+    }
 }
 
 /// Captures the ~46 shared handles the PTY reader/exit callbacks need, so
@@ -275,8 +287,10 @@ impl ReaderCtx {
                         log::debug!("ParserEvent: {:?} (state={:?})", event, state);
                         match event {
                             ParserEvent::Bytes(bytes) => {
-                                // Check for bell character (BEL = 0x07) and trigger callbacks
-                                if bytes.contains(&7) {
+                                // Check for bell character (BEL = 0x07) and trigger callbacks.
+                                // Ignore BELs that merely terminate an OSC sequence (e.g.
+                                // OSC 0/2 title updates), which are not real bells.
+                                if contains_bell(bytes) {
                                     for cb in bell_cbs.borrow().iter() {
                                         cb();
                                     }
@@ -1323,6 +1337,14 @@ impl ReaderCtx {
                                 } else {
                                     bstate_rc.set(BlockState::CollectingOutput);
                                 }
+                                // A CommandStart seen *while on the alt screen* bumps
+                                // osc133_depth as if it were a nested command. The
+                                // matching CommandEnd then arrives after the screen is
+                                // already torn down and would be swallowed by the
+                                // leftover depth, leaving the block stuck in
+                                // CollectingOutput forever. Clear the depth on leave so
+                                // the next CommandEnd finalizes the block normally.
+                                osc133_depth_rc.set(0);
                                 let active_for_idle = active_rc.clone();
                                 glib::idle_add_local_once(move || {
                                     active_for_idle.borrow().grab_focus();
@@ -2313,7 +2335,10 @@ impl TermView {
             lbl.set_halign(gtk4::Align::Start);
             lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         }
-        let breadcrumb_target: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        // Stores the *stable block id* (not a Vec index) of the block the
+        // breadcrumb names. Indices shift when an old block is evicted or deleted
+        // between the scroll handler setting the target and a later click.
+        let breadcrumb_target: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
         let scroll_overlay = gtk4::Overlay::new();
         // Inherit expand from block_scroll (don't pin it): in alt-screen mode the
@@ -2410,7 +2435,7 @@ impl TermView {
         // to this baseline is a stale read and must be dropped.
         let pager_pre_clear: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
-            LruCache::new(NonZeroUsize::new(config.ansi_cache_capacity as usize).unwrap()),
+            LruCache::new(NonZeroUsize::new((config.ansi_cache_capacity as usize).max(1)).unwrap()),
         ));
 
         let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
@@ -2648,10 +2673,10 @@ impl TermView {
                     }
                 }
                 match current {
-                    Some((idx, block)) => {
+                    Some((_idx, block)) => {
                         let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
                         breadcrumb_for_bc.set_label(&format!("\u{f054}  {}", cmd));
-                        target_for_bc.set(Some(idx));
+                        target_for_bc.set(Some(block.id));
                         breadcrumb_for_bc.set_visible(true);
                     }
                     None => {
@@ -2668,9 +2693,9 @@ impl TermView {
             let finished_blocks_for_click = finished_blocks_rc.clone();
             let target_for_click = breadcrumb_target.clone();
             breadcrumb.connect_clicked(move |_| {
-                if let Some(idx) = target_for_click.get() {
+                if let Some(target_id) = target_for_click.get() {
                     let finished = finished_blocks_for_click.borrow();
-                    if let Some(block) = finished.get(idx) {
+                    if let Some(block) = finished.iter().find(|b| b.id == target_id) {
                         let adj = block_scroll_for_click.vadjustment();
                         if let Some(value) = block.widget().compute_point(
                             &block_scroll_for_click,
@@ -2855,6 +2880,7 @@ impl TermView {
             visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
             selected_block_id,
             current_cwd: current_cwd.clone(),
+            resize_tick_id: RefCell::new(None),
         };
 
         // Load history if configured
@@ -2989,7 +3015,7 @@ impl TermView {
 
             let _last_frame = Rc::new(Cell::new(std::time::Instant::now()));
             let last_frame_for_tick = _last_frame.clone();
-            self.root.add_tick_callback(move |widget, _clock| {
+            let tick_id = self.root.add_tick_callback(move |widget, _clock| {
                 if prof_enabled() {
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(last_frame_for_tick.get()).as_micros();
@@ -3122,6 +3148,7 @@ impl TermView {
                 }
                 glib::ControlFlow::Continue
             });
+            *self.resize_tick_id.borrow_mut() = Some(tick_id);
     }
 
     /// Root GTK widget to embed in the notebook page.
@@ -3656,9 +3683,14 @@ impl TermView {
         let path = path_opt.unwrap();
         let blocks = self.block_data.borrow();
 
+        // Overwrite (truncate), do NOT append. The in-memory deque was itself
+        // seeded from this file at startup, so appending it re-wrote every loaded
+        // block on each session — O(N²) file growth and duplicate blocks on the
+        // next load. Persisting the current capped deque keeps the file bounded.
         let mut file = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(path)?;
 
         let compress = self.config.borrow().block_history_compress;
@@ -3667,15 +3699,22 @@ impl TermView {
             let serialized = rkyv::to_bytes::<_, 256>(block)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            if compress {
-                let compressed = zstd::encode_all(serialized.as_slice(), 3)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                file.write_all(&(compressed.len() as u32).to_le_bytes())?;
-                file.write_all(&compressed)?;
+            let record: &[u8] = if compress {
+                &zstd::encode_all(serialized.as_slice(), 3)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
             } else {
-                file.write_all(&(serialized.len() as u32).to_le_bytes())?;
-                file.write_all(&serialized)?;
+                &serialized
+            };
+
+            // The length prefix is a u32; silently truncating it would corrupt all
+            // following frame boundaries. Skip any (pathologically large) record
+            // that would not fit rather than write a bad prefix.
+            if record.len() > u32::MAX as usize {
+                log::warn!("save_history: skipping block of {} bytes (exceeds u32 frame limit)", record.len());
+                continue;
             }
+            file.write_all(&(record.len() as u32).to_le_bytes())?;
+            file.write_all(record)?;
         }
 
         Ok(())
@@ -3706,6 +3745,12 @@ impl TermView {
             }
 
             let len = u32::from_le_bytes(len_bytes) as usize;
+            // Guard against a corrupt/misaligned length causing a giant allocation.
+            const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+            if len > MAX_RECORD_BYTES {
+                log::warn!("load_history: record length {} exceeds {} — treating file as corrupt, stopping", len, MAX_RECORD_BYTES);
+                break;
+            }
             let mut data = vec![0u8; len];
             file.read_exact(&mut data)?;
 

@@ -157,6 +157,37 @@ pub(crate) fn contains_full_screen_redraw(bytes: &[u8]) -> bool {
     false
 }
 
+/// True if the byte stream contains a *real* bell (BEL, 0x07) — i.e. one that is
+/// NOT acting as the string terminator of an OSC sequence (`ESC ] … BEL`). A
+/// naive `bytes.contains(&7)` fires spuriously on every OSC 0/2 title update that
+/// uses the BEL terminator form.
+pub(crate) fn contains_bell(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b']' {
+            // OSC: skip to its terminator (BEL or ESC \), consuming the BEL.
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == 0x07 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// True if the byte stream contains `ESC[?25l` (hide cursor).
 pub(crate) fn contains_cursor_hide(bytes: &[u8]) -> bool {
     contains_private_mode(bytes, b'l')
@@ -388,6 +419,42 @@ mod pager_snapshot_tests {
     }
 }
 
+#[cfg(test)]
+mod contains_bell_tests {
+    use super::contains_bell;
+
+    #[test]
+    fn detects_real_bell() {
+        assert!(contains_bell(b"abc\x07def"));
+        assert!(contains_bell(b"\x07"));
+    }
+
+    #[test]
+    fn no_bell_in_plain_text() {
+        assert!(!contains_bell(b"hello world"));
+        assert!(!contains_bell(b""));
+    }
+
+    #[test]
+    fn ignores_bel_terminating_osc() {
+        // OSC title set: ESC ] 0 ; title BEL — the trailing BEL is a string
+        // terminator, not an audible bell, so it must not count.
+        assert!(!contains_bell(b"\x1b]0;my title\x07"));
+        assert!(!contains_bell(b"before\x1b]0;t\x07after"));
+    }
+
+    #[test]
+    fn osc_terminated_by_st_then_real_bell() {
+        // OSC closed with ESC \ (ST), followed by a genuine bell afterwards.
+        assert!(contains_bell(b"\x1b]0;t\x1b\\\x07"));
+    }
+
+    #[test]
+    fn real_bell_before_osc() {
+        assert!(contains_bell(b"\x07\x1b]0;t\x07"));
+    }
+}
+
 /// Decide the PTY size for the alt-screen VTE from VTE's OWN grid
 /// (`column_count`/`row_count`) — never from pixel math (vte_w / char_w).
 ///
@@ -453,7 +520,7 @@ pub(crate) fn visible_vte_text(vte: &Terminal) -> String {
         0,
         0,
         rows.saturating_sub(1),
-        cols,
+        cols.saturating_sub(1),
     );
 
     text.map(|s| s.to_string()).unwrap_or_default()

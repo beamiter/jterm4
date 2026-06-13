@@ -51,6 +51,13 @@ pub(crate) fn get_url_bounds_at_position(
         }
     }
 
+    // If the click landed on a delimiter, the backward scan pushes `start` one
+    // char past `iter` while `end` stays at `iter`, inverting the range. Bail out
+    // instead of reading an empty/garbage range.
+    if start.offset() >= end.offset() {
+        return None;
+    }
+
     let raw = buffer.text(&start, &end, false).to_string();
     let trimmed = trim_trailing(&raw);
     if !is_url(trimmed) {

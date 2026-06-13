@@ -1487,15 +1487,18 @@ pub(crate) fn set_active_output_buffer(
     palette: &[RGBA; 16],
     cursor_colors: Option<(&RGBA, &RGBA)>,
 ) {
-    let output_no_ansi = strip_ansi(output);
-    let output_plain = output_no_ansi
-        .lines()
-        .map(command_line_plain_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    buffer.set_text(&output_plain);
-
+    // Build the buffer text from the SAME runs the style tags are computed
+    // against. Previously the text came from strip_ansi (a simpler cursor model
+    // that keeps pre-clear text and mishandles ED/cursor moves) while tags came
+    // from ansi_text_runs (a full grid model). The two diverge on any output that
+    // rewrites itself with a screen clear or cursor motion (cargo/docker builds),
+    // so every tag after the first divergence landed on the wrong character.
     let output_runs = ansi_text_runs(output, palette);
+    let mut output_plain = String::new();
+    for run in &output_runs {
+        output_plain.push_str(&run.text);
+    }
+    buffer.set_text(&output_plain);
     apply_ansi_runs_to_buffer(buffer, 0, &output_runs);
 
     if let Some((cursor_color, cursor_foreground)) = cursor_colors {
@@ -1535,7 +1538,10 @@ pub(crate) fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                         params = vec!["0".to_string()];
                     }
 
-                    for param_str in &params {
+                    let mut pi = 0;
+                    while pi < params.len() {
+                        let param_str = &params[pi];
+                        pi += 1;
                         if param_str.is_empty() {
                             continue;
                         }
@@ -1658,58 +1664,42 @@ pub(crate) fn ansi_to_pango(input: &str, palette: &[RGBA; 16]) -> String {
                                 ));
                                 open_spans += 1;
                             }
-                            Ok(38) => {
-                                let j = params.iter().position(|p| p == param_str).unwrap_or(0);
-                                if j + 2 < params.len() {
-                                    if params[j + 1] == "5" {
-                                        if let Ok(idx) = params[j + 2].parse::<u8>() {
-                                            let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                            out.push_str(&format!(
-                                                "<span foreground=\"#{:02x}{:02x}{:02x}\">",
-                                                r, g, b
-                                            ));
-                                            open_spans += 1;
+                            Ok(38) | Ok(48) => {
+                                // Extended color. `pi` was already advanced past this
+                                // selector, so `j = pi - 1` is its index. Consume the
+                                // 5;N (256-color) or 2;R;G;B (truecolor) subparams and
+                                // advance `pi` past them so they aren't reprocessed as
+                                // standalone SGR codes (and so a second 38/48 in the
+                                // same sequence is handled at its own position).
+                                let is_fg = param_str == "38";
+                                let j = pi - 1;
+                                let color = if params.get(j + 1).map(String::as_str) == Some("5") {
+                                    params.get(j + 2).and_then(|p| p.parse::<u8>().ok()).map(|idx| {
+                                        pi = j + 3;
+                                        ansi256_to_rgb(idx, palette)
+                                    })
+                                } else if params.get(j + 1).map(String::as_str) == Some("2") {
+                                    match (
+                                        params.get(j + 2).and_then(|p| p.parse::<u8>().ok()),
+                                        params.get(j + 3).and_then(|p| p.parse::<u8>().ok()),
+                                        params.get(j + 4).and_then(|p| p.parse::<u8>().ok()),
+                                    ) {
+                                        (Some(r), Some(g), Some(b)) => {
+                                            pi = j + 5;
+                                            Some((r, g, b))
                                         }
-                                    } else if params[j + 1] == "2" && j + 4 < params.len() {
-                                        if let (Ok(r), Ok(g), Ok(b)) = (
-                                            params[j + 2].parse::<u8>(),
-                                            params[j + 3].parse::<u8>(),
-                                            params[j + 4].parse::<u8>(),
-                                        ) {
-                                            out.push_str(&format!(
-                                                "<span foreground=\"#{:02x}{:02x}{:02x}\">",
-                                                r, g, b
-                                            ));
-                                            open_spans += 1;
-                                        }
+                                        _ => None,
                                     }
-                                }
-                            }
-                            Ok(48) => {
-                                let j = params.iter().position(|p| p == param_str).unwrap_or(0);
-                                if j + 2 < params.len() {
-                                    if params[j + 1] == "5" {
-                                        if let Ok(idx) = params[j + 2].parse::<u8>() {
-                                            let (r, g, b) = ansi256_to_rgb(idx, palette);
-                                            out.push_str(&format!(
-                                                "<span background=\"#{:02x}{:02x}{:02x}\">",
-                                                r, g, b
-                                            ));
-                                            open_spans += 1;
-                                        }
-                                    } else if params[j + 1] == "2" && j + 4 < params.len() {
-                                        if let (Ok(r), Ok(g), Ok(b)) = (
-                                            params[j + 2].parse::<u8>(),
-                                            params[j + 3].parse::<u8>(),
-                                            params[j + 4].parse::<u8>(),
-                                        ) {
-                                            out.push_str(&format!(
-                                                "<span background=\"#{:02x}{:02x}{:02x}\">",
-                                                r, g, b
-                                            ));
-                                            open_spans += 1;
-                                        }
-                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some((r, g, b)) = color {
+                                    let attr = if is_fg { "foreground" } else { "background" };
+                                    out.push_str(&format!(
+                                        "<span {}=\"#{:02x}{:02x}{:02x}\">",
+                                        attr, r, g, b
+                                    ));
+                                    open_spans += 1;
                                 }
                             }
                             _ => {}

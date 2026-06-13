@@ -33,9 +33,26 @@ pub(crate) fn char_display_width(c: char) -> usize {
         return 0;
     }
     if (0x0300..=0x036F).contains(&cp)      // combining diacriticals
+        || (0x0483..=0x0489).contains(&cp)  // Cyrillic combining
+        || (0x0591..=0x05BD).contains(&cp)  // Hebrew points
+        || cp == 0x05BF || cp == 0x05C1 || cp == 0x05C2 || cp == 0x05C4 || cp == 0x05C5 || cp == 0x05C7
+        || (0x0610..=0x061A).contains(&cp)  // Arabic combining
+        || (0x064B..=0x065F).contains(&cp)  // Arabic diacritics
+        || cp == 0x0670                      // Arabic superscript alef
+        || (0x06D6..=0x06DC).contains(&cp)  // Arabic small high marks
+        || (0x06DF..=0x06E4).contains(&cp)
+        || (0x06E7..=0x06E8).contains(&cp)
+        || (0x06EA..=0x06ED).contains(&cp)
+        || (0x0900..=0x0902).contains(&cp)  // Devanagari combining (subset)
+        || cp == 0x093C || (0x0941..=0x0948).contains(&cp) || cp == 0x094D
+        || (0x0951..=0x0957).contains(&cp)
+        || (0x1AB0..=0x1AFF).contains(&cp)  // combining diacriticals extended
+        || (0x1DC0..=0x1DFF).contains(&cp)  // combining diacriticals supplement
         || (0x200B..=0x200F).contains(&cp)  // zero-width space .. RLM
         || cp == 0x200D                      // zero-width joiner
+        || (0x20D0..=0x20FF).contains(&cp)  // combining marks for symbols
         || (0xFE00..=0xFE0F).contains(&cp)  // variation selectors
+        || (0xFE20..=0xFE2F).contains(&cp)  // combining half marks
     {
         return 0;
     }
@@ -128,16 +145,15 @@ pub(crate) fn wrap_ansi_at(input: &str, cols: usize) -> String {
                 col = 0;
             }
             '\t' => {
-                let next_stop = (col / 8 + 1) * 8;
-                if next_stop > cols {
-                    out.push('\n');
-                    col = 0;
-                } else {
-                    for _ in col..next_stop {
-                        out.push(' ');
-                    }
-                    col = next_stop;
+                // VTE clamps a tab to the right margin rather than wrapping: it fills
+                // spaces to the line edge and parks the cursor there; the *next* glyph
+                // wraps. Discarding the filler used to make the finished line shorter
+                // than the live render. Fill to min(next_stop, cols).
+                let next_stop = ((col / 8 + 1) * 8).min(cols);
+                for _ in col..next_stop {
+                    out.push(' ');
                 }
+                col = next_stop;
             }
             _ => {
                 let w = char_display_width(c);
@@ -1366,4 +1382,67 @@ pub(crate) enum BlockState {
     /// has been seen within the startup grace window. Recovered to block mode if a
     /// PromptStart ever arrives (late-loading integration).
     RawFallback,
+}
+
+#[cfg(test)]
+mod char_width_tests {
+    use super::char_display_width;
+
+    #[test]
+    fn ascii_is_one() {
+        assert_eq!(char_display_width('a'), 1);
+        assert_eq!(char_display_width('Z'), 1);
+        assert_eq!(char_display_width('5'), 1);
+    }
+
+    #[test]
+    fn cjk_and_emoji_are_two() {
+        assert_eq!(char_display_width('中'), 2);
+        assert_eq!(char_display_width('한'), 2);
+        assert_eq!(char_display_width('\u{1F600}'), 2); // 😀
+    }
+
+    #[test]
+    fn combining_marks_are_zero() {
+        assert_eq!(char_display_width('\u{0301}'), 0); // combining acute accent
+        assert_eq!(char_display_width('\u{200D}'), 0); // zero-width joiner
+        assert_eq!(char_display_width('\u{0591}'), 0); // Hebrew accent (newly added range)
+        assert_eq!(char_display_width('\u{064B}'), 0); // Arabic fathatan (newly added range)
+        assert_eq!(char_display_width('\u{FE0F}'), 0); // variation selector-16
+    }
+}
+
+#[cfg(test)]
+mod wrap_ansi_tests {
+    use super::wrap_ansi_at;
+
+    #[test]
+    fn wraps_at_column_boundary() {
+        assert_eq!(wrap_ansi_at("abcdef", 3), "abc\ndef");
+    }
+
+    #[test]
+    fn zero_cols_is_passthrough() {
+        assert_eq!(wrap_ansi_at("abcdef", 0), "abcdef");
+    }
+
+    #[test]
+    fn ansi_escapes_do_not_count_toward_width() {
+        // The SGR sequence is zero-width: the 6 visible chars wrap at col 3.
+        let input = "\x1b[31mabcdef\x1b[0m";
+        assert_eq!(wrap_ansi_at(input, 3), "\x1b[31mabc\ndef\x1b[0m");
+    }
+
+    #[test]
+    fn tab_fills_to_stop_not_past_edge() {
+        // Tab from col 0 fills to next 8-stop, clamped to cols=5: 5 spaces, then 'x'
+        // wraps onto a new line.
+        assert_eq!(wrap_ansi_at("\tx", 5), "     \nx");
+    }
+
+    #[test]
+    fn double_width_glyph_wraps_as_two_columns() {
+        // cols=3: '中'(2) + 'a'(1) fills the line, second '中' wraps.
+        assert_eq!(wrap_ansi_at("中a中", 3), "中a\n中");
+    }
 }
