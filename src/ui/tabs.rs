@@ -1,6 +1,5 @@
 //! tabs — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
-use gtk4::gio::{self};
 use gtk4::{glib, Label, Paned};
 use gtk4::{GestureClick, ToggleButton};
 use libadwaita as adw;
@@ -247,12 +246,27 @@ impl UiState {
     }
 
     pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
+        self.add_tab_with_argv(working_directory, tab_name, session_id, initial_commands, None)
+    }
+
+    /// Open a new tab connecting to a saved remote host over ssh.
+    pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Terminal {
+        let argv = crate::config::build_remote_argv(host);
+        log::info!("[remote] connecting to {} via {:?}", host.name, argv);
+        self.add_tab_with_argv(None, Some(host.name.clone()), None, None, Some(argv))
+    }
+
+    /// Core tab-creation routine. When `argv_override` is `Some`, the tab runs that
+    /// argv (e.g. an ssh command) instead of the configured local shell.
+    fn add_tab_with_argv(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>, argv_override: Option<Vec<String>>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
         // Generate or reuse session ID for rsh session persistence
         let sid = session_id.unwrap_or_else(generate_session_id);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
+
+        let shell_argv: &[String] = argv_override.as_deref().unwrap_or(self.shell_argv.as_slice());
 
         // Create terminal view based on configured mode
         let (view_type, terminal) = {
@@ -262,7 +276,7 @@ impl UiState {
                     drop(config);
                     let term_view = Rc::new(TermView::new(
                         &self.config.borrow(),
-                        self.shell_argv.as_ref(),
+                        shell_argv,
                         working_directory.as_deref(),
                         Some(&sid),
                         initial_commands.as_deref(),
@@ -274,7 +288,7 @@ impl UiState {
                     drop(config);
                     let vte_view = Rc::new(VteTerminalView::new(
                         self.config.clone(),
-                        self.shell_argv.as_ref(),
+                        shell_argv,
                         working_directory.as_deref(),
                         Some(&sid),
                         initial_commands.as_deref(),
@@ -622,118 +636,162 @@ impl UiState {
         right_click_gesture.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
 
-            let menu = gio::Menu::new();
-            menu.append(Some("Rename"), Some("tab-ctx.rename"));
-            menu.append(Some("Duplicate"), Some("tab-ctx.duplicate"));
-            menu.append(Some("Mark Important"), Some("tab-ctx.toggle-mark"));
-            menu.append(Some("Pin Tab"), Some("tab-ctx.toggle-pin"));
-            menu.append(Some("Close"), Some("tab-ctx.close"));
-            menu.append(Some("New Tab"), Some("tab-ctx.new-tab"));
+            // NOTE: We deliberately build this menu out of plain Buttons inside a
+            // Popover rather than a PopoverMenu/gio::Menu model. The GAction-based
+            // dispatch (insert_action_group + "tab-ctx.*" detailed names) silently
+            // fails to activate in this GTK build, so direct connect_clicked closures
+            // are used instead.
+            let remote_hosts = ui_for_ctx.config.borrow().remote_hosts.clone();
 
-            // Add "Close Selected Tabs" if there are selected tabs
-            if !ui_for_ctx.selected_tabs.borrow().is_empty() {
-                menu.append(Some("Close Selected Tabs"), Some("tab-ctx.close-selected"));
-            }
-
-            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            let popover = gtk4::Popover::new();
             popover.set_parent(&strip_btn_for_ctx);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
 
-            let action_group = gio::SimpleActionGroup::new();
+            let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
 
-            // Rename action
-            let _ui_rename = ui_for_ctx.clone();
-            let label_for_rename = label.clone();
-            let strip_label_for_rename = strip_label.clone();
-            let custom_title_for_rename = custom_title.clone();
-            let window_for_rename = ui_for_ctx.window.clone();
-            let rename_action = gio::SimpleAction::new("rename", None);
-            rename_action.connect_activate(move |_, _| {
-                show_rename_dialog_with_strip(
-                    &window_for_rename,
-                    &label_for_rename,
-                    &strip_label_for_rename,
-                    custom_title_for_rename.clone(),
-                );
-            });
-            action_group.add_action(&rename_action);
-
-            // Duplicate action
-            let ui_duplicate_ctx = ui_for_ctx.clone();
-            let wd_for_dup = terminal_working_directory(&terminal_for_dup).or_else(|| std::env::var("HOME").ok());
-            let duplicate_action = gio::SimpleAction::new("duplicate", None);
-            duplicate_action.connect_activate(move |_, _| {
-                ui_duplicate_ctx.add_new_tab(wd_for_dup.clone(), None, None, None);
-            });
-            action_group.add_action(&duplicate_action);
-
-            // Toggle mark action
-            let strip_btn_mark = strip_btn_for_ctx.clone();
-            let mark_action = gio::SimpleAction::new("toggle-mark", None);
-            mark_action.connect_activate(move |_, _| {
-                if strip_btn_mark.has_css_class("tab-marked") {
-                    strip_btn_mark.remove_css_class("tab-marked");
-                    unsafe { strip_btn_mark.set_data::<bool>("marked", false); }
-                } else {
-                    strip_btn_mark.add_css_class("tab-marked");
-                    unsafe { strip_btn_mark.set_data::<bool>("marked", true); }
+            let make_item = |label: &str| -> gtk4::Button {
+                let btn = gtk4::Button::with_label(label);
+                btn.set_has_frame(false);
+                btn.set_halign(gtk4::Align::Fill);
+                if let Some(child) = btn.child() {
+                    child.set_halign(gtk4::Align::Start);
                 }
-            });
-            action_group.add_action(&mark_action);
+                btn.add_css_class("flat");
+                btn
+            };
 
-            // Close action
-            let ui_close_ctx = ui_for_ctx.clone();
-            let wrapper_for_ctx_close = term_wrapper_for_ctx.clone().upcast::<gtk4::Widget>();
-            let close_action = gio::SimpleAction::new("close", None);
-            close_action.connect_activate(move |_, _| {
-                ui_close_ctx.remove_tab_by_widget(&wrapper_for_ctx_close);
-            });
-            action_group.add_action(&close_action);
+            // Rename
+            {
+                let item = make_item("Rename");
+                let popover_c = popover.clone();
+                let window_for_rename = ui_for_ctx.window.clone();
+                let label_for_rename = label.clone();
+                let strip_label_for_rename = strip_label.clone();
+                let custom_title_for_rename = custom_title.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    show_rename_dialog_with_strip(
+                        &window_for_rename,
+                        &label_for_rename,
+                        &strip_label_for_rename,
+                        custom_title_for_rename.clone(),
+                    );
+                });
+                vbox.append(&item);
+            }
 
-            // New tab action
-            let ui_new_ctx = ui_for_ctx.clone();
-            let new_tab_action = gio::SimpleAction::new("new-tab", None);
-            new_tab_action.connect_activate(move |_, _| {
-                ui_new_ctx.execute_action(Action::NewTab);
-            });
-            action_group.add_action(&new_tab_action);
+            // Duplicate
+            {
+                let item = make_item("Duplicate");
+                let popover_c = popover.clone();
+                let ui_duplicate_ctx = ui_for_ctx.clone();
+                let wd_for_dup = terminal_working_directory(&terminal_for_dup).or_else(|| std::env::var("HOME").ok());
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_duplicate_ctx.add_new_tab(wd_for_dup.clone(), None, None, None);
+                });
+                vbox.append(&item);
+            }
 
-            // Toggle pin action
-            let strip_btn_pin = strip_btn_for_ctx.clone();
-            let term_wrapper_pin = term_wrapper_for_ctx.clone();
-            let pin_icon_pin = pin_icon.clone();
-            let pin_action = gio::SimpleAction::new("toggle-pin", None);
-            pin_action.connect_activate(move |_, _| {
-                if strip_btn_pin.has_css_class("tab-pinned") {
-                    strip_btn_pin.remove_css_class("tab-pinned");
-                    pin_icon_pin.set_visible(false);
-                    unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
-                    unsafe { term_wrapper_pin.set_data::<bool>("pinned", false); }
-                } else {
-                    strip_btn_pin.add_css_class("tab-pinned");
-                    pin_icon_pin.set_visible(true);
-                    unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
-                    unsafe { term_wrapper_pin.set_data::<bool>("pinned", true); }
-                }
-            });
-            action_group.add_action(&pin_action);
+            // Mark Important
+            {
+                let item = make_item("Mark Important");
+                let popover_c = popover.clone();
+                let strip_btn_mark = strip_btn_for_ctx.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if strip_btn_mark.has_css_class("tab-marked") {
+                        strip_btn_mark.remove_css_class("tab-marked");
+                        unsafe { strip_btn_mark.set_data::<bool>("marked", false); }
+                    } else {
+                        strip_btn_mark.add_css_class("tab-marked");
+                        unsafe { strip_btn_mark.set_data::<bool>("marked", true); }
+                    }
+                });
+                vbox.append(&item);
+            }
 
-            // Close selected tabs action
-            let ui_close_selected = ui_for_ctx.clone();
-            let close_selected_action = gio::SimpleAction::new("close-selected", None);
-            close_selected_action.connect_activate(move |_, _| {
-                ui_close_selected.close_selected_tabs();
-            });
-            action_group.add_action(&close_selected_action);
+            // Pin Tab
+            {
+                let item = make_item("Pin Tab");
+                let popover_c = popover.clone();
+                let strip_btn_pin = strip_btn_for_ctx.clone();
+                let term_wrapper_pin = term_wrapper_for_ctx.clone();
+                let pin_icon_pin = pin_icon.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    if strip_btn_pin.has_css_class("tab-pinned") {
+                        strip_btn_pin.remove_css_class("tab-pinned");
+                        pin_icon_pin.set_visible(false);
+                        unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
+                        unsafe { term_wrapper_pin.set_data::<bool>("pinned", false); }
+                    } else {
+                        strip_btn_pin.add_css_class("tab-pinned");
+                        pin_icon_pin.set_visible(true);
+                        unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
+                        unsafe { term_wrapper_pin.set_data::<bool>("pinned", true); }
+                    }
+                });
+                vbox.append(&item);
+            }
 
-            strip_btn_for_ctx.insert_action_group("tab-ctx", Some(&action_group));
+            // Close
+            {
+                let item = make_item("Close");
+                let popover_c = popover.clone();
+                let ui_close_ctx = ui_for_ctx.clone();
+                let wrapper_for_ctx_close = term_wrapper_for_ctx.clone().upcast::<gtk4::Widget>();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_close_ctx.remove_tab_by_widget(&wrapper_for_ctx_close);
+                });
+                vbox.append(&item);
+            }
 
-            // Clean up when popover closes
-            let strip_btn_cleanup = strip_btn_for_ctx.clone();
+            // New Tab
+            {
+                let item = make_item("New Tab");
+                let popover_c = popover.clone();
+                let ui_new_ctx = ui_for_ctx.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_new_ctx.execute_action(Action::NewTab);
+                });
+                vbox.append(&item);
+            }
+
+            // Close Selected Tabs (only if there are selected tabs)
+            if !ui_for_ctx.selected_tabs.borrow().is_empty() {
+                let item = make_item("Close Selected Tabs");
+                let popover_c = popover.clone();
+                let ui_close_selected = ui_for_ctx.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_close_selected.close_selected_tabs();
+                });
+                vbox.append(&item);
+            }
+
+            // Remote connect items
+            for h in remote_hosts.iter() {
+                let item = make_item(&format!("Remote: {}", h.name));
+                let popover_c = popover.clone();
+                let ui_remote = ui_for_ctx.clone();
+                let host = h.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_remote.connect_remote(&host);
+                });
+                vbox.append(&item);
+            }
+
+            popover.set_child(Some(&vbox));
+
+            // Clean up the parent reference when the popover closes
             popover.connect_closed(move |p| {
                 p.unparent();
-                strip_btn_cleanup.insert_action_group("tab-ctx", None::<&gio::SimpleActionGroup>);
             });
 
             popover.popup();

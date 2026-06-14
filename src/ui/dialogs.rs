@@ -1,7 +1,6 @@
 //! dialogs — UiState methods extracted from ui (mechanical split, no logic changes)
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
-use gtk4::gio::{self};
 use gtk4::pango::FontDescription;
 use gtk4::{Adjustment, Label, ListBox, Orientation, Scale, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchEntry};
@@ -527,100 +526,130 @@ impl UiState {
         right_click.connect_pressed(move |gesture, _n_press, x, y| {
             gesture.set_state(gtk4::EventSequenceState::Claimed);
 
-            let menu = gio::Menu::new();
-            menu.append(Some("Copy"), Some("ctx.copy"));
-            menu.append(Some("Paste"), Some("ctx.paste"));
+            // Plain Popover + Buttons: the GAction-based PopoverMenu dispatch does
+            // not fire in this GTK build, so direct connect_clicked closures are used.
+            let remote_hosts = ui.config.borrow().remote_hosts.clone();
+            let link_uri: Option<String> = term.check_match_at(x, y).0.map(|s| s.to_string());
 
-            let split_section = gio::Menu::new();
-            split_section.append(Some("Split Right"), Some("ctx.split-h"));
-            split_section.append(Some("Split Down"), Some("ctx.split-v"));
-            menu.append_section(None, &split_section);
-
-            let tab_section = gio::Menu::new();
-            tab_section.append(Some("New Tab"), Some("ctx.new-tab"));
-            tab_section.append(Some("Close Pane"), Some("ctx.close-pane"));
-            menu.append_section(None, &tab_section);
-
-            // Check if there's a hyperlink under cursor
-            if let (Some(uri), _) = term.check_match_at(x, y) {
-                let link_section = gio::Menu::new();
-                link_section.append(Some("Open Link"), Some("ctx.open-link"));
-                menu.append_section(None, &link_section);
-                // Store the URI for the action
-                unsafe { term.set_data::<String>("ctx-link-uri", uri.to_string()); }
-            }
-
-            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            let popover = gtk4::Popover::new();
             popover.set_parent(&term);
             popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.set_has_arrow(false);
 
-            // Register actions on the terminal widget
-            let action_group = gio::SimpleActionGroup::new();
+            let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+            vbox.add_css_class("menu");
 
-            let ui_copy = ui.clone();
-            let copy_action = gio::SimpleAction::new("copy", None);
-            let term_copy = term.clone();
-            copy_action.connect_activate(move |_, _| {
-                term_copy.copy_clipboard_format(Format::Text);
-                let _ = &ui_copy;
-            });
-            action_group.add_action(&copy_action);
-
-            let paste_action = gio::SimpleAction::new("paste", None);
-            let term_paste = term.clone();
-            paste_action.connect_activate(move |_, _| {
-                term_paste.paste_clipboard();
-            });
-            action_group.add_action(&paste_action);
-
-            let ui_split_h = ui.clone();
-            let split_h_action = gio::SimpleAction::new("split-h", None);
-            split_h_action.connect_activate(move |_, _| {
-                ui_split_h.split_current(Orientation::Horizontal);
-            });
-            action_group.add_action(&split_h_action);
-
-            let ui_split_v = ui.clone();
-            let split_v_action = gio::SimpleAction::new("split-v", None);
-            split_v_action.connect_activate(move |_, _| {
-                ui_split_v.split_current(Orientation::Vertical);
-            });
-            action_group.add_action(&split_v_action);
-
-            let ui_new_tab = ui.clone();
-            let new_tab_action = gio::SimpleAction::new("new-tab", None);
-            new_tab_action.connect_activate(move |_, _| {
-                ui_new_tab.execute_action(Action::NewTab);
-            });
-            action_group.add_action(&new_tab_action);
-
-            let ui_close = ui.clone();
-            let close_action = gio::SimpleAction::new("close-pane", None);
-            close_action.connect_activate(move |_, _| {
-                ui_close.execute_action(Action::ClosePaneOrTab);
-            });
-            action_group.add_action(&close_action);
-
-            let open_link_action = gio::SimpleAction::new("open-link", None);
-            let term_link = term.clone();
-            open_link_action.connect_activate(move |_, _| {
-                let uri: Option<String> = unsafe {
-                    term_link.data::<String>("ctx-link-uri").map(|p| p.as_ref().clone())
-                };
-                if let Some(uri) = uri {
-                    open_uri(&uri);
+            let make_item = |label: &str| -> gtk4::Button {
+                let btn = gtk4::Button::with_label(label);
+                btn.set_has_frame(false);
+                btn.set_halign(gtk4::Align::Fill);
+                if let Some(child) = btn.child() {
+                    child.set_halign(gtk4::Align::Start);
                 }
-            });
-            action_group.add_action(&open_link_action);
+                btn.add_css_class("flat");
+                btn
+            };
 
-            term.insert_action_group("ctx", Some(&action_group));
+            // Copy
+            {
+                let item = make_item("Copy");
+                let popover_c = popover.clone();
+                let term_copy = term.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    term_copy.copy_clipboard_format(Format::Text);
+                });
+                vbox.append(&item);
+            }
 
-            // Clean up when popover closes
-            let term_cleanup = term.clone();
+            // Paste
+            {
+                let item = make_item("Paste");
+                let popover_c = popover.clone();
+                let term_paste = term.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    term_paste.paste_clipboard();
+                });
+                vbox.append(&item);
+            }
+
+            // Split Right
+            {
+                let item = make_item("Split Right");
+                let popover_c = popover.clone();
+                let ui_split_h = ui.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_split_h.split_current(Orientation::Horizontal);
+                });
+                vbox.append(&item);
+            }
+
+            // Split Down
+            {
+                let item = make_item("Split Down");
+                let popover_c = popover.clone();
+                let ui_split_v = ui.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_split_v.split_current(Orientation::Vertical);
+                });
+                vbox.append(&item);
+            }
+
+            // New Tab
+            {
+                let item = make_item("New Tab");
+                let popover_c = popover.clone();
+                let ui_new_tab = ui.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_new_tab.execute_action(Action::NewTab);
+                });
+                vbox.append(&item);
+            }
+
+            // Close Pane
+            {
+                let item = make_item("Close Pane");
+                let popover_c = popover.clone();
+                let ui_close = ui.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_close.execute_action(Action::ClosePaneOrTab);
+                });
+                vbox.append(&item);
+            }
+
+            // Remote connect items
+            for h in remote_hosts.iter() {
+                let item = make_item(&format!("Connect: {}", h.name));
+                let popover_c = popover.clone();
+                let ui_remote = ui.clone();
+                let host = h.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    ui_remote.connect_remote(&host);
+                });
+                vbox.append(&item);
+            }
+
+            // Open Link (only when a hyperlink is under the cursor)
+            if let Some(uri) = link_uri {
+                let item = make_item("Open Link");
+                let popover_c = popover.clone();
+                item.connect_clicked(move |_| {
+                    popover_c.popdown();
+                    open_uri(&uri);
+                });
+                vbox.append(&item);
+            }
+
+            popover.set_child(Some(&vbox));
+
             popover.connect_closed(move |p| {
                 p.unparent();
-                term_cleanup.insert_action_group("ctx", None::<&gio::SimpleActionGroup>);
             });
 
             popover.popup();

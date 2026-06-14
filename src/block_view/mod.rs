@@ -1016,17 +1016,9 @@ impl ReaderCtx {
                                     right_click.connect_pressed(move |gesture, _n_press, x, y| {
                                         gesture.set_state(gtk4::EventSequenceState::Claimed);
 
-                                        let menu = gtk4::gio::Menu::new();
-                                        menu.append(Some("Copy Block"), Some("block-ctx.copy"));
-
-                                        let export_menu = gtk4::gio::Menu::new();
-                                        export_menu.append(Some("Export as JSON"), Some("block-ctx.export-json"));
-                                        export_menu.append(Some("Export as Markdown"), Some("block-ctx.export-markdown"));
-                                        menu.append_submenu(Some("Export Block"), &export_menu);
-
-                                        menu.append(Some("Delete Block"), Some("block-ctx.delete"));
-
-                                        let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+                                        // Plain Popover + Buttons: the GAction-based
+                                        // PopoverMenu dispatch does not fire in this GTK build.
+                                        let popover = gtk4::Popover::new();
                                         let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
                                         popover.set_parent(widget);
                                         popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
@@ -1034,82 +1026,109 @@ impl ReaderCtx {
                                         )));
                                         popover.set_has_arrow(false);
 
-                                        let action_group = gtk4::gio::SimpleActionGroup::new();
+                                        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                                        vbox.add_css_class("menu");
 
-                                        let copy_action = gtk4::gio::SimpleAction::new("copy", None);
-                                        let finished_for_copy = finished_menu_clone.clone();
-                                        let vte_for_action = vte_for_copy.clone();
-                                        copy_action.connect_activate(move |_, _| {
-                                            let prompt_text = finished_for_copy.prompt_buffer.text(
-                                                &finished_for_copy.prompt_buffer.start_iter(),
-                                                &finished_for_copy.prompt_buffer.end_iter(),
-                                                true,
-                                            );
-                                            let cmd_text = finished_for_copy.command_buffer.text(
-                                                &finished_for_copy.command_buffer.start_iter(),
-                                                &finished_for_copy.command_buffer.end_iter(),
-                                                true,
-                                            );
-                                            let output_text = finished_for_copy.output_buffer.text(
-                                                &finished_for_copy.output_buffer.start_iter(),
-                                                &finished_for_copy.output_buffer.end_iter(),
-                                                true,
-                                            );
-                                            let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
-                                            vte_for_action.clipboard().set_text(&full_text);
-                                        });
-                                        action_group.add_action(&copy_action);
-
-                                        let export_json_action = gtk4::gio::SimpleAction::new("export-json", None);
-                                        let block_data_for_json = block_data_for_export.clone();
-                                        let vte_for_json = vte_for_copy.clone();
-                                        let block_id_json = block_id;
-                                        export_json_action.connect_activate(move |_, _| {
-                                            let blocks = block_data_for_json.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
-                                                let json = block.to_json();
-                                                vte_for_json.clipboard().set_text(&json);
-                                                log::info!("Block exported as JSON to clipboard");
+                                        let make_item = |label: &str| -> gtk4::Button {
+                                            let btn = gtk4::Button::with_label(label);
+                                            btn.set_has_frame(false);
+                                            btn.set_halign(gtk4::Align::Fill);
+                                            if let Some(child) = btn.child() {
+                                                child.set_halign(gtk4::Align::Start);
                                             }
-                                        });
-                                        action_group.add_action(&export_json_action);
+                                            btn.add_css_class("flat");
+                                            btn
+                                        };
 
-                                        let export_md_action = gtk4::gio::SimpleAction::new("export-markdown", None);
-                                        let block_data_for_md = block_data_for_export.clone();
-                                        let vte_for_md = vte_for_copy.clone();
-                                        let block_id_md = block_id;
-                                        export_md_action.connect_activate(move |_, _| {
-                                            let blocks = block_data_for_md.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
-                                                let markdown = block.to_markdown();
-                                                vte_for_md.clipboard().set_text(&markdown);
-                                                log::info!("Block exported as Markdown to clipboard");
-                                            }
-                                        });
-                                        action_group.add_action(&export_md_action);
+                                        // Copy Block
+                                        {
+                                            let item = make_item("Copy Block");
+                                            let popover_c = popover.clone();
+                                            let finished_for_copy = finished_menu_clone.clone();
+                                            let vte_for_action = vte_for_copy.clone();
+                                            item.connect_clicked(move |_| {
+                                                popover_c.popdown();
+                                                let prompt_text = finished_for_copy.prompt_buffer.text(
+                                                    &finished_for_copy.prompt_buffer.start_iter(),
+                                                    &finished_for_copy.prompt_buffer.end_iter(),
+                                                    true,
+                                                );
+                                                let cmd_text = finished_for_copy.command_buffer.text(
+                                                    &finished_for_copy.command_buffer.start_iter(),
+                                                    &finished_for_copy.command_buffer.end_iter(),
+                                                    true,
+                                                );
+                                                let output_text = finished_for_copy.output_buffer.text(
+                                                    &finished_for_copy.output_buffer.start_iter(),
+                                                    &finished_for_copy.output_buffer.end_iter(),
+                                                    true,
+                                                );
+                                                let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+                                                vte_for_action.clipboard().set_text(&full_text);
+                                            });
+                                            vbox.append(&item);
+                                        }
 
-                                        let delete_action = gtk4::gio::SimpleAction::new("delete", None);
-                                        let finished_blocks_for_delete = finished_blocks_for_menu.clone();
-                                        let block_list_for_delete = block_list_for_menu.clone();
-                                        let block_id_del = block_id;
-                                        delete_action.connect_activate(move |_, _| {
-                                            let mut blocks = finished_blocks_for_delete.borrow_mut();
-                                            if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
-                                                let block = blocks.remove(pos);
-                                                block_list_for_delete.remove(block.widget());
-                                            }
-                                        });
-                                        action_group.add_action(&delete_action);
+                                        // Export as JSON
+                                        {
+                                            let item = make_item("Export as JSON");
+                                            let popover_c = popover.clone();
+                                            let block_data_for_json = block_data_for_export.clone();
+                                            let vte_for_json = vte_for_copy.clone();
+                                            let block_id_json = block_id;
+                                            item.connect_clicked(move |_| {
+                                                popover_c.popdown();
+                                                let blocks = block_data_for_json.borrow();
+                                                if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                                                    let json = block.to_json();
+                                                    vte_for_json.clipboard().set_text(&json);
+                                                    log::info!("Block exported as JSON to clipboard");
+                                                }
+                                            });
+                                            vbox.append(&item);
+                                        }
 
-                                        let finished_for_actions = finished_menu_clone.clone();
-                                        finished_for_actions.widget().insert_action_group("block-ctx", Some(&action_group));
+                                        // Export as Markdown
+                                        {
+                                            let item = make_item("Export as Markdown");
+                                            let popover_c = popover.clone();
+                                            let block_data_for_md = block_data_for_export.clone();
+                                            let vte_for_md = vte_for_copy.clone();
+                                            let block_id_md = block_id;
+                                            item.connect_clicked(move |_| {
+                                                popover_c.popdown();
+                                                let blocks = block_data_for_md.borrow();
+                                                if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                                                    let markdown = block.to_markdown();
+                                                    vte_for_md.clipboard().set_text(&markdown);
+                                                    log::info!("Block exported as Markdown to clipboard");
+                                                }
+                                            });
+                                            vbox.append(&item);
+                                        }
 
-                                        let finished_for_cleanup = finished_menu_clone.clone();
+                                        // Delete Block
+                                        {
+                                            let item = make_item("Delete Block");
+                                            let popover_c = popover.clone();
+                                            let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                                            let block_list_for_delete = block_list_for_menu.clone();
+                                            let block_id_del = block_id;
+                                            item.connect_clicked(move |_| {
+                                                popover_c.popdown();
+                                                let mut blocks = finished_blocks_for_delete.borrow_mut();
+                                                if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
+                                                    let block = blocks.remove(pos);
+                                                    block_list_for_delete.remove(block.widget());
+                                                }
+                                            });
+                                            vbox.append(&item);
+                                        }
+
+                                        popover.set_child(Some(&vbox));
+
                                         popover.connect_closed(move |p| {
                                             p.unparent();
-                                            finished_for_cleanup
-                                                .widget()
-                                                .insert_action_group("block-ctx", None::<&gtk4::gio::SimpleActionGroup>);
                                         });
 
                                         popover.popup();

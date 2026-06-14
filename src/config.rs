@@ -17,6 +17,45 @@ pub enum TerminalMode {
 }
 
 // ---------------------------------------------------------------------------
+// Remote host
+// ---------------------------------------------------------------------------
+
+/// A saved SSH target. A new tab can be opened that runs the remote shell over
+/// `ssh -t`, reusing all local PTY/terminal infrastructure (OSC 133 markers
+/// emitted by the remote shell flow through ssh, so block mode works remotely).
+#[derive(Clone, Debug)]
+pub struct RemoteHost {
+    pub name: String,
+    pub host: String,
+    pub user: Option<String>,
+    /// Shell to launch on the remote side (default "rsh").
+    pub remote_shell: String,
+    /// Stable session id passed to the remote rsh for resume-on-reconnect.
+    pub session: Option<String>,
+    /// Extra flags inserted before the target (e.g. ["-p", "2222"]).
+    pub ssh_args: Vec<String>,
+}
+
+/// Build the local argv that connects to a remote host via ssh.
+/// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "rsh --session home-main"]`.
+pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
+    let target = match &host.user {
+        Some(u) => format!("{u}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let mut remote_cmd = host.remote_shell.clone();
+    if let Some(sid) = &host.session {
+        remote_cmd.push_str(" --session ");
+        remote_cmd.push_str(sid);
+    }
+    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    argv.extend(host.ssh_args.iter().cloned());
+    argv.push(target);
+    argv.push(remote_cmd);
+    argv
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -49,6 +88,8 @@ pub struct Config {
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
     pub(crate) editor_input: bool,
+    /// Saved SSH targets selectable from the context menu.
+    pub(crate) remote_hosts: Vec<RemoteHost>,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +284,7 @@ struct FileConfig {
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     editor_input: Option<bool>,
+    remote_hosts: Vec<RemoteHost>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -256,6 +298,7 @@ fn load_file_config() -> FileConfig {
     };
 
     let colors = table.get("colors").and_then(|v| v.as_table());
+    let remote_hosts = parse_remote_hosts(&table);
 
     FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
@@ -282,7 +325,33 @@ fn load_file_config() -> FileConfig {
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
         editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
+        remote_hosts,
     }
+}
+
+/// Parse `[[remote_hosts]]` array-of-tables. Entries missing a `host` are skipped.
+fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
+    let Some(arr) = table.get("remote_hosts").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_table())
+        .filter_map(|t| {
+            let host = t.get("host").and_then(|v| v.as_str())?.to_string();
+            let name = t.get("name").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| host.clone());
+            let user = t.get("user").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let remote_shell = t.get("remote_shell").and_then(|v| v.as_str())
+                .unwrap_or("rsh")
+                .to_string();
+            let session = t.get("session").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let ssh_args = t.get("ssh_args").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +467,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_path,
         block_history_compress,
         editor_input: fc.editor_input.unwrap_or(true),
+        remote_hosts: fc.remote_hosts,
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
