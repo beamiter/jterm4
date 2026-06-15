@@ -290,11 +290,11 @@ struct FileConfig {
 fn load_file_config() -> FileConfig {
     let path = config_file_path();
     let Ok(contents) = fs::read_to_string(&path) else {
-        return FileConfig::default();
+        return FileConfig { remote_hosts: default_remote_hosts(), ..Default::default() };
     };
     let Ok(table) = contents.parse::<toml::Table>() else {
         log::warn!("Failed to parse config file {}", path.display());
-        return FileConfig::default();
+        return FileConfig { remote_hosts: default_remote_hosts(), ..Default::default() };
     };
 
     let colors = table.get("colors").and_then(|v| v.as_table());
@@ -352,6 +352,31 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             Some(RemoteHost { name, host, user, remote_shell, session, ssh_args })
         })
         .collect()
+}
+
+/// Built-in remote hosts used when no config file exists yet, so a fresh
+/// install can connect without hand-writing `[[remote_hosts]]` first.
+fn default_remote_hosts() -> Vec<RemoteHost> {
+    vec![
+        RemoteHost {
+            name: "cloud-dev".into(),
+            host: "10.21.31.17".into(),
+            user: Some("root".into()),
+            // Full path: a non-interactive ssh PATH resolves bare `rsh` to the
+            // system ssh-alternative, not the block-mode rsh in ~/.cargo/bin.
+            remote_shell: "/root/.cargo/bin/rsh".into(),
+            session: Some("cloud-test".into()),
+            ssh_args: Vec::new(),
+        },
+        RemoteHost {
+            name: "localhost-test".into(),
+            host: "localhost".into(),
+            user: Some("mm".into()),
+            remote_shell: "rsh".into(),
+            session: Some("local-test".into()),
+            ssh_args: Vec::new(),
+        },
+    ]
 }
 
 // ---------------------------------------------------------------------------
