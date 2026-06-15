@@ -85,7 +85,12 @@ fn main() -> glib::ExitCode {
 
     init_logging();
 
-    let app = adw::Application::builder().application_id("app.jterm4").build();
+    // NON_UNIQUE: each launch is its own process with its own window, instead of
+    // the second invocation activating the first instance and then exiting.
+    let app = adw::Application::builder()
+        .application_id("app.jterm4")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
 
     app.connect_activate(|app| {
         let (config, themes, keybinding_map) = load_config();
