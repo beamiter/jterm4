@@ -34,6 +34,11 @@ pub struct RemoteHost {
     pub session: Option<String>,
     /// Extra flags inserted before the target (e.g. ["-p", "2222"]).
     pub ssh_args: Vec<String>,
+    /// Run the remote command through a login shell (`bash -lc 'exec ...'`) so the
+    /// user's profile (PATH, ~/.cargo/env, etc.) is loaded. ssh's plain command
+    /// channel runs a non-login, non-interactive shell, which leaves tools like
+    /// cargo off PATH. Defaults to true.
+    pub login_shell: bool,
 }
 
 /// Build the local argv that connects to a remote host via ssh.
@@ -47,6 +52,12 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
     if let Some(sid) = &host.session {
         remote_cmd.push_str(" --session ");
         remote_cmd.push_str(sid);
+    }
+    if host.login_shell {
+        // Wrap in a login shell so the remote profile populates PATH before exec.
+        // Single-quote the payload and escape any embedded quotes.
+        let escaped = remote_cmd.replace('\'', "'\\''");
+        remote_cmd = format!("bash -lc 'exec {escaped}'");
     }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     argv.extend(host.ssh_args.iter().cloned());
@@ -349,7 +360,8 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             let ssh_args = t.get("ssh_args").and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args })
+            let login_shell = t.get("login_shell").and_then(|v| v.as_bool()).unwrap_or(true);
+            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args, login_shell })
         })
         .collect()
 }
@@ -367,6 +379,7 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
             remote_shell: "/root/.cargo/bin/rsh".into(),
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
+            login_shell: true,
         },
         RemoteHost {
             name: "localhost-test".into(),
@@ -375,6 +388,7 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
             remote_shell: "rsh".into(),
             session: Some("local-test".into()),
             ssh_args: Vec::new(),
+            login_shell: true,
         },
     ]
 }
@@ -606,4 +620,54 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 
     // Last resort: POSIX sh
     vec!["sh".to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> RemoteHost {
+        RemoteHost {
+            name: "h".into(),
+            host: "1.2.3.4".into(),
+            user: Some("yj".into()),
+            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
+            session: Some("cloud-test".into()),
+            ssh_args: Vec::new(),
+            login_shell: true,
+        }
+    }
+
+    #[test]
+    fn login_shell_wraps_in_bash_lc() {
+        let argv = build_remote_argv(&host());
+        assert_eq!(
+            argv,
+            vec![
+                "ssh",
+                "-t",
+                "yj@1.2.3.4",
+                "bash -lc 'exec /home/yj/.cargo/bin/rsh --session cloud-test'",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_login_shell_passes_command_bare() {
+        let mut h = host();
+        h.login_shell = false;
+        let argv = build_remote_argv(&h);
+        assert_eq!(argv.last().unwrap(), "/home/yj/.cargo/bin/rsh --session cloud-test");
+    }
+
+    #[test]
+    fn single_quotes_in_payload_are_escaped() {
+        let mut h = host();
+        h.session = Some("it's".into());
+        let argv = build_remote_argv(&h);
+        assert_eq!(
+            argv.last().unwrap(),
+            r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
+        );
+    }
 }
