@@ -1208,6 +1208,9 @@ impl UiState {
             }
         }
 
+        // Size the new button for the active placement (sidebar vs top bar)
+        self.apply_strip_btn_placement(&strip_btn);
+
         // Deactivate all other strip buttons
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();

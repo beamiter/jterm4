@@ -17,6 +17,57 @@ pub enum TerminalMode {
 }
 
 // ---------------------------------------------------------------------------
+// Tab placement
+// ---------------------------------------------------------------------------
+
+/// Where the custom tab bar is shown: down the left sidebar (vertical) or
+/// along the top bar (horizontal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabPlacement {
+    Sidebar,
+    TopBar,
+}
+
+impl TabPlacement {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            TabPlacement::Sidebar => "sidebar",
+            TabPlacement::TopBar => "top",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> TabPlacement {
+        match s.to_lowercase().as_str() {
+            "top" | "topbar" | "top_bar" => TabPlacement::TopBar,
+            _ => TabPlacement::Sidebar,
+        }
+    }
+}
+
+/// Which single view the sidebar shows (tab list vs file tree).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarView {
+    Tabs,
+    Files,
+}
+
+impl SidebarView {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SidebarView::Tabs => "tabs",
+            SidebarView::Files => "files",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> SidebarView {
+        match s.to_lowercase().as_str() {
+            "files" | "file" | "filetree" | "file_tree" => SidebarView::Files,
+            _ => SidebarView::Tabs,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Remote host
 // ---------------------------------------------------------------------------
 
@@ -115,6 +166,12 @@ pub struct Config {
     /// Commands to feed to new shells on startup (comma-separated).
     pub(crate) startup_commands: Option<String>,
     pub(crate) terminal_mode: TerminalMode,
+    /// Where the tab bar is shown (left sidebar vs top bar).
+    pub(crate) tab_placement: TabPlacement,
+    /// Which single view the sidebar shows (tab list vs file tree).
+    pub(crate) sidebar_view: SidebarView,
+    /// Sidebar width in pixels (resizable divider position).
+    pub(crate) sidebar_width: u32,
     // Block view optimizations
     pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
@@ -311,6 +368,9 @@ struct FileConfig {
     /// Commands to run when a new tab opens (comma-separated, e.g. "cd ~/project, nix develop").
     startup_commands: Option<String>,
     terminal_mode: Option<String>,
+    tab_placement: Option<String>,
+    sidebar_view: Option<String>,
+    sidebar_width: Option<u32>,
     // Block view optimizations
     ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
@@ -353,6 +413,9 @@ fn load_file_config() -> FileConfig {
         shell: table.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string()),
         startup_commands: table.get("startup_commands").and_then(|v| v.as_str()).map(|s| s.to_string()),
         terminal_mode: table.get("terminal_mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        tab_placement: table.get("tab_placement").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        sidebar_view: table.get("sidebar_view").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        sidebar_width: table.get("sidebar_width").and_then(|v| v.as_integer()).map(|v| v as u32),
         ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
         output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
@@ -526,6 +589,15 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         shell,
         startup_commands: fc.startup_commands,
         terminal_mode,
+        tab_placement: TabPlacement::parse(
+            &env_string("JTERM4_TAB_PLACEMENT")
+                .or(fc.tab_placement)
+                .unwrap_or_else(|| "sidebar".to_string()),
+        ),
+        sidebar_view: SidebarView::parse(
+            &fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()),
+        ),
+        sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
         ansi_cache_capacity,
         max_visible_blocks,
         output_batch_min_ms,
@@ -583,6 +655,9 @@ pub(crate) fn save_config(config: &Config) {
         TerminalMode::Block => "block",
         TerminalMode::Vte => "vte",
     }.to_string()));
+    table.insert("tab_placement".into(), toml::Value::String(config.tab_placement.as_str().to_string()));
+    table.insert("sidebar_view".into(), toml::Value::String(config.sidebar_view.as_str().to_string()));
+    table.insert("sidebar_width".into(), toml::Value::Integer(config.sidebar_width as i64));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));

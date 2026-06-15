@@ -176,7 +176,14 @@ fn main() -> glib::ExitCode {
              .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
              .tab-conn-dot.tab-connected { color: #50fa7b; }
              .tab-conn-dot.tab-disconnected { color: #ff5555; }
-             .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }",
+             .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }
+             .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; margin-right: 2px; }
+             .file-tree-box { border-top: 1px solid alpha(currentColor, 0.15); }
+             .file-tree-header { padding: 2px 4px; }
+             .file-tree-header, .file-tree-header button { color: #ffffff; }
+             .file-tree-root { font-size: 0.85em; opacity: 0.7; color: #ffffff; }
+             .sidebar-switcher button { color: #ffffff; }
+             .file-tree { padding: 2px; }",
         );
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().expect("display"),
@@ -203,10 +210,27 @@ fn main() -> glib::ExitCode {
         close_window_button.set_tooltip_text(Some("Close window"));
         close_window_button.add_css_class("flat");
 
+        // Toggles the tab bar between the left sidebar and the top bar.
+        let toggle_placement_btn = gtk4::Button::from_icon_name("view-list-symbolic");
+        toggle_placement_btn.set_focus_on_click(false);
+        toggle_placement_btn.set_can_focus(false);
+        toggle_placement_btn.set_tooltip_text(Some("Toggle tabs: sidebar / top bar"));
+        toggle_placement_btn.add_css_class("flat");
+
+        // Holder for the tab strip when it lives in the top bar (horizontal).
+        let top_tab_scroll = ScrolledWindow::new();
+        top_tab_scroll.set_hexpand(true);
+        top_tab_scroll.set_vexpand(false);
+        top_tab_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
+        top_tab_scroll.add_css_class("top-tab-scroll");
+        top_tab_scroll.set_visible(false);
+
         let top_bar = gtk4::Box::new(Orientation::Horizontal, 4);
         top_bar.add_css_class("top-bar");
         top_bar.append(&toggle_sidebar_btn);
-        // Spacer pushes + and ✕ to the right
+        top_bar.append(&toggle_placement_btn);
+        top_bar.append(&top_tab_scroll);
+        // Spacer pushes + and ✕ to the right (disabled when tabs fill the top bar)
         let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         top_bar.append(&spacer);
@@ -253,20 +277,113 @@ fn main() -> glib::ExitCode {
             });
             tab_search_wrapper.add_controller(click_ctrl);
         }
-        sidebar.append(&tab_search_wrapper);
 
-        sidebar.append(&tab_strip_scroll);
+        // Tabs view: filter entry + tab strip.
+        let sidebar_tabs_page = gtk4::Box::new(Orientation::Vertical, 0);
+        sidebar_tabs_page.set_vexpand(true);
+        sidebar_tabs_page.append(&tab_search_wrapper);
+        sidebar_tabs_page.append(&tab_strip_scroll);
 
-        // Content area: sidebar + notebook side by side
-        let content_box = gtk4::Box::new(Orientation::Horizontal, 0);
-        content_box.set_vexpand(true);
-        content_box.append(&sidebar);
+        // File tree section (header + tree), shown in the sidebar.
+        let file_tree_store = gtk4::TreeStore::new(&[
+            glib::types::Type::STRING, // 0: display name
+            glib::types::Type::STRING, // 1: absolute path
+            glib::types::Type::BOOL,   // 2: is directory
+            glib::types::Type::STRING, // 3: icon name
+        ]);
+        let file_tree = gtk4::TreeView::with_model(&file_tree_store);
+        file_tree.set_headers_visible(false);
+        file_tree.set_can_focus(true);
+        file_tree.add_css_class("file-tree");
+        {
+            let column = gtk4::TreeViewColumn::new();
+            let icon_renderer = gtk4::CellRendererPixbuf::new();
+            gtk4::prelude::CellLayoutExt::pack_start(&column, &icon_renderer, false);
+            gtk4::prelude::CellLayoutExt::add_attribute(&column, &icon_renderer, "icon-name", 3);
+            let text_renderer = gtk4::CellRendererText::new();
+            gtk4::prelude::CellLayoutExt::pack_start(&column, &text_renderer, true);
+            gtk4::prelude::CellLayoutExt::add_attribute(&column, &text_renderer, "text", 0);
+            file_tree.append_column(&column);
+        }
+
+        let file_tree_scroll = ScrolledWindow::new();
+        file_tree_scroll.set_hexpand(false);
+        file_tree_scroll.set_vexpand(true);
+        file_tree_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+        file_tree_scroll.set_child(Some(&file_tree));
+
+        let file_tree_root_label = gtk4::Label::new(Some("~"));
+        file_tree_root_label.set_hexpand(true);
+        file_tree_root_label.set_xalign(0.0);
+        file_tree_root_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        file_tree_root_label.add_css_class("file-tree-root");
+
+        let file_tree_cwd_btn = gtk4::Button::from_icon_name("go-home-symbolic");
+        file_tree_cwd_btn.set_focus_on_click(false);
+        file_tree_cwd_btn.set_can_focus(false);
+        file_tree_cwd_btn.set_tooltip_text(Some("Jump to current tab directory"));
+        file_tree_cwd_btn.add_css_class("flat");
+
+        let file_tree_up_btn = gtk4::Button::from_icon_name("go-up-symbolic");
+        file_tree_up_btn.set_focus_on_click(false);
+        file_tree_up_btn.set_can_focus(false);
+        file_tree_up_btn.set_tooltip_text(Some("Go to parent directory"));
+        file_tree_up_btn.add_css_class("flat");
+
+        let file_tree_header = gtk4::Box::new(Orientation::Horizontal, 2);
+        file_tree_header.add_css_class("file-tree-header");
+        file_tree_header.append(&file_tree_root_label);
+        file_tree_header.append(&file_tree_up_btn);
+        file_tree_header.append(&file_tree_cwd_btn);
+
+        let file_tree_box = gtk4::Box::new(Orientation::Vertical, 0);
+        file_tree_box.add_css_class("file-tree-box");
+        file_tree_box.set_vexpand(true);
+        file_tree_box.append(&file_tree_header);
+        file_tree_box.append(&file_tree_scroll);
+
+        // Segmented switcher at the top of the sidebar: Tabs | Files.
+        let sidebar_tabs_btn = gtk4::ToggleButton::with_label("Tabs");
+        sidebar_tabs_btn.set_focus_on_click(false);
+        sidebar_tabs_btn.set_can_focus(false);
+        sidebar_tabs_btn.set_hexpand(true);
+        sidebar_tabs_btn.set_active(true);
+        let sidebar_files_btn = gtk4::ToggleButton::with_label("Files");
+        sidebar_files_btn.set_focus_on_click(false);
+        sidebar_files_btn.set_can_focus(false);
+        sidebar_files_btn.set_hexpand(true);
+        let sidebar_switcher = gtk4::Box::new(Orientation::Horizontal, 0);
+        sidebar_switcher.add_css_class("linked");
+        sidebar_switcher.add_css_class("sidebar-switcher");
+        sidebar_switcher.append(&sidebar_tabs_btn);
+        sidebar_switcher.append(&sidebar_files_btn);
+
+        // Stack shows exactly one sidebar view at a time.
+        let sidebar_stack = gtk4::Stack::new();
+        sidebar_stack.set_vexpand(true);
+        sidebar_stack.add_named(&sidebar_tabs_page, Some("tabs"));
+        sidebar_stack.add_named(&file_tree_box, Some("files"));
+
+        sidebar.append(&sidebar_switcher);
+        sidebar.append(&sidebar_stack);
+
+        // Content area: resizable sidebar | notebook (draggable divider).
         let right_col = gtk4::Box::new(Orientation::Vertical, 0);
         right_col.set_hexpand(true);
         right_col.set_vexpand(true);
         right_col.append(&notebook);
         right_col.append(&search_bar);
-        content_box.append(&right_col);
+
+        let content_box = gtk4::Paned::new(Orientation::Horizontal);
+        content_box.set_vexpand(true);
+        content_box.set_wide_handle(true);
+        content_box.set_start_child(Some(&sidebar));
+        content_box.set_end_child(Some(&right_col));
+        content_box.set_resize_start_child(false);
+        content_box.set_resize_end_child(true);
+        content_box.set_shrink_start_child(false);
+        content_box.set_shrink_end_child(true);
+        content_box.set_position(config.borrow().sidebar_width as i32);
 
         // Main layout: top_bar + content_box (vertical)
         let main_box = gtk4::Box::new(Orientation::Vertical, 0);
@@ -290,6 +407,17 @@ fn main() -> glib::ExitCode {
             search_entry: search_entry.clone(),
             tab_strip: tab_strip.clone(),
             sidebar: sidebar.clone(),
+            top_spacer: spacer.clone(),
+            tab_strip_scroll: tab_strip_scroll.clone(),
+            top_tab_scroll: top_tab_scroll.clone(),
+            tab_placement: Rc::new(Cell::new(config.borrow().tab_placement)),
+            sidebar_stack: sidebar_stack.clone(),
+            sidebar_tabs_btn: sidebar_tabs_btn.clone(),
+            sidebar_files_btn: sidebar_files_btn.clone(),
+            sidebar_view: Rc::new(Cell::new(config.borrow().sidebar_view)),
+            file_tree_store: file_tree_store.clone(),
+            file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
+            file_tree_root_label: file_tree_root_label.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
             command_palette_dialog: Rc::new(RefCell::new(None)),
@@ -316,6 +444,48 @@ fn main() -> glib::ExitCode {
         toggle_sidebar_btn.connect_clicked(move |_| {
             ui_for_toggle.toggle_sidebar();
         });
+
+        // Wire tab-placement toggle (sidebar <-> top bar)
+        let ui_for_placement = ui.clone();
+        toggle_placement_btn.connect_clicked(move |_| {
+            ui_for_placement.toggle_tab_placement();
+        });
+
+        // Wire file-tree header buttons
+        let ui_for_ft_cwd = ui.clone();
+        file_tree_cwd_btn.connect_clicked(move |_| {
+            ui_for_ft_cwd.file_tree_goto_current_cwd();
+        });
+        let ui_for_ft_up = ui.clone();
+        file_tree_up_btn.connect_clicked(move |_| {
+            ui_for_ft_up.file_tree_go_up();
+        });
+
+        // Wire file-tree lazy expansion and row activation
+        let ui_for_ft_expand = ui.clone();
+        file_tree.connect_test_expand_row(move |_tv, iter, _path| {
+            ui_for_ft_expand.file_tree_on_expand(iter);
+            glib::Propagation::Proceed
+        });
+        let ui_for_ft_act = ui.clone();
+        file_tree.connect_row_activated(move |tv, path, _col| {
+            ui_for_ft_act.file_tree_on_activate(tv, path);
+        });
+
+        // Wire sidebar Tabs/Files segmented switcher
+        let ui_for_tabs_view = ui.clone();
+        sidebar_tabs_btn.connect_clicked(move |_| {
+            ui_for_tabs_view.apply_sidebar_view(crate::config::SidebarView::Tabs, true);
+        });
+        let ui_for_files_view = ui.clone();
+        sidebar_files_btn.connect_clicked(move |_| {
+            ui_for_files_view.apply_sidebar_view(crate::config::SidebarView::Files, true);
+        });
+
+        // Initialize the file tree and apply the persisted tab placement
+        // (which also restores the persisted sidebar view).
+        ui.init_file_tree();
+        ui.apply_tab_placement();
 
         // Wire close-window button
         let window_for_close = window.clone();
@@ -514,6 +684,11 @@ fn main() -> glib::ExitCode {
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
             ui_for_switch.sync_tab_strip_active(Some(page_num));
+            // File tree root follows the active tab's working directory.
+            let ui_ft = ui_for_switch.clone();
+            glib::idle_add_local_once(move || {
+                ui_ft.file_tree_goto_current_cwd();
+            });
         });
 
         window.add_controller(key_controller);
@@ -543,7 +718,14 @@ fn main() -> glib::ExitCode {
         let notebook_for_close_request = notebook.clone();
         let session_ids_for_close = ui.session_ids.clone();
         let app_for_close = app.clone();
+        let config_for_close = ui.config.clone();
+        let paned_for_close = content_box.clone();
         window.connect_close_request(move |_| {
+            // Persist the current sidebar width before teardown.
+            let width = paned_for_close.position().max(120) as u32;
+            config_for_close.borrow_mut().sidebar_width = width;
+            config::save_config(&config_for_close.borrow());
+
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             kill_all_terminal_children(&notebook_for_close_request);
 

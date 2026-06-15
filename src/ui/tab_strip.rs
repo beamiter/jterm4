@@ -22,9 +22,22 @@ impl UiState {
         }
     }
 
-    /// Hide sidebar when only one tab exists (zen mode).
+    /// Show the top-bar tab strip only when tabs live there and more than one
+    /// tab exists. The sidebar itself stays visible (it always offers the file
+    /// tree); use Ctrl+\ to hide it.
     pub(crate) fn sync_tab_bar_visibility(&self) {
-        self.sidebar.set_visible(self.notebook.n_pages() > 1);
+        use crate::config::TabPlacement;
+        let show_strip = self.notebook.n_pages() > 1;
+        match self.tab_placement.get() {
+            TabPlacement::Sidebar => {
+                self.tab_strip_scroll.set_visible(true);
+                self.top_tab_scroll.set_visible(false);
+            }
+            TabPlacement::TopBar => {
+                self.top_tab_scroll.set_visible(show_strip);
+                self.tab_strip_scroll.set_visible(true);
+            }
+        }
     }
 
     /// Remove the tab strip button that corresponds to a notebook page widget.

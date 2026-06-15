@@ -1,12 +1,13 @@
 use gtk4::Notebook;
-use gtk4::{CssProvider, SearchBar, SearchEntry};
+use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton, TreeStore};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::Terminal;
 
-use crate::config::{Config, Theme};
+use crate::config::{Config, SidebarView, TabPlacement, Theme};
 use crate::keybindings::KeybindingMap;
 use crate::block_view::TermView;
 use crate::terminal::VteTerminalView;
@@ -14,6 +15,8 @@ use crate::terminal::VteTerminalView;
 mod actions;
 mod config_apply;
 mod dialogs;
+mod file_tree;
+mod layout;
 mod panes;
 mod search;
 mod session;
@@ -72,6 +75,23 @@ pub(crate) struct UiState {
     pub(crate) search_entry: SearchEntry,
     pub(crate) tab_strip: gtk4::Box,
     pub(crate) sidebar: gtk4::Box,
+    /// Flexible spacer in the top bar; its hexpand toggles with tab placement.
+    pub(crate) top_spacer: gtk4::Box,
+    /// Sidebar scroll holder for the (vertical) tab strip.
+    pub(crate) tab_strip_scroll: ScrolledWindow,
+    /// Top-bar scroll holder for the (horizontal) tab strip.
+    pub(crate) top_tab_scroll: ScrolledWindow,
+    /// Current tab placement (sidebar vs top bar).
+    pub(crate) tab_placement: Rc<Cell<TabPlacement>>,
+    /// Sidebar content stack (one of: tab list, file tree).
+    pub(crate) sidebar_stack: Stack,
+    pub(crate) sidebar_tabs_btn: ToggleButton,
+    pub(crate) sidebar_files_btn: ToggleButton,
+    /// Which sidebar view the user prefers (persisted).
+    pub(crate) sidebar_view: Rc<Cell<SidebarView>>,
+    pub(crate) file_tree_store: TreeStore,
+    pub(crate) file_tree_root: Rc<RefCell<PathBuf>>,
+    pub(crate) file_tree_root_label: gtk4::Label,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
