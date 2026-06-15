@@ -154,6 +154,16 @@ impl UiState {
         }
         self.remove_strip_button_for(widget);
 
+        // Drop per-tab bookkeeping keyed by tab_num parsed from the widget name.
+        if let Some(tab_num) = widget
+            .widget_name()
+            .strip_prefix("tab-")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            self.session_ids.borrow_mut().remove(&tab_num);
+            self.tab_connections.borrow_mut().remove(&tab_num);
+        }
+
         if let Some(page_num) = self.notebook.page_num(widget) {
             self.notebook.remove_page(Some(page_num));
         }
@@ -246,25 +256,180 @@ impl UiState {
     }
 
     pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
-        self.add_tab_with_argv(working_directory, tab_name, session_id, initial_commands, None)
+        self.add_tab_with_argv(working_directory, tab_name, session_id, initial_commands, None, None)
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
     pub(crate) fn connect_remote(&self, host: &crate::config::RemoteHost) -> Terminal {
+        self.connect_remote_with_attempt(host, 0)
+    }
+
+    /// Like `connect_remote`, but seeds the new tab's reconnect-backoff counter.
+    /// Used by auto-reconnect to carry the attempt count across respawns.
+    fn connect_remote_with_attempt(&self, host: &crate::config::RemoteHost, attempt: u32) -> Terminal {
         let argv = crate::config::build_remote_argv(host);
         log::info!("[remote] connecting to {} via {:?}", host.name, argv);
-        self.add_tab_with_argv(None, Some(host.name.clone()), None, None, Some(argv))
+        self.add_tab_with_argv(None, Some(host.name.clone()), None, None, Some(argv), Some((host.clone(), attempt)))
+    }
+
+    /// Mark a remote tab as connected (green badge). Called on first output.
+    /// Note: this is a visual signal only — backoff reset is decided at exit
+    /// time by `spawn_at` duration, so a fast ssh error banner can't reset it.
+    fn mark_tab_connected(&self, tab_num: u32) {
+        if let Some(conn) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
+            conn.status = ConnStatus::Connected;
+        }
+        self.set_tab_conn_status(tab_num, ConnStatus::Connected);
+    }
+
+    /// Close the tab with the given tab_num via the normal exit path.
+    fn close_tab_by_num(&self, tab_num: u32) {
+        for i in 0..self.notebook.n_pages() {
+            if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
+                if page_widget.widget_name() == format!("tab-{}", tab_num) {
+                    let eff_widget = scrollbar_wrapper_of(&page_widget)
+                        .map(|bx| bx.upcast::<gtk4::Widget>())
+                        .unwrap_or_else(|| page_widget.clone());
+                    self.handle_terminal_exited(&eff_widget);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Decide what to do when a tab's child process exits: for a remote tab that
+    /// died abnormally (non-zero exit), schedule an auto-reconnect; otherwise
+    /// close the tab normally.
+    pub(crate) fn handle_tab_exit(&self, tab_num: u32, code: i32) {
+        let conn = self.tab_connections.borrow().get(&tab_num).cloned();
+        if let Some(conn) = conn {
+            if code != 0 {
+                self.schedule_reconnect(tab_num, conn, code);
+                return;
+            }
+            // Clean exit (user typed `exit`/logout): drop record, close normally.
+            self.tab_connections.borrow_mut().remove(&tab_num);
+        }
+        self.close_tab_by_num(tab_num);
+    }
+
+    /// Start a backoff countdown then respawn the remote connection in place.
+    fn schedule_reconnect(&self, tab_num: u32, conn: TabConnection, code: i32) {
+        const MAX_ATTEMPT: u32 = 6;
+        // A session that stayed up long enough is treated as a healthy link that
+        // dropped → reset backoff. A short-lived one (failed handshake/auth)
+        // grows it.
+        let stable = conn.spawn_at.elapsed() >= std::time::Duration::from_secs(10);
+        let next_attempt = if stable { 0 } else { conn.attempt + 1 };
+
+        if next_attempt > MAX_ATTEMPT {
+            log::warn!(
+                "[remote] giving up reconnect for '{}' (tab {}) after {} attempts",
+                conn.host.name, tab_num, conn.attempt
+            );
+            if let Some(c) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
+                c.status = ConnStatus::Disconnected;
+            }
+            self.set_tab_conn_status(tab_num, ConnStatus::Disconnected);
+            return;
+        }
+
+        let delay = if next_attempt == 0 {
+            1u64
+        } else {
+            (1u64 << next_attempt.min(5)).min(30)
+        };
+
+        if let Some(c) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
+            c.status = ConnStatus::Disconnected;
+            c.attempt = next_attempt;
+        }
+        self.set_tab_conn_status(tab_num, ConnStatus::Disconnected);
+
+        let host = conn.host.clone();
+        log::info!(
+            "[remote] '{}' (tab {}) disconnected (exit {}); reconnecting in {}s (attempt {})",
+            host.name, tab_num, code, delay, next_attempt
+        );
+
+        let ui = self.clone();
+        let remaining = Rc::new(Cell::new(delay));
+        self.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, delay));
+
+        glib::timeout_add_seconds_local(1, move || {
+            // If the page is gone, the user closed the tab → cancel reconnect.
+            let exists = (0..ui.notebook.n_pages()).any(|i| {
+                ui.notebook
+                    .nth_page(Some(i))
+                    .map(|w| w.widget_name() == format!("tab-{}", tab_num))
+                    .unwrap_or(false)
+            });
+            if !exists {
+                ui.tab_connections.borrow_mut().remove(&tab_num);
+                return glib::ControlFlow::Break;
+            }
+            let left = remaining.get();
+            if left > 1 {
+                remaining.set(left - 1);
+                ui.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, left - 1));
+                return glib::ControlFlow::Continue;
+            }
+            ui.do_reconnect(tab_num, &host, next_attempt);
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Respawn a dead remote tab in place: insert a fresh connection at the dead
+    /// tab's notebook slot (preserving position), then remove the dead page. The
+    /// rebuilt argv reuses the host's baked-in `--session` id so rsh restores the
+    /// snapshot.
+    fn do_reconnect(&self, dead_tab_num: u32, host: &crate::config::RemoteHost, attempt: u32) {
+        let dead_name = format!("tab-{}", dead_tab_num);
+        let dead_idx = (0..self.notebook.n_pages()).find(|&i| {
+            self.notebook
+                .nth_page(Some(i))
+                .map(|w| w.widget_name() == dead_name)
+                .unwrap_or(false)
+        });
+        let Some(dead_idx) = dead_idx else {
+            self.tab_connections.borrow_mut().remove(&dead_tab_num);
+            return;
+        };
+
+        // Insert the replacement right after the dead page.
+        self.notebook.set_current_page(Some(dead_idx));
+        self.connect_remote_with_attempt(host, attempt);
+
+        // Remove the now-stale dead page (still at dead_idx); position is preserved.
+        self.tab_connections.borrow_mut().remove(&dead_tab_num);
+        if let Some(dead_widget) = self.notebook.nth_page(Some(dead_idx)) {
+            if dead_widget.widget_name() == dead_name {
+                self.remove_tab_by_widget_internal(&dead_widget);
+            }
+        }
     }
 
     /// Core tab-creation routine. When `argv_override` is `Some`, the tab runs that
-    /// argv (e.g. an ssh command) instead of the configured local shell.
-    fn add_tab_with_argv(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>, argv_override: Option<Vec<String>>) -> Terminal {
+    /// argv (e.g. an ssh command) instead of the configured local shell. When
+    /// `remote` is `Some`, the tab is tracked as an ssh connection (status badge +
+    /// auto-reconnect) via `tab_connections`.
+    fn add_tab_with_argv(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>, argv_override: Option<Vec<String>>, remote: Option<(crate::config::RemoteHost, u32)>) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
         // Generate or reuse session ID for rsh session persistence
         let sid = session_id.unwrap_or_else(generate_session_id);
         self.session_ids.borrow_mut().insert(tab_num, sid.clone());
+
+        // Record the per-tab connection so we can show status and auto-reconnect.
+        if let Some((host, attempt)) = &remote {
+            self.tab_connections.borrow_mut().insert(tab_num, TabConnection {
+                host: host.clone(),
+                status: ConnStatus::Connecting,
+                attempt: *attempt,
+                spawn_at: std::time::Instant::now(),
+            });
+        }
 
         let shell_argv: &[String] = argv_override.as_deref().unwrap_or(self.shell_argv.as_slice());
 
@@ -309,40 +474,31 @@ impl UiState {
                 let ui_for_exit = UiState::clone(self);
                 let term_view_for_exit = term_view.clone();
                 let tab_num_for_exit = tab_num;
-                term_view.connect_exited(move |_code| {
+                term_view.connect_exited(move |code| {
                     let _ = term_view_for_exit.save_history();
-                    // Find the widget by tab number and close it
-                    for i in 0..ui_for_exit.notebook.n_pages() {
-                        if let Some(page_widget) = ui_for_exit.notebook.nth_page(Some(i)) {
-                            if page_widget.widget_name() == format!("tab-{}", tab_num_for_exit) {
-                                let eff_widget = scrollbar_wrapper_of(&page_widget)
-                                    .map(|bx| bx.upcast::<gtk4::Widget>())
-                                    .unwrap_or_else(|| page_widget.clone());
-                                ui_for_exit.handle_terminal_exited(&eff_widget);
-                                break;
-                            }
-                        }
-                    }
+                    ui_for_exit.handle_tab_exit(tab_num_for_exit, code);
                 });
             }
             TerminalViewType::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);
                 let tab_num_for_exit = tab_num;
-                vte_view.connect_exited(move |_code| {
-                    // Find the widget by tab number and close it
-                    for i in 0..ui_for_exit.notebook.n_pages() {
-                        if let Some(page_widget) = ui_for_exit.notebook.nth_page(Some(i)) {
-                            if page_widget.widget_name() == format!("tab-{}", tab_num_for_exit) {
-                                let eff_widget = scrollbar_wrapper_of(&page_widget)
-                                    .map(|bx| bx.upcast::<gtk4::Widget>())
-                                    .unwrap_or_else(|| page_widget.clone());
-                                ui_for_exit.handle_terminal_exited(&eff_widget);
-                                break;
-                            }
-                        }
-                    }
+                vte_view.connect_exited(move |code| {
+                    ui_for_exit.handle_tab_exit(tab_num_for_exit, code);
                 });
             }
+        }
+
+        // For remote tabs, flip the status badge to green on first output.
+        if remote.is_some() {
+            let ui_for_conn = self.clone();
+            let fired = Rc::new(Cell::new(false));
+            terminal.connect_contents_changed(move |_| {
+                if fired.get() {
+                    return;
+                }
+                fired.set(true);
+                ui_for_conn.mark_tab_connected(tab_num);
+            });
         }
 
         // Create tab header with a close button
@@ -488,7 +644,17 @@ impl UiState {
         pin_icon.add_css_class("tab-pin-icon");
         pin_icon.set_visible(false);  // Hidden by default
 
+        // Connection-status dot (remote tabs only): yellow→green→red.
+        let conn_dot = Label::new(Some("\u{25CF}"));
+        conn_dot.add_css_class("tab-conn-dot");
+        if remote.is_some() {
+            conn_dot.add_css_class("tab-connecting");
+        } else {
+            conn_dot.set_visible(false);
+        }
+
         let strip_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        strip_box.append(&conn_dot);
         strip_box.append(&strip_label);
         strip_box.append(&process_label);
         strip_box.append(&pin_icon);
@@ -520,9 +686,26 @@ impl UiState {
         let terminal_for_tooltip = terminal.clone();
         let tab_strip_for_tooltip = self.tab_strip.clone();
         let strip_btn_for_tooltip = strip_btn.clone();
+        let tab_connections_for_tooltip = self.tab_connections.clone();
         strip_btn.connect_query_tooltip(move |_, _x, _y, _keyboard, tooltip| {
             // Build tooltip text with cwd, process name, and status
             let mut tooltip_parts = Vec::new();
+
+            // Remote connection info, if this is a remote tab.
+            if let Some(num) = strip_btn_for_tooltip
+                .widget_name()
+                .strip_prefix("tab-")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if let Some(conn) = tab_connections_for_tooltip.borrow().get(&num) {
+                    let state = match conn.status {
+                        ConnStatus::Connecting => "connecting",
+                        ConnStatus::Connected => "connected",
+                        ConnStatus::Disconnected => "disconnected",
+                    };
+                    tooltip_parts.push(format!("Remote: {} ({})", conn.host.name, state));
+                }
+            }
 
             // Add working directory
             if let Some(cwd) = terminal_working_directory(&terminal_for_tooltip) {

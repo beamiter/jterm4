@@ -288,4 +288,53 @@ impl UiState {
             btn.remove_css_class("tab-bell-flash");
         }
     }
+
+    /// Locate the connection-status dot inside a tab's strip button, if any.
+    fn find_conn_dot(&self, tab_num: u32) -> Option<gtk4::Widget> {
+        let btn = self.find_strip_button(&format!("tab-{}", tab_num))?;
+        let strip_box = btn.child()?;
+        let mut child = strip_box.first_child();
+        while let Some(c) = child {
+            if c.has_css_class("tab-conn-dot") {
+                return Some(c);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    /// Update the per-tab connection-status dot (yellow/green/red).
+    pub(crate) fn set_tab_conn_status(&self, tab_num: u32, status: super::ConnStatus) {
+        if let Some(dot) = self.find_conn_dot(tab_num) {
+            dot.remove_css_class("tab-connecting");
+            dot.remove_css_class("tab-connected");
+            dot.remove_css_class("tab-disconnected");
+            match status {
+                super::ConnStatus::Connecting => dot.add_css_class("tab-connecting"),
+                super::ConnStatus::Connected => dot.add_css_class("tab-connected"),
+                super::ConnStatus::Disconnected => dot.add_css_class("tab-disconnected"),
+            }
+            dot.set_visible(true);
+        }
+    }
+
+    /// Relabel a tab's strip button (used for the reconnect countdown).
+    pub(crate) fn set_tab_strip_label(&self, tab_num: u32, text: &str) {
+        if let Some(btn) = self.find_strip_button(&format!("tab-{}", tab_num)) {
+            if let Some(strip_box) = btn.child() {
+                let mut child = strip_box.first_child();
+                while let Some(c) = child {
+                    if let Ok(label) = c.clone().downcast::<gtk4::Label>() {
+                        if !label.has_css_class("tab-conn-dot")
+                            && !label.has_css_class("tab-process-indicator")
+                        {
+                            label.set_text(text);
+                            return;
+                        }
+                    }
+                    child = c.next_sibling();
+                }
+            }
+        }
+    }
 }

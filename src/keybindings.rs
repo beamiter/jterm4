@@ -28,7 +28,7 @@ pub(crate) enum Action {
     CyclePaneFocusForward,
     CyclePaneFocusBackward,
     QuickSwitchTab(u8),
-    ConnectRemote(u8),
+    ShowRemotePicker,
     ResizePaneLeft,
     ResizePaneRight,
     ResizePaneUp,
@@ -87,7 +87,7 @@ impl Action {
                 8 => "Switch to tab 9",
                 _ => "Switch to last tab",
             },
-            Action::ConnectRemote(_) => "Connect to remote host",
+            Action::ShowRemotePicker => "Connect to remote host…",
             Action::ResizePaneLeft => "Resize pane left",
             Action::ResizePaneRight => "Resize pane right",
             Action::ResizePaneUp => "Resize pane up",
@@ -135,7 +135,7 @@ impl Action {
             Action::CyclePaneFocusForward => Some("cycle_pane_focus_forward"),
             Action::CyclePaneFocusBackward => Some("cycle_pane_focus_backward"),
             Action::QuickSwitchTab(_) => None,
-            Action::ConnectRemote(_) => None,
+            Action::ShowRemotePicker => Some("show_remote_picker"),
             Action::ResizePaneLeft => Some("resize_pane_left"),
             Action::ResizePaneRight => Some("resize_pane_right"),
             Action::ResizePaneUp => Some("resize_pane_up"),
@@ -182,6 +182,7 @@ impl Action {
             Action::ScrollDown,
             Action::CyclePaneFocusForward,
             Action::CyclePaneFocusBackward,
+            Action::ShowRemotePicker,
             Action::ResizePaneLeft,
             Action::ResizePaneRight,
             Action::ResizePaneUp,
@@ -408,7 +409,7 @@ impl KeybindingMap {
         for i in 0..=9u8 {
             bind(&format!("Ctrl+{i}"), Action::QuickSwitchTab(i));
         }
-        bind("Ctrl+Shift+R", Action::ConnectRemote(0));
+        bind("Ctrl+Shift+R", Action::ShowRemotePicker);
         bind("Alt+Tab", Action::CyclePaneFocusForward);
         bind("Alt+Shift+Tab", Action::CyclePaneFocusBackward);
 

@@ -159,12 +159,8 @@ impl UiState {
                     self.notebook.set_current_page(Some(target));
                 }
             }
-            Action::ConnectRemote(n) => {
-                let host = self.config.borrow().remote_hosts.get(n as usize).cloned();
-                match host {
-                    Some(h) => { self.connect_remote(&h); }
-                    None => { log::warn!("[remote] no remote_hosts[{n}] configured"); }
-                }
+            Action::ShowRemotePicker => {
+                self.show_remote_picker();
             }
             Action::ResizePaneLeft => {
                 self.resize_pane(Orientation::Horizontal, -30);

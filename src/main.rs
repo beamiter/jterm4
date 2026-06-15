@@ -171,6 +171,11 @@ fn main() -> glib::ExitCode {
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
              .tab-selected { background-color: alpha(currentColor, 0.1); }
+             .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
+             @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
+             .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
+             .tab-conn-dot.tab-connected { color: #50fa7b; }
+             .tab-conn-dot.tab-disconnected { color: #ff5555; }
              .tab-strip-search { padding: 4px 8px; margin: 2px 4px; }",
         );
         gtk4::style_context_add_provider_for_display(
@@ -288,12 +293,14 @@ fn main() -> glib::ExitCode {
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
             command_palette_dialog: Rc::new(RefCell::new(None)),
+            remote_picker_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),
             session_ids: Rc::new(RefCell::new(HashMap::new())),
+            tab_connections: Rc::new(RefCell::new(HashMap::new())),
         });
 
         // Register the dynamic scrollbar CSS provider and apply initial colors

@@ -39,6 +39,22 @@ pub struct RemoteHost {
     /// channel runs a non-login, non-interactive shell, which leaves tools like
     /// cargo off PATH. Defaults to true.
     pub login_shell: bool,
+    /// Reuse one ssh connection for repeat tabs to this host (ControlMaster), so
+    /// the 2nd+ tab skips the handshake/auth. Defaults to true.
+    pub multiplex: bool,
+}
+
+/// Directory for ssh ControlMaster sockets. Prefers `$XDG_RUNTIME_DIR`, falls
+/// back to `~/.cache/jterm4`. Created if missing.
+fn control_socket_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/jterm4")))?;
+    if let Err(err) = fs::create_dir_all(&base) {
+        log::warn!("Failed to create ssh control socket dir {}: {err}", base.display());
+        return None;
+    }
+    Some(base)
 }
 
 /// Build the local argv that connects to a remote host via ssh.
@@ -60,6 +76,18 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
         remote_cmd = format!("bash -lc 'exec {escaped}'");
     }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
+    if host.multiplex {
+        if let Some(dir) = control_socket_dir() {
+            // %C is ssh's hash of (local user, host, port, user) — a safe filename.
+            let ctl_path = dir.join("cm-%C");
+            argv.push("-o".to_string());
+            argv.push("ControlMaster=auto".to_string());
+            argv.push("-o".to_string());
+            argv.push("ControlPersist=120".to_string());
+            argv.push("-o".to_string());
+            argv.push(format!("ControlPath={}", ctl_path.display()));
+        }
+    }
     argv.extend(host.ssh_args.iter().cloned());
     argv.push(target);
     argv.push(remote_cmd);
@@ -361,7 +389,8 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
             let login_shell = t.get("login_shell").and_then(|v| v.as_bool()).unwrap_or(true);
-            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args, login_shell })
+            let multiplex = t.get("multiplex").and_then(|v| v.as_bool()).unwrap_or(true);
+            Some(RemoteHost { name, host, user, remote_shell, session, ssh_args, login_shell, multiplex })
         })
         .collect()
 }
@@ -380,6 +409,7 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
+            multiplex: true,
         },
         RemoteHost {
             name: "localhost-test".into(),
@@ -389,6 +419,7 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
             session: Some("local-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
+            multiplex: true,
         },
     ]
 }
@@ -635,6 +666,9 @@ mod tests {
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
+            // Off by default in tests so exact-argv assertions stay deterministic
+            // (multiplex injects an env-dependent ControlPath).
+            multiplex: false,
         }
     }
 
@@ -669,5 +703,26 @@ mod tests {
             argv.last().unwrap(),
             r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
         );
+    }
+
+    #[test]
+    fn multiplex_injects_controlmaster_flags() {
+        let mut h = host();
+        h.multiplex = true;
+        std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
+        let argv = build_remote_argv(&h);
+        assert!(argv.iter().any(|a| a == "ControlMaster=auto"), "argv: {argv:?}");
+        assert!(argv.iter().any(|a| a == "ControlPersist=120"), "argv: {argv:?}");
+        assert!(argv.iter().any(|a| a.starts_with("ControlPath=")), "argv: {argv:?}");
+        // ControlMaster flags must precede the target.
+        let target_idx = argv.iter().position(|a| a == "yj@1.2.3.4").unwrap();
+        let cm_idx = argv.iter().position(|a| a == "ControlMaster=auto").unwrap();
+        assert!(cm_idx < target_idx);
+    }
+
+    #[test]
+    fn no_multiplex_omits_controlmaster_flags() {
+        let argv = build_remote_argv(&host()); // multiplex=false
+        assert!(!argv.iter().any(|a| a.contains("ControlMaster")), "argv: {argv:?}");
     }
 }
