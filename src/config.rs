@@ -492,12 +492,12 @@ fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
 fn default_remote_hosts() -> Vec<RemoteHost> {
     vec![
         RemoteHost {
-            name: "cloud-dev".into(),
-            host: "10.21.31.17".into(),
-            user: Some("root".into()),
+            name: "home-dev".into(),
+            host: "100.99.153.18".into(),
+            user: Some("yj".into()),
             // Full path: a non-interactive ssh PATH resolves bare `rsh` to the
             // system ssh-alternative, not the block-mode rsh in ~/.cargo/bin.
-            remote_shell: "/root/.cargo/bin/rsh".into(),
+            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
             session: Some("cloud-test".into()),
             ssh_args: Vec::new(),
             login_shell: true,
