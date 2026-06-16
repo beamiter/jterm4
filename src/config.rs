@@ -397,7 +397,14 @@ fn load_file_config() -> FileConfig {
     };
 
     let colors = table.get("colors").and_then(|v| v.as_table());
-    let remote_hosts = parse_remote_hosts(&table);
+    // Fall back to built-in defaults when the section is entirely absent (e.g. a
+    // config file first created to persist some other setting). An explicit,
+    // possibly empty, [[remote_hosts]] array is respected as-is.
+    let remote_hosts = if table.contains_key("remote_hosts") {
+        parse_remote_hosts(&table)
+    } else {
+        default_remote_hosts()
+    };
 
     FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
@@ -456,6 +463,28 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
             Some(RemoteHost { name, host, user, remote_shell, session, ssh_args, login_shell, multiplex })
         })
         .collect()
+}
+
+/// Serialize a `RemoteHost` back into a TOML table that `parse_remote_hosts`
+/// round-trips. Optional fields are only emitted when present.
+fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
+    let mut t = toml::Table::new();
+    t.insert("name".into(), toml::Value::String(h.name.clone()));
+    t.insert("host".into(), toml::Value::String(h.host.clone()));
+    if let Some(user) = &h.user {
+        t.insert("user".into(), toml::Value::String(user.clone()));
+    }
+    t.insert("remote_shell".into(), toml::Value::String(h.remote_shell.clone()));
+    if let Some(session) = &h.session {
+        t.insert("session".into(), toml::Value::String(session.clone()));
+    }
+    if !h.ssh_args.is_empty() {
+        let args: Vec<toml::Value> = h.ssh_args.iter().map(|a| toml::Value::String(a.clone())).collect();
+        t.insert("ssh_args".into(), toml::Value::Array(args));
+    }
+    t.insert("login_shell".into(), toml::Value::Boolean(h.login_shell));
+    t.insert("multiplex".into(), toml::Value::Boolean(h.multiplex));
+    toml::Value::Table(t)
 }
 
 /// Built-in remote hosts used when no config file exists yet, so a fresh
@@ -665,6 +694,16 @@ pub(crate) fn save_config(config: &Config) {
     colors.insert("cursor".into(), toml::Value::String(rgba_to_hex(&config.cursor)));
     colors.insert("cursor_foreground".into(), toml::Value::String(rgba_to_hex(&config.cursor_foreground)));
     table.insert("colors".into(), toml::Value::Table(colors));
+
+    // Seed the built-in default hosts on the FIRST save (when the file has no
+    // [[remote_hosts]] yet), so writing any other setting doesn't create a config
+    // that silently drops the context-menu remote-connect items. remote_hosts has
+    // no in-app editor, so once the section exists it is user-authored: never
+    // overwrite it here, or hand-edited hosts get clobbered on the next save.
+    if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
+        let hosts: Vec<toml::Value> = config.remote_hosts.iter().map(remote_host_to_toml).collect();
+        table.insert("remote_hosts".into(), toml::Value::Array(hosts));
+    }
 
     let content = table.to_string();
     let tmp_path = path.with_extension("toml.tmp");
