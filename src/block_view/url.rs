@@ -17,7 +17,7 @@ pub(crate) fn is_url(text: &str) -> bool {
 /// Trailing characters that are almost always sentence punctuation rather than
 /// part of a URL (e.g. `see http://x.com.` → drop the period).
 fn trim_trailing(text: &str) -> &str {
-    text.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"'))
+    text.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '\'', '"'])
 }
 
 /// Extract URL at cursor position in a TextView's buffer, returning bounds and text

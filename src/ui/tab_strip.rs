@@ -257,6 +257,42 @@ impl UiState {
         }
     }
 
+    /// Toggle the "pinned" state of the current tab, mirroring the context-menu
+    /// "Pin Tab" item: flips the strip button's css class + `pinned` data, the
+    /// pin icon's visibility, and the notebook page's `pinned` data (read by
+    /// session save). Unlike jterm1 this does not reorder — jterm4's pinning is
+    /// a visual flag persisted across restarts, not a sort key.
+    pub(crate) fn toggle_current_tab_pinned(&self) {
+        let Some(page) = self.notebook.current_page() else {
+            return;
+        };
+        // The notebook page widget is the term wrapper that session save reads.
+        if let Some(wrapper) = self.notebook.nth_page(Some(page)) {
+            let mut idx = 0u32;
+            let mut child = self.tab_strip.first_child();
+            while let Some(c) = child {
+                if idx == page {
+                    if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
+                        let pinned = !btn.has_css_class("tab-pinned");
+                        if pinned {
+                            btn.add_css_class("tab-pinned");
+                        } else {
+                            btn.remove_css_class("tab-pinned");
+                        }
+                        unsafe { btn.set_data::<bool>("pinned", pinned); }
+                        unsafe { wrapper.set_data::<bool>("pinned", pinned); }
+                        if let Some(icon) = find_pin_icon(&btn) {
+                            icon.set_visible(pinned);
+                        }
+                    }
+                    break;
+                }
+                idx += 1;
+                child = c.next_sibling();
+            }
+        }
+    }
+
     /// Find the strip button widget for a given tab widget name.
     pub(crate) fn find_strip_button(&self, widget_name: &str) -> Option<ToggleButton> {
         let mut child = self.tab_strip.first_child();
@@ -350,4 +386,19 @@ impl UiState {
             }
         }
     }
+}
+
+/// Locate the pin icon (`tab-pin-icon`) inside a strip button's child box.
+fn find_pin_icon(btn: &ToggleButton) -> Option<gtk4::Image> {
+    let strip_box = btn.child()?;
+    let mut child = strip_box.first_child();
+    while let Some(c) = child {
+        if let Ok(img) = c.clone().downcast::<gtk4::Image>() {
+            if img.has_css_class("tab-pin-icon") {
+                return Some(img);
+            }
+        }
+        child = c.next_sibling();
+    }
+    None
 }

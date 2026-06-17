@@ -204,6 +204,12 @@ impl UiState {
             Action::ToggleTabMarked => {
                 self.toggle_current_tab_marked();
             }
+            Action::ToggleTabPinned => {
+                self.toggle_current_tab_pinned();
+            }
+            Action::ToggleTabPlacement => {
+                self.toggle_tab_placement();
+            }
             Action::FilterFailedBlocks => {
                 log::info!("Filter failed blocks");
                 if let Some(term_view) = self.current_term_view() {
