@@ -219,23 +219,6 @@ pub(crate) fn install_block_css(config: &Config) {
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
-        .block-breadcrumb {{
-            color: {dim_fg};
-            background-color: {block_bg_hex};
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.28);
-            border-left: 3px solid {accent};
-            border-radius: 999px;
-            margin: 8px 14px;
-            padding: 4px 14px;
-            font-family: "{font_family}";
-            font-size: 0.85em;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.32);
-            transition: background-color 120ms ease, color 120ms ease;
-        }}
-        .block-breadcrumb:hover {{
-            color: {fg_hex};
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
-        }}
         .block-header {{
             border-radius: 6px 6px 0 0;
         }}

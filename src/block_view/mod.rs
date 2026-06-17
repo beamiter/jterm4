@@ -1000,8 +1000,8 @@ impl TermView {
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(false); // Don't expand - only take space needed
-        block_list.set_valign(gtk4::Align::Start); // Align to top
+        block_list.set_vexpand(true); // jterm1: expand so the active card fills
+                                      // the space left below finished blocks.
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
@@ -1037,42 +1037,7 @@ impl TermView {
             });
         }
 
-        // Floating breadcrumb: names the command whose output currently fills the
-        // top of the viewport while scrolling a long block (IDE "sticky header").
-        let breadcrumb = gtk4::Button::with_label("");
-        breadcrumb.add_css_class("block-breadcrumb");
-        breadcrumb.set_halign(gtk4::Align::Fill);
-        breadcrumb.set_valign(gtk4::Align::Start);
-        breadcrumb.set_can_target(true);
-        breadcrumb.set_visible(false);
-        if let Some(lbl) = breadcrumb.child().and_downcast::<gtk4::Label>() {
-            lbl.set_halign(gtk4::Align::Start);
-            lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        }
-        // Stores the *stable block id* (not a Vec index) of the block the
-        // breadcrumb names. Indices shift when an old block is evicted or deleted
-        // between the scroll handler setting the target and a later click.
-        let breadcrumb_target: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-
-        let scroll_overlay = gtk4::Overlay::new();
-        // Inherit expand from block_scroll (don't pin it): in alt-screen mode the
-        // alt-screen code sets block_scroll vexpand=false + invisible, and the
-        // overlay must collapse with it instead of leaving a blank gap.
-        scroll_overlay.set_child(Some(&block_scroll));
-        scroll_overlay.add_overlay(&breadcrumb);
-
-        // The breadcrumb is an overlay child, so it would otherwise float over the
-        // alt-screen VTE. Hide it whenever the block scroll itself is hidden.
-        {
-            let breadcrumb_for_vis = breadcrumb.clone();
-            block_scroll.connect_visible_notify(move |bs| {
-                if !bs.is_visible() {
-                    breadcrumb_for_vis.set_visible(false);
-                }
-            });
-        }
-
-        root.append(&scroll_overlay);
+        root.append(&block_scroll);
 
         // ── PTY ───────────────────────────────────────────────────────────
         // Detect rsh shell for session_id passing
@@ -1275,123 +1240,9 @@ impl TermView {
                 if programmatic.get() {
                     return;
                 }
-                let at_bottom = adj.value() >= adj.upper() - adj.page_size() - 5.0;
+                let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+                let at_bottom = adj.value() >= max_val - 4.0;
                 user_scrolled.set(!at_bottom);
-            });
-        }
-
-        // ── Follow bottom on layout reflow ────────────────────────────────
-        // The `changed` signal fires whenever the scrollable extent (upper /
-        // page_size) updates — i.e. exactly when GTK finishes (re)laying out
-        // newly added blocks. Timer-based scroll snapshots race with this async
-        // reflow and can read a stale `upper`, leaving the view stuck partway up
-        // after a tall block lands. Re-pinning here is authoritative: it tracks
-        // the real content height no matter how late the reflow settles.
-        //
-        // The re-pin is deferred to an idle tick rather than done inline: calling
-        // set_value() from inside the adjustment's own `changed` handler re-enters
-        // layout (scroll → re-allocate child → VTE height-for-width re-measure →
-        // extent recomputed → `changed` again), thrashing the main loop and
-        // starving the PTY reader so streaming output stalls for seconds. A
-        // coalesced idle runs after the current layout pass settles, breaking the
-        // reentrancy while still reading the final, correct `upper`.
-        {
-            let user_scrolled = user_scrolled_up.clone();
-            let programmatic = programmatic_scroll.clone();
-            let follow_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let scroll_for_follow = block_scroll.clone();
-            block_scroll.vadjustment().connect_changed(move |_| {
-                if user_scrolled.get() || follow_pending.get() {
-                    return;
-                }
-                follow_pending.set(true);
-                let user_scrolled = user_scrolled.clone();
-                let programmatic = programmatic.clone();
-                let follow_pending = follow_pending.clone();
-                let scroll = scroll_for_follow.clone();
-                glib::idle_add_local_once(move || {
-                    follow_pending.set(false);
-                    if user_scrolled.get() {
-                        return;
-                    }
-                    let adj = scroll.vadjustment();
-                    let target = adj.upper() - adj.page_size();
-                    if target > 0.0 && (adj.value() - target).abs() > 1.0 {
-                        programmatic.set(true);
-                        adj.set_value(target);
-                        programmatic.set(false);
-                    }
-                });
-            });
-        }
-
-        // ── Floating breadcrumb: track which block fills the viewport top ──────
-        {
-            let block_scroll_for_bc = block_scroll.clone();
-            let finished_blocks_for_bc = finished_blocks_rc.clone();
-            let breadcrumb_for_bc = breadcrumb.clone();
-            let target_for_bc = breadcrumb_target.clone();
-            block_scroll.vadjustment().connect_value_changed(move |adj| {
-                let scroll_top = adj.value();
-                // Near the top there's nothing useful to pin — hide the breadcrumb.
-                if scroll_top <= 8.0 {
-                    breadcrumb_for_bc.set_visible(false);
-                    target_for_bc.set(None);
-                    return;
-                }
-                let finished = finished_blocks_for_bc.borrow();
-                // Blocks are ordered top→bottom, so "top edge scrolled above the
-                // viewport" (p.y() <= 0) is true for a prefix of the list; we want
-                // the LAST such block. Scan from the end and stop at the first match:
-                // when scrolled down (the common case) this terminates almost
-                // immediately, instead of the forward scan's O(blocks-above-viewport).
-                let mut current: Option<(usize, &FinishedBlock)> = None;
-                for (idx, block) in finished.iter().enumerate().rev() {
-                    if let Some(p) = block.widget().compute_point(
-                        &block_scroll_for_bc,
-                        &gtk4::graphene::Point::new(0.0, 0.0),
-                    ) {
-                        // p.y() is the block top relative to the viewport; <= 0 means
-                        // its top has scrolled above the visible area.
-                        if p.y() as f64 <= 0.0 {
-                            current = Some((idx, block));
-                            break;
-                        }
-                    }
-                }
-                match current {
-                    Some((_idx, block)) => {
-                        let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
-                        breadcrumb_for_bc.set_label(&format!("\u{f054}  {}", cmd));
-                        target_for_bc.set(Some(block.id));
-                        breadcrumb_for_bc.set_visible(true);
-                    }
-                    None => {
-                        breadcrumb_for_bc.set_visible(false);
-                        target_for_bc.set(None);
-                    }
-                }
-            });
-        }
-
-        // Clicking the breadcrumb jumps to the top of the block it names.
-        {
-            let block_scroll_for_click = block_scroll.clone();
-            let finished_blocks_for_click = finished_blocks_rc.clone();
-            let target_for_click = breadcrumb_target.clone();
-            breadcrumb.connect_clicked(move |_| {
-                if let Some(target_id) = target_for_click.get() {
-                    let finished = finished_blocks_for_click.borrow();
-                    if let Some(block) = finished.iter().find(|b| b.id == target_id) {
-                        let adj = block_scroll_for_click.vadjustment();
-                        if let Some(value) = block.widget().compute_point(
-                            &block_scroll_for_click,
-                            &gtk4::graphene::Point::new(0.0, 0.0),
-                        ) {
-                            adj.set_value(adj.value() + value.y() as f64);
-                        }
-                    }
-                }
             });
         }
 
