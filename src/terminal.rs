@@ -575,33 +575,19 @@ pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     terminal.add_controller(click_controller);
 }
 
-/// Find the first Terminal in a widget tree (depth-first).
+/// Find the first Terminal in a widget tree (depth-first). Traverses children
+/// generically so the live VTE buried under ScrolledWindow → Viewport →
+/// block_list → active_holder is reachable.
 pub(crate) fn find_first_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
     if let Ok(term) = widget.clone().downcast::<Terminal>() {
         return Some(term);
     }
-    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
-            let mut child = bx.first_child();
-            while let Some(c) = child {
-                if let Some(term) = find_first_terminal(&c) {
-                    return Some(term);
-                }
-                child = c.next_sibling();
-            }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(term) = find_first_terminal(&c) {
+            return Some(term);
         }
-    }
-    if let Ok(paned) = widget.clone().downcast::<Paned>() {
-        if let Some(child) = paned.start_child() {
-            if let Some(term) = find_first_terminal(&child) {
-                return Some(term);
-            }
-        }
-        if let Some(child) = paned.end_child() {
-            if let Some(term) = find_first_terminal(&child) {
-                return Some(term);
-            }
-        }
+        child = c.next_sibling();
     }
     None
 }
@@ -613,28 +599,12 @@ pub(crate) fn find_focused_terminal(widget: &gtk4::Widget) -> Option<Terminal> {
             return Some(term);
         }
     }
-    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
-            let mut child = bx.first_child();
-            while let Some(c) = child {
-                if let Some(term) = find_focused_terminal(&c) {
-                    return Some(term);
-                }
-                child = c.next_sibling();
-            }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(term) = find_focused_terminal(&c) {
+            return Some(term);
         }
-    }
-    if let Ok(paned) = widget.clone().downcast::<Paned>() {
-        if let Some(child) = paned.start_child() {
-            if let Some(term) = find_focused_terminal(&child) {
-                return Some(term);
-            }
-        }
-        if let Some(child) = paned.end_child() {
-            if let Some(term) = find_focused_terminal(&child) {
-                return Some(term);
-            }
-        }
+        child = c.next_sibling();
     }
     None
 }
@@ -645,23 +615,10 @@ pub(crate) fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) 
         out.push(term);
         return;
     }
-    if let Ok(bx) = widget.clone().downcast::<gtk4::Box>() {
-        if bx.has_css_class("terminal-box") || bx.has_css_class("term-view-root") {
-            let mut child = bx.first_child();
-            while let Some(c) = child {
-                collect_terminals(&c, out);
-                child = c.next_sibling();
-            }
-            return;
-        }
-    }
-    if let Ok(paned) = widget.clone().downcast::<Paned>() {
-        if let Some(child) = paned.start_child() {
-            collect_terminals(&child, out);
-        }
-        if let Some(child) = paned.end_child() {
-            collect_terminals(&child, out);
-        }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        collect_terminals(&c, out);
+        child = c.next_sibling();
     }
 }
 

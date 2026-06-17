@@ -1,7 +1,6 @@
 //! blocks — extracted from block_view (mechanical split, no logic changes)
-use gtk4::gdk::RGBA;
 use gtk4::prelude::*;
-use gtk4::{glib, EventControllerKey, Orientation, TextBuffer, TextView};
+use gtk4::{Orientation, TextView};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -778,474 +777,85 @@ impl FinishedBlock {
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |_| {
-            let active = active_for_rerun.borrow();
-            *active.pending_cmd.borrow_mut() = cmd_for_rerun.clone();
-            active.cursor_offset.set(cmd_for_rerun.chars().count());
+            // Clear any partial line at the live prompt (Ctrl+U) then type the
+            // command bytes into the shell, leaving the user to press Enter
+            // (jterm1 rerun model).
             if pty_synced_for_rerun.get() {
                 pty_for_rerun.write_bytes(b"\x15");
             }
             pty_for_rerun.write_bytes(cmd_for_rerun.as_bytes());
             pty_synced_for_rerun.set(true);
-            *active.pending_suggestion.borrow_mut() = String::new();
-            active.cursor_visible.set(true);
-            active.update_content_view();
-            active.command_view.grab_focus();
+            active_for_rerun.borrow().grab_focus();
         });
     }
 }
 
 // ─── ActiveBlock ──────────────────────────────────────────────────────────────
 
+/// The live area: a single persistent input-enabled VTE pinned to the viewport
+/// height (jterm1 model). The shell's prompt, the user's typing, and command
+/// output all render natively in this one VTE. When a command finishes, its
+/// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
+/// stacked above this card.
 pub(crate) struct ActiveBlock {
     pub(crate) widget: gtk4::Box,
-    pub(crate) prompt_buffer: gtk4::TextBuffer,
-    pub(crate) command_view: gtk4::TextView,
-    pub(crate) command_buffer: gtk4::TextBuffer,
-    pub(crate) output_vte: Terminal,
+    pub(crate) active_vte: Terminal,
+    /// Raw output bytes accumulated during CollectingOutput, consumed by the
+    /// finalize path to build the styled finished block (jterm1's `out_buf`).
     pub(crate) raw_output: Rc<RefCell<Vec<u8>>>,
-    // Incremental counters mirroring raw_output, so feed_output never rescans the
-    // whole accumulated buffer (which made large outputs quadratic).
-    pub(crate) output_newlines: Rc<Cell<i64>>,
-    pub(crate) output_bytes: Rc<Cell<i64>>,
-    // High-water mark of grid rows the output has actually occupied (from VTE's
-    // cursor row). Drives the exact widget height so the running block is flush
-    // with its content like a normal terminal, instead of the byte-estimate that
-    // over-grows (badly so for carriage-return progress bars with no newlines).
-    pub(crate) output_max_row: Rc<Cell<i64>>,
-    pub(crate) pending_cmd: Rc<RefCell<String>>,        // User input only
-    pub(crate) pending_preedit: Rc<RefCell<String>>,    // IME composing text
-    pub(crate) pending_suggestion: Rc<RefCell<String>>, // Shell suggestion/autocomplete
-    pub(crate) cursor_visible: Rc<Cell<bool>>, // For blinking cursor animation
-    pub(crate) cursor_offset: Rc<Cell<usize>>, // Cursor position in chars (editor mode)
-    // True while a command is executing. The live cursor then belongs to the
-    // output VTE, so the input line's blinking cursor is suppressed to match
-    // VTE's single-cursor behaviour (otherwise two cursors show at once).
-    pub(crate) command_running: Rc<Cell<bool>>,
-    pub(crate) cursor_color: RGBA,
-    pub(crate) cursor_foreground: RGBA,
-    pub(crate) cwd_label: gtk4::Label,
-    pub(crate) running_label: gtk4::Label,
-    pub(crate) running_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
-    pub(crate) blink_timer_handle: Rc<RefCell<Option<glib::SourceId>>>,
-    // The exact column count last pushed to the PTY by the resize tick — the single
-    // source of truth the running program (and a real terminal) wraps at. The live
-    // output VTE is sized to this, and finished blocks are pre-wrapped at it, so the
-    // grid, the PTY, and the completed render all agree. 0 until the first tick.
-    pub(crate) pty_cols: Rc<Cell<u16>>,
 }
 
 impl ActiveBlock {
-    pub(crate) fn new(_batch_min_ms: u32, _batch_max_ms: u32, config: &Config) -> Self {
+    pub(crate) fn new(config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
-        widget.set_margin_top(4);
-        widget.set_margin_bottom(2);
-        widget.set_can_focus(false);
-        widget.set_can_target(false);
+        // focusable(false) keeps the holder Box from being a focus target, but we
+        // must NOT set can_focus(false): in GTK4 that blocks all descendants
+        // (including active_vte) from ever receiving focus.
         widget.set_focusable(false);
+        widget.set_hexpand(true);
+        widget.set_vexpand(true);
 
-        // Helper to create and configure a TextView
-        let create_textview = |css_class: &str, editable: bool| -> (gtk4::TextView, gtk4::TextBuffer) {
-            let buffer = TextBuffer::new(None);
-            let view = TextView::with_buffer(&buffer);
-            view.add_css_class(css_class);
-            view.set_editable(editable);
-            view.set_cursor_visible(editable);
-            view.set_can_focus(true);
-            view.set_focusable(true);
-            view.set_hexpand(true);
-            view.set_vexpand(false);
-            view.set_wrap_mode(gtk4::WrapMode::Char);
-            view.set_left_margin(12);
-            view.set_right_margin(8);
-            view.set_top_margin(0);
-            view.set_bottom_margin(0);
-            view.set_monospace(true);
+        let active_vte = create_active_terminal(config);
+        active_vte.set_hexpand(true);
+        active_vte.set_vexpand(true);
+        widget.append(&active_vte);
 
-            if !editable {
-                let key_controller = EventControllerKey::new();
-                key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                key_controller.connect_key_pressed(|_controller, _key, _code, _modifier| {
-                    glib::Propagation::Stop
-                });
-                view.add_controller(key_controller);
-            }
-
-            (view, buffer)
-        };
-
-        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view", false);
-        let (command_view, command_buffer) = create_textview("block-command-view", false);
-        // The input row gets its leading indent from the accent prompt chevron, so
-        // drop the command view's own left margin to avoid a double indent.
-        command_view.set_left_margin(2);
-
-        // Accent prompt chevron (❯), Warp-style, marking the live input line.
-        let prompt_chevron = gtk4::Label::new(Some("\u{276f}"));
-        prompt_chevron.add_css_class("block-prompt-chevron");
-        prompt_chevron.set_valign(gtk4::Align::Start);
-        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
-        cmd_row.append(&prompt_chevron);
-        cmd_row.append(&command_view);
-
-        // Running timer label (shown during command execution)
-        let running_label = gtk4::Label::new(None);
-        running_label.add_css_class("block-running-label");
-        running_label.set_halign(gtk4::Align::End);
-        running_label.set_hexpand(false);
-        running_label.set_visible(false);
-
-        // Header row: cwd on the left, running timer on the right — mirrors the
-        // finished block header so the active block reads consistently.
-        let cwd_label = gtk4::Label::new(None);
-        cwd_label.add_css_class("block-header-label");
-        cwd_label.set_halign(gtk4::Align::Start);
-        cwd_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
-        cwd_label.set_max_width_chars(40);
-
-        let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
-        header_row.add_css_class("block-header");
-        header_row.set_margin_start(12);
-        header_row.set_margin_end(8);
-        header_row.set_margin_top(6);
-        header_row.set_margin_bottom(2);
-        header_row.append(&cwd_label);
-        let header_spacer = gtk4::Box::new(Orientation::Horizontal, 0);
-        header_spacer.set_hexpand(true);
-        header_row.append(&header_spacer);
-        header_row.append(&running_label);
-
-        // Output: use VTE widget for full terminal compatibility
-        let output_vte = build_output_vte(config);
-        output_vte.set_visible(false); // Hidden until there's output
-
-        // Append to widget
-        widget.append(&header_row);
-        widget.append(&prompt_view);
-        widget.append(&cmd_row);
-        widget.append(&output_vte);
-
-        // Grab focus on command_view when realized
-        let command_view_clone = command_view.clone();
-        command_view.connect_realize(move |_| {
-            command_view_clone.grab_focus();
-        });
-
-        let cursor_visible = Rc::new(Cell::new(true));
-        let cursor_offset: Rc<Cell<usize>> = Rc::new(Cell::new(0));
-        let command_running = Rc::new(Cell::new(false));
-        let pending_cmd = Rc::new(RefCell::new(String::new()));
-        let pending_preedit = Rc::new(RefCell::new(String::new()));
-        let pending_suggestion = Rc::new(RefCell::new(String::new()));
-
-        let blink_timer_handle = Rc::new(RefCell::new(None::<glib::SourceId>));
+        // Focus the live VTE as soon as it is realized (jterm1 block.rs:324-328).
         {
-            // Manual cursor blink animation (both editor and non-editor modes)
-            let cursor_visible_clone = cursor_visible.clone();
-            let cursor_offset_clone = cursor_offset.clone();
-            let command_running_clone = command_running.clone();
-            let command_buffer_clone = command_buffer.clone();
-            let command_view_for_timer = command_view.clone();
-            let pending_cmd_clone = pending_cmd.clone();
-            let pending_preedit_clone = pending_preedit.clone();
-            let pending_suggestion_clone = pending_suggestion.clone();
-            let cursor_color_for_timer = config.cursor;
-            let cursor_foreground_for_timer = config.cursor_foreground;
-
-            let handle = glib::timeout_add_local(std::time::Duration::from_millis(530), move || {
-                // While a command is executing the live cursor lives in the output
-                // VTE. Match VTE's single-cursor behaviour by hiding the input
-                // cursor: draw the command text once without a cursor, then idle
-                // until the command finishes (cursor_visible is restored by
-                // reset_for_next_prompt).
-                if command_running_clone.get() {
-                    if !cursor_visible_clone.get() {
-                        return glib::ControlFlow::Continue;
-                    }
-                    cursor_visible_clone.set(false);
-                } else {
-                    // Match VTE: when the toplevel window is not focused, show a steady
-                    // (non-blinking) cursor and skip the buffer rebuild entirely once it's
-                    // solid — no point burning redraws on a blink nobody can see.
-                    let window_active = command_view_for_timer
-                        .root()
-                        .and_then(|r| r.downcast::<gtk4::Window>().ok())
-                        .map(|w| w.is_active())
-                        .unwrap_or(true);
-                    if !window_active {
-                        if cursor_visible_clone.get() {
-                            return glib::ControlFlow::Continue;
-                        }
-                        cursor_visible_clone.set(true);
-                    } else {
-                        cursor_visible_clone.set(!cursor_visible_clone.get());
-                    }
-                }
-
-                let cmd = pending_cmd_clone.borrow();
-                let preedit = pending_preedit_clone.borrow();
-                let suggestion = pending_suggestion_clone.borrow();
-
-                let cur_pos = cursor_offset_clone.get();
-                let default_pos = cmd.chars().count() + preedit.chars().count();
-                let explicit_pos = if cur_pos != default_pos { Some(cur_pos) } else { None };
-
-                set_active_command_buffer_at(
-                    &command_buffer_clone,
-                    &cmd,
-                    &preedit,
-                    cursor_visible_clone.get(),
-                    &suggestion,
-                    &cursor_color_for_timer,
-                    &cursor_foreground_for_timer,
-                    explicit_pos,
-                );
-
-                glib::ControlFlow::Continue
+            let av = active_vte.clone();
+            active_vte.connect_realize(move |_| {
+                av.grab_focus();
             });
-            *blink_timer_handle.borrow_mut() = Some(handle);
-
-            set_active_command_buffer_at(
-                &command_buffer,
-                "",
-                "",
-                true,
-                "",
-                &config.cursor,
-                &config.cursor_foreground,
-                None,
-            );
+        }
+        // realize fires before the toplevel is presented, so grab_focus there
+        // can be lost. connect_map fires when the VTE actually becomes visible
+        // (window shown / tab switched), which is the reliable point to take
+        // keyboard focus.
+        {
+            let av = active_vte.clone();
+            active_vte.connect_map(move |_| {
+                av.grab_focus();
+            });
         }
 
         ActiveBlock {
             widget,
-            prompt_buffer,
-            command_view,
-            command_buffer,
-            output_vte,
+            active_vte,
             raw_output: Rc::new(RefCell::new(Vec::new())),
-            output_newlines: Rc::new(Cell::new(0)),
-            output_bytes: Rc::new(Cell::new(0)),
-            output_max_row: Rc::new(Cell::new(0)),
-            pending_cmd,
-            pending_preedit,
-            pending_suggestion,
-            cursor_visible,
-            cursor_offset,
-            command_running,
-            cursor_color: config.cursor,
-            cursor_foreground: config.cursor_foreground,
-            cwd_label,
-            running_label,
-            running_timer_handle: Rc::new(RefCell::new(None)),
-            blink_timer_handle,
-            pty_cols: Rc::new(Cell::new(0)),
         }
     }
 
-    pub(crate) fn cancel_blink_timer(&self) {
-        if let Some(handle) = self.blink_timer_handle.borrow_mut().take() {
-            handle.remove();
+    /// Append raw command-output bytes to the snapshot buffer (bounded). The bytes
+    /// are also fed to the live VTE separately by the reader; this buffer is only
+    /// the source the finalize path styles into a finished block.
+    pub(crate) fn accumulate_output(&self, raw_bytes: &[u8]) {
+        let mut buf = self.raw_output.borrow_mut();
+        buf.extend_from_slice(raw_bytes);
+        if buf.len() > super::MAX_RAW_OUTPUT_BYTES {
+            let drop = buf.len() - super::MAX_RAW_OUTPUT_BYTES;
+            buf.drain(..drop);
         }
-    }
-
-    pub(crate) fn set_prompt(&self, text: &str) {
-        set_active_prompt_buffer(&self.prompt_buffer, text);
-    }
-
-    pub(crate) fn update_cwd(&self, cwd: &str) {
-        if cwd.is_empty() {
-            self.cwd_label.set_visible(false);
-        } else {
-            self.cwd_label.set_text(&shorten_path(cwd));
-            self.cwd_label.set_visible(true);
-        }
-    }
-
-    pub(crate) fn set_cmd(&self, text: &str) {
-        log::debug!("set_cmd: text={:?}", text);
-        *self.pending_cmd.borrow_mut() = text.to_string();
-        self.pending_preedit.borrow_mut().clear();
-        *self.pending_suggestion.borrow_mut() = String::new();
-        self.cursor_offset.set(text.chars().count());
-        self.update_content_view();
-    }
-
-    pub(crate) fn set_preedit(&self, text: &str) {
-        *self.pending_preedit.borrow_mut() = text.to_string();
-        self.update_content_view();
-    }
-
-    pub(crate) fn set_cmd_parts(&self, user_part: &str, suggestion_part: &str) {
-        let user_plain = plain_text_from_ansi(user_part);
-        let suggestion_plain = plain_text_from_ansi(suggestion_part);
-
-        log::debug!(
-            "set_cmd_parts: user={:?}, suggestion={:?}",
-            user_plain,
-            suggestion_plain
-        );
-
-        *self.pending_cmd.borrow_mut() = user_plain;
-        self.pending_preedit.borrow_mut().clear();
-        *self.pending_suggestion.borrow_mut() = suggestion_plain;
-        self.update_content_view();
-    }
-
-    pub(crate) fn update_content_view(&self) {
-        if self.command_view.is_editable() {
-            return;
-        }
-        let cmd = self.pending_cmd.borrow();
-        let preedit = self.pending_preedit.borrow();
-        let suggestion = self.pending_suggestion.borrow();
-        log::debug!(
-            "update_content_view: cmd={:?}, suggestion={:?}, cursor_visible={}",
-            cmd,
-            suggestion,
-            self.cursor_visible.get()
-        );
-
-        let cursor_pos = self.cursor_offset.get();
-        let default_pos = cmd.chars().count() + preedit.chars().count();
-        let explicit_pos = if cursor_pos != default_pos {
-            Some(cursor_pos)
-        } else {
-            None
-        };
-
-        // Suppress the input cursor while a command runs: the live cursor then
-        // belongs to the output VTE (see command_running).
-        let cursor_visible = self.cursor_visible.get() && !self.command_running.get();
-
-        set_active_command_buffer_at(
-            &self.command_buffer,
-            &cmd,
-            &preedit,
-            cursor_visible,
-            &suggestion,
-            &self.cursor_color,
-            &self.cursor_foreground,
-            explicit_pos,
-        );
-    }
-
-    pub(crate) fn feed_output(&self, raw_bytes: &[u8]) {
-        let _pf = if super::prof_enabled() { Some(std::time::Instant::now()) } else { None };
-        if !self.output_vte.is_visible() {
-            self.output_vte.set_visible(true);
-        }
-        // Derive the wrap width from the BLOCK CONTAINER's allocation, NOT the
-        // output VTE's own. feed_output runs in the PTY reader callback, before
-        // the layout pass that allocates the just-shown VTE, so the output VTE
-        // still reports its pre-realization ~2px allocation here — and its
-        // column_count stays pinned at VTE's 80-column default. Sizing the grid
-        // from that stale 80 made every long line wrap at 80 while the shell was
-        // told the real (narrower) PTY width by the resize tick, so raw output
-        // wider than the screen wrapped in the wrong place. The block container
-        // is realized and stable, so (container_w - chrome) / char_w yields the
-        // SAME column count the tick sends to the PTY — keeping grid == PTY, the
-        // way a real terminal does.
-        let char_width = self.output_vte.char_width();
-        let container_width = self.widget.allocated_width() as i64;
-        let mut cols = self.output_vte.column_count();
-        let _dbg_colcount = cols;
-        // Use the exact PTY width the resize tick committed, so the live grid wraps
-        // where the program (and a real terminal) does. Before the first tick, fall
-        // back to the container-derived estimate.
-        let pty_cols = self.pty_cols.get() as i64;
-        if pty_cols >= 20 {
-            cols = pty_cols;
-        } else if char_width > 0 && container_width > char_width * 40 {
-            cols = ((container_width - super::OUTPUT_GRID_CHROME_PX) / char_width).max(20);
-        }
-        if std::env::var("JT_WDBG").is_ok() {
-            eprintln!("[WDBG feed] column_count={} char_w={} container_w={} -> cols={} (first={})",
-                _dbg_colcount, char_width, container_width, cols, raw_bytes.len() < 4000 && self.output_bytes.get()==0);
-        }
-        // Accumulate raw bytes first so we can estimate from total content.
-        // Track newline/byte totals incrementally — only scan the NEW chunk — so this
-        // stays O(chunk) instead of O(total) on every feed (was quadratic for big output).
-        {
-            let mut buf = self.raw_output.borrow_mut();
-            buf.extend_from_slice(raw_bytes);
-            // Bound memory for runaway output: keep only the most recent tail.
-            if buf.len() > super::MAX_RAW_OUTPUT_BYTES {
-                let drop = buf.len() - super::MAX_RAW_OUTPUT_BYTES;
-                buf.drain(..drop);
-            }
-        }
-        let new_newlines = raw_bytes.iter().filter(|&&b| b == b'\n').count() as i64;
-        let total_newlines = self.output_newlines.get() + new_newlines;
-        self.output_newlines.set(total_newlines);
-        let total_bytes = self.output_bytes.get() + raw_bytes.len() as i64;
-        self.output_bytes.set(total_bytes);
-        let wrap_extra = if cols > 0 {
-            total_bytes / cols
-        } else {
-            0
-        };
-        // Pre-size the grid to a GENEROUS upper bound before feeding. Because bytes
-        // include ANSI escapes and UTF-8 continuation bytes, total_bytes/cols can
-        // only ever over-count the real number of wrapped rows, so this guarantees
-        // all freshly fed content lands in the visible grid (never in scrollback) —
-        // which is what makes the cursor-row read below an accurate height. Capped
-        // at MAX_INLINE_OUTPUT_ROWS (the output VTE's scrollback bound) so a runaway
-        // command can't try to make the widget millions of rows tall.
-        let upper = (total_newlines + wrap_extra + 2).min(MAX_INLINE_OUTPUT_ROWS);
-        let current_rows = self.output_vte.row_count();
-        if upper > current_rows || cols != self.output_vte.column_count() {
-            self.output_vte.set_size(cols, upper.max(current_rows));
-        }
-        self.output_vte.feed(raw_bytes);
-
-        // Trim to the ACTUAL content height. VTE parses feed() synchronously, and
-        // since the grid was sized to `upper` >= content, the whole output is in the
-        // grid and the cursor row is the high-water mark of rows used. A real
-        // terminal shows output flush with no trailing blank rows; the byte estimate
-        // over-grows the block (badly for carriage-return progress bars that emit
-        // megabytes with no newlines), so collapse the grid back to what's used.
-        let (_ccol, crow) = self.output_vte.cursor_position();
-        let high = self.output_max_row.get().max(crow + 1);
-        self.output_max_row.set(high);
-        // Floor at the newline count (a hard lower bound for line-oriented output) so
-        // a program that parks the cursor higher up can't shrink the grid under real
-        // content. Wrapped output exceeds this floor and is captured by `high`.
-        let needed_rows = high.max(total_newlines + 1).min(MAX_INLINE_OUTPUT_ROWS);
-        if needed_rows != self.output_vte.row_count() {
-            self.output_vte.set_size(cols, needed_rows);
-        }
-        self.output_vte.queue_resize();
-        if let Some(t) = _pf {
-            super::prof!("    feed_output: {} bytes in {}us (newlines={}, rows={}, cursor_row={})",
-                raw_bytes.len(), t.elapsed().as_micros(), total_newlines, needed_rows, crow);
-        }
-    }
-
-    pub(crate) fn flush_output(&self) {
-        // VTE renders immediately on feed(), no flush needed
-    }
-
-    /// The column count the live output VTE is wrapping at — computed exactly the
-    /// way `feed_output` derives the grid width (and the way the resize tick sizes
-    /// the PTY), so a finished block can be pre-wrapped at the SAME column the user
-    /// just watched the running command wrap at. Keeps the finished render byte-for-
-    /// byte aligned with the live one (and with a real terminal).
-    pub(crate) fn output_grid_cols(&self) -> usize {
-        // Prefer the exact PTY width the resize tick last sent — what the program
-        // actually wrapped at. Fall back to the container-derived estimate only
-        // before the first tick has run.
-        let pty_cols = self.pty_cols.get();
-        if pty_cols >= 20 {
-            return pty_cols as usize;
-        }
-        let char_width = self.output_vte.char_width();
-        let container_width = self.widget.allocated_width() as i64;
-        let mut cols = self.output_vte.column_count();
-        if char_width > 0 && container_width > char_width * 40 {
-            cols = ((container_width - super::OUTPUT_GRID_CHROME_PX) / char_width).max(20);
-        }
-        cols.max(20) as usize
     }
 
     pub(crate) fn output_text(&self) -> String {
@@ -1256,100 +866,24 @@ impl ActiveBlock {
         String::from_utf8_lossy(&raw).into_owned()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn visible_output_text(&self) -> String {
-        let rows = self.output_vte.row_count();
-        let cols = self.output_vte.column_count();
-        if rows <= 0 || cols <= 0 {
-            return String::new();
-        }
-        let (text, _) = self.output_vte.text_range_format(
-            vte4::Format::Text,
-            0,
-            0,
-            rows.saturating_sub(1),
-            cols,
-        );
-        let raw = text.map(|s| s.to_string()).unwrap_or_default();
-        // Trim trailing empty lines left by pre-grown VTE rows
-        raw.trim_end().to_string()
-    }
-
-    pub(crate) fn append_output(&self, text: &str) {
-        self.feed_output(text.as_bytes());
-    }
-
-    /// Clear the accumulated output buffer and its incremental counters without
-    /// touching the VTE widget. Use when discarding transient content (e.g. a
-    /// completion menu) that was fed to output_vte but isn't real command output.
+    /// Clear the accumulated output buffer (without touching the VTE).
     pub(crate) fn reset_output_buffer(&self) {
         self.raw_output.borrow_mut().clear();
-        self.output_newlines.set(0);
-        self.output_bytes.set(0);
-        self.output_max_row.set(0);
     }
 
-    pub(crate) fn clear_output(&self) {
+    /// The column count the live VTE is wrapping at — the single source of truth
+    /// for pre-wrapping finished blocks so they align with what the user watched.
+    pub(crate) fn grid_cols(&self) -> usize {
+        (self.active_vte.column_count().max(20)) as usize
+    }
+
+    /// Reset the live VTE for the next prompt (jterm1 block.rs:1028-1044). `reset`
+    /// acts immediately, but already-queued feed() bytes are processed async, so the
+    /// in-stream clear (fed after them) wipes stale output in the correct order.
+    pub(crate) fn reset_active(&self) {
+        self.active_vte.reset(true, true);
+        self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
         self.raw_output.borrow_mut().clear();
-        self.output_newlines.set(0);
-        self.output_bytes.set(0);
-        self.output_max_row.set(0);
-        self.output_vte.feed(b"\x1b[2J\x1b[H\x1b[3J");
-        self.output_vte.reset(true, true);
-        let cols = self.output_vte.column_count().max(80);
-        self.output_vte.set_size(cols, 1);
-        self.output_vte.set_visible(false);
-    }
-
-    pub(crate) fn start_command(&self, command: &str) {
-        *self.pending_cmd.borrow_mut() = command.to_string();
-        self.pending_preedit.borrow_mut().clear();
-        self.pending_suggestion.borrow_mut().clear();
-        self.command_running.set(true);
-        self.clear_output();
-        self.command_buffer.set_text("");
-    }
-
-    pub(crate) fn start_timer(&self) {
-        self.stop_timer();
-        self.running_label.set_text("0s");
-        self.running_label.set_visible(true);
-        let label = self.running_label.clone();
-        let start = std::time::Instant::now();
-        let handle = glib::timeout_add_local(
-            std::time::Duration::from_secs(1),
-            move || {
-                let elapsed = start.elapsed().as_secs();
-                let text = if elapsed < 60 {
-                    format!("{}s", elapsed)
-                } else {
-                    format!("{}m{}s", elapsed / 60, elapsed % 60)
-                };
-                label.set_text(&text);
-                glib::ControlFlow::Continue
-            },
-        );
-        *self.running_timer_handle.borrow_mut() = Some(handle);
-    }
-
-    pub(crate) fn stop_timer(&self) {
-        if let Some(handle) = self.running_timer_handle.borrow_mut().take() {
-            handle.remove();
-        }
-        self.running_label.set_visible(false);
-    }
-
-    pub(crate) fn reset_for_next_prompt(&self) {
-        self.stop_timer();
-        self.set_prompt("");
-        *self.pending_cmd.borrow_mut() = String::new();
-        self.pending_preedit.borrow_mut().clear();
-        self.pending_suggestion.borrow_mut().clear();
-        self.command_running.set(false);
-        self.clear_output();
-        self.cursor_visible.set(true);
-        self.cursor_offset.set(0);
-        self.command_buffer.set_text("");
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
@@ -1357,7 +891,7 @@ impl ActiveBlock {
     }
 
     pub(crate) fn grab_focus(&self) {
-        self.command_view.grab_focus();
+        self.active_vte.grab_focus();
     }
 }
 

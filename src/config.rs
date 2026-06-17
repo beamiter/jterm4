@@ -175,15 +175,12 @@ pub struct Config {
     // Block view optimizations
     pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
-    pub(crate) output_batch_min_ms: u32,
-    pub(crate) output_batch_max_ms: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
-    pub(crate) editor_input: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
 }
@@ -374,15 +371,12 @@ struct FileConfig {
     // Block view optimizations
     ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
-    output_batch_min_ms: Option<u32>,
-    output_batch_max_ms: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
-    editor_input: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
 }
 
@@ -425,15 +419,12 @@ fn load_file_config() -> FileConfig {
         sidebar_width: table.get("sidebar_width").and_then(|v| v.as_integer()).map(|v| v as u32),
         ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
-        output_batch_min_ms: table.get("output_batch_min_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
-        output_batch_max_ms: table.get("output_batch_max_ms").and_then(|v| v.as_integer()).map(|v| v as u32),
         lazy_load_threshold: table.get("lazy_load_threshold").and_then(|v| v.as_integer()).map(|v| v as u32),
         truncation_threshold_lines: table.get("truncation_threshold_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_collapsed_output_lines: table.get("max_collapsed_output_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
         virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
-        editor_input: table.get("editor_input").and_then(|v| v.as_bool()),
         remote_hosts,
     }
 }
@@ -572,12 +563,6 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200);
-    let output_batch_min_ms = env_u32("JTERM4_BATCH_MIN")
-        .or(fc.output_batch_min_ms)
-        .unwrap_or(10);
-    let output_batch_max_ms = env_u32("JTERM4_BATCH_MAX")
-        .or(fc.output_batch_max_ms)
-        .unwrap_or(100);
     let lazy_load_threshold = env_u32("JTERM4_LAZY_LINES")
         .or(fc.lazy_load_threshold)
         .unwrap_or(1000);
@@ -629,15 +614,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
         ansi_cache_capacity,
         max_visible_blocks,
-        output_batch_min_ms,
-        output_batch_max_ms,
         lazy_load_threshold,
         truncation_threshold_lines,
         max_collapsed_output_lines,
         virtual_scroll_margin,
         block_history_path,
         block_history_compress,
-        editor_input: fc.editor_input.unwrap_or(true),
         remote_hosts: fc.remote_hosts,
     };
 

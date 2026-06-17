@@ -170,19 +170,10 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: inset 3px 0 0 0 {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.35);
         }}
         .block-active {{
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
-            border-left: 3px solid {accent};
-            border-radius: 10px;
-            margin: 6px 8px;
-            padding-top: 4px;
-            padding-bottom: 4px;
-            background-color: {block_bg_hex};
-            min-height: 40px;
-            transition: box-shadow 140ms ease, border-color 140ms ease;
-        }}
-        .block-active:focus-within {{
-            border-color: {accent};
-            box-shadow: 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.45), 0 6px 18px rgba(0,0,0,0.30);
+            border: none;
+            margin: 0;
+            padding: 0;
+            background-color: {bg_hex};
         }}
         .block-prompt-chevron {{
             color: {accent};

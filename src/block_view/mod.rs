@@ -9,7 +9,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use vte4::Terminal;
-use vte4::TerminalExt;
+use vte4::{TerminalExt, TerminalExtManual};
+use gtk4::gdk::RGBA;
 
 use crate::config::Config;
 use crate::parser::{Parser, ParserEvent};
@@ -36,18 +37,6 @@ pub(crate) fn prof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("JTERM_PROF").is_ok())
 }
-fn prof_now_us() -> u128 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_micros()
-}
-macro_rules! prof {
-    ($($arg:tt)*) => {
-        if prof_enabled() {
-            eprintln!("[PROF {:>10}us] {}", prof_now_us(), format!($($arg)*));
-        }
-    };
-}
-pub(crate) use prof;
 
 // Global block ID counter
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -56,13 +45,7 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Upper bound on rows for the inline per-command output VTE. Matches the output
-/// VTE scrollback (build_output_vte) so we never size the widget taller than the
-/// content it can actually retain. Bounds resource use for runaway output.
-const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
-
-/// Cap on the retained raw output buffer for a single running command. The inline
-/// output VTE already bounds its scrollback (MAX_INLINE_OUTPUT_ROWS), but the raw
+/// Cap on the retained raw output buffer for a single running command. The raw
 /// byte buffer used to re-render the finished block grew without bound — a runaway
 /// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
 /// buffer exceeds this, the oldest bytes are dropped, keeping the most recent tail
@@ -70,51 +53,23 @@ const MAX_INLINE_OUTPUT_ROWS: i64 = 10_000;
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Cap on bytes buffered in the Idle pre-prompt grace window. Without shell
-/// integration, PromptStart never arrives and these bytes accumulate until the
-/// 500ms fallback timer fires; a chatty startup could balloon this. Past the cap
-/// we just stop buffering — the fallback replays what we have.
-const MAX_IDLE_BUFFER_BYTES: usize = 256 * 1024;
-
-/// Horizontal pixels between the block container's allocation and the output
-/// text grid: `.block-active` margin (8+8) + border (3 left + 1 right) = 20px
-/// (see css.rs). Both the resize tick (which derives the PTY column count) and
-/// `feed_output` (which sizes the output VTE grid) subtract this from the block
-/// container width so the shell is told EXACTLY the column count the grid wraps
-/// at — a real terminal guarantees PTY width == grid width.
-pub(crate) const OUTPUT_GRID_CHROME_PX: i64 = 20;
-
-/// Erase the alt VTE before a new full-screen command reuses it: erase display
-/// (`2J`), erase scrollback (`3J`), and home the cursor (`H`). Fed through VTE's
-/// data pipeline rather than `Terminal::reset`, because reset only clears modes
-/// and scrollback — it leaves the visible grid intact, so the previous command's
-/// screen would leak into the next block's captured output.
-const ALT_VTE_CLEAR: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
-
-/// Force the shared alt VTE back to its pre-allocation default grid before a new
-/// full-screen command reuses it. The widget renders fed data into its grid only
-/// when a `size_allocate` flushes the pending feed: on the very first alt-screen
-/// entry the widget grows from this 80x24 default to the real grid when shown,
-/// and that resize is what processes the feed. On later entries the widget keeps
-/// the previous alt grid, so showing it triggers no resize and the fed frame is
-/// never processed — leaving an empty block. Resetting the size here reinstates
-/// the known-good grow-on-show path for every entry. The transient size is
-/// immediately overridden by the next allocation, so it never reaches the user.
-fn reset_alt_vte_grid(vte: &Terminal) {
-    vte.set_size(80, 24);
-}
-
 #[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
     block_scroll: ScrolledWindow,
     block_list: gtk4::Box,
-    vte_box: gtk4::Box,
-    vte: Terminal,
+    /// The single persistent live VTE (jterm1 model): prompt + typing + output all
+    /// render here natively; finished commands snapshot into styled blocks above.
+    active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
     prompt_buf: Rc<RefCell<String>>,
     cmd_buf: Rc<RefCell<String>>,
+    /// Command line reconstructed from VTE `commit` keystrokes while awaiting a
+    /// command — the source the finalize path styles into the finished block.
+    typed_cmd: Rc<RefCell<String>>,
+    /// True while an alt-screen app owns the viewport (finished blocks hidden).
+    fullscreen: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
     cwd_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
@@ -148,30 +103,25 @@ impl Drop for TermView {
     }
 }
 
-/// Captures the ~46 shared handles the PTY reader/exit callbacks need, so
-/// `TermView::new` does not carry an 800-line closure inline.
+/// Captures the shared handles the PTY reader/exit callbacks need, so
+/// `TermView::new` does not carry the reader closure inline.
 struct ReaderCtx {
     active_rc: Rc<RefCell<ActiveBlock>>,
+    /// The live VTE — every byte is fed here; alt-screen toggles feed it 1049h/l.
+    active_vte: Terminal,
     bstate_rc: Rc<Cell<BlockState>>,
-    /// True while the alt-screen was entered from `AwaitingCommand` (an
-    /// interactive widget at the prompt, e.g. fzf, rather than a submitted
-    /// command). On leave we return to `AwaitingCommand` instead of
-    /// `CollectingOutput`.
-    alt_from_awaiting_rc: Rc<Cell<bool>>,
-    cursor_hide_pending_rc: Rc<Cell<bool>>,
+    /// State to restore when an alt-screen app exits (jterm1 model).
+    prev_state_rc: Rc<Cell<BlockState>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
     cmd_buf_rc: Rc<RefCell<String>>,
-    cmd_display_raw_rc: Rc<RefCell<String>>,
-    cmd_display_markup_rc: Rc<RefCell<String>>,
-    last_nonempty_cmd_raw_rc: Rc<RefCell<String>>,
-    last_nonempty_cmd_markup_rc: Rc<RefCell<String>>,
-    executing_cmd_raw_rc: Rc<RefCell<String>>,
-    executing_cmd_markup_rc: Rc<RefCell<String>>,
+    /// Keystroke-reconstructed command line (built in connect_commit).
+    typed_cmd_rc: Rc<RefCell<String>>,
+    /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
+    /// finalize path since prompt_buf is cleared once the prompt ends.
+    prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
-    vte_for_alt: Terminal,
-    vte_box_rc: gtk4::Box,
     cwd_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     bell_cbs: VoidCallbacks,
@@ -191,14 +141,10 @@ struct ReaderCtx {
     scroll_debouncer: ScrollDebouncer,
     ansi_cache_for_cb: Rc<RefCell<LruCache<String, String>>>,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
-    editor_input_for_cb: bool,
-    tab_pending_rc: Rc<Cell<bool>>,
     pty_synced_rc: Rc<Cell<bool>>,
-    completion_active_rc: Rc<Cell<bool>>,
-    isearch_active_rc: Rc<Cell<bool>>,
+    visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen_rc: Rc<Cell<bool>>,
     ftcs_seen_rc: Rc<Cell<bool>>,
-    idle_buf_rc: Rc<RefCell<Vec<u8>>>,
-    fallback_armed_rc: Rc<Cell<bool>>,
     init_cmds_queue_for_cb: Rc<RefCell<std::collections::VecDeque<String>>>,
     pty_for_init: Rc<OwnedPty>,
     block_start_time_for_cb: Rc<Cell<Option<SystemTime>>>,
@@ -211,22 +157,16 @@ impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
             active_rc,
+            active_vte,
             bstate_rc,
-            alt_from_awaiting_rc,
-            cursor_hide_pending_rc,
+            prev_state_rc,
             osc133_depth_rc,
             prompt_buf_rc,
             cmd_buf_rc,
-            cmd_display_raw_rc,
-            cmd_display_markup_rc,
-            last_nonempty_cmd_raw_rc,
-            last_nonempty_cmd_markup_rc,
-            executing_cmd_raw_rc,
-            executing_cmd_markup_rc,
+            typed_cmd_rc,
+            prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
-            vte_for_alt,
-            vte_box_rc,
             cwd_cbs,
             exited_cbs,
             bell_cbs,
@@ -246,14 +186,10 @@ impl ReaderCtx {
             scroll_debouncer,
             ansi_cache_for_cb,
             widget_pool_for_cb,
-            editor_input_for_cb,
-            tab_pending_rc,
             pty_synced_rc,
-            completion_active_rc,
-            isearch_active_rc,
+            visible_indices_rc,
+            fullscreen_rc,
             ftcs_seen_rc,
-            idle_buf_rc,
-            fallback_armed_rc,
             init_cmds_queue_for_cb,
             pty_for_init,
             block_start_time_for_cb,
@@ -261,1175 +197,653 @@ impl ReaderCtx {
             current_cwd_for_cb,
             event_buf,
         } = self;
-            pty.start_reader(
-                move |data: Vec<u8>| {
-                    let _prof_cb_start = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
-                    prof!("CB enter: {} bytes, state={:?}", data.len(), bstate_rc.get());
-                    log::debug!("PTY data: {} bytes, state={:?}", data.len(), bstate_rc.get());
-                    if data.len() < 512 {
-                        log::debug!("PTY hex: {:02x?}", &data);
-                    }
-                    // PTY sizing is owned solely by the resize tick callback
-                    // (install_resize_tick), which keeps cols == the output grid
-                    // width and rows == the visible viewport height, updating only
-                    // on real allocation changes — exactly like a normal terminal.
-                    // The old per-chunk resize here hardcoded rows=24, fighting the
-                    // tick callback and leaving the shell on a 24-row terminal
-                    // (breaking `tput lines`, `clear`, and any non-alt TUI) plus
-                    // firing spurious SIGWINCHs the program had to react to.
-                    let mut events = event_buf.borrow_mut();
-                    events.clear();
-                    parser.borrow_mut().feed(&data, &mut events);
-                    prof!("CB after-parse: {} events", events.len());
+        let _ = &ansi_cache_for_cb;
+        pty.start_reader(
+            move |data: Vec<u8>| {
+                let mut events = event_buf.borrow_mut();
+                events.clear();
+                parser.borrow_mut().feed(&data, &mut events);
 
-                    for event in events.iter() {
-                        let state = bstate_rc.get();
-                        log::debug!("ParserEvent: {:?} (state={:?})", event, state);
-                        match event {
-                            ParserEvent::Bytes(bytes) => {
-                                // Check for bell character (BEL = 0x07) and trigger callbacks.
-                                // Ignore BELs that merely terminate an OSC sequence (e.g.
-                                // OSC 0/2 title updates), which are not real bells.
-                                if contains_bell(bytes) {
-                                    for cb in bell_cbs.borrow().iter() {
+                for event in events.iter() {
+                    let state = bstate_rc.get();
+                    match event {
+                        ParserEvent::Bytes(bytes) => {
+                            // Bell (real BEL, not an OSC terminator).
+                            if contains_bell(bytes) {
+                                for cb in bell_cbs.borrow().iter() {
+                                    cb();
+                                }
+                            }
+
+                            // Single-pass byte scan for control sequences
+                            {
+                                let mut i = 0;
+                                while i < bytes.len() {
+                                    if bytes[i] == 0x1b && i + 1 < bytes.len() {
+                                        match bytes[i + 1] {
+                                            b']' => {
+                                                if i + 3 < bytes.len()
+                                                    && (bytes[i + 2] == b'0' || bytes[i + 2] == b'2')
+                                                    && bytes[i + 3] == b';'
+                                                {
+                                                    let title_start = i + 4;
+                                                    let mut title_end = title_start;
+                                                    while title_end < bytes.len() {
+                                                        if bytes[title_end] == 0x07 {
+                                                            break;
+                                                        }
+                                                        if bytes[title_end] == 0x1b
+                                                            && title_end + 1 < bytes.len()
+                                                            && bytes[title_end + 1] == b'\\'
+                                                        {
+                                                            break;
+                                                        }
+                                                        title_end += 1;
+                                                    }
+                                                    if title_end > title_start {
+                                                        if let Ok(title) = std::str::from_utf8(&bytes[title_start..title_end]) {
+                                                            for cb in title_cbs.borrow().iter() {
+                                                                cb(title);
+                                                            }
+                                                        }
+                                                    }
+                                                    i = title_end;
+                                                }
+                                            }
+                                            b'[' => {
+                                                if i + 2 < bytes.len() && bytes[i + 2] == b'?' {
+                                                    let seq_start = i + 3;
+                                                    let mut seq_end = seq_start;
+                                                    while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b';') {
+                                                        seq_end += 1;
+                                                    }
+                                                    if seq_end < bytes.len() {
+                                                        let final_byte = bytes[seq_end];
+                                                        let param_slice = &bytes[seq_start..seq_end];
+                                                        match (param_slice, final_byte) {
+                                                            (b"2004", b'h') => bracketed_paste_rc.set(true),
+                                                            (b"2004", b'l') => bracketed_paste_rc.set(false),
+                                                            (b"1", b'h') => application_cursor_rc.set(true),
+                                                            (b"1", b'l') => application_cursor_rc.set(false),
+                                                            (b"1000", b'h') => mouse_reporting_rc.set(MouseReportingMode::Click),
+                                                            (b"1002", b'h') => mouse_reporting_rc.set(MouseReportingMode::Button),
+                                                            (b"1003", b'h') => mouse_reporting_rc.set(MouseReportingMode::Motion),
+                                                            (b"1006", b'h') => mouse_reporting_rc.set(MouseReportingMode::Sgr),
+                                                            (b"1000", b'l') => {
+                                                                if mouse_reporting_rc.get() == MouseReportingMode::Click {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                            }
+                                                            (b"1002", b'l') => {
+                                                                if mouse_reporting_rc.get() == MouseReportingMode::Button {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                            }
+                                                            (b"1003", b'l') => {
+                                                                if mouse_reporting_rc.get() == MouseReportingMode::Motion {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                            }
+                                                            (b"1006", b'l') => {
+                                                                if mouse_reporting_rc.get() == MouseReportingMode::Sgr {
+                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                        i = seq_end;
+                                                    }
+                                                } else {
+                                                    let seq_start = i + 2;
+                                                    let mut seq_end = seq_start;
+                                                    while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b' ') {
+                                                        seq_end += 1;
+                                                    }
+                                                    if seq_end < bytes.len() && bytes[seq_end] == b'q' {
+                                                        let param_slice = &bytes[seq_start..seq_end];
+                                                        let param_str = param_slice.iter()
+                                                            .filter(|b| b.is_ascii_digit())
+                                                            .copied()
+                                                            .collect::<Vec<u8>>();
+                                                        match param_str.as_slice() {
+                                                            b"0" | b"1" | b"2" => cursor_shape_rc.set(TermCursorShape::Block),
+                                                            b"3" | b"4" => cursor_shape_rc.set(TermCursorShape::Underline),
+                                                            b"5" | b"6" => cursor_shape_rc.set(TermCursorShape::Bar),
+                                                            _ => {}
+                                                        }
+                                                        i = seq_end;
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    i += 1;
+                                }
+                            }
+
+                            // No shell integration seen yet: once real output flows,
+                            // stream everything into the live VTE (raw fallback).
+                            if state == BlockState::Idle {
+                                bstate_rc.set(BlockState::RawFallback);
+                            }
+
+                            match bstate_rc.get() {
+                                BlockState::CollectingPrompt => {
+                                    let text = String::from_utf8_lossy(bytes);
+                                    prompt_buf_rc.borrow_mut().push_str(&text);
+                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                }
+                                BlockState::AwaitingCommand => {
+                                    let text = String::from_utf8_lossy(bytes);
+                                    cmd_buf_rc.borrow_mut().push_str(&text);
+                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                }
+                                BlockState::CollectingOutput | BlockState::PostCommand => {
+                                    active_rc.borrow().accumulate_output(bytes);
+                                    for cb in activity_cbs.borrow().iter() {
                                         cb();
                                     }
+                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
                                 }
-
-                                // Single-pass byte scan for control sequences
-                                {
-                                    let mut i = 0;
-                                    while i < bytes.len() {
-                                        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-                                            match bytes[i + 1] {
-                                                b']' => {
-                                                    // OSC: check for title (OSC 0; or OSC 2;)
-                                                    if i + 3 < bytes.len()
-                                                        && (bytes[i + 2] == b'0' || bytes[i + 2] == b'2')
-                                                        && bytes[i + 3] == b';'
-                                                    {
-                                                        let title_start = i + 4;
-                                                        let mut title_end = title_start;
-                                                        while title_end < bytes.len() {
-                                                            if bytes[title_end] == 0x07 {
-                                                                break;
-                                                            }
-                                                            if bytes[title_end] == 0x1b
-                                                                && title_end + 1 < bytes.len()
-                                                                && bytes[title_end + 1] == b'\\'
-                                                            {
-                                                                break;
-                                                            }
-                                                            title_end += 1;
-                                                        }
-                                                        if title_end > title_start {
-                                                            if let Ok(title) = std::str::from_utf8(&bytes[title_start..title_end]) {
-                                                                for cb in title_cbs.borrow().iter() {
-                                                                    cb(title);
-                                                                }
-                                                            }
-                                                        }
-                                                        i = title_end;
-                                                    }
-                                                }
-                                                b'[' => {
-                                                    // CSI: check for mode sequences
-                                                    if i + 2 < bytes.len() && bytes[i + 2] == b'?' {
-                                                        let seq_start = i + 3;
-                                                        let mut seq_end = seq_start;
-                                                        while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b';') {
-                                                            seq_end += 1;
-                                                        }
-                                                        if seq_end < bytes.len() {
-                                                            let final_byte = bytes[seq_end];
-                                                            let param_slice = &bytes[seq_start..seq_end];
-                                                            match (param_slice, final_byte) {
-                                                                (b"2004", b'h') => {
-                                                                    bracketed_paste_rc.set(true);
-                                                                }
-                                                                (b"2004", b'l') => {
-                                                                    bracketed_paste_rc.set(false);
-                                                                }
-                                                                (b"1", b'h') => {
-                                                                    application_cursor_rc.set(true);
-                                                                }
-                                                                (b"1", b'l') => {
-                                                                    application_cursor_rc.set(false);
-                                                                }
-                                                                (b"1000", b'h') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::Click);
-                                                                }
-                                                                (b"1002", b'h') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::Button);
-                                                                }
-                                                                (b"1003", b'h') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::Motion);
-                                                                }
-                                                                (b"1006", b'h') => {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::Sgr);
-                                                                }
-                                                                // A reset (`l`) only disables reporting when it
-                                                                // targets the mode that is actually active. This
-                                                                // prevents e.g. `?1000l` from clearing reporting
-                                                                // when a different mode (`?1006h`) is still on.
-                                                                (b"1000", b'l') => {
-                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Click {
-                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                    }
-                                                                }
-                                                                (b"1002", b'l') => {
-                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Button {
-                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                    }
-                                                                }
-                                                                (b"1003", b'l') => {
-                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Motion {
-                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                    }
-                                                                }
-                                                                (b"1006", b'l') => {
-                                                                    if mouse_reporting_rc.get() == MouseReportingMode::Sgr {
-                                                                        mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                    }
-                                                                }
-                                                                _ => {}
-                                                            }
-                                                            i = seq_end;
-                                                        }
-                                                    } else {
-                                                        // Non-? CSI: check for DECSCUSR (cursor shape: CSI Ps SP q)
-                                                        let seq_start = i + 2;
-                                                        let mut seq_end = seq_start;
-                                                        while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b' ') {
-                                                            seq_end += 1;
-                                                        }
-                                                        if seq_end < bytes.len() && bytes[seq_end] == b'q' {
-                                                            // DECSCUSR: extract parameter digit
-                                                            let param_slice = &bytes[seq_start..seq_end];
-                                                            let param_str = param_slice.iter()
-                                                                .filter(|b| b.is_ascii_digit())
-                                                                .copied()
-                                                                .collect::<Vec<u8>>();
-                                                            match param_str.as_slice() {
-                                                                b"0" | b"1" | b"2" => cursor_shape_rc.set(TermCursorShape::Block),
-                                                                b"3" | b"4" => cursor_shape_rc.set(TermCursorShape::Underline),
-                                                                b"5" | b"6" => cursor_shape_rc.set(TermCursorShape::Bar),
-                                                                _ => {}
-                                                            }
-                                                            i = seq_end;
-                                                        }
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                        i += 1;
+                                BlockState::AltScreen => {
+                                    // A pager repainting a fresh page clears the screen
+                                    // first; snapshot the current grid before the clear
+                                    // lands so paged content is preserved.
+                                    if contains_clear_screen(bytes) {
+                                        record_pager_snapshot(&active_vte, &pager_snapshots_rc, &pager_pre_clear_rc);
                                     }
-                                }
-
-                                let text = String::from_utf8_lossy(bytes).into_owned();
-                                match state {
-                                    BlockState::CollectingPrompt => {
-                                        prompt_buf_rc.borrow_mut().push_str(&text);
-                                        // strip trailing whitespace/newlines and ANSI codes from prompt display
-                                        let clean = strip_ansi(&text).trim_end().to_string();
-                                        if !clean.is_empty() {
-                                            active_rc.borrow().set_prompt(&clean);
-                                        }
-                                        // Auto-scroll to bottom while collecting prompt
-                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    }
-                                    BlockState::AwaitingCommand => {
-                                        // An interactive widget can take over the
-                                        // alt-screen straight from the prompt (e.g. fzf
-                                        // bound to a key) without a command ever being
-                                        // submitted, so no CommandStart arrives. Detect a
-                                        // definitive alt-screen enter here and switch; on
-                                        // leave we return to AwaitingCommand. Only the
-                                        // unambiguous ?47/?1047/?1049 sequences count —
-                                        // the app-cursor heuristic would false-positive on
-                                        // ordinary line editing.
-                                        if contains_alt_screen_enter(bytes) {
-                                            alt_from_awaiting_rc.set(true);
-                                            cursor_hide_pending_rc.set(false);
-                                            bstate_rc.set(BlockState::AltScreen);
-                                            pager_snapshots_rc.borrow_mut().clear();
-                                            pager_snapshot_generation_rc.set(
-                                                pager_snapshot_generation_rc.get().wrapping_add(1),
-                                            );
-                                            *pager_pre_clear_rc.borrow_mut() =
-                                                normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
-                                            vte_for_alt.reset(true, true);
-                                            reset_alt_vte_grid(&vte_for_alt);
-                                            vte_for_alt.feed(ALT_VTE_CLEAR);
-                                            show_alt_screen(
-                                                &block_scroll_rc,
-                                                &vte_box_rc,
-                                                &vte_for_alt,
-                                                Some(bytes),
-                                            );
-                                            schedule_pager_snapshot(
-                                                &vte_for_alt,
-                                                &pager_snapshots_rc,
-                                                &pager_snapshot_generation_rc,
-                                                &pager_pre_clear_rc,
-                                            );
-                                            continue;
-                                        }
-                                        if editor_input_for_cb {
-                                            let raw_text = text.clone();
-                                            let stripped = strip_ansi(&raw_text);
-                                            let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
-                                            let prompt_clean = prompt_text.trim();
-
-                                            // Detect multi-line content (completion menu)
-                                            let after_prompt = if !prompt_clean.is_empty() {
-                                                stripped.strip_prefix(prompt_clean).unwrap_or(&stripped)
-                                            } else {
-                                                &stripped
-                                            };
-                                            let has_menu_content = after_prompt.contains('\n')
-                                                || raw_text.contains("\x1b[B")
-                                                || raw_text.contains("\x1b[A");
-
-                                            if completion_active_rc.get() {
-                                                // Completion menu is active: render in output VTE
-                                                active_rc.borrow().feed_output(bytes);
-
-                                                // Check if this is a clean single-line redraw (menu closed)
-                                                if !has_menu_content && !stripped.is_empty()
-                                                    && (prompt_clean.is_empty() || stripped.contains(prompt_clean))
-                                                {
-                                                    // Menu closed — extract the completed command
-                                                    let cmd_part = if !prompt_clean.is_empty() {
-                                                        after_prompt.trim()
-                                                    } else {
-                                                        stripped.trim()
-                                                    };
-                                                    if !cmd_part.is_empty() {
-                                                        *active_rc.borrow().pending_cmd.borrow_mut() = cmd_part.to_string();
-                                                        active_rc.borrow().cursor_offset.set(cmd_part.chars().count());
-                                                        pty_synced_rc.set(true);
-                                                    }
-                                                    // Hide completion output
-                                                    active_rc.borrow().output_vte.set_visible(false);
-                                                    active_rc.borrow().reset_output_buffer();
-                                                    completion_active_rc.set(false);
-                                                    tab_pending_rc.set(false);
-                                                    *active_rc.borrow().pending_suggestion.borrow_mut() = String::new();
-                                                    active_rc.borrow().update_content_view();
-                                                }
-                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                                continue;
-                                            }
-
-                                            if isearch_active_rc.get() {
-                                                // Reverse/forward incremental search active: render in output VTE
-                                                active_rc.borrow().feed_output(bytes);
-
-                                                // Search ended when readline redraws a normal line w/o the marker
-                                                if !detect_isearch_marker(&stripped) && !stripped.is_empty()
-                                                    && (prompt_clean.is_empty() || stripped.contains(prompt_clean))
-                                                {
-                                                    let cmd_part = if !prompt_clean.is_empty() {
-                                                        after_prompt.trim()
-                                                    } else {
-                                                        stripped.trim()
-                                                    };
-                                                    if !cmd_part.is_empty() {
-                                                        *active_rc.borrow().pending_cmd.borrow_mut() = cmd_part.to_string();
-                                                        active_rc.borrow().cursor_offset.set(cmd_part.chars().count());
-                                                        pty_synced_rc.set(true);
-                                                    }
-                                                    active_rc.borrow().output_vte.set_visible(false);
-                                                    active_rc.borrow().reset_output_buffer();
-                                                    isearch_active_rc.set(false);
-                                                    *active_rc.borrow().pending_suggestion.borrow_mut() = String::new();
-                                                    active_rc.borrow().update_content_view();
-                                                }
-                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                                continue;
-                                            }
-
-                                            // Entering incremental search (Ctrl-R / Ctrl-S)
-                                            if detect_isearch_marker(&stripped) {
-                                                isearch_active_rc.set(true);
-                                                active_rc.borrow().reset_output_buffer();
-                                                active_rc.borrow().feed_output(bytes);
-                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                                continue;
-                                            }
-
-                                            if tab_pending_rc.get() && has_menu_content {
-                                                // Tab triggered a completion menu — show it in output VTE
-                                                completion_active_rc.set(true);
-                                                active_rc.borrow().reset_output_buffer();
-                                                active_rc.borrow().feed_output(bytes);
-                                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                                continue;
-                                            }
-
-                                            // Normal single-line: extract suggestion
-                                            if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
-                                                *cmd_buf_rc.borrow_mut() = raw_text.clone();
-                                            } else {
-                                                cmd_buf_rc.borrow_mut().push_str(&raw_text);
-                                            }
-
-                                            let current_raw_buf = cmd_buf_rc.borrow().clone();
-                                            let current_stripped = strip_ansi(&current_raw_buf);
-                                            let prompt_char_count = prompt_clean.chars().count();
-                                            let (mut raw_cmd, mut command_column_offset) = if !prompt_clean.is_empty() {
-                                                if current_stripped.strip_prefix(prompt_clean).is_some() {
-                                                    (
-                                                        skip_ansi_visible_chars(&current_raw_buf, prompt_char_count),
-                                                        prompt_char_count,
-                                                    )
-                                                } else if let Some(pos) = current_stripped.find(prompt_clean) {
-                                                    let pos_chars = current_stripped[..pos].chars().count();
-                                                    (
-                                                        skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count),
-                                                        pos_chars + prompt_char_count,
-                                                    )
-                                                } else {
-                                                    (current_raw_buf.clone(), 0)
-                                                }
-                                            } else {
-                                                (current_raw_buf.clone(), 0)
-                                            };
-
-                                            command_column_offset += strip_ansi(&raw_cmd)
-                                                .chars()
-                                                .take_while(|ch| ch.is_whitespace() && *ch != '\n')
-                                                .count();
-                                            raw_cmd = raw_cmd.trim_start().to_string();
-                                            let display = raw_cmd.trim_end_matches('\n').trim_end();
-
-                                            let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
-
-                                            if tab_pending_rc.get() {
-                                                // Single-line tab completion (direct insert, no menu)
-                                                let user_plain = plain_text_from_ansi(&user_raw);
-                                                if !user_plain.is_empty() {
-                                                    *active_rc.borrow().pending_cmd.borrow_mut() = user_plain.clone();
-                                                    active_rc.borrow().cursor_offset.set(user_plain.chars().count());
-                                                }
-                                                tab_pending_rc.set(false);
-                                            }
-
-                                            let suggestion_plain = plain_text_from_ansi(&suggestion_raw);
-                                            *active_rc.borrow().pending_suggestion.borrow_mut() = suggestion_plain;
-                                            active_rc.borrow().update_content_view();
-                                            scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                            continue;
-                                        }
-                                        // Shell's line editor sends the full line (prompt + input) with each keystroke.
-                                        // Store raw text with ANSI codes preserved
-                                        let raw_text = text.clone();
-                                        let stripped = strip_ansi(&raw_text);
-
-                                        let prompt_text = strip_ansi(&prompt_buf_rc.borrow());
-                                        let prompt_clean = prompt_text.trim();
-
-                                        // If this chunk starts with the prompt, it's a fresh redraw - replace buffer
-                                        if !prompt_clean.is_empty() && stripped.starts_with(prompt_clean) {
-                                            *cmd_buf_rc.borrow_mut() = raw_text.clone();
-                                        } else {
-                                            // No prompt at start means this is continuation input
-                                            cmd_buf_rc.borrow_mut().push_str(&raw_text);
-                                        }
-
-                                        // Now extract the command from the raw buffer
-                                        let current_raw_buf = cmd_buf_rc.borrow().clone();
-                                        let current_stripped = strip_ansi(&current_raw_buf);
-
-                                        // Skip the prompt visible characters to get to the command
-                                        // Use character count, not byte length (important for UTF-8 chars like ❯)
-                                        let prompt_char_count = prompt_clean.chars().count();
-                                        let (mut raw_cmd, mut command_column_offset) = if !prompt_clean.is_empty() {
-                                            if let Some(_after_prompt) = current_stripped.strip_prefix(prompt_clean) {
-                                                // Calculate visible chars to skip in raw text
-                                                (
-                                                    skip_ansi_visible_chars(&current_raw_buf, prompt_char_count),
-                                                    prompt_char_count,
-                                                )
-                                            } else if let Some(pos) = current_stripped.find(prompt_clean) {
-                                                let pos_chars = current_stripped[..pos].chars().count();
-                                                (
-                                                    skip_ansi_visible_chars(&current_raw_buf, pos_chars + prompt_char_count),
-                                                    pos_chars + prompt_char_count,
-                                                )
-                                            } else {
-                                                (current_raw_buf.clone(), 0)
-                                            }
-                                        } else {
-                                            (current_raw_buf.clone(), 0)
-                                        };
-
-                                        command_column_offset += strip_ansi(&raw_cmd)
-                                            .chars()
-                                            .take_while(|ch| ch.is_whitespace() && *ch != '\n')
-                                            .count();
-                                        raw_cmd = raw_cmd.trim_start().to_string();
-                                        let display = raw_cmd.trim_end_matches('\n').trim_end();
-
-                                        let (user_raw, suggestion_raw) = separate_input_and_suggestion(display, command_column_offset);
-
-                                        // Use LRU cache for ANSI → Pango conversion
-                                        let _user_markup = {
-                                            let mut cache = ansi_cache_for_cb.borrow_mut();
-                                            if let Some(cached) = cache.get(&user_raw) {
-                                                cached.clone()
-                                            } else {
-                                                let result = ansi_to_pango(&user_raw, &config_for_cb.borrow().palette);
-                                                // LRU automatically evicts least-recently-used entry
-                                                cache.put(user_raw.clone(), result.clone());
-                                                result
-                                            }
-                                        };
-
-                                        active_rc.borrow().set_cmd_parts(&user_raw, &suggestion_raw);
-
-                                        // Save the full command (user input + suggestion) for CommandEnd
-                                        // This ensures commands accepted via autocomplete are properly recorded
-                                        let full_cmd_raw = display.to_string();
-                                        // Reuse the LRU cache for the ANSI→Pango conversion so an
-                                        // unchanged command line (the common case while editing) is
-                                        // not re-rendered on every keystroke.
-                                        let full_cmd_markup = {
-                                            let mut cache = ansi_cache_for_cb.borrow_mut();
-                                            if let Some(cached) = cache.get(&full_cmd_raw) {
-                                                cached.clone()
-                                            } else {
-                                                let result = ansi_to_pango(&full_cmd_raw, &config_for_cb.borrow().palette);
-                                                cache.put(full_cmd_raw.clone(), result.clone());
-                                                result
-                                            }
-                                        };
-
-                                        if !strip_ansi(&full_cmd_raw).trim().is_empty() {
-                                            *last_nonempty_cmd_raw_rc.borrow_mut() = full_cmd_raw.clone();
-                                            *last_nonempty_cmd_markup_rc.borrow_mut() = full_cmd_markup.clone();
-                                        }
-                                        *cmd_display_raw_rc.borrow_mut() = full_cmd_raw;
-                                        *cmd_display_markup_rc.borrow_mut() = full_cmd_markup;
-
-                                        // Auto-scroll to bottom while typing command
-                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    }
-                                    BlockState::CollectingOutput => {
-                                        for cb in activity_cbs.borrow().iter() {
-                                            cb();
-                                        }
-
-                                        // Decide whether this command is a
-                                        // full-screen TUI. Alt-screen / app-cursor
-                                        // sequences are definitive. A bare cursor
-                                        // hide (ESC[?25l) is ambiguous — git, npm
-                                        // and cargo hide the cursor for progress
-                                        // bars too — so it only counts once paired
-                                        // with a full-screen redraw, which may
-                                        // arrive in a later chunk.
-                                        let mut enter_alt = contains_interactive_screen_enter(bytes);
-                                        if !enter_alt {
-                                            let redraw = contains_full_screen_redraw(bytes);
-                                            if cursor_hide_pending_rc.get() {
-                                                if redraw {
-                                                    enter_alt = true;
-                                                } else if contains_cursor_show(bytes) {
-                                                    cursor_hide_pending_rc.set(false);
-                                                }
-                                            } else if contains_cursor_hide(bytes) {
-                                                if redraw {
-                                                    enter_alt = true;
-                                                } else {
-                                                    cursor_hide_pending_rc.set(true);
-                                                }
-                                            }
-                                        }
-
-                                        if enter_alt {
-                                            cursor_hide_pending_rc.set(false);
-                                            bstate_rc.set(BlockState::AltScreen);
-                                            pager_snapshots_rc.borrow_mut().clear();
-                                            pager_snapshot_generation_rc.set(
-                                                pager_snapshot_generation_rc.get().wrapping_add(1),
-                                            );
-                                            *pager_pre_clear_rc.borrow_mut() =
-                                                normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
-                                            vte_for_alt.reset(true, true);
-                                            reset_alt_vte_grid(&vte_for_alt);
-                                            vte_for_alt.feed(ALT_VTE_CLEAR);
-                                            let prior = active_rc.borrow().raw_output.borrow().clone();
-                                            if !prior.is_empty() {
-                                                vte_for_alt.feed(&prior);
-                                            }
-                                            show_alt_screen(
-                                                &block_scroll_rc,
-                                                &vte_box_rc,
-                                                &vte_for_alt,
-                                                Some(bytes),
-                                            );
-                                            schedule_pager_snapshot(
-                                                &vte_for_alt,
-                                                &pager_snapshots_rc,
-                                                &pager_snapshot_generation_rc,
-                                                &pager_pre_clear_rc,
-                                            );
-                                            continue;
-                                        }
-
-                                        // Feed raw bytes directly to VTE output widget
-                                        active_rc.borrow().feed_output(bytes);
-                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    }
-                                    BlockState::AltScreen => {
-                                        // If bytes contain clear screen, record current page BEFORE clearing
-                                        if contains_clear_screen(bytes) {
-                                            log::debug!("Detected clear screen in pager, recording current page first");
-                                            record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
-                                        }
-
-                                        // Feed raw bytes directly to VTE
-                                        vte_for_alt.feed(bytes);
-
-                                        // Schedule snapshot to capture the new page after rendering
-                                        schedule_pager_snapshot(
-                                            &vte_for_alt,
-                                            &pager_snapshots_rc,
-                                            &pager_snapshot_generation_rc,
-                                            &pager_pre_clear_rc,
-                                        );
-                                    }
-                                    BlockState::PostCommand => {
-                                        // Late-arriving output after CommandEnd — still feed to VTE
-                                        active_rc.borrow().feed_output(bytes);
-                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    }
-                                    BlockState::RawFallback => {
-                                        // No shell integration: stream straight to the raw VTE.
-                                        vte_for_alt.feed(bytes);
-                                    }
-                                    BlockState::Idle => {
-                                        // Bytes before the first prompt. With shell integration
-                                        // these are pre-prompt noise dropped at PromptStart. Without
-                                        // it, PromptStart never comes — so buffer the bytes and arm a
-                                        // one-shot grace timer; if no FTCS event arrives before it
-                                        // fires, switch to the raw VTE and replay the buffer so the
-                                        // user never sees a black screen.
-                                        {
-                                            let mut buf = idle_buf_rc.borrow_mut();
-                                            if buf.len() < MAX_IDLE_BUFFER_BYTES {
-                                                buf.extend_from_slice(bytes);
-                                            }
-                                        }
-                                        if !fallback_armed_rc.get() && !ftcs_seen_rc.get() {
-                                            fallback_armed_rc.set(true);
-                                            let bstate_t = bstate_rc.clone();
-                                            let ftcs_t = ftcs_seen_rc.clone();
-                                            let idle_t = idle_buf_rc.clone();
-                                            let vte_t = vte_for_alt.clone();
-                                            let vte_box_t = vte_box_rc.clone();
-                                            let block_scroll_t = block_scroll_rc.clone();
-                                            glib::timeout_add_local_once(
-                                                std::time::Duration::from_millis(500),
-                                                move || {
-                                                    if ftcs_t.get()
-                                                        || bstate_t.get() != BlockState::Idle
-                                                    {
-                                                        return;
-                                                    }
-                                                    bstate_t.set(BlockState::RawFallback);
-                                                    let buffered = idle_t.borrow().clone();
-                                                    show_alt_screen(
-                                                        &block_scroll_t,
-                                                        &vte_box_t,
-                                                        &vte_t,
-                                                        Some(&buffered),
-                                                    );
-                                                    idle_t.borrow_mut().clear();
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            ParserEvent::PromptStart => {
-                                ftcs_seen_rc.set(true);
-                                let state = bstate_rc.get();
-                                if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
-                                    log::debug!("[altdiag] PromptStart SKIPPED (state={:?}, osc133_depth={})", state, osc133_depth_rc.get());
-                                    continue;
-                                }
-                                // Late-loading shell integration: a PromptStart arrived after we
-                                // had already fallen back to the raw VTE. Recover to block mode so
-                                // the user gets proper command blocks from here on.
-                                if state == BlockState::RawFallback {
-                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
-                                    idle_buf_rc.borrow_mut().clear();
-                                }
-                                // Finalize the previous block if we're in PostCommand state
-                                if state == BlockState::PostCommand {
-                                    let _pf_fin = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
-                                    active_rc.borrow().flush_output();
-
-                                    let prompt = strip_ansi(&prompt_buf_rc.borrow()).trim().to_string();
-
-                                    let mut raw_cmd_with_ansi = executing_cmd_raw_rc.borrow().clone();
-                                    if raw_cmd_with_ansi.trim().is_empty()
-                                        && !last_nonempty_cmd_raw_rc.borrow().trim().is_empty()
-                                    {
-                                        raw_cmd_with_ansi = last_nonempty_cmd_raw_rc.borrow().clone();
-                                    }
-                                    let cmd = strip_ansi(&raw_cmd_with_ansi).trim().to_string();
-                                    // Persist the raw-ANSI command so finished blocks (and restored
-                                    // history) can render the shell's own syntax highlighting.
-                                    let cmd_ansi_trimmed = raw_cmd_with_ansi.trim().to_string();
-
-                                    // Use raw_output for finalization — it's always correct
-                                    // (properly cleared between commands). VTE text_range can
-                                    // include stale scrollback content causing duplication.
-                                    let raw_output_text = active_rc.borrow().output_text();
-
-                                    // Preserve ANSI codes for colored display, only handle \r overwrites
-                                    let output_with_ansi = {
-                                        let mut result = String::new();
-                                        for line in raw_output_text.lines() {
-                                            if let Some(pos) = line.rfind('\r') {
-                                                result.push_str(&line[pos + 1..]);
-                                            } else {
-                                                result.push_str(line);
-                                            }
-                                            result.push('\n');
-                                        }
-                                        result.trim().to_string()
-                                    };
-
-                                    let output_plain = strip_ansi(&output_with_ansi).to_string();
-
-                                    let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
-                                    let output_trimmed = {
-                                        let trimmed = output_plain.trim();
-                                        let lines: Vec<&str> = trimmed.lines().collect();
-                                        if lines.len() > truncation_limit {
-                                            let kept: String = lines[..truncation_limit].join("\n");
-                                            format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
-                                        } else {
-                                            trimmed.to_string()
-                                        }
-                                    };
-                                    log::debug!("Finalize block: cmd={:?}, output_len={}, first_20_chars={:?}",
-                                        cmd, output_trimmed.len(), output_plain.chars().take(20).collect::<String>());
-
-                                    let line_count = output_trimmed.lines().count();
-                                    let estimated_height = {
-                                        // Virtual-scroll placeholder height (no widget/pango context
-                                        // available here, so approximate the per-line height from the
-                                        // configured font point size at 96 DPI × CSS line-height 1.2,
-                                        // mirroring blocks::fit_output_height so the estimate tracks
-                                        // the font scale instead of a fixed 20px).
-                                        let cfg = config_for_cb.borrow();
-                                        let parts: Vec<&str> = cfg.font_desc.split_whitespace().collect();
-                                        let base_size = parts
-                                            .last()
-                                            .and_then(|s| s.parse::<i32>().ok())
-                                            .unwrap_or(14);
-                                        let scaled_pt = (base_size as f64 * cfg.default_font_scale).max(1.0);
-                                        let per_line = (scaled_pt * (96.0 / 72.0) * 1.2).ceil() as i32;
-                                        (line_count as i32 * per_line.max(1)).max(60)
-                                    };
-
-                                    let start_time = block_start_time_for_cb.get();
-                                    let now = SystemTime::now();
-                                    let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
-                                    let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
-                                    let duration_ms = start_time.and_then(|st| {
-                                        now.duration_since(st).ok().map(|d| d.as_millis() as u64)
-                                    });
-
-                                    let block_cwd = {
-                                        let cwd_str = current_cwd_for_cb.borrow().clone();
-                                        if cwd_str.is_empty() { None } else { Some(cwd_str) }
-                                    };
-
-                                    let exit_code = pending_exit_code_rc.get();
-
-                                    let block_data = BlockData {
-                                        id: next_block_id(),
-                                        prompt: prompt.clone(),
-                                        cmd: cmd.clone(),
-                                        cmd_markup: if cmd_ansi_trimmed.is_empty() { None } else { Some(cmd_ansi_trimmed.clone()) },
-                                        // Store the FULL output: the widget already renders the
-                                        // complete text (display_output_ansi), and export / search /
-                                        // session restore must not silently lose truncated lines.
-                                        // `output_trimmed` is only an in-memory display estimate.
-                                        output: output_plain.trim().to_string(),
-                                        exit_code,
-                                        estimated_height,
-                                        line_count,
-                                        start_time_ms,
-                                        end_time_ms,
-                                        duration_ms,
-                                        cwd: block_cwd.clone(),
-                                    };
-
-                                    block_data_for_cb.borrow_mut().push_back(block_data);
-
-                                    // Pre-wrap the finished output at the SAME column the live
-                                    // output VTE just wrapped at, so the completed block keeps
-                                    // the identical line breaks (no reflow jump on completion).
-                                    let wrap_cols = active_rc.borrow().output_grid_cols();
-                                    let display_output_ansi = blocks::wrap_ansi_at(&output_with_ansi, wrap_cols);
-
-                                    let _pf_new = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
-                                    let recycled = widget_pool_for_cb.borrow_mut().acquire();
-                                    let finished = FinishedBlock::new_with_pool(
-                                        &prompt, &cmd, if cmd_ansi_trimmed.is_empty() { None } else { Some(&cmd_ansi_trimmed) }, &display_output_ansi, exit_code, &config_for_cb.borrow(),
-                                        duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
+                                    schedule_pager_snapshot(
+                                        &active_vte,
+                                        &pager_snapshots_rc,
+                                        &pager_snapshot_generation_rc,
+                                        &pager_pre_clear_rc,
                                     );
-                                    if let Some(t) = _pf_new { prof!("  FinishedBlock::new {}us (blocks={})", t.elapsed().as_micros(), finished_blocks_for_cb.borrow().len()); }
+                                }
+                                _ => {}
+                            }
 
-                                    let _pf_ins = if prof_enabled() { Some(std::time::Instant::now()) } else { None };
-                                    finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
-                                    if let Some(t) = _pf_ins { prof!("  insert_before {}us", t.elapsed().as_micros()); }
+                            // Everything renders in the one live VTE.
+                            active_vte.feed(bytes);
+                        }
 
-                                    let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
-                                    let finished_clone = finished.clone();
-                                    let finished_widget = finished_clone.widget().clone();
+                        ParserEvent::PromptStart => {
+                            ftcs_seen_rc.set(true);
+                            let state = bstate_rc.get();
+                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                continue;
+                            }
+                            // Finalize the previous command (deferred from CommandEnd).
+                            if state == BlockState::PostCommand {
+                                // Command: prefer the keystroke-reconstructed line,
+                                // fall back to scraping the last echoed line.
+                                let typed = typed_cmd_rc.borrow().trim().to_string();
+                                let cmd = if !typed.is_empty() {
+                                    typed
+                                } else {
+                                    strip_ansi(&cmd_buf_rc.borrow())
+                                        .lines()
+                                        .next_back()
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string()
+                                };
 
-                                    finished_clone.connect_actions(&vte_for_alt, &pty_for_init, &pty_synced_rc, &active_rc);
+                                if cmd.is_empty() {
+                                    // Nothing meaningful to record; just reset.
+                                    active_rc.borrow().reset_active();
+                                    bstate_rc.set(BlockState::CollectingPrompt);
+                                    prompt_buf_rc.borrow_mut().clear();
+                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                    continue;
+                                }
 
-                                    finished_blocks_for_cb.borrow_mut().push(finished);
+                                let prompt = prompt_display_rc.borrow().clone();
 
-                                    // Setup right-click context menu
-                                    let finished_blocks_for_menu = finished_blocks_for_cb.clone();
-                                    let block_list_for_menu = block_list_rc.clone();
-                                    let vte_for_copy = vte_for_alt.clone();
-                                    let block_id = finished_clone.id;
+                                let raw_output_text = active_rc.borrow().output_text();
 
-                                    let right_click = gtk4::GestureClick::new();
-                                    right_click.set_button(3);
-
-                                    let finished_menu_clone = finished_clone.clone();
-                                    let block_data_for_export = block_data_for_cb.clone();
-                                    right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                                        gesture.set_state(gtk4::EventSequenceState::Claimed);
-
-                                        // Plain Popover + Buttons: the GAction-based
-                                        // PopoverMenu dispatch does not fire in this GTK build.
-                                        let popover = gtk4::Popover::new();
-                                        let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
-                                        popover.set_parent(widget);
-                                        popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                                            x as i32, y as i32, 1, 1,
-                                        )));
-                                        popover.set_has_arrow(false);
-
-                                        let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-                                        vbox.add_css_class("menu");
-
-                                        let make_item = |label: &str| -> gtk4::Button {
-                                            let btn = gtk4::Button::with_label(label);
-                                            btn.set_has_frame(false);
-                                            btn.set_halign(gtk4::Align::Fill);
-                                            if let Some(child) = btn.child() {
-                                                child.set_halign(gtk4::Align::Start);
-                                            }
-                                            btn.add_css_class("flat");
-                                            btn
-                                        };
-
-                                        // Copy Block
-                                        {
-                                            let item = make_item("Copy Block");
-                                            let popover_c = popover.clone();
-                                            let finished_for_copy = finished_menu_clone.clone();
-                                            let vte_for_action = vte_for_copy.clone();
-                                            item.connect_clicked(move |_| {
-                                                popover_c.popdown();
-                                                let prompt_text = finished_for_copy.prompt_buffer.text(
-                                                    &finished_for_copy.prompt_buffer.start_iter(),
-                                                    &finished_for_copy.prompt_buffer.end_iter(),
-                                                    true,
-                                                );
-                                                let cmd_text = finished_for_copy.command_buffer.text(
-                                                    &finished_for_copy.command_buffer.start_iter(),
-                                                    &finished_for_copy.command_buffer.end_iter(),
-                                                    true,
-                                                );
-                                                let output_text = finished_for_copy.output_buffer.text(
-                                                    &finished_for_copy.output_buffer.start_iter(),
-                                                    &finished_for_copy.output_buffer.end_iter(),
-                                                    true,
-                                                );
-                                                let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
-                                                vte_for_action.clipboard().set_text(&full_text);
-                                            });
-                                            vbox.append(&item);
+                                // Preserve ANSI codes for colored display, only handle
+                                // \r overwrites within a line.
+                                let output_with_ansi = {
+                                    let mut result = String::new();
+                                    for line in raw_output_text.lines() {
+                                        if let Some(pos) = line.rfind('\r') {
+                                            result.push_str(&line[pos + 1..]);
+                                        } else {
+                                            result.push_str(line);
                                         }
+                                        result.push('\n');
+                                    }
+                                    result.trim().to_string()
+                                };
 
-                                        // Export as JSON
-                                        {
-                                            let item = make_item("Export as JSON");
-                                            let popover_c = popover.clone();
-                                            let block_data_for_json = block_data_for_export.clone();
-                                            let vte_for_json = vte_for_copy.clone();
-                                            let block_id_json = block_id;
-                                            item.connect_clicked(move |_| {
-                                                popover_c.popdown();
-                                                let blocks = block_data_for_json.borrow();
-                                                if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
-                                                    let json = block.to_json();
-                                                    vte_for_json.clipboard().set_text(&json);
-                                                    log::info!("Block exported as JSON to clipboard");
-                                                }
-                                            });
-                                            vbox.append(&item);
+                                let output_plain = strip_ansi(&output_with_ansi).to_string();
+
+                                let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
+                                let output_trimmed = {
+                                    let trimmed = output_plain.trim();
+                                    let lines: Vec<&str> = trimmed.lines().collect();
+                                    if lines.len() > truncation_limit {
+                                        let kept: String = lines[..truncation_limit].join("\n");
+                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
+                                    } else {
+                                        trimmed.to_string()
+                                    }
+                                };
+
+                                let line_count = output_trimmed.lines().count();
+                                let estimated_height = {
+                                    let cfg = config_for_cb.borrow();
+                                    let parts: Vec<&str> = cfg.font_desc.split_whitespace().collect();
+                                    let base_size = parts
+                                        .last()
+                                        .and_then(|s| s.parse::<i32>().ok())
+                                        .unwrap_or(14);
+                                    let scaled_pt = (base_size as f64 * cfg.default_font_scale).max(1.0);
+                                    let per_line = (scaled_pt * (96.0 / 72.0) * 1.2).ceil() as i32;
+                                    (line_count as i32 * per_line.max(1)).max(60)
+                                };
+
+                                let start_time = block_start_time_for_cb.get();
+                                let now = SystemTime::now();
+                                let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
+                                let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
+                                let duration_ms = start_time.and_then(|st| {
+                                    now.duration_since(st).ok().map(|d| d.as_millis() as u64)
+                                });
+
+                                let block_cwd = {
+                                    let cwd_str = current_cwd_for_cb.borrow().clone();
+                                    if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                };
+
+                                let exit_code = pending_exit_code_rc.get();
+
+                                let block_data = BlockData {
+                                    id: next_block_id(),
+                                    prompt: prompt.clone(),
+                                    cmd: cmd.clone(),
+                                    cmd_markup: None,
+                                    output: output_plain.trim().to_string(),
+                                    exit_code,
+                                    estimated_height,
+                                    line_count,
+                                    start_time_ms,
+                                    end_time_ms,
+                                    duration_ms,
+                                    cwd: block_cwd.clone(),
+                                };
+
+                                block_data_for_cb.borrow_mut().push_back(block_data);
+
+                                // Pre-wrap the finished output at the SAME column the
+                                // live VTE wrapped at, so the completed block keeps the
+                                // identical line breaks (no reflow jump on completion).
+                                let wrap_cols = active_rc.borrow().grid_cols();
+                                let display_output_ansi = blocks::wrap_ansi_at(&output_with_ansi, wrap_cols);
+
+                                let recycled = widget_pool_for_cb.borrow_mut().acquire();
+                                let finished = FinishedBlock::new_with_pool(
+                                    &prompt, &cmd, None, &display_output_ansi, exit_code, &config_for_cb.borrow(),
+                                    duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
+                                );
+
+                                finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+
+                                let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
+                                let finished_clone = finished.clone();
+                                let finished_widget = finished_clone.widget().clone();
+
+                                finished_clone.connect_actions(&active_vte, &pty_for_init, &pty_synced_rc, &active_rc);
+
+                                finished_blocks_for_cb.borrow_mut().push(finished);
+
+                                // Right-click context menu.
+                                let finished_blocks_for_menu = finished_blocks_for_cb.clone();
+                                let block_list_for_menu = block_list_rc.clone();
+                                let vte_for_copy = active_vte.clone();
+                                let block_id = finished_clone.id;
+
+                                let right_click = gtk4::GestureClick::new();
+                                right_click.set_button(3);
+
+                                let finished_menu_clone = finished_clone.clone();
+                                let block_data_for_export = block_data_for_cb.clone();
+                                right_click.connect_pressed(move |gesture, _n_press, x, y| {
+                                    gesture.set_state(gtk4::EventSequenceState::Claimed);
+
+                                    let popover = gtk4::Popover::new();
+                                    let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
+                                    popover.set_parent(widget);
+                                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
+                                        x as i32, y as i32, 1, 1,
+                                    )));
+                                    popover.set_has_arrow(false);
+
+                                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+                                    vbox.add_css_class("menu");
+
+                                    let make_item = |label: &str| -> gtk4::Button {
+                                        let btn = gtk4::Button::with_label(label);
+                                        btn.set_has_frame(false);
+                                        btn.set_halign(gtk4::Align::Fill);
+                                        if let Some(child) = btn.child() {
+                                            child.set_halign(gtk4::Align::Start);
                                         }
-
-                                        // Export as Markdown
-                                        {
-                                            let item = make_item("Export as Markdown");
-                                            let popover_c = popover.clone();
-                                            let block_data_for_md = block_data_for_export.clone();
-                                            let vte_for_md = vte_for_copy.clone();
-                                            let block_id_md = block_id;
-                                            item.connect_clicked(move |_| {
-                                                popover_c.popdown();
-                                                let blocks = block_data_for_md.borrow();
-                                                if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
-                                                    let markdown = block.to_markdown();
-                                                    vte_for_md.clipboard().set_text(&markdown);
-                                                    log::info!("Block exported as Markdown to clipboard");
-                                                }
-                                            });
-                                            vbox.append(&item);
-                                        }
-
-                                        // Delete Block
-                                        {
-                                            let item = make_item("Delete Block");
-                                            let popover_c = popover.clone();
-                                            let finished_blocks_for_delete = finished_blocks_for_menu.clone();
-                                            let block_list_for_delete = block_list_for_menu.clone();
-                                            let block_id_del = block_id;
-                                            item.connect_clicked(move |_| {
-                                                popover_c.popdown();
-                                                let mut blocks = finished_blocks_for_delete.borrow_mut();
-                                                if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
-                                                    let block = blocks.remove(pos);
-                                                    block_list_for_delete.remove(block.widget());
-                                                }
-                                            });
-                                            vbox.append(&item);
-                                        }
-
-                                        popover.set_child(Some(&vbox));
-
-                                        popover.connect_closed(move |p| {
-                                            p.unparent();
-                                        });
-
-                                        popover.popup();
-                                    });
-                                    finished_widget.add_controller(right_click);
+                                        btn.add_css_class("flat");
+                                        btn
+                                    };
 
                                     {
-                                        let active_for_click = active_rc.clone();
-                                        let left_click = gtk4::GestureClick::new();
-                                        left_click.set_button(1);
-                                        left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                                        left_click.connect_pressed(move |gesture, _, _, _| {
-                                            active_for_click.borrow().grab_focus();
-                                            gesture.set_state(gtk4::EventSequenceState::Denied);
+                                        let item = make_item("Copy Block");
+                                        let popover_c = popover.clone();
+                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let prompt_text = finished_for_copy.prompt_buffer.text(
+                                                &finished_for_copy.prompt_buffer.start_iter(),
+                                                &finished_for_copy.prompt_buffer.end_iter(),
+                                                true,
+                                            );
+                                            let cmd_text = finished_for_copy.command_buffer.text(
+                                                &finished_for_copy.command_buffer.start_iter(),
+                                                &finished_for_copy.command_buffer.end_iter(),
+                                                true,
+                                            );
+                                            let output_text = finished_for_copy.output_buffer.text(
+                                                &finished_for_copy.output_buffer.start_iter(),
+                                                &finished_for_copy.output_buffer.end_iter(),
+                                                true,
+                                            );
+                                            let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+                                            vte_for_action.clipboard().set_text(&full_text);
                                         });
-                                        finished_widget.add_controller(left_click);
+                                        vbox.append(&item);
                                     }
 
-                                    if finished_blocks_for_cb.borrow().len() > max_blocks {
-                                        let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
-                                        let widget_to_release = oldest.widget().clone();
-                                        block_list_rc.remove(&widget_to_release);
-                                        widget_pool_for_cb.borrow_mut().release(widget_to_release);
+                                    {
+                                        let item = make_item("Export as JSON");
+                                        let popover_c = popover.clone();
+                                        let block_data_for_json = block_data_for_export.clone();
+                                        let vte_for_json = vte_for_copy.clone();
+                                        let block_id_json = block_id;
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let blocks = block_data_for_json.borrow();
+                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                                                let json = block.to_json();
+                                                vte_for_json.clipboard().set_text(&json);
+                                            }
+                                        });
+                                        vbox.append(&item);
                                     }
 
-                                    if block_data_for_cb.borrow().len() > max_blocks {
-                                        block_data_for_cb.borrow_mut().pop_front();
+                                    {
+                                        let item = make_item("Export as Markdown");
+                                        let popover_c = popover.clone();
+                                        let block_data_for_md = block_data_for_export.clone();
+                                        let vte_for_md = vte_for_copy.clone();
+                                        let block_id_md = block_id;
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let blocks = block_data_for_md.borrow();
+                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                                                let markdown = block.to_markdown();
+                                                vte_for_md.clipboard().set_text(&markdown);
+                                            }
+                                        });
+                                        vbox.append(&item);
                                     }
 
-                                    active_rc.borrow().reset_for_next_prompt();
+                                    {
+                                        let item = make_item("Delete Block");
+                                        let popover_c = popover.clone();
+                                        let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                                        let block_list_for_delete = block_list_for_menu.clone();
+                                        let block_id_del = block_id;
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let mut blocks = finished_blocks_for_delete.borrow_mut();
+                                            if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
+                                                let block = blocks.remove(pos);
+                                                block_list_for_delete.remove(block.widget());
+                                            }
+                                        });
+                                        vbox.append(&item);
+                                    }
 
-                                    executing_cmd_raw_rc.borrow_mut().clear();
-                                    executing_cmd_markup_rc.borrow_mut().clear();
-                                    last_nonempty_cmd_raw_rc.borrow_mut().clear();
-                                    last_nonempty_cmd_markup_rc.borrow_mut().clear();
-
-                                    scroll_debouncer.reset_scroll_lock();
-                                    if let Some(t) = _pf_fin { prof!("  finalize TOTAL {}us", t.elapsed().as_micros()); }
-                                }
-                                bstate_rc.set(BlockState::CollectingPrompt);
-                                prompt_buf_rc.borrow_mut().clear();
-                                // Auto-scroll to bottom when new prompt starts
-                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                            }
-
-                            ParserEvent::PromptEnd => {
-                                if bstate_rc.get() != BlockState::CollectingPrompt {
-                                    continue;
-                                }
-                                bstate_rc.set(BlockState::AwaitingCommand);
-                                cmd_buf_rc.borrow_mut().clear();
-                                cmd_display_raw_rc.borrow_mut().clear();
-                                cmd_display_markup_rc.borrow_mut().clear();
-                                active_rc.borrow().set_cmd("");
-                                pty_synced_rc.set(false);
-                                tab_pending_rc.set(false);
-                                if completion_active_rc.get() || isearch_active_rc.get() {
-                                    active_rc.borrow().output_vte.set_visible(false);
-                                    active_rc.borrow().reset_output_buffer();
-                                    completion_active_rc.set(false);
-                                    isearch_active_rc.set(false);
-                                }
-
-                                if editor_input_for_cb {
-                                    let active_for_prompt_focus = active_rc.clone();
-                                    glib::idle_add_local_once(move || {
-                                        active_for_prompt_focus.borrow().grab_focus();
+                                    popover.set_child(Some(&vbox));
+                                    popover.connect_closed(move |p| {
+                                        p.unparent();
                                     });
-                                }
-
-                                // Feed next initial command if any
-                                if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
-                                    let text = format!("{}\r", cmd);
-                                    pty_for_init.write_bytes(text.as_bytes());
-                                }
-
-                                // Reset scroll lock and auto-scroll when prompt ends
-                                scroll_debouncer.reset_scroll_lock();
-                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                            }
-
-                            ParserEvent::CommandStart => {
-                                ftcs_seen_rc.set(true);
-                                let state = bstate_rc.get();
-                                if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
-                                    osc133_depth_rc.set(osc133_depth_rc.get() + 1);
-                                    log::debug!("[altdiag] CommandStart NESTED (state={:?}, osc133_depth->{})", state, osc133_depth_rc.get());
-                                    continue;
-                                }
-                                if state != BlockState::AwaitingCommand {
-                                    log::debug!("[altdiag] CommandStart IGNORED (state={:?})", state);
-                                    continue;
-                                }
-                                osc133_depth_rc.set(0);
-                                cursor_hide_pending_rc.set(false);
-                                alt_from_awaiting_rc.set(false);
-                                bstate_rc.set(BlockState::CollectingOutput);
-                                block_start_time_for_cb.set(Some(SystemTime::now()));
-                                let raw_cmd = cmd_display_raw_rc.borrow().clone();
-                                if !raw_cmd.trim().is_empty() {
-                                    *executing_cmd_raw_rc.borrow_mut() = raw_cmd;
-                                    *executing_cmd_markup_rc.borrow_mut() = cmd_display_markup_rc.borrow().clone();
-                                } else if !last_nonempty_cmd_raw_rc.borrow().trim().is_empty() {
-                                    *executing_cmd_raw_rc.borrow_mut() = last_nonempty_cmd_raw_rc.borrow().clone();
-                                    *executing_cmd_markup_rc.borrow_mut() = last_nonempty_cmd_markup_rc.borrow().clone();
-                                } else {
-                                    let active_cmd = active_rc.borrow().pending_cmd.borrow().clone();
-                                    *executing_cmd_raw_rc.borrow_mut() = active_cmd.clone();
-                                    *executing_cmd_markup_rc.borrow_mut() = ansi_to_pango(&active_cmd, &config_for_cb.borrow().palette);
-                                }
-                                let executing_cmd = plain_text_from_ansi(&executing_cmd_raw_rc.borrow())
-                                    .trim()
-                                    .to_string();
-                                active_rc.borrow().start_command(&executing_cmd);
-                                active_rc.borrow().start_timer();
-                                // Auto-scroll to bottom when command starts executing
-                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                            }
-
-                            ParserEvent::CommandEnd(code) => {
-                                let state = bstate_rc.get();
-                                if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
-                                    log::debug!("[altdiag] CommandEnd IGNORED (state={:?})", state);
-                                    continue;
-                                }
-                                if osc133_depth_rc.get() > 0 {
-                                    osc133_depth_rc.set(osc133_depth_rc.get() - 1);
-                                    log::debug!("[altdiag] CommandEnd SWALLOWED by nesting (osc133_depth->{})", osc133_depth_rc.get());
-                                    continue;
-                                }
-                                active_rc.borrow().stop_timer();
-                                cursor_hide_pending_rc.set(false);
-                                // A command actually finished, so any prompt-level
-                                // alt-screen bookkeeping no longer applies.
-                                alt_from_awaiting_rc.set(false);
-                                if state == BlockState::AltScreen || vte_box_rc.is_visible() {
-                                    record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
-                                    hide_alt_screen(&block_scroll_rc, &vte_box_rc);
-                                    // Blank the shared alt VTE now that we've captured its final
-                                    // frame. Leaving the frame on the grid would make the *next*
-                                    // alt-screen command's pre-clear baseline equal to this frame,
-                                    // and a near-identical re-run (e.g. `top` twice) would then be
-                                    // dropped as a stale read, producing an empty block.
-                                    vte_for_alt.reset(true, true);
-                                    vte_for_alt.feed(ALT_VTE_CLEAR);
-                                    let active_for_idle = active_rc.clone();
-                                    glib::idle_add_local_once(move || {
-                                        active_for_idle.borrow().grab_focus();
-                                    });
-                                }
-
-                                let pager_output = drain_pager_snapshots(&pager_snapshots_rc);
-                                pager_snapshot_generation_rc.set(
-                                    pager_snapshot_generation_rc.get().wrapping_add(1),
-                                );
-                                if !pager_output.is_empty() {
-                                    let needs_separator = !active_rc.borrow().output_text().trim().is_empty();
-                                    if needs_separator {
-                                        active_rc.borrow().append_output("\n\n");
-                                    }
-                                    active_rc.borrow().append_output(&pager_output);
-                                }
-
-                                // Save exit code and transition to PostCommand state.
-                                // Block finalization is deferred until PromptStart arrives,
-                                // allowing any late-arriving output bytes to be captured.
-                                pending_exit_code_rc.set(*code);
-                                bstate_rc.set(BlockState::PostCommand);
-                                scroll_debouncer.mark_dirty(&block_scroll_rc);
-                            }
-
-                            ParserEvent::CwdUpdate(path) => {
-                                *current_cwd_for_cb.borrow_mut() = path.clone();
-                                active_rc.borrow().update_cwd(path);
-                                for cb in cwd_cbs.borrow().iter() {
-                                    cb(path);
-                                }
-                            }
-
-                            ParserEvent::AltScreenEnter => {
-                                let from_state = bstate_rc.get();
-                                if from_state != BlockState::CollectingOutput
-                                    && from_state != BlockState::AwaitingCommand
-                                {
-                                    log::debug!("[altdiag] AltScreenEnter REJECTED (state={:?}, osc133_depth={})", from_state, osc133_depth_rc.get());
-                                    continue;
-                                }
-                                alt_from_awaiting_rc.set(from_state == BlockState::AwaitingCommand);
-                                bstate_rc.set(BlockState::AltScreen);
-                                pager_snapshots_rc.borrow_mut().clear();
-                                pager_snapshot_generation_rc.set(
-                                    pager_snapshot_generation_rc.get().wrapping_add(1),
-                                );
-                                *pager_pre_clear_rc.borrow_mut() =
-                                    normalize_pager_snapshot(&visible_vte_text(&vte_for_alt));
-                                vte_for_alt.reset(true, true);
-                                reset_alt_vte_grid(&vte_for_alt);
-                                vte_for_alt.feed(ALT_VTE_CLEAR);
-                                show_alt_screen(
-                                    &block_scroll_rc,
-                                    &vte_box_rc,
-                                    &vte_for_alt,
-                                    None,
-                                );
-                            }
-
-                            ParserEvent::AltScreenLeave => {
-                                if bstate_rc.get() != BlockState::AltScreen {
-                                    log::debug!("[altdiag] AltScreenLeave REJECTED (state={:?})", bstate_rc.get());
-                                    continue;
-                                }
-                                record_pager_snapshot(&vte_for_alt, &pager_snapshots_rc, &pager_pre_clear_rc);
-                                hide_alt_screen(&block_scroll_rc, &vte_box_rc);
-                                // Blank the shared alt VTE so the next alt-screen command's
-                                // pre-clear baseline starts empty. Otherwise this frame lingers and
-                                // a near-identical re-run (e.g. `top` twice) is dropped as a stale
-                                // read, leaving an empty block.
-                                vte_for_alt.reset(true, true);
-                                vte_for_alt.feed(ALT_VTE_CLEAR);
-                                // If the alt-screen was a prompt-level widget (fzf etc.),
-                                // no command ran — return to AwaitingCommand so the next
-                                // PromptStart/CommandStart sequencing stays correct.
-                                if alt_from_awaiting_rc.replace(false) {
-                                    bstate_rc.set(BlockState::AwaitingCommand);
-                                } else {
-                                    bstate_rc.set(BlockState::CollectingOutput);
-                                }
-                                // A CommandStart seen *while on the alt screen* bumps
-                                // osc133_depth as if it were a nested command. The
-                                // matching CommandEnd then arrives after the screen is
-                                // already torn down and would be swallowed by the
-                                // leftover depth, leaving the block stuck in
-                                // CollectingOutput forever. Clear the depth on leave so
-                                // the next CommandEnd finalizes the block normally.
-                                osc133_depth_rc.set(0);
-                                let active_for_idle = active_rc.clone();
-                                glib::idle_add_local_once(move || {
-                                    active_for_idle.borrow().grab_focus();
+                                    popover.popup();
                                 });
+                                finished_widget.add_controller(right_click);
+
+                                {
+                                    let active_for_click = active_rc.clone();
+                                    let left_click = gtk4::GestureClick::new();
+                                    left_click.set_button(1);
+                                    left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                                    left_click.connect_pressed(move |gesture, _, _, _| {
+                                        active_for_click.borrow().grab_focus();
+                                        gesture.set_state(gtk4::EventSequenceState::Denied);
+                                    });
+                                    finished_widget.add_controller(left_click);
+                                }
+
+                                if finished_blocks_for_cb.borrow().len() > max_blocks {
+                                    let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
+                                    let widget_to_release = oldest.widget().clone();
+                                    block_list_rc.remove(&widget_to_release);
+                                    widget_pool_for_cb.borrow_mut().release(widget_to_release);
+                                }
+
+                                if block_data_for_cb.borrow().len() > max_blocks {
+                                    block_data_for_cb.borrow_mut().pop_front();
+                                }
+
+                                active_rc.borrow().reset_active();
+                                scroll_debouncer.reset_scroll_lock();
+                            }
+                            bstate_rc.set(BlockState::CollectingPrompt);
+                            prompt_buf_rc.borrow_mut().clear();
+                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                        }
+
+                        ParserEvent::PromptEnd => {
+                            if bstate_rc.get() != BlockState::CollectingPrompt {
+                                continue;
+                            }
+                            // Capture the rendered prompt (last non-empty line) for the
+                            // finished block / export.
+                            let prompt_line = {
+                                let pb = prompt_buf_rc.borrow();
+                                strip_ansi(&pb)
+                                    .lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string()
+                            };
+                            *prompt_display_rc.borrow_mut() = prompt_line;
+                            prompt_buf_rc.borrow_mut().clear();
+                            cmd_buf_rc.borrow_mut().clear();
+                            typed_cmd_rc.borrow_mut().clear();
+                            pty_synced_rc.set(false);
+                            bstate_rc.set(BlockState::AwaitingCommand);
+
+                            // Feed next initial command if any.
+                            if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
+                                let text = format!("{}\r", cmd);
+                                pty_for_init.write_bytes(text.as_bytes());
                             }
 
-                            ParserEvent::ClipboardSet(text) => {
-                                if let Some(display) = gtk4::gdk::Display::default() {
-                                    let clipboard = display.clipboard();
-                                    clipboard.set_text(text);
-                                    log::info!("OSC 52: clipboard set ({} chars)", text.len());
-                                }
-                            }
+                            scroll_debouncer.reset_scroll_lock();
+                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                        }
 
-                            ParserEvent::ApcSequence(payload) => {
-                                let is_kitty = payload.first() == Some(&b'G');
-                                if is_kitty {
-                                    log::info!("Kitty graphics protocol detected ({} bytes)", payload.len());
-                                    if bstate_rc.get() == BlockState::AltScreen {
-                                        let mut seq = Vec::with_capacity(payload.len() + 4);
-                                        seq.push(0x1b);
-                                        seq.push(b'_');
-                                        seq.extend_from_slice(payload);
-                                        seq.push(0x1b);
-                                        seq.push(b'\\');
-                                        vte_for_alt.feed(&seq);
-                                    }
+                        ParserEvent::CommandStart => {
+                            ftcs_seen_rc.set(true);
+                            let state = bstate_rc.get();
+                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                                osc133_depth_rc.set(osc133_depth_rc.get() + 1);
+                                continue;
+                            }
+                            if state != BlockState::AwaitingCommand {
+                                continue;
+                            }
+                            osc133_depth_rc.set(0);
+                            active_rc.borrow().reset_output_buffer();
+                            block_start_time_for_cb.set(Some(SystemTime::now()));
+                            bstate_rc.set(BlockState::CollectingOutput);
+                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                        }
+
+                        ParserEvent::CommandEnd(code) => {
+                            let state = bstate_rc.get();
+                            if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+                                continue;
+                            }
+                            if osc133_depth_rc.get() > 0 {
+                                osc133_depth_rc.set(osc133_depth_rc.get() - 1);
+                                continue;
+                            }
+                            pending_exit_code_rc.set(*code);
+                            bstate_rc.set(BlockState::PostCommand);
+                            scroll_debouncer.mark_dirty(&block_scroll_rc);
+                        }
+
+                        ParserEvent::CwdUpdate(path) => {
+                            *current_cwd_for_cb.borrow_mut() = path.clone();
+                            for cb in cwd_cbs.borrow().iter() {
+                                cb(path);
+                            }
+                        }
+
+                        ParserEvent::AltScreenEnter => {
+                            let from_state = bstate_rc.get();
+                            if from_state != BlockState::CollectingOutput
+                                && from_state != BlockState::AwaitingCommand
+                            {
+                                continue;
+                            }
+                            prev_state_rc.set(from_state);
+                            bstate_rc.set(BlockState::AltScreen);
+                            pager_snapshot_generation_rc.set(
+                                pager_snapshot_generation_rc.get().wrapping_add(1),
+                            );
+                            pager_snapshots_rc.borrow_mut().clear();
+                            *pager_pre_clear_rc.borrow_mut() =
+                                normalize_pager_snapshot(&visible_vte_text(&active_vte));
+                            // Hand the viewport to the alt-screen app: hide finished
+                            // blocks so the live VTE fills the scroll area.
+                            enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
+                            active_vte.feed(b"\x1b[?1049h");
+                        }
+
+                        ParserEvent::AltScreenLeave => {
+                            if bstate_rc.get() != BlockState::AltScreen {
+                                continue;
+                            }
+                            // Capture the final visible frame synchronously before
+                            // switching back to the normal buffer.
+                            record_pager_snapshot(&active_vte, &pager_snapshots_rc, &pager_pre_clear_rc);
+                            active_vte.feed(b"\x1b[?1049l");
+                            pager_snapshot_generation_rc.set(
+                                pager_snapshot_generation_rc.get().wrapping_add(1),
+                            );
+                            let merged = drain_pager_snapshots(&pager_snapshots_rc);
+                            if !merged.is_empty() {
+                                let needs_separator = !active_rc.borrow().output_text().trim().is_empty();
+                                if needs_separator {
+                                    active_rc.borrow().accumulate_output(b"\n");
                                 }
+                                active_rc.borrow().accumulate_output(merged.as_bytes());
+                            }
+                            exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
+                            osc133_depth_rc.set(0);
+                            bstate_rc.set(prev_state_rc.get());
+                            let active_for_idle = active_rc.clone();
+                            glib::idle_add_local_once(move || {
+                                active_for_idle.borrow().grab_focus();
+                            });
+                        }
+
+                        ParserEvent::ClipboardSet(text) => {
+                            if let Some(display) = gtk4::gdk::Display::default() {
+                                let clipboard = display.clipboard();
+                                clipboard.set_text(text);
+                            }
+                        }
+
+                        ParserEvent::ApcSequence(payload) => {
+                            let is_kitty = payload.first() == Some(&b'G');
+                            if is_kitty && bstate_rc.get() == BlockState::AltScreen {
+                                let mut seq = Vec::with_capacity(payload.len() + 4);
+                                seq.push(0x1b);
+                                seq.push(b'_');
+                                seq.extend_from_slice(payload);
+                                seq.push(0x1b);
+                                seq.push(b'\\');
+                                active_vte.feed(&seq);
                             }
                         }
                     }
-                    if let Some(t) = _prof_cb_start {
-                        prof!("CB exit: total {}us", t.elapsed().as_micros());
-                    }
-                },
-                move |exit_code| {
-                    log::debug!("Shell exited with code {}", exit_code);
-                    for cb in exited_cbs.borrow().iter() {
-                        cb(exit_code);
-                    }
-                },
-            );
+                }
+            },
+            move |exit_code| {
+                log::debug!("Shell exited with code {}", exit_code);
+                for cb in exited_cbs.borrow().iter() {
+                    cb(exit_code);
+                }
+            },
+        );
     }
 }
 
-/// Captures the handles the keyboard `connect_key_pressed` closure needs,
-/// keeping the ~800-line key handler out of `TermView::new`.
+/// Hand the viewport to an alt-screen app: hide every finished block so the live
+/// VTE fills the scroll area like a normal full-screen terminal.
+fn enter_fullscreen(
+    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
+    fullscreen: &Rc<Cell<bool>>,
+) {
+    if fullscreen.replace(true) {
+        return;
+    }
+    for block in finished.borrow().iter() {
+        block.widget().set_visible(false);
+    }
+}
+
+/// Restore the block list when the alt-screen app exits, re-applying virtual-scroll
+/// visibility so only the previously-visible blocks reappear.
+fn exit_fullscreen(
+    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
+    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen: &Rc<Cell<bool>>,
+) {
+    if !fullscreen.replace(false) {
+        return;
+    }
+    let visible = visible_indices.borrow();
+    for (i, block) in finished.borrow().iter().enumerate() {
+        block.widget().set_visible(visible.contains(&i));
+    }
+}
+
+/// Captures the handles the live-VTE key handler needs. With the VTE owning line
+/// editing + IME natively (jterm1 model), this is reduced to a Capture-phase
+/// navigation / copy-paste / block-selection handler; printable keys and editing
+/// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
-    vte_for_key: Terminal,
-    root_for_key: gtk4::Box,
-    im_context_for_key: gtk4::IMMulticontext,
-    application_cursor_for_key: Rc<Cell<bool>>,
-    bracketed_paste_for_key: Rc<Cell<bool>>,
-    bstate_for_key: Rc<Cell<BlockState>>,
-    active_for_key: Rc<RefCell<ActiveBlock>>,
-    editor_input_enabled: bool,
-    block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
-    history_index: Rc<Cell<Option<usize>>>,
-    pty_synced_for_key: Rc<Cell<bool>>,
-    tab_pending_for_key: Rc<Cell<bool>>,
-    completion_active_for_key: Rc<Cell<bool>>,
-    isearch_active_for_key: Rc<Cell<bool>>,
+    active_vte_for_key: Terminal,
+    typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     block_list_for_key: gtk4::Box,
-    user_scrolled_up_for_key: Rc<Cell<bool>>,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
 }
@@ -1438,854 +852,134 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
-            vte_for_key,
-            root_for_key,
-            im_context_for_key,
-            application_cursor_for_key,
-            bracketed_paste_for_key,
-            bstate_for_key,
-            active_for_key,
-            editor_input_enabled,
-            block_data_for_key,
-            history_index,
-            pty_synced_for_key,
-            tab_pending_for_key,
-            completion_active_for_key,
-            isearch_active_for_key,
+            active_vte_for_key,
+            typed_cmd_for_key,
             finished_blocks_for_key,
             block_list_for_key,
-            user_scrolled_up_for_key,
             selected_block_id_for_key,
             block_scroll_for_key,
         } = self;
-            key_ctrl.connect_key_pressed(move |controller, keyval, _keycode, modifiers| {
-                let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
-                let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+        key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+            use gtk4::gdk::Key;
+            let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
+            let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
 
-                log::debug!("KEY: keyval={:?}, ctrl={}, shift={}, alt={}", keyval, ctrl, shift, alt);
+            // Shift+PageUp/PageDown: page the block history locally. The
+            // vadjustment value_changed handler keeps scroll-lock in sync.
+            if shift && !ctrl && !alt && matches!(keyval, Key::Page_Up | Key::Page_Down) {
+                let adj = block_scroll_for_key.vadjustment();
+                let step = (adj.page_size() * 0.9).max(1.0);
+                let delta = if keyval == Key::Page_Up { -step } else { step };
+                let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+                adj.set_value((adj.value() + delta).clamp(adj.lower(), max_val));
+                return glib::Propagation::Stop;
+            }
 
-                // Shift+PageUp/PageDown: scroll the block history locally instead of
-                // forwarding to the PTY. The vadjustment value_changed handler keeps
-                // the scroll-lock (user_scrolled_up) in sync, so paging up engages it
-                // and paging back to the bottom releases it automatically.
-                if shift && (keyval == gtk4::gdk::Key::Page_Up || keyval == gtk4::gdk::Key::Page_Down) {
-                    let adj = block_scroll_for_key.vadjustment();
-                    let step = (adj.page_size() * 0.9).max(1.0);
-                    let delta = if keyval == gtk4::gdk::Key::Page_Up { -step } else { step };
-                    let target = (adj.value() + delta).clamp(adj.lower(), adj.upper() - adj.page_size());
-                    adj.set_value(target);
+            // Ctrl+Shift+Up/Down: move the finished-block selection.
+            if ctrl && shift && matches!(keyval, Key::Up | Key::Down) {
+                let finished = finished_blocks_for_key.borrow();
+                if finished.is_empty() {
                     return glib::Propagation::Stop;
                 }
-
-                // Editor mode: when awaiting command input, handle editing locally
-                // During completion menu, forward keys directly to PTY (pass-through)
-                if editor_input_enabled && bstate_for_key.get() == BlockState::AwaitingCommand && !completion_active_for_key.get() && !isearch_active_for_key.get() {
-                    // Ctrl+Shift+V/C: always handle clipboard ourselves
-                    if ctrl && shift && (keyval == gtk4::gdk::Key::v || keyval == gtk4::gdk::Key::V) {
-                        let clipboard = root_for_key.clipboard();
-                        let active_for_paste = active_for_key.clone();
-                        let pty_for_paste = pty_for_key.clone();
-                        let pty_synced_for_paste = pty_synced_for_key.clone();
-                        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                            if let Ok(Some(text)) = result {
-                                let active = active_for_paste.borrow();
-                                let pos = active.cursor_offset.get();
-                                let mut cmd = active.pending_cmd.borrow().clone();
-                                let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                                cmd.insert_str(byte_pos, &text);
-                                let new_pos = pos + text.chars().count();
-                                *active.pending_cmd.borrow_mut() = cmd.clone();
-                                active.cursor_offset.set(new_pos);
-                                // Resync PTY with new full content
-                                pty_for_paste.write_bytes(b"\x15");
-                                pty_for_paste.write_bytes(cmd.as_bytes());
-                                pty_synced_for_paste.set(true);
-                                *active.pending_suggestion.borrow_mut() = String::new();
-                                active.cursor_visible.set(true);
-                                active.update_content_view();
-                            }
-                        });
-                        return glib::Propagation::Stop;
+                let current = selected_block_id_for_key.get();
+                let current_idx = current.and_then(|id| finished.iter().position(|b| b.id == id));
+                let new_idx = if keyval == Key::Up {
+                    match current_idx {
+                        None => Some(finished.len() - 1),
+                        Some(0) => Some(0),
+                        Some(i) => Some(i - 1),
                     }
-
-                    // Ctrl+Shift+C: copy selected text (PRIMARY) or pending_cmd
-                    if ctrl && shift && (keyval == gtk4::gdk::Key::c || keyval == gtk4::gdk::Key::C) {
-                        let display = root_for_key.display();
-                        let primary = display.primary_clipboard();
-                        let clipboard = display.clipboard();
-                        let active_for_copy = active_for_key.clone();
-                        primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                            let copied_from_primary = match result {
-                                Ok(Some(ref text)) if !text.is_empty() => {
-                                    clipboard.set_text(text);
-                                    true
-                                }
-                                _ => false,
-                            };
-                            if !copied_from_primary {
-                                let active = active_for_copy.borrow();
-                                let cmd = active.pending_cmd.borrow().clone();
-                                if !cmd.is_empty() {
-                                    clipboard.set_text(&cmd);
-                                }
-                            }
-                        });
-                        return glib::Propagation::Stop;
-                    }
-
-                    // IME: let input method handle key events (switch, compose, commit)
-                    if let Some(event) = controller.current_event() {
-                        if im_context_for_key.filter_keypress(&event) {
-                            return glib::Propagation::Stop;
-                        }
-                    }
-
-                    // Enter: send command to PTY
-                    if keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter {
-                        if shift {
-                            // Shift+Enter: insert newline
-                            let active = active_for_key.borrow();
-                            let pos = active.cursor_offset.get();
-                            let mut cmd = active.pending_cmd.borrow().clone();
-                            let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                            cmd.insert(byte_pos, '\n');
-                            *active.pending_cmd.borrow_mut() = cmd;
-                            active.cursor_offset.set(pos + 1);
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                            return glib::Propagation::Stop;
-                        }
-                        // If a block is selected, copy its command to input instead of submitting
-                        if let Some(sel_id) = selected_block_id_for_key.get() {
-                            let finished = finished_blocks_for_key.borrow();
-                            if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                                block.widget().remove_css_class("block-selected");
-                                let cmd_text = block.cmd_text.clone();
-                                selected_block_id_for_key.set(None);
-                                drop(finished);
-                                let active = active_for_key.borrow();
-                                *active.pending_cmd.borrow_mut() = cmd_text.clone();
-                                active.cursor_offset.set(cmd_text.chars().count());
-                                if pty_synced_for_key.get() {
-                                    pty_for_key.write_bytes(b"\x15");
-                                }
-                                pty_for_key.write_bytes(cmd_text.as_bytes());
-                                pty_synced_for_key.set(true);
-                                *active.pending_suggestion.borrow_mut() = String::new();
-                                active.cursor_visible.set(true);
-                                active.update_content_view();
-                            } else {
-                                selected_block_id_for_key.set(None);
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        // Regular Enter: send the command
-                        let active = active_for_key.borrow();
-                        let cmd = active.pending_cmd.borrow().clone();
-                        let trimmed = cmd.trim();
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\r");
-                        } else if !trimmed.is_empty() {
-                            pty_for_key.write_bytes(format!("{}\r", trimmed).as_bytes());
-                        } else {
-                            pty_for_key.write_bytes(b"\r");
-                        }
-                        active.cursor_offset.set(0);
-                        *active.pending_suggestion.borrow_mut() = String::new();
-                        pty_synced_for_key.set(false);
-                        history_index.set(None);
-                        user_scrolled_up_for_key.set(false);
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+C: send SIGINT
-                    if ctrl && (keyval == gtk4::gdk::Key::c || keyval == gtk4::gdk::Key::C) {
-                        pty_for_key.write_bytes(b"\x03");
-                        let active = active_for_key.borrow();
-                        *active.pending_cmd.borrow_mut() = String::new();
-                        active.cursor_offset.set(0);
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        history_index.set(None);
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+D: send EOF when command is empty (closes shell)
-                    if ctrl && (keyval == gtk4::gdk::Key::d || keyval == gtk4::gdk::Key::D) {
-                        let active = active_for_key.borrow();
-                        if active.pending_cmd.borrow().is_empty() {
-                            pty_for_key.write_bytes(b"\x04");
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Shift+Tab (backtab): send CSI Z instead of being swallowed
-                    if keyval == gtk4::gdk::Key::ISO_Left_Tab
-                        || (shift && keyval == gtk4::gdk::Key::Tab)
-                    {
-                        if !pty_synced_for_key.get() {
-                            let active = active_for_key.borrow();
-                            let cmd = active.pending_cmd.borrow().clone();
-                            pty_for_key.write_bytes(cmd.as_bytes());
-                            pty_synced_for_key.set(true);
-                        }
-                        pty_for_key.write_bytes(b"\x1b[Z");
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Tab: trigger shell completion
-                    if keyval == gtk4::gdk::Key::Tab {
-                        if !pty_synced_for_key.get() {
-                            let active = active_for_key.borrow();
-                            let cmd = active.pending_cmd.borrow().clone();
-                            pty_for_key.write_bytes(cmd.as_bytes());
-                            pty_synced_for_key.set(true);
-                        }
-                        pty_for_key.write_bytes(b"\t");
-                        tab_pending_for_key.set(true);
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+Shift+Up/Down: block navigation
-                    if ctrl && shift && (keyval == gtk4::gdk::Key::Up || keyval == gtk4::gdk::Key::Down) {
-                        let finished = finished_blocks_for_key.borrow();
-                        if finished.is_empty() {
-                            return glib::Propagation::Stop;
-                        }
-                        let current = selected_block_id_for_key.get();
-                        let current_idx = current.and_then(|id| finished.iter().position(|b| b.id == id));
-
-                        let new_idx = if keyval == gtk4::gdk::Key::Up {
-                            match current_idx {
-                                None => Some(finished.len() - 1),
-                                Some(0) => Some(0),
-                                Some(i) => Some(i - 1),
-                            }
-                        } else {
-                            match current_idx {
-                                None => None,
-                                Some(i) if i >= finished.len() - 1 => None,
-                                Some(i) => Some(i + 1),
-                            }
-                        };
-
-                        if let Some(old_idx) = current_idx {
-                            if let Some(block) = finished.get(old_idx) {
-                                block.widget().remove_css_class("block-selected");
-                            }
-                        }
-
-                        if let Some(idx) = new_idx {
-                            if let Some(block) = finished.get(idx) {
-                                block.widget().add_css_class("block-selected");
-                                selected_block_id_for_key.set(Some(block.id));
-                                let widget = block.widget().clone();
-                                let scroll = block_scroll_for_key.clone();
-                                glib::idle_add_local_once(move || {
-                                    if let Some(point) = widget.compute_point(
-                                        &scroll,
-                                        &gtk4::graphene::Point::new(0.0, 0.0),
-                                    ) {
-                                        let adj = scroll.vadjustment();
-                                        let target = (point.y() as f64) - adj.page_size() / 3.0;
-                                        adj.set_value(target.max(0.0));
-                                    }
-                                });
-                            }
-                        } else {
-                            selected_block_id_for_key.set(None);
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Up/Down: history navigation
-                    if keyval == gtk4::gdk::Key::Up || keyval == gtk4::gdk::Key::Down {
-                        let block_data = block_data_for_key.borrow();
-                        if block_data.is_empty() {
-                            return glib::Propagation::Stop;
-                        }
-                        let current_idx = history_index.get();
-                        let new_idx = if keyval == gtk4::gdk::Key::Up {
-                            match current_idx {
-                                None => Some(block_data.len().saturating_sub(1)),
-                                Some(0) => Some(0),
-                                Some(i) => Some(i - 1),
-                            }
-                        } else {
-                            match current_idx {
-                                None => None,
-                                Some(i) if i >= block_data.len().saturating_sub(1) => None,
-                                Some(i) => Some(i + 1),
-                            }
-                        };
-                        history_index.set(new_idx);
-                        let active = active_for_key.borrow();
-                        if let Some(idx) = new_idx {
-                            if let Some(block) = block_data.get(idx) {
-                                *active.pending_cmd.borrow_mut() = block.cmd.clone();
-                                active.cursor_offset.set(block.cmd.chars().count());
-                                // Resync PTY with history selection
-                                pty_for_key.write_bytes(b"\x15");
-                                pty_for_key.write_bytes(block.cmd.as_bytes());
-                                pty_synced_for_key.set(true);
-                            }
-                        } else {
-                            *active.pending_cmd.borrow_mut() = String::new();
-                            active.cursor_offset.set(0);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x15");
-                                pty_synced_for_key.set(false);
-                            }
-                        }
-                        *active.pending_suggestion.borrow_mut() = String::new();
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Escape: clear input and block selection
-                    if keyval == gtk4::gdk::Key::Escape {
-                        if let Some(sel_id) = selected_block_id_for_key.get() {
-                            let finished = finished_blocks_for_key.borrow();
-                            if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                                block.widget().remove_css_class("block-selected");
-                            }
-                            selected_block_id_for_key.set(None);
-                        }
-                        let active = active_for_key.borrow();
-                        *active.pending_cmd.borrow_mut() = String::new();
-                        active.cursor_offset.set(0);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x15");
-                            pty_synced_for_key.set(false);
-                        }
-                        *active.pending_suggestion.borrow_mut() = String::new();
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        history_index.set(None);
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Backspace: delete character before cursor
-                    if keyval == gtk4::gdk::Key::BackSpace {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        if pos > 0 {
-                            let mut cmd = active.pending_cmd.borrow().clone();
-                            let byte_pos = cmd.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
-                            let next_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                            cmd.drain(byte_pos..next_byte);
-                            *active.pending_cmd.borrow_mut() = cmd.clone();
-                            active.cursor_offset.set(pos - 1);
-                            if pty_synced_for_key.get() {
-                                let new_cursor = active.cursor_offset.get();
-                                if new_cursor == cmd.chars().count() {
-                                    pty_for_key.write_bytes(b"\x7f");
-                                } else {
-                                    pty_for_key.write_bytes(b"\x15");
-                                    pty_for_key.write_bytes(cmd.as_bytes());
-                                }
-                            }
-                            *active.pending_suggestion.borrow_mut() = String::new();
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Delete: delete character after cursor
-                    if keyval == gtk4::gdk::Key::Delete {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let mut cmd = active.pending_cmd.borrow().clone();
-                        let char_count = cmd.chars().count();
-                        if pos < char_count {
-                            let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                            let next_byte = cmd.char_indices().nth(pos + 1).map(|(i, _)| i).unwrap_or(cmd.len());
-                            cmd.drain(byte_pos..next_byte);
-                            *active.pending_cmd.borrow_mut() = cmd.clone();
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x15");
-                                pty_for_key.write_bytes(cmd.as_bytes());
-                            }
-                            *active.pending_suggestion.borrow_mut() = String::new();
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Left: move cursor left
-                    if keyval == gtk4::gdk::Key::Left {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        if pos > 0 {
-                            active.cursor_offset.set(pos - 1);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x1b[D");
-                            }
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Right: move cursor right or accept suggestion at EOL
-                    if keyval == gtk4::gdk::Key::Right {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let len = active.pending_cmd.borrow().chars().count();
-                        if pos < len {
-                            active.cursor_offset.set(pos + 1);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x1b[C");
-                            }
-                        } else {
-                            // At end of line: accept inline suggestion if present
-                            let suggestion = active.pending_suggestion.borrow().clone();
-                            if !suggestion.is_empty() {
-                                let mut cmd = active.pending_cmd.borrow().clone();
-                                cmd.push_str(&suggestion);
-                                *active.pending_cmd.borrow_mut() = cmd.clone();
-                                active.cursor_offset.set(cmd.chars().count());
-                                *active.pending_suggestion.borrow_mut() = String::new();
-                                pty_for_key.write_bytes(b"\x1b[C");
-                                pty_synced_for_key.set(true);
-                            }
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Home: move cursor to start
-                    if keyval == gtk4::gdk::Key::Home {
-                        let active = active_for_key.borrow();
-                        active.cursor_offset.set(0);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x1b[H");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // End: move cursor to end
-                    if keyval == gtk4::gdk::Key::End {
-                        let active = active_for_key.borrow();
-                        let len = active.pending_cmd.borrow().chars().count();
-                        active.cursor_offset.set(len);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x1b[F");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+A: move cursor to beginning of line
-                    if ctrl && (keyval == gtk4::gdk::Key::a || keyval == gtk4::gdk::Key::A) {
-                        let active = active_for_key.borrow();
-                        active.cursor_offset.set(0);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x01");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+E: move cursor to end of line
-                    if ctrl && (keyval == gtk4::gdk::Key::e || keyval == gtk4::gdk::Key::E) {
-                        let active = active_for_key.borrow();
-                        let len = active.pending_cmd.borrow().chars().count();
-                        active.cursor_offset.set(len);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x05");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+K: kill text from cursor to end of line
-                    if ctrl && (keyval == gtk4::gdk::Key::k || keyval == gtk4::gdk::Key::K) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let mut cmd = active.pending_cmd.borrow().clone();
-                        let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                        cmd.truncate(byte_pos);
-                        *active.pending_cmd.borrow_mut() = cmd.clone();
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x15");
-                            if !cmd.is_empty() {
-                                pty_for_key.write_bytes(cmd.as_bytes());
-                            }
-                        }
-                        *active.pending_suggestion.borrow_mut() = String::new();
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+B: move cursor back one character
-                    if ctrl && (keyval == gtk4::gdk::Key::b || keyval == gtk4::gdk::Key::B) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        if pos > 0 {
-                            active.cursor_offset.set(pos - 1);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x02");
-                            }
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+F: move cursor forward one character
-                    if ctrl && (keyval == gtk4::gdk::Key::f || keyval == gtk4::gdk::Key::F) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let len = active.pending_cmd.borrow().chars().count();
-                        if pos < len {
-                            active.cursor_offset.set(pos + 1);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x06");
-                            }
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+U: clear line before cursor
-                    if ctrl && (keyval == gtk4::gdk::Key::u || keyval == gtk4::gdk::Key::U) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let mut cmd = active.pending_cmd.borrow().clone();
-                        let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                        cmd.drain(..byte_pos);
-                        *active.pending_cmd.borrow_mut() = cmd.clone();
-                        active.cursor_offset.set(0);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x15");
-                            if !cmd.is_empty() {
-                                pty_for_key.write_bytes(cmd.as_bytes());
-                            }
-                        }
-                        *active.pending_suggestion.borrow_mut() = String::new();
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+W: delete word before cursor
-                    if ctrl && (keyval == gtk4::gdk::Key::w || keyval == gtk4::gdk::Key::W) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        if pos > 0 {
-                            let mut cmd = active.pending_cmd.borrow().clone();
-                            let chars: Vec<char> = cmd.chars().collect();
-                            let mut new_pos = pos;
-                            // Skip trailing spaces
-                            while new_pos > 0 && chars[new_pos - 1] == ' ' {
-                                new_pos -= 1;
-                            }
-                            // Skip word chars
-                            while new_pos > 0 && chars[new_pos - 1] != ' ' {
-                                new_pos -= 1;
-                            }
-                            let start_byte = cmd.char_indices().nth(new_pos).map(|(i, _)| i).unwrap_or(0);
-                            let end_byte = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                            cmd.drain(start_byte..end_byte);
-                            *active.pending_cmd.borrow_mut() = cmd.clone();
-                            active.cursor_offset.set(new_pos);
-                            if pty_synced_for_key.get() {
-                                pty_for_key.write_bytes(b"\x15");
-                                if !cmd.is_empty() {
-                                    pty_for_key.write_bytes(cmd.as_bytes());
-                                }
-                            }
-                            *active.pending_suggestion.borrow_mut() = String::new();
-                            active.cursor_visible.set(true);
-                            active.update_content_view();
-                        }
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+L: clear visible block history
-                    if ctrl && (keyval == gtk4::gdk::Key::l || keyval == gtk4::gdk::Key::L) {
-                        let mut blocks = finished_blocks_for_key.borrow_mut();
-                        for block in blocks.drain(..) {
-                            block_list_for_key.remove(block.widget());
-                        }
-                        pty_for_key.write_bytes(b"\x0c");
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Ctrl+R: reverse incremental history search. Forward to the
-                    // shell; its echoed search prompt is detected by the PTY
-                    // reader, which routes the search UI to the output VTE.
-                    if ctrl && !shift && !alt && (keyval == gtk4::gdk::Key::r || keyval == gtk4::gdk::Key::R) {
-                        pty_for_key.write_bytes(b"\x12");
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Alt+B: move cursor back one word
-                    if alt && !ctrl && (keyval == gtk4::gdk::Key::b || keyval == gtk4::gdk::Key::B) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let cmd = active.pending_cmd.borrow().clone();
-                        let chars: Vec<char> = cmd.chars().collect();
-                        let mut new_pos = pos;
-                        while new_pos > 0 && !chars[new_pos - 1].is_alphanumeric() {
-                            new_pos -= 1;
-                        }
-                        while new_pos > 0 && chars[new_pos - 1].is_alphanumeric() {
-                            new_pos -= 1;
-                        }
-                        active.cursor_offset.set(new_pos);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x1bb");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Alt+F: move cursor forward one word
-                    if alt && !ctrl && (keyval == gtk4::gdk::Key::f || keyval == gtk4::gdk::Key::F) {
-                        let active = active_for_key.borrow();
-                        let pos = active.cursor_offset.get();
-                        let cmd = active.pending_cmd.borrow().clone();
-                        let chars: Vec<char> = cmd.chars().collect();
-                        let len = chars.len();
-                        let mut new_pos = pos;
-                        while new_pos < len && !chars[new_pos].is_alphanumeric() {
-                            new_pos += 1;
-                        }
-                        while new_pos < len && chars[new_pos].is_alphanumeric() {
-                            new_pos += 1;
-                        }
-                        active.cursor_offset.set(new_pos);
-                        if pty_synced_for_key.get() {
-                            pty_for_key.write_bytes(b"\x1bf");
-                        }
-                        active.cursor_visible.set(true);
-                        active.update_content_view();
-                        return glib::Propagation::Stop;
-                    }
-
-                    // Normal printable characters: insert at cursor position
-                    if !ctrl && !alt {
-                        if let Some(ch) = keyval.to_unicode() {
-                            if !ch.is_control() {
-                                let active = active_for_key.borrow();
-                                let pos = active.cursor_offset.get();
-                                let mut cmd = active.pending_cmd.borrow().clone();
-                                let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                                let mut buf = [0u8; 4];
-                                let s = ch.encode_utf8(&mut buf);
-                                cmd.insert_str(byte_pos, s);
-                                *active.pending_cmd.borrow_mut() = cmd.clone();
-                                active.cursor_offset.set(pos + 1);
-                                // Mirror to PTY for suggestion generation
-                                let new_cursor = active.cursor_offset.get();
-                                if new_cursor == cmd.chars().count() {
-                                    pty_for_key.write_bytes(s.as_bytes());
-                                    pty_synced_for_key.set(true);
-                                } else if pty_synced_for_key.get() {
-                                    pty_for_key.write_bytes(b"\x15");
-                                    pty_for_key.write_bytes(cmd.as_bytes());
-                                    pty_synced_for_key.set(true);
-                                }
-                                *active.pending_suggestion.borrow_mut() = String::new();
-                                active.cursor_visible.set(true);
-                                active.update_content_view();
-                                return glib::Propagation::Stop;
-                            }
-                        }
-                    }
-
-                    // Let bare modifier keys propagate for input method switching (e.g. Shift toggles Chinese/English in fcitx5/ibus)
-                    match keyval {
-                        v if v == gtk4::gdk::Key::Shift_L
-                            || v == gtk4::gdk::Key::Shift_R
-                            || v == gtk4::gdk::Key::Control_L
-                            || v == gtk4::gdk::Key::Control_R
-                            || v == gtk4::gdk::Key::Alt_L
-                            || v == gtk4::gdk::Key::Alt_R
-                            || v == gtk4::gdk::Key::Super_L
-                            || v == gtk4::gdk::Key::Super_R
-                            || v == gtk4::gdk::Key::Meta_L
-                            || v == gtk4::gdk::Key::Meta_R => {
-                            return glib::Propagation::Proceed;
-                        }
-                        _ => {}
-                    }
-
-                    // Unhandled keys: consume to prevent interference
-                    return glib::Propagation::Stop;
-                }
-
-                // Handle Ctrl+Shift+C (copy) and Ctrl+Shift+V (paste)
-                if ctrl && shift {
-                    match keyval {
-                        v if v == gtk4::gdk::Key::c || v == gtk4::gdk::Key::C => {
-                            log::debug!(">>> COPY: Ctrl+Shift+C pressed");
-                            // Copy selected text to clipboard
-                            // First try VTE (for alt-screen mode)
-                            if let Some(text) = vte_for_key.text_selected(vte4::Format::Text) {
-                                log::debug!(">>> Copy: got {} chars from VTE", text.len());
-                                if !text.is_empty() {
-                                    let clipboard = vte_for_key.clipboard();
-                                    clipboard.set_text(&text);
-                                    log::debug!(">>> Copy: set VTE text to clipboard");
-                                } else {
-                                    log::debug!(">>> Copy: VTE text empty, trying PRIMARY");
-                                    // Fall back to PRIMARY clipboard (selected text in labels)
-                                    let display = root_for_key.display();
-                                    let primary = display.primary_clipboard();
-                                    log::debug!(">>> Copy: got PRIMARY clipboard, calling read_text_async");
-                                    let clipboard = display.clipboard();
-                                    primary.read_text_async(None::<&gtk4::gio::Cancellable>, move |result: Result<Option<gtk4::glib::GString>, _>| {
-                                        log::debug!(">>> Copy callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
-                                        match result {
-                                            Ok(text_opt) => {
-                                                if let Some(text_str) = text_opt {
-                                                    if !text_str.is_empty() {
-                                                        log::debug!(">>> Copy: got {} chars from PRIMARY", text_str.len());
-                                                        clipboard.set_text(&text_str);
-                                                        log::debug!(">>> Copy: copied to regular clipboard");
-                                                    } else {
-                                                        log::debug!(">>> Copy: PRIMARY is empty");
-                                                    }
-                                                } else {
-                                                    log::debug!(">>> Copy: PRIMARY is None");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::debug!(">>> Copy: error reading PRIMARY: {}", e);
-                                            }
-                                        }
-                                    });
-                                }
-                            } else {
-                                log::debug!(">>> Copy: VTE returned None");
-                            }
-                            return glib::Propagation::Stop;
-                        }
-                        v if v == gtk4::gdk::Key::v || v == gtk4::gdk::Key::V => {
-                            log::debug!(">>> PASTE: Ctrl+Shift+V pressed");
-                            // Paste: read clipboard and write to PTY
-                            let clipboard = vte_for_key.clipboard();
-                            let pty_for_paste = pty_for_key.clone();
-                            let bracketed_paste = bracketed_paste_for_key.get();
-                            log::debug!(">>> Paste: got clipboard, bracketed_paste={}, calling read_text_async", bracketed_paste);
-                            clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                                log::debug!(">>> Paste callback: result={:?}", result.as_ref().map(|opt| opt.as_ref().map(|s| s.len())));
-                                match result {
-                                    Ok(text_opt) => {
-                                        if let Some(text_str) = text_opt {
-                                            log::debug!(">>> Paste: got {} chars from clipboard", text_str.len());
-                                            // Wrap paste with bracketed paste mode if enabled
-                                            if bracketed_paste {
-                                                pty_for_paste.write_bytes(b"\x1b[200~");
-                                                pty_for_paste.write_bytes(text_str.as_bytes());
-                                                pty_for_paste.write_bytes(b"\x1b[201~");
-                                            } else {
-                                                pty_for_paste.write_bytes(text_str.as_bytes());
-                                            }
-                                            log::debug!(">>> Paste: wrote {} bytes to PTY", text_str.len());
-                                        } else {
-                                            log::debug!(">>> Paste: clipboard is None");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!(">>> Paste: error: {}", e);
-                                    }
-                                }
-                            });
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if let Some(event) = controller.current_event() {
-                    if im_context_for_key.filter_keypress(&event) {
-                        return glib::Propagation::Stop;
-                    }
-                }
-
-                let bytes: Option<Vec<u8>> = match keyval {
-                    v if v == gtk4::gdk::Key::Return || v == gtk4::gdk::Key::KP_Enter => {
-                        Some(b"\r".to_vec())
-                    }
-                    v if v == gtk4::gdk::Key::BackSpace => Some(b"\x7f".to_vec()),
-                    // Shift+Tab (backtab): GTK delivers it as ISO_Left_Tab, but some
-                    // layouts send Tab + SHIFT. Both must encode as CSI Z so TUIs
-                    // (e.g. Claude CLI plan-mode toggle) receive the backtab.
-                    v if v == gtk4::gdk::Key::ISO_Left_Tab => Some(b"\x1b[Z".to_vec()),
-                    v if v == gtk4::gdk::Key::Tab && shift => Some(b"\x1b[Z".to_vec()),
-                    v if v == gtk4::gdk::Key::Tab => Some(b"\t".to_vec()),
-                    v if v == gtk4::gdk::Key::Escape => Some(b"\x1b".to_vec()),
-                    v if v == gtk4::gdk::Key::Up && application_cursor_for_key.get() => Some(b"\x1bOA".to_vec()),
-                    v if v == gtk4::gdk::Key::Down && application_cursor_for_key.get() => Some(b"\x1bOB".to_vec()),
-                    v if v == gtk4::gdk::Key::Right && application_cursor_for_key.get() => Some(b"\x1bOC".to_vec()),
-                    v if v == gtk4::gdk::Key::Left && application_cursor_for_key.get() => Some(b"\x1bOD".to_vec()),
-                    v if v == gtk4::gdk::Key::Up => Some(b"\x1b[A".to_vec()),
-                    v if v == gtk4::gdk::Key::Down => Some(b"\x1b[B".to_vec()),
-                    v if v == gtk4::gdk::Key::Right => Some(b"\x1b[C".to_vec()),
-                    v if v == gtk4::gdk::Key::Left => Some(b"\x1b[D".to_vec()),
-                    v if v == gtk4::gdk::Key::Home => Some(b"\x1b[H".to_vec()),
-                    v if v == gtk4::gdk::Key::End => Some(b"\x1b[F".to_vec()),
-                    v if v == gtk4::gdk::Key::Delete => Some(b"\x1b[3~".to_vec()),
-                    v if v == gtk4::gdk::Key::Insert => Some(b"\x1b[2~".to_vec()),
-                    v if v == gtk4::gdk::Key::Page_Up => Some(b"\x1b[5~".to_vec()),
-                    v if v == gtk4::gdk::Key::Page_Down => Some(b"\x1b[6~".to_vec()),
-                    v if v == gtk4::gdk::Key::F1 => Some(b"\x1bOP".to_vec()),
-                    v if v == gtk4::gdk::Key::F2 => Some(b"\x1bOQ".to_vec()),
-                    v if v == gtk4::gdk::Key::F3 => Some(b"\x1bOR".to_vec()),
-                    v if v == gtk4::gdk::Key::F4 => Some(b"\x1bOS".to_vec()),
-                    v if v == gtk4::gdk::Key::F5 => Some(b"\x1b[15~".to_vec()),
-                    v if v == gtk4::gdk::Key::F6 => Some(b"\x1b[17~".to_vec()),
-                    v if v == gtk4::gdk::Key::F7 => Some(b"\x1b[18~".to_vec()),
-                    v if v == gtk4::gdk::Key::F8 => Some(b"\x1b[19~".to_vec()),
-                    v if v == gtk4::gdk::Key::F9 => Some(b"\x1b[20~".to_vec()),
-                    v if v == gtk4::gdk::Key::F10 => Some(b"\x1b[21~".to_vec()),
-                    v if v == gtk4::gdk::Key::F11 => Some(b"\x1b[23~".to_vec()),
-                    v if v == gtk4::gdk::Key::F12 => Some(b"\x1b[24~".to_vec()),
-                    v if ctrl => {
-                        if let Some(ch) = v.to_unicode() {
-                            let ctrl_byte = (ch as u8).wrapping_sub(b'`');
-                            if ctrl_byte < 32 {
-                                Some(vec![ctrl_byte])
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    v => {
-                        if let Some(ch) = v.to_unicode() {
-                            let mut buf = [0u8; 4];
-                            Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
-                        } else {
-                            None
-                        }
+                } else {
+                    match current_idx {
+                        None => None,
+                        Some(i) if i >= finished.len() - 1 => None,
+                        Some(i) => Some(i + 1),
                     }
                 };
-                if let Some(data) = bytes {
-                    pty_for_key.write_bytes(&data);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+                if let Some(old_idx) = current_idx {
+                    if let Some(block) = finished.get(old_idx) {
+                        block.widget().remove_css_class("block-selected");
+                    }
                 }
-            });
+                if let Some(idx) = new_idx {
+                    if let Some(block) = finished.get(idx) {
+                        block.widget().add_css_class("block-selected");
+                        selected_block_id_for_key.set(Some(block.id));
+                        let widget = block.widget().clone();
+                        let scroll = block_scroll_for_key.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(point) = widget.compute_point(
+                                &scroll,
+                                &gtk4::graphene::Point::new(0.0, 0.0),
+                            ) {
+                                let adj = scroll.vadjustment();
+                                let target = (point.y() as f64) - adj.page_size() / 3.0;
+                                adj.set_value(target.max(0.0));
+                            }
+                        });
+                    }
+                } else {
+                    selected_block_id_for_key.set(None);
+                }
+                return glib::Propagation::Stop;
+            }
+
+            // Enter while a block is selected: recall its command into the live
+            // input line (clear the shell line with Ctrl+U, then type it).
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(sel_id) = selected_block_id_for_key.get() {
+                    let finished = finished_blocks_for_key.borrow();
+                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
+                        let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
+                        pty_for_key.write_bytes(b"\x15");
+                        pty_for_key.write_bytes(cmd.as_bytes());
+                        typed_cmd_for_key.borrow_mut().clear();
+                        block.widget().remove_css_class("block-selected");
+                    }
+                    selected_block_id_for_key.set(None);
+                    return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
+
+            // Escape clears the block selection (when one is active).
+            if keyval == Key::Escape {
+                if let Some(sel_id) = selected_block_id_for_key.get() {
+                    let finished = finished_blocks_for_key.borrow();
+                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
+                        block.widget().remove_css_class("block-selected");
+                    }
+                    selected_block_id_for_key.set(None);
+                    return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
+
+            // Ctrl+L: clear visible finished blocks + send form feed to the shell.
+            if ctrl && !shift && !alt && matches!(keyval, Key::l | Key::L) {
+                let mut blocks = finished_blocks_for_key.borrow_mut();
+                for block in blocks.drain(..) {
+                    block_list_for_key.remove(block.widget());
+                }
+                pty_for_key.write_bytes(b"\x0c");
+                return glib::Propagation::Stop;
+            }
+
+            // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste against the live VTE.
+            if ctrl && shift && matches!(keyval, Key::c | Key::C) {
+                active_vte_for_key.copy_clipboard_format(vte4::Format::Text);
+                return glib::Propagation::Stop;
+            }
+            if ctrl && shift && matches!(keyval, Key::v | Key::V) {
+                active_vte_for_key.paste_clipboard();
+                return glib::Propagation::Stop;
+            }
+
+            // Everything else: let the VTE translate it (printable keys, editing,
+            // control sequences, IME) and emit `commit`.
+            glib::Propagation::Proceed
+        });
     }
 }
 
@@ -2308,7 +1002,6 @@ impl TermView {
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
         block_list.set_vexpand(false); // Don't expand - only take space needed
         block_list.set_valign(gtk4::Align::Start); // Align to top
-        block_list.set_margin_bottom(8);
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
@@ -2317,30 +1010,32 @@ impl TermView {
         block_scroll.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
         block_scroll.set_child(Some(&block_list));
         block_scroll.add_css_class("block-scroll");
+        // A focusable ScrolledWindow steals keyboard focus from the live VTE
+        // child (cursor goes hollow, keystrokes never reach the terminal). Make
+        // it not a focus target so focus delegates to the VTE. NOTE: use
+        // `focusable(false)`, NOT `can_focus(false)` — in GTK4 `can-focus=false`
+        // blocks the whole subtree (including the VTE) from ever taking focus.
+        block_scroll.set_focusable(false);
 
-        // Active block always at bottom
-        let active = Rc::new(RefCell::new(ActiveBlock::new(
-            config.output_batch_min_ms,
-            config.output_batch_max_ms,
-            config,
-        )));
-        if let Some(initial_cwd) = cwd {
-            active.borrow().update_cwd(initial_cwd);
-        }
-        // Active block is pinned outside the scroll area (appended to root below)
-
-        // VTE fallback for alt-screen mode
-        let vte = build_vte(config);
-        let vte_scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, vte.vadjustment().as_ref());
-        let vte_box = gtk4::Box::new(Orientation::Horizontal, 0);
-        vte_box.set_hexpand(true);
-        vte_box.set_vexpand(true);
-        vte_box.add_css_class("terminal-box"); // Allow find_first_terminal to discover the VTE inside
-        vte_box.append(&vte);
-        vte_box.append(&vte_scrollbar);
-        vte_box.set_visible(false); // hidden until alt-screen
+        // Active block: a single persistent live VTE pinned at the bottom of the
+        // block list. Prompt + typing + output all render here natively (jterm1
+        // model); finished commands snapshot into styled blocks above it.
+        let active = Rc::new(RefCell::new(ActiveBlock::new(config)));
+        let active_vte = active.borrow().active_vte.clone();
 
         block_list.append(active.borrow().widget());
+
+        // Pin the live VTE holder to one viewport page so it always fills the
+        // bottom of the scroll area, like jterm1.
+        {
+            let holder = active.borrow().widget().clone();
+            block_scroll.vadjustment().connect_changed(move |adj| {
+                let page = adj.page_size();
+                if page > 1.0 {
+                    holder.set_height_request(page as i32);
+                }
+            });
+        }
 
         // Floating breadcrumb: names the command whose output currently fills the
         // top of the viewport while scrolling a long block (IDE "sticky header").
@@ -2378,7 +1073,6 @@ impl TermView {
         }
 
         root.append(&scroll_overlay);
-        root.append(&vte_box);
 
         // ── PTY ───────────────────────────────────────────────────────────
         // Detect rsh shell for session_id passing
@@ -2408,9 +1102,9 @@ impl TermView {
 
         let pty = Rc::new(OwnedPty::spawn(&argv, cwd, &env_extra).expect("PTY spawn failed"));
 
-        // Store child PID on VTE widget so kill_all_terminal_children can find it
+        // Store child PID on the live VTE so kill_all_terminal_children can find it
         unsafe {
-            vte.set_data::<i32>("child-pid", pty.pid_i32());
+            active_vte.set_data::<i32>("child-pid", pty.pid_i32());
         }
 
         // ── Register CSS ──────────────────────────────────────────────────
@@ -2418,21 +1112,19 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
-        let alt_from_awaiting = Rc::new(Cell::new(false));
-        // Set when the running command hides the cursor (ESC[?25l) but has not
-        // yet shown a full-screen redraw. A bare cursor-hide is ambiguous —
-        // git/npm/cargo hide it for progress bars — so we wait for a redraw
-        // before treating the command as a TUI and switching to alt-screen.
-        let cursor_hide_pending = Rc::new(Cell::new(false));
+        // State to restore when an alt-screen app exits (jterm1 model).
+        let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_display_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_display_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let last_nonempty_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let last_nonempty_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let executing_cmd_raw: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let executing_cmd_markup: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // Command line reconstructed from VTE commit keystrokes; the finalize path
+        // styles this into the finished block.
+        let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // Rendered prompt captured at PromptEnd (prompt_buf is cleared once the
+        // prompt ends, so the finalize path reads this instead).
+        let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // True while an alt-screen app owns the viewport (finished blocks hidden).
+        let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
         let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
@@ -2461,18 +1153,14 @@ impl TermView {
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let tab_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let completion_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let isearch_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        // No-shell-integration fallback: set once any OSC-133 (FTCS) event is seen.
-        // While false, pre-prompt output is buffered; if the grace timer fires with
-        // FTCS still unseen, the view auto-switches to the raw VTE so nothing drops.
+        let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
+        // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
+        // integration is live.
         let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let idle_buf: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
-        let fallback_armed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
             cwd.unwrap_or("").to_string()
         ));
@@ -2480,22 +1168,16 @@ impl TermView {
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
             let active_rc = active.clone();
+            let active_vte_rc = active_vte.clone();
             let bstate_rc = bstate.clone();
-            let alt_from_awaiting_rc = alt_from_awaiting.clone();
-            let cursor_hide_pending_rc = cursor_hide_pending.clone();
+            let prev_state_rc = prev_state.clone();
             let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
             let cmd_buf_rc = cmd_buf.clone();
-            let cmd_display_raw_rc = cmd_display_raw.clone();
-            let cmd_display_markup_rc = cmd_display_markup.clone();
-            let last_nonempty_cmd_raw_rc = last_nonempty_cmd_raw.clone();
-            let last_nonempty_cmd_markup_rc = last_nonempty_cmd_markup.clone();
-            let executing_cmd_raw_rc = executing_cmd_raw.clone();
-            let executing_cmd_markup_rc = executing_cmd_markup.clone();
+            let typed_cmd_rc = typed_cmd.clone();
+            let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
-            let vte_for_alt = vte.clone();
-            let vte_box_rc = vte_box.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
             let bell_cbs = bell_callbacks.clone();
@@ -2518,14 +1200,10 @@ impl TermView {
             );
             let ansi_cache_for_cb = ansi_cache.clone();
             let widget_pool_for_cb = widget_pool.clone();
-            let editor_input_for_cb = config.editor_input;
-            let tab_pending_rc = tab_pending.clone();
             let pty_synced_rc = pty_synced.clone();
-            let completion_active_rc = completion_active.clone();
-            let isearch_active_rc = isearch_active.clone();
+            let visible_indices_rc = visible_indices.clone();
+            let fullscreen_rc = fullscreen.clone();
             let ftcs_seen_rc = ftcs_seen.clone();
-            let idle_buf_rc = idle_buf.clone();
-            let fallback_armed_rc = fallback_armed.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
             let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
@@ -2546,22 +1224,16 @@ impl TermView {
             let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
             ReaderCtx {
                 active_rc,
+                active_vte: active_vte_rc,
                 bstate_rc,
-                alt_from_awaiting_rc,
-                cursor_hide_pending_rc,
+                prev_state_rc,
                 osc133_depth_rc,
                 prompt_buf_rc,
                 cmd_buf_rc,
-                cmd_display_raw_rc,
-                cmd_display_markup_rc,
-                last_nonempty_cmd_raw_rc,
-                last_nonempty_cmd_markup_rc,
-                executing_cmd_raw_rc,
-                executing_cmd_markup_rc,
+                typed_cmd_rc,
+                prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
-                vte_for_alt,
-                vte_box_rc,
                 cwd_cbs,
                 exited_cbs,
                 bell_cbs,
@@ -2581,14 +1253,10 @@ impl TermView {
                 scroll_debouncer,
                 ansi_cache_for_cb,
                 widget_pool_for_cb,
-                editor_input_for_cb,
-                tab_pending_rc,
                 pty_synced_rc,
-                completion_active_rc,
-                isearch_active_rc,
+                visible_indices_rc,
+                fullscreen_rc,
                 ftcs_seen_rc,
-                idle_buf_rc,
-                fallback_armed_rc,
                 init_cmds_queue_for_cb,
                 pty_for_init,
                 block_start_time_for_cb,
@@ -2730,102 +1398,41 @@ impl TermView {
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
 
-        // ── GTK input method support ─────────────────────────────────────
-        let im_context = gtk4::IMMulticontext::new();
-        let im_client_widget = active.borrow().command_view.clone();
-
-        im_context.set_client_widget(Some(&im_client_widget));
-
+        // ── Live VTE input → PTY (jterm1 model) ───────────────────────────
+        // The active VTE has input_enabled(true), so it translates keystrokes and
+        // owns IME natively; its `commit` signal carries the bytes to send. We
+        // forward them to the PTY and, while awaiting a command, reconstruct the
+        // typed command line so the finalize path can style it into the block.
         {
             let pty_for_commit = pty.clone();
-            let active_for_commit = active.clone();
             let bstate_for_commit = bstate.clone();
-            let pty_synced_for_commit = pty_synced.clone();
-            let editor_input_for_commit = config.editor_input;
-            im_context.connect_commit(move |_, text| {
-                if editor_input_for_commit && bstate_for_commit.get() == BlockState::AwaitingCommand {
-                    let active = active_for_commit.borrow();
-                    let pos = active.cursor_offset.get();
-                    let mut cmd = active.pending_cmd.borrow().clone();
-                    let byte_pos = cmd.char_indices().nth(pos).map(|(i, _)| i).unwrap_or(cmd.len());
-                    cmd.insert_str(byte_pos, text);
-                    let new_pos = pos + text.chars().count();
-                    *active.pending_cmd.borrow_mut() = cmd.clone();
-                    active.cursor_offset.set(new_pos);
-                    active.pending_preedit.borrow_mut().clear();
-                    if new_pos == cmd.chars().count() {
-                        pty_for_commit.write_bytes(text.as_bytes());
-                        pty_synced_for_commit.set(true);
-                    } else if pty_synced_for_commit.get() {
-                        pty_for_commit.write_bytes(b"\x15");
-                        pty_for_commit.write_bytes(cmd.as_bytes());
+            let typed_cmd_for_commit = typed_cmd.clone();
+            active_vte.connect_commit(move |_, text, _size| {
+                pty_for_commit.write_bytes(text.as_bytes());
+                if bstate_for_commit.get() == BlockState::AwaitingCommand {
+                    let mut cmd = typed_cmd_for_commit.borrow_mut();
+                    for ch in text.chars() {
+                        if ch == '\r' || ch == '\n' {
+                            // Submit — leave the reconstructed line intact for finalize.
+                        } else if ch == '\x7f' || ch == '\x08' {
+                            cmd.pop();
+                        } else if (ch as u32) < 0x20 {
+                            // Control bytes (Tab, Ctrl-*, escape sequences): ignore.
+                        } else {
+                            cmd.push(ch);
+                        }
                     }
-                    *active.pending_suggestion.borrow_mut() = String::new();
-                    active.cursor_visible.set(true);
-                    active.update_content_view();
-                } else {
-                    pty_for_commit.write_bytes(text.as_bytes());
                 }
             });
         }
 
-        {
-            let active_for_preedit = active.clone();
-            im_context.connect_preedit_changed(move |context| {
-                let (preedit, _, _) = context.preedit_string();
-                active_for_preedit.borrow().set_preedit(preedit.as_str());
-            });
-        }
-
-        if config.editor_input {
-            // Editor mode: attach a focus controller on root so the IM context
-            // is re-activated whenever focus returns to the terminal area (e.g.
-            // after exiting an alt-screen pager when the sidebar is open).
-            im_context.focus_in();
-            let focus_ctrl = gtk4::EventControllerFocus::new();
-            let im_for_root_focus_in = im_context.clone();
-            focus_ctrl.connect_enter(move |_| {
-                im_for_root_focus_in.focus_in();
-            });
-            root.add_controller(focus_ctrl);
-        } else {
-            let focus_ctrl = gtk4::EventControllerFocus::new();
-            let im_for_focus_in = im_context.clone();
-            focus_ctrl.connect_enter(move |_| {
-                im_for_focus_in.focus_in();
-            });
-
-            let im_for_focus_out = im_context.clone();
-            let active_for_focus_out = active.clone();
-            focus_ctrl.connect_leave(move |_| {
-                im_for_focus_out.focus_out();
-                im_for_focus_out.reset();
-                active_for_focus_out.borrow().set_preedit("");
-            });
-            im_client_widget.add_controller(focus_ctrl);
-            im_context.focus_in();
-        }
-
-        // ── Keyboard input → PTY ──────────────────────────────────────────
+        // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
             let pty_for_key = pty.clone();
-            let vte_for_key = vte.clone();
-            let root_for_key = root.clone();
-            let im_context_for_key = im_context.clone();
-            let application_cursor_for_key = application_cursor_mode.clone();
-            let bracketed_paste_for_key = bracketed_paste_mode.clone();
-            let bstate_for_key = bstate.clone();
-            let active_for_key = active.clone();
-            let editor_input_enabled = config.editor_input;
-            let block_data_for_key = block_data_rc.clone();
-            let history_index: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-            let pty_synced_for_key = pty_synced.clone();
-            let tab_pending_for_key = tab_pending.clone();
-            let completion_active_for_key = completion_active.clone();
-            let isearch_active_for_key = isearch_active.clone();
+            let active_vte_for_key = active_vte.clone();
+            let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let block_list_for_key = block_list.clone();
-            let user_scrolled_up_for_key = user_scrolled_up.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let block_scroll_for_key = block_scroll.clone();
             let key_ctrl = gtk4::EventControllerKey::new();
@@ -2833,49 +1440,29 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
-                vte_for_key,
-                root_for_key,
-                im_context_for_key,
-                application_cursor_for_key,
-                bracketed_paste_for_key,
-                bstate_for_key,
-                active_for_key,
-                editor_input_enabled,
-                block_data_for_key,
-                history_index,
-                pty_synced_for_key,
-                tab_pending_for_key,
-                completion_active_for_key,
-                isearch_active_for_key,
+                active_vte_for_key,
+                typed_cmd_for_key,
                 finished_blocks_for_key,
                 block_list_for_key,
-                user_scrolled_up_for_key,
                 selected_block_id_for_key,
                 block_scroll_for_key,
             }
             .connect(&key_ctrl);
 
-            let im_context_for_release = im_context.clone();
-            key_ctrl.connect_key_released(move |controller, _keyval, _keycode, _modifiers| {
-                if let Some(event) = controller.current_event() {
-                    im_context_for_release.filter_keypress(&event);
-                }
-            });
-            root.add_controller(key_ctrl);
-            // Don't set root as focusable - it prevents child labels from being selectable
-            // root.set_focusable(true);
+            active_vte.add_controller(key_ctrl);
         }
 
         let term_view = TermView {
             root,
             block_scroll,
             block_list,
-            vte_box,
-            vte,
+            active_vte,
             active,
             bstate,
             prompt_buf,
             cmd_buf,
+            typed_cmd,
+            fullscreen,
             pty,
             cwd_callbacks,
             exited_callbacks,
@@ -2896,7 +1483,7 @@ impl TermView {
                 total_height: 0,
             })),
             widget_pool,
-            visible_indices: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            visible_indices,
             selected_block_id,
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
@@ -2922,7 +1509,7 @@ impl TermView {
                     block.cwd.as_deref(),
                 );
                 finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
-                finished.connect_actions(&term_view.vte, &term_view.pty, &pty_synced, &term_view.active);
+                finished.connect_actions(&term_view.active_vte, &term_view.pty, &pty_synced, &term_view.active);
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
         }
@@ -3005,169 +1592,29 @@ impl TermView {
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
         term_view.install_resize_tick();
 
-        // Give initial focus to ActiveBlock's TextView for cursor blinking
-        term_view.active.borrow().command_view.grab_focus();
+        // Give initial focus to the live VTE.
+        term_view.active_vte.grab_focus();
 
         term_view
     }
 
+    /// Keep the PTY grid in sync with the live VTE (jterm1 model). The VTE
+    /// re-derives its own column/row count from its allocation on every
+    /// size_allocate, so we just mirror that onto the PTY whenever it changes —
+    /// no pixel math, no chrome calibration.
     fn install_resize_tick(&self) {
-            let pty_for_resize = self.pty.clone();
-            let active_for_resize = self.active.clone();
-            let vte_for_resize = self.vte.clone();
-            let vte_box_for_resize = self.vte_box.clone();
-            let last_cols: Rc<Cell<u16>> = Rc::new(Cell::new(0));
-            let last_rows: Rc<Cell<u16>> = Rc::new(Cell::new(0));
-            let last_alloc_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-            let last_alloc_h: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-            let last_vte_visible: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let last_out_w: Rc<Cell<i32>> = Rc::new(Cell::new(0));
-            // Horizontal chrome (px) between the block container's allocation and the
-            // output grid: .block-active margin (8+8) + border (3 left + 1 right) = 20px
-            // (see css.rs). Seeded to that CSS value so the FIRST command already wraps
-            // at the true grid width, then self-calibrated from any realized output VTE
-            // so it tracks CSS/font changes automatically. Deriving cols from the always
-            // realized container (minus this chrome) — instead of the output VTE's own
-            // allocation — means the right width is known BEFORE the first byte is fed,
-            // not a frame or two later once the just-shown VTE finally gets laid out.
-            let out_chrome: Rc<Cell<i32>> = Rc::new(Cell::new(OUTPUT_GRID_CHROME_PX as i32));
-
-            let _last_frame = Rc::new(Cell::new(std::time::Instant::now()));
-            let last_frame_for_tick = _last_frame.clone();
-            let tick_id = self.root.add_tick_callback(move |widget, _clock| {
-                if prof_enabled() {
-                    let now = std::time::Instant::now();
-                    let dt = now.duration_since(last_frame_for_tick.get()).as_micros();
-                    last_frame_for_tick.set(now);
-                    if dt > 50_000 {
-                        prof!("FRAME gap {}us (>50ms — main loop stalled)", dt);
-                    }
-                }
-                let width = widget.allocated_width();
-                let height = widget.allocated_height();
-                if width <= 0 || height <= 0 {
-                    return glib::ControlFlow::Continue;
-                }
-                let vte_visible = vte_box_for_resize.is_visible();
-                let visibility_changed = vte_visible != last_vte_visible.get();
-                // Also watch the inline output VTE's OWN width. It starts at ~2px
-                // (hidden) and only gets its real allocation a frame or two after
-                // the first output makes it visible — and that transition does NOT
-                // change the root allocation. Without reacting to it the PTY keeps
-                // the coarse widget-width estimate (off by a couple cols from the
-                // VTE's true grid), so the shell wraps a hair wider than the screen.
-                let out_w = active_for_resize
-                    .try_borrow()
-                    .map(|a| a.output_vte.allocated_width())
-                    .unwrap_or(0);
-                let out_w_changed = out_w != last_out_w.get();
-                let alloc_changed =
-                    width != last_alloc_w.get() || height != last_alloc_h.get();
-                // While the alt screen is shown we must re-check VTE's grid every
-                // frame. Entering the alt screen does not change the root
-                // allocation, and the VTE's row/column counts only settle a frame
-                // or two after it becomes visible (tick callbacks run in the frame
-                // clock's UPDATE phase, before the LAYOUT phase that allocates the
-                // just-shown VTE). Without this poll the child keeps the stale
-                // pre-alt-screen row count and leaves blank space at the bottom of
-                // the window. In block mode we still only react to allocation
-                // changes.
-                if !vte_visible && !alloc_changed && !visibility_changed && !out_w_changed {
-                    return glib::ControlFlow::Continue;
-                }
-                last_vte_visible.set(vte_visible);
-                last_alloc_w.set(width);
-                last_alloc_h.set(height);
-                last_out_w.set(out_w);
-                let (cols, rows) = if vte_visible {
-                    // Use VTE's OWN grid as the source of truth, not pixel math.
-                    // See alt_screen_pty_size for why pixel-derived counts corrupt
-                    // box-drawing characters on sidebar toggle.
-                    match alt_screen_pty_size(
-                        vte_for_resize.column_count(),
-                        vte_for_resize.row_count(),
-                    ) {
-                        Some(size) => size,
-                        None => return glib::ControlFlow::Continue,
-                    }
-                } else {
-                    let Ok(active) = active_for_resize.try_borrow() else {
-                        return glib::ControlFlow::Continue;
-                    };
-                    let char_w = active.output_vte.char_width();
-                    if char_w <= 0 {
-                        return glib::ControlFlow::Continue;
-                    }
-                    // The PTY column count must equal the OUTPUT grid width so the
-                    // shell wraps exactly where the displayed output wraps — that is
-                    // what a real terminal does (its PTY width == its grid width).
-                    //
-                    // Derive it from the BLOCK CONTAINER, which is realized and stable
-                    // from the start, minus the fixed horizontal chrome between it and
-                    // the output grid (out_chrome). The output VTE's own allocation is
-                    // NOT usable as the source here: it stays ~2px for a frame or two
-                    // after feed_output makes it visible, so the entire burst of a short
-                    // command gets fed before the VTE ever reports its real width — the
-                    // shell would wrap a couple cols wide and the tail would be clipped.
-                    // Container-minus-chrome is correct on the very first byte.
-                    let widget_w = active.widget().allocated_width() as i64;
-                    if widget_w <= 0 {
-                        return glib::ControlFlow::Continue;
-                    }
-                    // Self-calibrate the chrome whenever the output VTE is realized at a
-                    // real width, so a CSS/font change can't desync the two.
-                    let vte_w = active.output_vte.allocated_width() as i64;
-                    if active.output_vte.is_visible() && vte_w >= char_w * 40 {
-                        out_chrome.set((widget_w - vte_w).max(0) as i32);
-                    }
-                    let grid_w = widget_w - out_chrome.get() as i64;
-                    let c = ((grid_w / char_w).max(20)) as u16;
-                    // Publish the committed PTY width so the live output VTE sizes its
-                    // grid to it and finished blocks pre-wrap at it — keeping the grid,
-                    // the PTY, and completed renders all on the same column.
-                    active.pty_cols.set(c);
-                    let char_h = active.output_vte.char_height();
-                    let r = if char_h > 0 {
-                        (height as i64 / char_h).max(1) as u16
-                    } else {
-                        24
-                    };
-                    (c, r)
-                };
-                if std::env::var("JT_WDBG2").is_ok() {
-                    eprintln!("[WDBG tick] computed cols={} rows={} (last_cols={} last_rows={}) out_w={} out_w_changed={} alloc_changed={} vte_visible={} last_real={}",
-                        cols, rows, last_cols.get(), last_rows.get(), out_w, out_w_changed, alloc_changed, vte_visible, out_chrome.get());
-                }
-                if cols != last_cols.get() || rows != last_rows.get() {
-                    last_cols.set(cols);
-                    last_rows.set(rows);
-                    if std::env::var("JT_WDBG").is_ok() {
-                        if let Ok(a) = active_for_resize.try_borrow() {
-                            eprintln!("[WDBG resize] PTY <- cols={} rows={} | widget_w={} out_vte: col_count={} alloc_w={} char_w={} visible={}",
-                                cols, rows, a.widget().allocated_width(), a.output_vte.column_count(), a.output_vte.allocated_width(), a.output_vte.char_width(), a.output_vte.is_visible());
-                        }
-                    }
-                    pty_for_resize.resize(cols, rows);
-                    if vte_box_for_resize.is_visible() {
-                        // Do NOT call vte.set_size() here. The VTE widget already
-                        // re-derives its grid (column_count/row_count) from its own
-                        // allocation on every size_allocate. Forcing a pixel-computed
-                        // size on top of that fights VTE's auto-sizing: the values
-                        // disagree by the integer-division remainder / scrollbar /
-                        // padding, so the grid VTE draws into no longer matches the
-                        // size the child (e.g. Claude Code) redraws for after the
-                        // SIGWINCH from pty.resize — producing the overlapping
-                        // "historical frame" artifact when the sidebar toggles.
-                        // Resizing only the PTY mirrors the known-good initial path
-                        // in show_alt_screen and keeps everything consistent.
-                    } else if let Ok(active) = active_for_resize.try_borrow() {
-                        let current_rows = active.output_vte.row_count();
-                        active.output_vte.set_size(cols as i64, current_rows.max(rows as i64));
-                    }
-                }
-                glib::ControlFlow::Continue
-            });
-            *self.resize_tick_id.borrow_mut() = Some(tick_id);
+        let pty_for_resize = self.pty.clone();
+        let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
+        let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
+            let cols = vte.column_count() as u16;
+            let rows = vte.row_count() as u16;
+            if cols > 0 && rows > 0 && (cols, rows) != last.get() {
+                last.set((cols, rows));
+                pty_for_resize.resize(cols, rows);
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.resize_tick_id.borrow_mut() = Some(tick_id);
     }
 
     /// Root GTK widget to embed in the notebook page.
@@ -3183,15 +1630,10 @@ impl TermView {
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) {
         self.pty.resize(cols, rows);
-        let active = self.active.borrow();
-        let current_rows = active.output_vte.row_count();
-        let new_rows = current_rows.max(rows as i64);
-        active.output_vte.set_size(cols as i64, new_rows);
     }
 
     /// Kill the child process.
     pub fn kill(&self) {
-        self.active.borrow().cancel_blink_timer();
         self.pty.kill();
     }
 
@@ -3200,7 +1642,7 @@ impl TermView {
     }
 
     pub fn vte(&self) -> &Terminal {
-        &self.vte
+        &self.active_vte
     }
 
     pub fn cwd(&self) -> String {
@@ -3208,11 +1650,7 @@ impl TermView {
     }
 
     pub fn grab_focus(&self) {
-        if self.vte_box.is_visible() {
-            self.vte.grab_focus();
-        } else {
-            self.root.grab_focus();
-        }
+        self.active_vte.grab_focus();
     }
 
     /// Copy selected text to clipboard.
@@ -3221,13 +1659,13 @@ impl TermView {
     pub fn copy_to_clipboard(&self) {
         log::debug!(">>> TermView::copy_to_clipboard called");
         // First try VTE (for alt-screen mode)
-        let vte_text = self.vte.text_selected(vte4::Format::Text);
+        let vte_text = self.active_vte.text_selected(vte4::Format::Text);
         let has_vte_text = vte_text.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
 
         if has_vte_text {
             let text = vte_text.unwrap();
             log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
-            let clipboard = self.vte.clipboard();
+            let clipboard = self.active_vte.clipboard();
             clipboard.set_text(&text);
             log::debug!(">>> TermView copy: set VTE text to clipboard");
         } else {
@@ -3279,7 +1717,7 @@ impl TermView {
     /// Paste from clipboard to PTY.
     pub fn paste_from_clipboard(&self) {
         log::debug!(">>> TermView::paste_from_clipboard called");
-        let clipboard = self.vte.clipboard();
+        let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste_mode.get();
         log::debug!(">>> TermView paste: got clipboard, calling read_text_async");
@@ -3339,14 +1777,23 @@ impl TermView {
         self.cursor_shape.get()
     }
 
-    /// Apply updated theme colors to the block widgets.
+    /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
-        install_block_css(&self.config.borrow());
+        let config = self.config.borrow();
+        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+        self.active_vte.set_colors(
+            Some(&config.foreground),
+            Some(&config.background),
+            &palette_refs,
+        );
+        self.active_vte.set_color_cursor(Some(&config.cursor));
+        self.active_vte.set_color_cursor_foreground(Some(&config.cursor_foreground));
+        install_block_css(&config);
     }
 
     /// Update font for VTE terminal and block view CSS.
     pub fn set_font(&self, font_desc: &FontDescription) {
-        self.vte.set_font(Some(font_desc));
+        self.active_vte.set_font(Some(font_desc));
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = font_desc.to_string();
         install_block_css(&self.config.borrow());
@@ -3354,7 +1801,7 @@ impl TermView {
 
     /// Update font scale for VTE terminal and block view CSS.
     pub fn set_font_scale(&self, scale: f64) {
-        self.vte.set_font_scale(scale);
+        self.active_vte.set_font_scale(scale);
         self.config.borrow_mut().default_font_scale = scale;
         // Regenerate CSS with updated font scale
         install_block_css(&self.config.borrow());
@@ -3517,10 +1964,8 @@ impl TermView {
     /// Collect a snapshot of internal runtime state for the debug dashboard.
     /// Returns labelled sections, each a list of (key, value) rows.
     pub fn debug_info(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
-        let active = self.active.borrow();
-        let out_cols = active.output_vte.column_count();
-        let out_rows = active.output_vte.row_count();
-        drop(active);
+        let out_cols = self.active_vte.column_count();
+        let out_rows = self.active_vte.row_count();
 
         let finished_len = self.finished_blocks.borrow().len();
         let block_data_len = self.block_data.borrow().len();
@@ -3564,7 +2009,7 @@ impl TermView {
                     ),
                     (
                         "Alt screen visible".to_string(),
-                        self.vte_box.is_visible().to_string(),
+                        self.fullscreen.get().to_string(),
                     ),
                 ],
             ),
@@ -3685,7 +2130,7 @@ impl TermView {
             let output_text = strip_ansi(&block.full_output.borrow());
 
             let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
-            let clipboard = self.vte.clipboard();
+            let clipboard = self.active_vte.clipboard();
             clipboard.set_text(&full_text);
         }
     }
@@ -3810,10 +2255,7 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ansi_text_runs, ansi_to_pango, command_line_plain_text, separate_input_and_suggestion,
-        skip_ansi_visible_chars, strip_ansi, strip_ansi_with_clear_detect,
-    };
+    use super::{ansi_text_runs, strip_ansi, strip_ansi_with_clear_detect};
     use gtk4::gdk::RGBA;
 
     fn palette() -> [RGBA; 16] {
@@ -3823,21 +2265,6 @@ mod tests {
     #[test]
     fn strips_charset_designation_from_output() {
         assert_eq!(strip_ansi("\u{1b}(Btop"), "top");
-    }
-
-    #[test]
-    fn skips_charset_designation_when_counting_visible_chars() {
-        assert_eq!(skip_ansi_visible_chars("\u{1b}(Btop", 1), "op");
-    }
-
-    #[test]
-    fn ignores_charset_designation_in_command_plain_text() {
-        assert_eq!(command_line_plain_text("\u{1b}(Btop"), "top");
-    }
-
-    #[test]
-    fn ignores_charset_designation_in_pango_conversion() {
-        assert_eq!(ansi_to_pango("\u{1b}(Btop", &palette()), "top");
     }
 
     #[test]
@@ -4113,13 +2540,6 @@ mod tests {
             strip_ansi_with_clear_detect("\u{1b}[0J"),
             ("".to_string(), false)
         );
-    }
-
-    #[test]
-    fn separates_dim_suggestion_without_cursor_padding() {
-        let (input, suggestion) = separate_input_and_suggestion("git p\u{1b}[2mull\u{1b}[0m", 0);
-        assert_eq!(input, "git p");
-        assert_eq!(suggestion, "ull");
     }
 
     #[test]
