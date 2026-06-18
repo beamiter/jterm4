@@ -284,6 +284,12 @@ fn show_command_palette(
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Minimum rows the live input cell is guaranteed when idle (warp-style compact
+/// input): it shrinks to fit the prompt + typed command but never below this, so
+/// there is always usable room to type. It grows with multiline input up to the
+/// viewport, and is forced to the full viewport only for alt-screen apps.
+const MIN_INPUT_ROWS: i32 = 6;
+
 #[allow(dead_code)]
 pub struct TermView {
     root: gtk4::Box,
@@ -1323,17 +1329,10 @@ impl TermView {
 
         block_list.append(active.borrow().widget());
 
-        // Pin the live VTE holder to one viewport page so it always fills the
-        // bottom of the scroll area, like jterm1.
-        {
-            let holder = active.borrow().widget().clone();
-            block_scroll.vadjustment().connect_changed(move |adj| {
-                let page = adj.page_size();
-                if page > 1.0 {
-                    holder.set_height_request(page as i32);
-                }
-            });
-        }
+        // The live VTE holder is NOT pinned to the full viewport. Its height is
+        // driven by `update_input_height` (installed after `bstate` exists below):
+        // compact (content-sized, min MIN_INPUT_ROWS) while idle so history shows
+        // above it (warp model), and full-viewport only for alt-screen apps.
 
         // ── Jump-to-bottom floating action button ─────────────────────────
         // Shown when the user scrolls up into history; an optional unread badge
@@ -1415,14 +1414,80 @@ impl TermView {
 
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
+
+        // Command line reconstructed from VTE commit keystrokes; also drives the
+        // idle input-cell height (line count), so it is declared before the
+        // sizing closure below.
+        let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+        // ── Warp-style input-cell sizing ──────────────────────────────────
+        // The live VTE holder hugs its content (prompt + typed command) with a
+        // guaranteed minimum height while idle, so finished blocks remain visible
+        // above it. It is forced to the full viewport only for alt-screen apps
+        // (vim/less/TUIs) which need real terminal rows. During a running command
+        // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
+        // thrash); the full output is snapshotted into a finished block when done.
+        let update_input_height: Rc<dyn Fn()> = {
+            let holder = active.borrow().widget().clone();
+            let vte = active_vte.clone();
+            let scroll = block_scroll.clone();
+            let bstate = bstate.clone();
+            let typed_cmd = typed_cmd.clone();
+            Rc::new(move || {
+                let page = scroll.vadjustment().page_size() as i32;
+                if page <= 1 {
+                    return;
+                }
+                let cell_h = (vte.char_height() as i32).max(1);
+                let viewport_rows = (page / cell_h).max(1);
+                let target = match bstate.get() {
+                    // Full-screen apps & non-OSC133 shells behave like a normal
+                    // terminal: give them the whole viewport.
+                    BlockState::AltScreen | BlockState::RawFallback => page,
+                    // Running / draining a command: leave the height frozen so the
+                    // reported PTY rows stay stable for the command's lifetime.
+                    BlockState::CollectingOutput | BlockState::PostCommand => {
+                        return;
+                    }
+                    // Idle: size to the typed command's line count (1 + newlines),
+                    // clamped to a usable minimum. We must NOT use the VTE cursor
+                    // row: cursor_position().1 is the ABSOLUTE scrollback row, which
+                    // climbs without bound as content accumulates and triggers a
+                    // grow→redraw→grow runaway that fills the viewport.
+                    BlockState::Idle
+                    | BlockState::CollectingPrompt
+                    | BlockState::AwaitingCommand => {
+                        let input_lines =
+                            1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i32;
+                        let floor = MIN_INPUT_ROWS.min(viewport_rows);
+                        let cap = viewport_rows.max(floor);
+                        input_lines.clamp(floor, cap) * cell_h
+                    }
+                };
+                // Constrain the VTE itself, not just the holder: the VTE's natural
+                // height (~24 rows) would otherwise keep the holder full-height.
+                if vte.height_request() != target {
+                    vte.set_height_request(target);
+                    holder.set_height_request(target);
+                }
+            })
+        };
+        {
+            // Re-apply on viewport resize (page_size changes) and whenever the live
+            // VTE's contents change (prompt printed, user typing, alt-screen toggle).
+            let f = update_input_height.clone();
+            block_scroll
+                .vadjustment()
+                .connect_changed(move |_| f());
+            let f = update_input_height.clone();
+            active_vte.connect_contents_changed(move |_| f());
+        }
+
         // State to restore when an alt-screen app exits (jterm1 model).
         let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        // Command line reconstructed from VTE commit keystrokes; the finalize path
-        // styles this into the finished block.
-        let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // Rendered prompt captured at PromptEnd (prompt_buf is cleared once the
         // prompt ends, so the finalize path reads this instead).
         let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));

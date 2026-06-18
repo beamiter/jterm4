@@ -824,11 +824,15 @@ impl ActiveBlock {
         // (including active_vte) from ever receiving focus.
         widget.set_focusable(false);
         widget.set_hexpand(true);
-        widget.set_vexpand(true);
+        // NOT vexpand: the input cell hugs its content (warp model). Its exact
+        // height is driven by `update_input_height` in block_view/mod.rs via
+        // height_request. With vexpand the cell would fill the whole viewport
+        // regardless of the requested height.
+        widget.set_vexpand(false);
 
         let active_vte = create_active_terminal(config);
         active_vte.set_hexpand(true);
-        active_vte.set_vexpand(true);
+        active_vte.set_vexpand(false);
         widget.append(&active_vte);
 
         // Focus the live VTE as soon as it is realized (jterm1 block.rs:324-328).
