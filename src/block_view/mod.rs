@@ -307,6 +307,12 @@ pub struct TermView {
     typed_cmd: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Rc<Cell<bool>>,
+    /// True once the user has scrolled up off the live prompt; while false the
+    /// view follows the bottom. Read by the per-frame tick to re-pin the prompt.
+    user_scrolled_up: Rc<Cell<bool>>,
+    /// Guards programmatic scrolls so the scroll-lock detector doesn't mistake
+    /// them for a user drag.
+    programmatic_scroll: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
     cwd_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
@@ -1420,6 +1426,14 @@ impl TermView {
         // sizing closure below.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
+        // Scroll-lock flags shared across the contents_changed pin, value_changed
+        // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
+        // follow-bottom pin while the user is reading history; `programmatic_scroll`
+        // marks our own adjustment writes so the value_changed detector doesn't
+        // mistake them for a user drag.
+        let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
         // ── Warp-style input-cell sizing ──────────────────────────────────
         // The live VTE holder hugs its content (prompt + typed command) with a
         // guaranteed minimum height while idle, so finished blocks remain visible
@@ -1434,16 +1448,17 @@ impl TermView {
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
             Rc::new(move || {
+                let cell_h = (vte.char_height() as i32).max(1);
                 let page = scroll.vadjustment().page_size() as i32;
                 if page <= 1 {
                     return;
                 }
-                let cell_h = (vte.char_height() as i32).max(1);
-                let viewport_rows = (page / cell_h).max(1);
-                let target = match bstate.get() {
+                let viewport_rows = ((page / cell_h).max(1)) as i64;
+                let cols = vte.column_count().max(1);
+                let target_rows = match bstate.get() {
                     // Full-screen apps & non-OSC133 shells behave like a normal
                     // terminal: give them the whole viewport.
-                    BlockState::AltScreen | BlockState::RawFallback => page,
+                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
                     // Running / draining a command: leave the height frozen so the
                     // reported PTY rows stay stable for the command's lifetime.
                     BlockState::CollectingOutput | BlockState::PostCommand => {
@@ -1458,29 +1473,68 @@ impl TermView {
                     | BlockState::CollectingPrompt
                     | BlockState::AwaitingCommand => {
                         let input_lines =
-                            1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i32;
-                        let floor = MIN_INPUT_ROWS.min(viewport_rows);
+                            1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
+                        let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
                         let cap = viewport_rows.max(floor);
-                        input_lines.clamp(floor, cap) * cell_h
+                        input_lines.clamp(floor, cap)
                     }
                 };
-                // Constrain the VTE itself, not just the holder: the VTE's natural
-                // height (~24 rows) would otherwise keep the holder full-height.
-                if vte.height_request() != target {
-                    vte.set_height_request(target);
-                    holder.set_height_request(target);
+                // Drive the VTE grid directly. `set_height_request` only sets a
+                // *minimum*, so it cannot shrink a VTE whose natural height
+                // (row_count * char_height) is larger — the cell would stay
+                // full-height. `set_size` sets the preferred grid, shrinking the
+                // VTE's natural height so the (non-expanding) holder collapses to
+                // it. The PTY-resize tick then follows row_count up/down.
+                if vte.row_count() != target_rows {
+                    vte.set_size(cols, target_rows);
                 }
+                holder.set_height_request((target_rows as i32) * cell_h);
             })
         };
+        // Coalesces follow-bottom pins so a burst of contents-changed signals
+        // schedules at most one deferred scroll.
+        let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
-            // Re-apply on viewport resize (page_size changes) and whenever the live
-            // VTE's contents change (prompt printed, user typing, alt-screen toggle).
+            // Drive sizing from the data path (contents changed: prompt printed,
+            // user typing, output streaming, alt-screen toggle), and follow the
+            // bottom from here too — NOT from the vadjustment `changed` signal.
+            //
+            // Why a deferred idle and not `changed`: pinning inside `changed`
+            // reacts to virtualization's own `upper` changes (off-screen blocks
+            // collapse to 0 height when hidden), so pin → hide top block → upper
+            // shrinks → `changed` → pin → block reappears → upper grows → `changed`
+            // → … an infinite two-state oscillation. A low-priority idle runs once
+            // per content burst, AFTER layout settles (so `upper` is final), and is
+            // never re-triggered by the visibility side-effects of its own scroll.
             let f = update_input_height.clone();
-            block_scroll
-                .vadjustment()
-                .connect_changed(move |_| f());
-            let f = update_input_height.clone();
-            active_vte.connect_contents_changed(move |_| f());
+            let scroll = block_scroll.clone();
+            let user_scrolled = user_scrolled_up.clone();
+            let programmatic = programmatic_scroll.clone();
+            let pin_pending = pin_pending.clone();
+            active_vte.connect_contents_changed(move |_| {
+                f();
+                if user_scrolled.get() || pin_pending.get() {
+                    return;
+                }
+                pin_pending.set(true);
+                let scroll = scroll.clone();
+                let user_scrolled = user_scrolled.clone();
+                let programmatic = programmatic.clone();
+                let pin_pending = pin_pending.clone();
+                glib::idle_add_local_once(move || {
+                    pin_pending.set(false);
+                    if user_scrolled.get() {
+                        return;
+                    }
+                    let adj = scroll.vadjustment();
+                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
+                    if (adj.value() - target).abs() > 1.0 {
+                        programmatic.set(true);
+                        adj.set_value(target);
+                        programmatic.set(false);
+                    }
+                });
+            });
         }
 
         // State to restore when an alt-screen app exits (jterm1 model).
@@ -1521,8 +1575,6 @@ impl TermView {
 
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
@@ -1697,6 +1749,26 @@ impl TermView {
             });
         }
 
+        // ── Re-clamp input height on viewport resize ──────────────────────
+        // `changed` fires during the viewport's size-allocate, after layout. We
+        // re-clamp the input height here ONLY when the viewport itself resized
+        // (page_size moved) — content-driven sizing comes from the data path
+        // (contents_changed) above. We deliberately do NOT pin the scroll here:
+        // pinning from `changed` reacts to virtualization's own `upper` changes
+        // (hidden off-screen blocks collapse to 0 height) and oscillates forever.
+        // The follow-bottom pin is the deferred idle scheduled on contents_changed.
+        {
+            let f = update_input_height.clone();
+            let last_page = Rc::new(Cell::new(0.0f64));
+            block_scroll.vadjustment().connect_changed(move |adj| {
+                let page = adj.page_size();
+                if (page - last_page.get()).abs() > 0.5 {
+                    last_page.set(page);
+                    f();
+                }
+            });
+        }
+
         // ── Jump-to-bottom FAB click: return to the live prompt ───────────
         {
             let scroll = block_scroll.clone();
@@ -1862,6 +1934,8 @@ impl TermView {
             cmd_buf,
             typed_cmd,
             fullscreen,
+            user_scrolled_up: user_scrolled_up.clone(),
+            programmatic_scroll: programmatic_scroll.clone(),
             pty,
             cwd_callbacks,
             exited_callbacks,
