@@ -45,6 +45,237 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
+/// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
+fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
+    if unread > 0 {
+        let n = if unread > 99 { "99+".to_string() } else { unread.to_string() };
+        fab.set_label(&format!("\u{f078}  {}", n));
+    } else {
+        fab.set_label("\u{f078}");
+    }
+}
+
+/// Move the finished-block selection to `new_id` (or clear it with `None`),
+/// updating the selected CSS class and persistent quick-action visibility on both
+/// the previously-selected and newly-selected blocks. Shared by click selection
+/// and keyboard navigation so they stay in sync.
+fn select_finished_block(
+    finished: &[FinishedBlock],
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    new_id: Option<u64>,
+) {
+    let prev = selected_block_id.get();
+    if let Some(pid) = prev {
+        if let Some(b) = finished.iter().find(|b| b.id == pid) {
+            b.widget().remove_css_class("block-selected");
+            b.action_box.set_visible(false);
+        }
+    }
+    if let Some(nid) = new_id {
+        if let Some(b) = finished.iter().find(|b| b.id == nid) {
+            b.widget().add_css_class("block-selected");
+            b.action_box.set_visible(true);
+        }
+    }
+    selected_block_id.set(new_id);
+}
+
+/// Subsequence fuzzy match: returns `Some(score)` if every char of `query`
+/// appears in `text` in order (case-insensitive), else `None`. Lower score is a
+/// better match (penalizes a late first match and gaps between matched chars).
+fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let mut qi = 0;
+    let mut score: i64 = 0;
+    let mut last: i64 = -1;
+    for (ti, ch) in text.to_lowercase().chars().enumerate() {
+        if qi < q.len() && ch == q[qi] {
+            score += if last < 0 { ti as i64 } else { ti as i64 - last - 1 };
+            last = ti as i64;
+            qi += 1;
+        }
+    }
+    if qi == q.len() { Some(score) } else { None }
+}
+
+/// Pop up a fuzzy-searchable command-history palette (Ctrl+P). `commands` should
+/// be most-recent-first and deduped. Selecting an entry clears the live shell
+/// line and types the command into it (without executing), mirroring the
+/// single-block recall path so the user can edit before pressing Enter.
+fn show_command_palette(
+    parent: &ScrolledWindow,
+    commands: Vec<String>,
+    pty: Rc<OwnedPty>,
+    typed_cmd: Rc<RefCell<String>>,
+    live_vte: Terminal,
+) {
+    let popover = gtk4::Popover::new();
+    popover.set_parent(parent);
+    popover.set_has_arrow(false);
+    popover.set_autohide(true);
+    popover.add_css_class("command-palette");
+    popover.set_position(gtk4::PositionType::Bottom);
+    let pw = parent.width().max(1);
+    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(pw / 2, 0, 1, 1)));
+
+    let vbox = gtk4::Box::new(Orientation::Vertical, 6);
+    vbox.set_size_request(540, -1);
+
+    let entry = gtk4::SearchEntry::new();
+    entry.set_placeholder_text(Some("Search command history…"));
+    vbox.append(&entry);
+
+    let list = gtk4::ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::Single);
+    list.add_css_class("command-palette-list");
+
+    let scroller = ScrolledWindow::new();
+    scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroller.set_min_content_height(300);
+    scroller.set_max_content_height(300);
+    scroller.set_child(Some(&list));
+    vbox.append(&scroller);
+    popover.set_child(Some(&vbox));
+
+    let commands = Rc::new(commands);
+    let filtered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let populate = {
+        let list = list.clone();
+        let commands = commands.clone();
+        let filtered = filtered.clone();
+        move |query: &str| {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let mut scored: Vec<(i64, &String)> = commands
+                .iter()
+                .filter_map(|c| fuzzy_score(query, c).map(|s| (s, c)))
+                .collect();
+            // Stable sort keeps recency (input order) as the tiebreak.
+            scored.sort_by_key(|(s, _)| *s);
+            let mut keep = Vec::with_capacity(scored.len());
+            for (_, c) in scored {
+                let row_label = gtk4::Label::new(Some(c));
+                row_label.set_halign(gtk4::Align::Start);
+                row_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                row_label.add_css_class("command-palette-row");
+                let row = gtk4::ListBoxRow::new();
+                row.set_child(Some(&row_label));
+                list.append(&row);
+                keep.push(c.clone());
+            }
+            *filtered.borrow_mut() = keep;
+            if let Some(first) = list.row_at_index(0) {
+                list.select_row(Some(&first));
+            }
+        }
+    };
+    populate("");
+
+    let choose: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let filtered = filtered.clone();
+        let popover = popover.clone();
+        let scroll = parent.clone();
+        Rc::new(move || {
+            let idx = list.selected_row().map(|r| r.index()).unwrap_or(-1);
+            if idx >= 0 {
+                if let Some(cmd) = filtered.borrow().get(idx as usize) {
+                    pty.write_bytes(b"\x15");
+                    pty.write_bytes(cmd.as_bytes());
+                    typed_cmd.borrow_mut().clear();
+                }
+            }
+            popover.popdown();
+            // Dismissing the popover returns focus to the live VTE, which makes the
+            // ScrolledWindow scroll to reveal the holder's *top* (jumping up into
+            // history). Re-pin to the bottom so the user lands back on the prompt
+            // with the recalled command.
+            let scroll = scroll.clone();
+            let live_vte = live_vte.clone();
+            glib::idle_add_local_once(move || {
+                live_vte.grab_focus();
+                let adj = scroll.vadjustment();
+                adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+            });
+        })
+    };
+
+    {
+        let populate = populate.clone();
+        entry.connect_search_changed(move |e| populate(e.text().as_str()));
+    }
+
+    {
+        let choose = choose.clone();
+        list.connect_row_activated(move |list, row| {
+            list.select_row(Some(row));
+            choose();
+        });
+    }
+
+    {
+        let list = list.clone();
+        let popover = popover.clone();
+        let choose = choose.clone();
+        let key = gtk4::EventControllerKey::new();
+        key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, keyval, _, _| {
+            use gtk4::gdk::Key;
+            let n_rows = {
+                let mut n = 0;
+                while list.row_at_index(n).is_some() {
+                    n += 1;
+                }
+                n
+            };
+            let cur = list.selected_row().map(|r| r.index()).unwrap_or(-1);
+            match keyval {
+                Key::Up => {
+                    if n_rows > 0 {
+                        let next = if cur <= 0 { n_rows - 1 } else { cur - 1 };
+                        if let Some(r) = list.row_at_index(next) {
+                            list.select_row(Some(&r));
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                Key::Down => {
+                    if n_rows > 0 {
+                        let next = if cur < 0 || cur >= n_rows - 1 { 0 } else { cur + 1 };
+                        if let Some(r) = list.row_at_index(next) {
+                            list.select_row(Some(&r));
+                        }
+                    }
+                    glib::Propagation::Stop
+                }
+                Key::Return | Key::KP_Enter => {
+                    choose();
+                    glib::Propagation::Stop
+                }
+                Key::Escape => {
+                    popover.popdown();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        entry.add_controller(key);
+    }
+
+    // A Popover with an explicit parent must be unparented when dismissed or it
+    // leaks (and warns at teardown).
+    popover.connect_closed(|p| p.unparent());
+
+    popover.popup();
+    entry.grab_focus();
+}
+
 /// Cap on the retained raw output buffer for a single running command. The raw
 /// byte buffer used to re-render the finished block grew without bound — a runaway
 /// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
@@ -151,6 +382,11 @@ struct ReaderCtx {
     pending_exit_code_rc: Rc<Cell<i32>>,
     current_cwd_for_cb: Rc<RefCell<String>>,
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
+    unread_count_rc: Rc<Cell<u32>>,
+    jump_fab: gtk4::Button,
+    selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    cmd_running_rc: Rc<Cell<bool>>,
+    running_cmd_rc: Rc<RefCell<String>>,
 }
 
 impl ReaderCtx {
@@ -196,6 +432,11 @@ impl ReaderCtx {
             pending_exit_code_rc,
             current_cwd_for_cb,
             event_buf,
+            unread_count_rc,
+            jump_fab,
+            selected_block_id_rc,
+            cmd_running_rc,
+            running_cmd_rc,
         } = self;
         let _ = &ansi_cache_for_cb;
         pty.start_reader(
@@ -490,6 +731,15 @@ impl ReaderCtx {
 
                                 finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
 
+                                // If the user is reading history (scrolled up), this
+                                // freshly-finished block is "unread": bump the FAB badge
+                                // so they can see work completed below and jump to it.
+                                if scroll_debouncer.user_scrolled_up.get() {
+                                    unread_count_rc.set(unread_count_rc.get().saturating_add(1));
+                                    set_jump_fab_label(&jump_fab, unread_count_rc.get());
+                                    jump_fab.set_visible(true);
+                                }
+
                                 let max_blocks = config_for_cb.borrow().max_visible_blocks as usize;
                                 let finished_clone = finished.clone();
                                 let finished_widget = finished_clone.widget().clone();
@@ -621,13 +871,41 @@ impl ReaderCtx {
                                 });
                                 finished_widget.add_controller(right_click);
 
+                                // Single capture-phase click handler for the whole
+                                // block: it both moves focus to the live VTE and (when
+                                // the press lands on the header strip) toggles selection.
+                                //
+                                // This is deliberately ONE gesture rather than a separate
+                                // GestureClick on header_row. A capture-phase gesture here
+                                // grabs focus on press, which interrupts delivery of the
+                                // bubble-phase event to any controller mounted on a child
+                                // widget — so a header_row gesture would silently never
+                                // fire. Instead we gate selection on the press y-coordinate
+                                // falling within the header strip's height. Selection
+                                // enables Enter-to-rerun and keeps the quick actions
+                                // visible after the pointer leaves.
                                 {
                                     let active_for_click = active_rc.clone();
+                                    let header_for_click = finished_clone.header_row.clone();
+                                    let finished_blocks_for_select = finished_blocks_for_cb.clone();
+                                    let selected_for_click = selected_block_id_rc.clone();
+                                    let this_id = finished_clone.id;
                                     let left_click = gtk4::GestureClick::new();
                                     left_click.set_button(1);
                                     left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                                    left_click.connect_pressed(move |gesture, _, _, _| {
+                                    left_click.connect_pressed(move |gesture, _, _, y| {
                                         active_for_click.borrow().grab_focus();
+                                        // Header strip occupies the top of the block; a
+                                        // press there toggles this block's selection.
+                                        if y <= header_for_click.height() as f64 {
+                                            let finished = finished_blocks_for_select.borrow();
+                                            let target = if selected_for_click.get() == Some(this_id) {
+                                                None
+                                            } else {
+                                                Some(this_id)
+                                            };
+                                            select_finished_block(&finished, &selected_for_click, target);
+                                        }
                                         gesture.set_state(gtk4::EventSequenceState::Denied);
                                     });
                                     finished_widget.add_controller(left_click);
@@ -698,6 +976,9 @@ impl ReaderCtx {
                             osc133_depth_rc.set(0);
                             active_rc.borrow().reset_output_buffer();
                             block_start_time_for_cb.set(Some(SystemTime::now()));
+                            // Capture the command text for the sticky running-header.
+                            *running_cmd_rc.borrow_mut() = typed_cmd_rc.borrow().trim().to_string();
+                            cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
@@ -712,6 +993,7 @@ impl ReaderCtx {
                                 continue;
                             }
                             pending_exit_code_rc.set(*code);
+                            cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
@@ -897,15 +1179,10 @@ impl KeyCtx {
                         Some(i) => Some(i + 1),
                     }
                 };
-                if let Some(old_idx) = current_idx {
-                    if let Some(block) = finished.get(old_idx) {
-                        block.widget().remove_css_class("block-selected");
-                    }
-                }
+                let new_id = new_idx.and_then(|idx| finished.get(idx).map(|b| b.id));
+                select_finished_block(&finished, &selected_block_id_for_key, new_id);
                 if let Some(idx) = new_idx {
                     if let Some(block) = finished.get(idx) {
-                        block.widget().add_css_class("block-selected");
-                        selected_block_id_for_key.set(Some(block.id));
                         let widget = block.widget().clone();
                         let scroll = block_scroll_for_key.clone();
                         glib::idle_add_local_once(move || {
@@ -919,8 +1196,6 @@ impl KeyCtx {
                             }
                         });
                     }
-                } else {
-                    selected_block_id_for_key.set(None);
                 }
                 return glib::Propagation::Stop;
             }
@@ -935,9 +1210,8 @@ impl KeyCtx {
                         pty_for_key.write_bytes(b"\x15");
                         pty_for_key.write_bytes(cmd.as_bytes());
                         typed_cmd_for_key.borrow_mut().clear();
-                        block.widget().remove_css_class("block-selected");
                     }
-                    selected_block_id_for_key.set(None);
+                    select_finished_block(&finished, &selected_block_id_for_key, None);
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
@@ -945,12 +1219,9 @@ impl KeyCtx {
 
             // Escape clears the block selection (when one is active).
             if keyval == Key::Escape {
-                if let Some(sel_id) = selected_block_id_for_key.get() {
+                if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
-                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        block.widget().remove_css_class("block-selected");
-                    }
-                    selected_block_id_for_key.set(None);
+                    select_finished_block(&finished, &selected_block_id_for_key, None);
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
@@ -973,6 +1244,33 @@ impl KeyCtx {
             }
             if ctrl && shift && matches!(keyval, Key::v | Key::V) {
                 active_vte_for_key.paste_clipboard();
+                return glib::Propagation::Stop;
+            }
+
+            // Ctrl+P: fuzzy command-history palette. Build a deduped, most-recent
+            // -first command list from the finished blocks and pop it up.
+            if ctrl && !shift && !alt && matches!(keyval, Key::p | Key::P) {
+                let mut seen = std::collections::HashSet::new();
+                let mut cmds = Vec::new();
+                {
+                    let finished = finished_blocks_for_key.borrow();
+                    for b in finished.iter().rev() {
+                        let c = b.cmd_text.lines().next().unwrap_or("").trim().to_string();
+                        if c.is_empty() {
+                            continue;
+                        }
+                        if seen.insert(c.clone()) {
+                            cmds.push(c);
+                        }
+                    }
+                }
+                show_command_palette(
+                    &block_scroll_for_key,
+                    cmds,
+                    pty_for_key.clone(),
+                    typed_cmd_for_key.clone(),
+                    active_vte_for_key.clone(),
+                );
                 return glib::Propagation::Stop;
             }
 
@@ -1037,7 +1335,47 @@ impl TermView {
             });
         }
 
-        root.append(&block_scroll);
+        // ── Jump-to-bottom floating action button ─────────────────────────
+        // Shown when the user scrolls up into history; an optional unread badge
+        // counts finished blocks that completed while scrolled away. Clicking it
+        // returns the view to the live prompt. Overlaid on the scroll area so it
+        // floats over the block list without taking layout space.
+        let jump_fab = gtk4::Button::new();
+        jump_fab.add_css_class("jump-bottom-fab");
+        jump_fab.add_css_class("flat");
+        jump_fab.set_label("\u{f078}"); // nf-fa-chevron_down
+        jump_fab.set_tooltip_text(Some("Jump to latest"));
+        jump_fab.set_halign(gtk4::Align::End);
+        jump_fab.set_valign(gtk4::Align::End);
+        jump_fab.set_margin_end(18);
+        jump_fab.set_margin_bottom(18);
+        jump_fab.set_visible(false);
+        jump_fab.set_can_focus(false);
+
+        // ── Sticky running-command header ─────────────────────────────────
+        // When a command is running and the user has scrolled up into history,
+        // a thin bar pins to the top of the scroll area showing the live command
+        // and its elapsed time, so they don't lose track of what's executing.
+        let sticky_label = gtk4::Label::new(None);
+        sticky_label.set_halign(gtk4::Align::Start);
+        sticky_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        sticky_label.set_hexpand(true);
+        sticky_label.add_css_class("sticky-running-label");
+        let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        sticky_bar.add_css_class("sticky-running-header");
+        sticky_bar.append(&sticky_label);
+        sticky_bar.set_halign(gtk4::Align::Fill);
+        sticky_bar.set_valign(gtk4::Align::Start);
+        sticky_bar.set_visible(false);
+        sticky_bar.set_can_focus(false);
+
+        let scroll_overlay = gtk4::Overlay::new();
+        scroll_overlay.set_child(Some(&block_scroll));
+        scroll_overlay.add_overlay(&sticky_bar);
+        scroll_overlay.add_overlay(&jump_fab);
+        root.append(&scroll_overlay);
+
+        let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
         // Detect rsh shell for session_id passing
@@ -1121,6 +1459,11 @@ impl TermView {
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        // Sticky running-command header state: true while a command is executing,
+        // plus the command text captured at CommandStart.
+        let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
@@ -1181,7 +1524,6 @@ impl TermView {
             ));
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
-            let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
             let block_start_time_for_cb = block_start_time.clone();
             let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
@@ -1228,21 +1570,162 @@ impl TermView {
                 pending_exit_code_rc,
                 current_cwd_for_cb,
                 event_buf,
+                unread_count_rc: unread_count.clone(),
+                jump_fab: jump_fab.clone(),
+                selected_block_id_rc: selected_block_id.clone(),
+                cmd_running_rc: cmd_running.clone(),
+                running_cmd_rc: running_cmd.clone(),
             }
             .install(&pty);
         }
 
-        // ── Scroll lock: detect user scrolling up ─────────────────────────
+        // ── Scroll lock + jump-to-bottom FAB ──────────────────────────────
+        // The block list virtualizes (off-screen finished blocks are hidden →
+        // 0 height), so `adjustment.upper()` shrinks as you scroll and the usual
+        // value-vs-max "at bottom" math can never be trusted. Instead detect the
+        // live bottom geometrically off the never-virtualized live VTE holder.
+        //
+        // Key subtlety (see scroll.rs): in the normal follow state the holder is
+        // one full page tall and parked at its *top*, so its top edge sits a little
+        // below y=0 (≈ the just-finished block's height) and its bottom edge falls
+        // *below* the viewport. So neither "top≈0" nor "bottom inside viewport"
+        // alone is right. What actually distinguishes "following" from "scrolled
+        // up into history" is whether the live prompt is still on screen: while
+        // following, the holder's top is somewhere inside the viewport; scroll up
+        // far enough and the holder (prompt) slides off the bottom. So: at-bottom
+        // ⟺ holder top is above the viewport's bottom edge. Sampled on idle so it
+        // reflects the settled post-scroll layout.
         {
             let user_scrolled = user_scrolled_up.clone();
-            let programmatic = programmatic_scroll.clone();
-            block_scroll.vadjustment().connect_value_changed(move |adj| {
-                if programmatic.get() {
+            let fab = jump_fab.clone();
+            let unread = unread_count.clone();
+            let scroll = block_scroll.clone();
+            let holder = active.borrow().widget().clone();
+            let check_pending = Rc::new(Cell::new(false));
+            block_scroll.vadjustment().connect_value_changed(move |_adj| {
+                if check_pending.get() {
                     return;
                 }
-                let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
-                let at_bottom = adj.value() >= max_val - 4.0;
-                user_scrolled.set(!at_bottom);
+                check_pending.set(true);
+                let user_scrolled = user_scrolled.clone();
+                let fab = fab.clone();
+                let unread = unread.clone();
+                let scroll = scroll.clone();
+                let holder = holder.clone();
+                let check_pending = check_pending.clone();
+                glib::idle_add_local_once(move || {
+                    check_pending.set(false);
+                    let vp_h = scroll.height() as f64;
+                    let at_bottom = holder
+                        .compute_bounds(&scroll)
+                        .map(|b| (b.y() as f64) < vp_h - 4.0)
+                        .unwrap_or(true);
+                    user_scrolled.set(!at_bottom);
+                    if at_bottom {
+                        unread.set(0);
+                        fab.set_visible(false);
+                    } else {
+                        set_jump_fab_label(&fab, unread.get());
+                        fab.set_visible(true);
+                    }
+                });
+            });
+        }
+
+        // ── Jump-to-bottom FAB click: return to the live prompt ───────────
+        {
+            let scroll = block_scroll.clone();
+            let programmatic = programmatic_scroll.clone();
+            let user_scrolled = user_scrolled_up.clone();
+            let unread = unread_count.clone();
+            let fab = jump_fab.clone();
+            jump_fab.connect_clicked(move |_| {
+                // Returning to the live prompt is not a single set_value: blocks
+                // below the viewport are virtualized to 0 height, so `upper` only
+                // grows as they scroll into view. One jump lands partway; we have
+                // to re-apply `upper - page` across idle passes until `upper` stops
+                // growing (true bottom reached) or we hit a small iteration cap.
+                user_scrolled.set(false);
+                unread.set(0);
+                fab.set_visible(false);
+                let adj = scroll.vadjustment();
+                programmatic.set(true);
+                adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+                programmatic.set(false);
+
+                let scroll = scroll.clone();
+                let programmatic = programmatic.clone();
+                let tries = Rc::new(Cell::new(0u8));
+                glib::idle_add_local(move || {
+                    // Runs for a handful of frames (cap below), too fast for the
+                    // user to interrupt — so we don't watch user_scrolled here; the
+                    // value_changed geometry check settles the FAB state afterward.
+                    if tries.get() >= 12 {
+                        return glib::ControlFlow::Break;
+                    }
+                    tries.set(tries.get() + 1);
+                    let adj = scroll.vadjustment();
+                    let before = adj.value();
+                    let target = (adj.upper() - adj.page_size()).max(adj.lower());
+                    programmatic.set(true);
+                    adj.set_value(target);
+                    programmatic.set(false);
+                    // Stable once another pass no longer advances the position.
+                    if (adj.value() - before).abs() < 1.0 {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+            });
+        }
+
+        // ── Sticky running-command header: poll-driven refresh ────────────
+        // Shown only while a command is executing AND the user has scrolled up
+        // (so the live prompt is off-screen). Polling lets one place own both the
+        // visibility decision and the elapsed-time tick without threading updates
+        // through the reader's CommandStart/End and the scroll handler.
+        {
+            let sticky = sticky_bar.clone();
+            let sticky_label = sticky_label.clone();
+            let cmd_running = cmd_running.clone();
+            let running_cmd = running_cmd.clone();
+            let block_start_time = block_start_time.clone();
+            let user_scrolled = user_scrolled_up.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                // Stop the timer once the view is torn down (tab closed), so it
+                // doesn't leak by keeping the widgets/state alive forever. The bar
+                // is parented to the overlay at construction, so a None parent means
+                // the overlay was disposed.
+                if sticky.parent().is_none() {
+                    return glib::ControlFlow::Break;
+                }
+                if cmd_running.get() && user_scrolled.get() {
+                    let cmd = running_cmd.borrow();
+                    let cmd_disp = cmd.trim();
+                    let elapsed = block_start_time
+                        .get()
+                        .and_then(|st| SystemTime::now().duration_since(st).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let elapsed_str = if elapsed >= 60 {
+                        format!("{}m{:02}s", elapsed / 60, elapsed % 60)
+                    } else {
+                        format!("{}s", elapsed)
+                    };
+                    let label = if cmd_disp.is_empty() {
+                        format!("\u{25b6}  (running)    {}", elapsed_str)
+                    } else {
+                        format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
+                    };
+                    sticky_label.set_text(&label);
+                    if !sticky.get_visible() {
+                        sticky.set_visible(true);
+                    }
+                } else if sticky.get_visible() {
+                    sticky.set_visible(false);
+                }
+                glib::ControlFlow::Continue
             });
         }
 

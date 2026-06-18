@@ -395,6 +395,60 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-show-more:hover {{
             background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
         }}
+        .jump-bottom-fab {{
+            color: {bg_hex};
+            background-color: {accent};
+            background-image: none;
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.55);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            font-weight: bold;
+            min-width: 18px;
+            min-height: 18px;
+            padding: 6px 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+            transition: background-color 120ms ease, box-shadow 120ms ease;
+        }}
+        .jump-bottom-fab:hover {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+        }}
+        .sticky-running-header {{
+            background-color: {block_bg_hex};
+            border-bottom: 1px solid rgba({acc_r},{acc_g},{acc_b},0.45);
+            box-shadow: 0 3px 10px rgba(0,0,0,0.30);
+            padding: 6px 14px;
+        }}
+        .sticky-running-label {{
+            color: {accent};
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            font-weight: bold;
+        }}
+        .command-palette > contents {{
+            background-color: {block_bg_hex};
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.45);
+            border-radius: 10px;
+            padding: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+        }}
+        .command-palette-list {{
+            background-color: transparent;
+        }}
+        .command-palette-list row {{
+            padding: 0;
+            border-radius: 6px;
+        }}
+        .command-palette-list row:selected {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.28);
+        }}
+        .command-palette-row {{
+            color: {fg_hex};
+            font-family: "{font_family}";
+            font-size: 0.92em;
+            padding: 6px 10px;
+        }}
         "#,
     );
 

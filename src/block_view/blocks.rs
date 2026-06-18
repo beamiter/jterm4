@@ -300,6 +300,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) copy_cmd_btn: gtk4::Button,
     pub(crate) copy_output_btn: gtk4::Button,
     pub(crate) rerun_btn: gtk4::Button,
+    pub(crate) header_row: gtk4::Box,
+    pub(crate) action_box: gtk4::Box,
 }
 
 impl Clone for FinishedBlock {
@@ -319,6 +321,8 @@ impl Clone for FinishedBlock {
             copy_cmd_btn: self.copy_cmd_btn.clone(),
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
+            header_row: self.header_row.clone(),
+            action_box: self.action_box.clone(),
         }
     }
 }
@@ -476,7 +480,11 @@ impl FinishedBlock {
         let action_box_for_leave = action_box.clone();
         hover_ctrl.connect_leave(move |_| {
             outer_for_leave.remove_css_class("block-hovered");
-            action_box_for_leave.set_visible(false);
+            // Keep the quick actions visible while the block is selected so they
+            // stay reachable without re-hovering.
+            if !outer_for_leave.has_css_class("block-selected") {
+                action_box_for_leave.set_visible(false);
+            }
         });
         outer.add_controller(hover_ctrl);
 
@@ -740,6 +748,8 @@ impl FinishedBlock {
             copy_cmd_btn,
             copy_output_btn,
             rerun_btn,
+            header_row,
+            action_box,
         }
     }
 
