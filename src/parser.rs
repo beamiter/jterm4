@@ -13,6 +13,8 @@ pub enum ParserEvent {
     CommandEnd(i32),
     /// OSC 7 — shell reported new CWD.
     CwdUpdate(String),
+    /// OSC 0 / OSC 2 — window title set by the application.
+    TitleUpdate(String),
     /// CSI ? 1049 h — alt screen entered (vim, less, etc.)
     AltScreenEnter,
     /// CSI ? 1049 l — alt screen left.
@@ -273,6 +275,15 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
                 }
             }
         }
+        return;
+    }
+
+    // OSC 0 ; <title> (icon + window title) and OSC 2 ; <title> (window title).
+    // OSC 1 sets only the icon name, which we don't surface, so it's left to the
+    // pass-through path below. Emitting a semantic event here lets the reader drop
+    // its hand-rolled title byte-scan.
+    if let Some(rest) = s.strip_prefix("0;").or_else(|| s.strip_prefix("2;")) {
+        events.push(ParserEvent::TitleUpdate(rest.to_string()));
         return;
     }
 

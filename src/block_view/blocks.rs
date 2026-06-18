@@ -288,8 +288,7 @@ pub struct BlockFilters {
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
     pub(crate) widget: gtk4::Box,
-    pub(crate) prompt_view: gtk4::TextView,
-    pub(crate) prompt_buffer: gtk4::TextBuffer,
+    pub(crate) prompt_text: String,
     pub(crate) command_view: gtk4::TextView,
     pub(crate) command_buffer: gtk4::TextBuffer,
     pub(crate) output_view: gtk4::TextView,
@@ -309,8 +308,7 @@ impl Clone for FinishedBlock {
         Self {
             id: self.id,
             widget: self.widget.clone(),
-            prompt_view: self.prompt_view.clone(),
-            prompt_buffer: self.prompt_buffer.clone(),
+            prompt_text: self.prompt_text.clone(),
             command_view: self.command_view.clone(),
             command_buffer: self.command_buffer.clone(),
             output_view: self.output_view.clone(),
@@ -330,6 +328,7 @@ impl Clone for FinishedBlock {
 impl FinishedBlock {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        id: u64,
         prompt: &str,
         cmd: &str,
         cmd_ansi: Option<&str>,
@@ -340,11 +339,12 @@ impl FinishedBlock {
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
     ) -> Self {
-        Self::new_with_pool(prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
+        Self::new_with_pool(id, prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_pool(
+        id: u64,
         prompt: &str,
         cmd: &str,
         cmd_ansi: Option<&str>,
@@ -519,7 +519,6 @@ impl FinishedBlock {
             (view, buffer)
         };
 
-        let (prompt_view, prompt_buffer) = create_textview("block-prompt-view");
         let (command_view, command_buffer) = create_textview("block-command-view");
         let (output_view, output_buffer) = create_textview("block-output-view");
         // The live output is rendered in a VTE appended flush to the block's left
@@ -536,9 +535,6 @@ impl FinishedBlock {
         // re-break each full-width line one column early. Disabling wrap keeps the
         // identical line structure the user saw live.
         output_view.set_wrap_mode(gtk4::WrapMode::None);
-
-        // Populate buffers
-        set_active_prompt_buffer(&prompt_buffer, prompt);
 
         // Render the command line with the shell's own ANSI syntax highlighting
         // when it's available; otherwise fall back to plain text.
@@ -734,10 +730,9 @@ impl FinishedBlock {
         }
 
         FinishedBlock {
-            id: next_block_id(),
+            id,
             widget: outer,
-            prompt_view,
-            prompt_buffer,
+            prompt_text: prompt.to_string(),
             command_view,
             command_buffer,
             output_view,

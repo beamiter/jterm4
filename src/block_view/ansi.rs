@@ -160,8 +160,11 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
     let first = needle[0];
     let finder = memchr::memchr_iter(first, haystack);
     for pos in finder {
+        // memchr_iter yields ascending positions, so once a candidate would run
+        // past the end every later one does too: stop scanning this byte, but
+        // still fall through to the uppercase-variant search below.
         if pos + needle.len() > haystack.len() {
-            return false;
+            break;
         }
         let candidate = &haystack[pos..pos + needle.len()];
         if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
@@ -174,7 +177,7 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
         let finder = memchr::memchr_iter(first_upper, haystack);
         for pos in finder {
             if pos + needle.len() > haystack.len() {
-                return false;
+                break;
             }
             let candidate = &haystack[pos..pos + needle.len()];
             if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
@@ -999,10 +1002,6 @@ pub(crate) fn apply_ansi_runs_to_buffer(buffer: &TextBuffer, start_offset: usize
     }
 }
 
-pub(crate) fn set_active_prompt_buffer(buffer: &TextBuffer, prompt: &str) {
-    buffer.set_text(prompt);
-}
-
 #[allow(clippy::too_many_arguments)]
 
 /// Returns (cursor_col_in_last_line, after_newline).
@@ -1156,5 +1155,36 @@ pub(crate) fn set_active_output_buffer(
 
     if let Some((cursor_color, cursor_foreground)) = cursor_colors {
         apply_output_cursor(buffer, output, cursor_color, cursor_foreground);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_case_insensitive as cci;
+
+    #[test]
+    fn matches_regardless_of_case() {
+        assert!(cci(b"Hello World", b"hello"));
+        assert!(cci(b"hello world", b"world"));
+        assert!(cci(b"MiXeD", b"mixed"));
+    }
+
+    #[test]
+    fn reports_absent_needle() {
+        assert!(!cci(b"abcdef", b"xyz"));
+    }
+
+    #[test]
+    fn empty_needle_always_matches() {
+        assert!(cci(b"anything", b""));
+    }
+
+    #[test]
+    fn finds_uppercase_first_byte_after_oob_lowercase_hit() {
+        // Regression: the lowercase-first-byte scan finds 'f' at the final
+        // position (out of bounds for a 2-byte needle). The old code returned
+        // false there, skipping the uppercase-variant scan that matches "Fo"
+        // at position 0.
+        assert!(cci(b"Foxf", b"fo"));
     }
 }

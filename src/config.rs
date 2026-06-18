@@ -173,7 +173,6 @@ pub struct Config {
     /// Sidebar width in pixels (resizable divider position).
     pub(crate) sidebar_width: u32,
     // Block view optimizations
-    pub(crate) ansi_cache_capacity: u32,
     pub(crate) max_visible_blocks: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
@@ -369,7 +368,6 @@ struct FileConfig {
     sidebar_view: Option<String>,
     sidebar_width: Option<u32>,
     // Block view optimizations
-    ansi_cache_capacity: Option<u32>,
     max_visible_blocks: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
@@ -417,7 +415,6 @@ fn load_file_config() -> FileConfig {
         tab_placement: table.get("tab_placement").and_then(|v| v.as_str()).map(|s| s.to_string()),
         sidebar_view: table.get("sidebar_view").and_then(|v| v.as_str()).map(|s| s.to_string()),
         sidebar_width: table.get("sidebar_width").and_then(|v| v.as_integer()).map(|v| v as u32),
-        ansi_cache_capacity: table.get("ansi_cache_capacity").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
         lazy_load_threshold: table.get("lazy_load_threshold").and_then(|v| v.as_integer()).map(|v| v as u32),
         truncation_threshold_lines: table.get("truncation_threshold_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
@@ -556,10 +553,6 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or(theme.cursor_foreground);
 
     // Block view optimization settings
-    let ansi_cache_capacity = env_u32("JTERM4_ANSI_CACHE_CAP")
-        .or(fc.ansi_cache_capacity)
-        .unwrap_or(256)
-        .max(1);
     let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
         .unwrap_or(200);
@@ -612,7 +605,6 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             &fc.sidebar_view.unwrap_or_else(|| "tabs".to_string()),
         ),
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
-        ansi_cache_capacity,
         max_visible_blocks,
         lazy_load_threshold,
         truncation_threshold_lines,

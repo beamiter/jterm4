@@ -247,20 +247,6 @@ pub(crate) fn install_block_css(config: &Config) {
             line-height: 1.0;
             margin: 0;
         }}
-        .block-prompt-view {{
-            color: {dim_fg};
-            font-family: "{font_family}";
-            font-size: {font_size};
-            padding: 0;
-            line-height: 1.2;
-            margin: 0;
-            background-color: {bg_hex};
-            min-height: 48px;
-        }}
-        .block-prompt-view text {{
-            color: {dim_fg};
-            background-color: {bg_hex};
-        }}
         .block-command-view {{
             color: {fg_hex};
             font-family: "{font_family}";

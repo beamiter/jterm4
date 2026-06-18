@@ -1,10 +1,8 @@
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
-use lru::LruCache;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -106,9 +104,20 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
 /// be most-recent-first and deduped. Selecting an entry clears the live shell
 /// line and types the command into it (without executing), mirroring the
 /// single-block recall path so the user can edit before pressing Enter.
+/// A command-history entry for the palette, carrying the outcome metadata the
+/// failed/slow filters need (the plain command list can't express those).
+struct PaletteEntry {
+    cmd: String,
+    failed: bool,
+    slow: bool,
+}
+
+/// A run taking longer than this is flagged "slow" for the palette filter.
+const PALETTE_SLOW_MS: u64 = 2000;
+
 fn show_command_palette(
     parent: &ScrolledWindow,
-    commands: Vec<String>,
+    entries: Vec<PaletteEntry>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
     live_vte: Terminal,
@@ -129,6 +138,22 @@ fn show_command_palette(
     entry.set_placeholder_text(Some("Search command history…"));
     vbox.append(&entry);
 
+    // Outcome filters: restrict the list to failed-only / slow-only runs. The
+    // backend metadata (exit code, duration) rides along on each PaletteEntry.
+    let filter_row = gtk4::Box::new(Orientation::Horizontal, 6);
+    let failed_toggle = gtk4::ToggleButton::with_label("Failed");
+    failed_toggle.set_tooltip_text(Some("Show only commands that exited non-zero"));
+    failed_toggle.add_css_class("flat");
+    let slow_toggle = gtk4::ToggleButton::with_label("Slow");
+    slow_toggle.set_tooltip_text(Some("Show only commands slower than 2s"));
+    slow_toggle.add_css_class("flat");
+    filter_row.append(&failed_toggle);
+    filter_row.append(&slow_toggle);
+    vbox.append(&filter_row);
+
+    let failed_only = Rc::new(Cell::new(false));
+    let slow_only = Rc::new(Cell::new(false));
+
     let list = gtk4::ListBox::new();
     list.set_selection_mode(gtk4::SelectionMode::Single);
     list.add_css_class("command-palette-list");
@@ -141,20 +166,25 @@ fn show_command_palette(
     vbox.append(&scroller);
     popover.set_child(Some(&vbox));
 
-    let commands = Rc::new(commands);
+    let entries = Rc::new(entries);
     let filtered: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
     let populate = {
         let list = list.clone();
-        let commands = commands.clone();
+        let entries = entries.clone();
         let filtered = filtered.clone();
+        let failed_only = failed_only.clone();
+        let slow_only = slow_only.clone();
         move |query: &str| {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
-            let mut scored: Vec<(i64, &String)> = commands
+            let want_failed = failed_only.get();
+            let want_slow = slow_only.get();
+            let mut scored: Vec<(i64, &str)> = entries
                 .iter()
-                .filter_map(|c| fuzzy_score(query, c).map(|s| (s, c)))
+                .filter(|e| (!want_failed || e.failed) && (!want_slow || e.slow))
+                .filter_map(|e| fuzzy_score(query, &e.cmd).map(|s| (s, e.cmd.as_str())))
                 .collect();
             // Stable sort keeps recency (input order) as the tiebreak.
             scored.sort_by_key(|(s, _)| *s);
@@ -167,7 +197,7 @@ fn show_command_palette(
                 let row = gtk4::ListBoxRow::new();
                 row.set_child(Some(&row_label));
                 list.append(&row);
-                keep.push(c.clone());
+                keep.push(c.to_string());
             }
             *filtered.borrow_mut() = keep;
             if let Some(first) = list.row_at_index(0) {
@@ -176,6 +206,26 @@ fn show_command_palette(
         }
     };
     populate("");
+
+    // Toggling a filter re-runs the current query through the new predicate.
+    {
+        let populate = populate.clone();
+        let entry = entry.clone();
+        let failed_only = failed_only.clone();
+        failed_toggle.connect_toggled(move |btn| {
+            failed_only.set(btn.is_active());
+            populate(entry.text().as_str());
+        });
+    }
+    {
+        let populate = populate.clone();
+        let entry = entry.clone();
+        let slow_only = slow_only.clone();
+        slow_toggle.connect_toggled(move |btn| {
+            slow_only.set(btn.is_active());
+            populate(entry.text().as_str());
+        });
+    }
 
     let choose: Rc<dyn Fn()> = {
         let list = list.clone();
@@ -326,7 +376,6 @@ pub struct TermView {
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
-    ansi_cache: Rc<RefCell<LruCache<String, String>>>,
     viewport: Rc<RefCell<ViewportState>>,
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -382,7 +431,6 @@ struct ReaderCtx {
     pager_snapshot_generation_rc: Rc<Cell<u64>>,
     pager_pre_clear_rc: Rc<RefCell<String>>,
     scroll_debouncer: ScrollDebouncer,
-    ansi_cache_for_cb: Rc<RefCell<LruCache<String, String>>>,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
     visible_indices_rc: Rc<RefCell<std::collections::HashSet<usize>>>,
@@ -399,6 +447,12 @@ struct ReaderCtx {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
+    /// Re-runs the input-cell sizing (`update_input_height`). Called at
+    /// alt-screen enter/leave so the live VTE is driven to the full viewport
+    /// (or back to compact) synchronously on the transition, instead of waiting
+    /// for the alt app's first `contents_changed` — which would otherwise let
+    /// the app start drawing into the 6-row idle cell before the grid grows.
+    resize_active: Rc<dyn Fn()>,
 }
 
 impl ReaderCtx {
@@ -432,7 +486,6 @@ impl ReaderCtx {
             pager_snapshot_generation_rc,
             pager_pre_clear_rc,
             scroll_debouncer,
-            ansi_cache_for_cb,
             widget_pool_for_cb,
             pty_synced_rc,
             visible_indices_rc,
@@ -449,8 +502,8 @@ impl ReaderCtx {
             selected_block_id_rc,
             cmd_running_rc,
             running_cmd_rc,
+            resize_active,
         } = self;
-        let _ = &ansi_cache_for_cb;
         pty.start_reader(
             move |data: Vec<u8>| {
                 let mut events = event_buf.borrow_mut();
@@ -474,35 +527,6 @@ impl ReaderCtx {
                                 while i < bytes.len() {
                                     if bytes[i] == 0x1b && i + 1 < bytes.len() {
                                         match bytes[i + 1] {
-                                            b']' => {
-                                                if i + 3 < bytes.len()
-                                                    && (bytes[i + 2] == b'0' || bytes[i + 2] == b'2')
-                                                    && bytes[i + 3] == b';'
-                                                {
-                                                    let title_start = i + 4;
-                                                    let mut title_end = title_start;
-                                                    while title_end < bytes.len() {
-                                                        if bytes[title_end] == 0x07 {
-                                                            break;
-                                                        }
-                                                        if bytes[title_end] == 0x1b
-                                                            && title_end + 1 < bytes.len()
-                                                            && bytes[title_end + 1] == b'\\'
-                                                        {
-                                                            break;
-                                                        }
-                                                        title_end += 1;
-                                                    }
-                                                    if title_end > title_start {
-                                                        if let Ok(title) = std::str::from_utf8(&bytes[title_start..title_end]) {
-                                                            for cb in title_cbs.borrow().iter() {
-                                                                cb(title);
-                                                            }
-                                                        }
-                                                    }
-                                                    i = title_end;
-                                                }
-                                            }
                                             b'[' => {
                                                 if i + 2 < bytes.len() && bytes[i + 2] == b'?' {
                                                     let seq_start = i + 3;
@@ -712,8 +736,12 @@ impl ReaderCtx {
 
                                 let exit_code = pending_exit_code_rc.get();
 
+                                // Single id shared by the serializable BlockData and
+                                // the GTK FinishedBlock so id-keyed lookups (export,
+                                // delete) resolve in both lists.
+                                let block_id = next_block_id();
                                 let block_data = BlockData {
-                                    id: next_block_id(),
+                                    id: block_id,
                                     prompt: prompt.clone(),
                                     cmd: cmd.clone(),
                                     cmd_markup: None,
@@ -737,7 +765,7 @@ impl ReaderCtx {
 
                                 let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                 let finished = FinishedBlock::new_with_pool(
-                                    &prompt, &cmd, None, &display_output_ansi, exit_code, &config_for_cb.borrow(),
+                                    block_id, &prompt, &cmd, None, &display_output_ansi, exit_code, &config_for_cb.borrow(),
                                     duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
                                 );
 
@@ -803,11 +831,7 @@ impl ReaderCtx {
                                         let vte_for_action = vte_for_copy.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let prompt_text = finished_for_copy.prompt_buffer.text(
-                                                &finished_for_copy.prompt_buffer.start_iter(),
-                                                &finished_for_copy.prompt_buffer.end_iter(),
-                                                true,
-                                            );
+                                            let prompt_text = finished_for_copy.prompt_text.clone();
                                             let cmd_text = finished_for_copy.command_buffer.text(
                                                 &finished_for_copy.command_buffer.start_iter(),
                                                 &finished_for_copy.command_buffer.end_iter(),
@@ -863,6 +887,7 @@ impl ReaderCtx {
                                         let popover_c = popover.clone();
                                         let finished_blocks_for_delete = finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
+                                        let block_data_for_delete = block_data_for_export.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
@@ -871,6 +896,8 @@ impl ReaderCtx {
                                                 let block = blocks.remove(pos);
                                                 block_list_for_delete.remove(block.widget());
                                             }
+                                            // Keep block_data in lockstep with the widget list.
+                                            block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
                                         });
                                         vbox.append(&item);
                                     }
@@ -1017,6 +1044,12 @@ impl ReaderCtx {
                             }
                         }
 
+                        ParserEvent::TitleUpdate(title) => {
+                            for cb in title_cbs.borrow().iter() {
+                                cb(title);
+                            }
+                        }
+
                         ParserEvent::AltScreenEnter => {
                             let from_state = bstate_rc.get();
                             if from_state != BlockState::CollectingOutput
@@ -1035,6 +1068,9 @@ impl ReaderCtx {
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
+                            // Grow the live VTE to the full viewport *before* the
+                            // app draws, so it queries the right size right away.
+                            resize_active();
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1060,6 +1096,9 @@ impl ReaderCtx {
                             exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
+                            // Collapse the live VTE back to the compact input cell
+                            // now that the alt app has released the viewport.
+                            resize_active();
                             let active_for_idle = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_idle.borrow().grab_focus();
@@ -1137,6 +1176,7 @@ struct KeyCtx {
     active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
+    block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
     block_list_for_key: gtk4::Box,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
@@ -1149,6 +1189,7 @@ impl KeyCtx {
             active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
+            block_data_for_key,
             block_list_for_key,
             selected_block_id_for_key,
             block_scroll_for_key,
@@ -1260,25 +1301,30 @@ impl KeyCtx {
             }
 
             // Ctrl+P: fuzzy command-history palette. Build a deduped, most-recent
-            // -first command list from the finished blocks and pop it up.
+            // -first entry list from block_data (which carries exit code + duration
+            // for the failed/slow filters) and pop it up.
             if ctrl && !shift && !alt && matches!(keyval, Key::p | Key::P) {
                 let mut seen = std::collections::HashSet::new();
-                let mut cmds = Vec::new();
+                let mut entries = Vec::new();
                 {
-                    let finished = finished_blocks_for_key.borrow();
-                    for b in finished.iter().rev() {
-                        let c = b.cmd_text.lines().next().unwrap_or("").trim().to_string();
+                    let block_data = block_data_for_key.borrow();
+                    for b in block_data.iter().rev() {
+                        let c = b.cmd.lines().next().unwrap_or("").trim().to_string();
                         if c.is_empty() {
                             continue;
                         }
                         if seen.insert(c.clone()) {
-                            cmds.push(c);
+                            entries.push(PaletteEntry {
+                                cmd: c,
+                                failed: b.exit_code != 0,
+                                slow: b.duration_ms.map(|d| d >= PALETTE_SLOW_MS).unwrap_or(false),
+                            });
                         }
                     }
                 }
                 show_command_palette(
                     &block_scroll_for_key,
-                    cmds,
+                    entries,
                     pty_for_key.clone(),
                     typed_cmd_for_key.clone(),
                     active_vte_for_key.clone(),
@@ -1567,9 +1613,6 @@ impl TermView {
         // read the *previous* command's still-rendered frame. Any snapshot equal
         // to this baseline is a stale read and must be dropped.
         let pager_pre_clear: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let ansi_cache: Rc<RefCell<LruCache<String, String>>> = Rc::new(RefCell::new(
-            LruCache::new(NonZeroUsize::new((config.ansi_cache_capacity as usize).max(1)).unwrap()),
-        ));
 
         let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
 
@@ -1623,7 +1666,6 @@ impl TermView {
                 user_scrolled_up.clone(),
                 programmatic_scroll.clone(),
             );
-            let ansi_cache_for_cb = ansi_cache.clone();
             let widget_pool_for_cb = widget_pool.clone();
             let pty_synced_rc = pty_synced.clone();
             let visible_indices_rc = visible_indices.clone();
@@ -1675,7 +1717,6 @@ impl TermView {
                 pager_snapshot_generation_rc,
                 pager_pre_clear_rc,
                 scroll_debouncer,
-                ansi_cache_for_cb,
                 widget_pool_for_cb,
                 pty_synced_rc,
                 visible_indices_rc,
@@ -1692,6 +1733,7 @@ impl TermView {
                 selected_block_id_rc: selected_block_id.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
+                resize_active: update_input_height.clone(),
             }
             .install(&pty);
         }
@@ -1903,6 +1945,7 @@ impl TermView {
             let active_vte_for_key = active_vte.clone();
             let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
+            let block_data_for_key = block_data_rc.clone();
             let block_list_for_key = block_list.clone();
             let selected_block_id_for_key = selected_block_id.clone();
             let block_scroll_for_key = block_scroll.clone();
@@ -1914,6 +1957,7 @@ impl TermView {
                 active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
+                block_data_for_key,
                 block_list_for_key,
                 selected_block_id_for_key,
                 block_scroll_for_key,
@@ -1949,7 +1993,6 @@ impl TermView {
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
-            ansi_cache,
             viewport: Rc::new(RefCell::new(ViewportState {
                 first_visible: 0,
                 last_visible: 0,
@@ -1971,6 +2014,7 @@ impl TermView {
             let config = term_view.config.borrow();
             for block in block_data_ref.iter() {
                 let finished = FinishedBlock::new(
+                    block.id,
                     &block.prompt,
                     &block.cmd,
                     block.cmd_markup.as_deref(),
@@ -2452,7 +2496,6 @@ impl TermView {
             .sum();
         let viewport = self.viewport.borrow().clone();
         let visible = self.visible_indices.borrow().len();
-        let ansi_cache_len = self.ansi_cache.borrow().len();
         let selected = self
             .selected_block_id
             .get()
@@ -2512,7 +2555,6 @@ impl TermView {
                     ("Last visible".to_string(), viewport.last_visible.to_string()),
                     ("Total height".to_string(), format!("{}px", viewport.total_height)),
                     ("Realized widgets".to_string(), visible.to_string()),
-                    ("ANSI cache entries".to_string(), ansi_cache_len.to_string()),
                     ("Profiling".to_string(), prof_enabled().to_string()),
                 ],
             ),
@@ -2582,6 +2624,9 @@ impl TermView {
             self.block_list.remove(&widget_to_release);
             // Return widget to pool for potential reuse
             self.widget_pool.borrow_mut().release(widget_to_release);
+            // Keep the serializable record list in lockstep with the widget list;
+            // otherwise the two desync and count-based eviction / id lookups drift.
+            self.block_data.borrow_mut().retain(|b| b.id != block_id);
         }
     }
 
@@ -2589,11 +2634,7 @@ impl TermView {
     pub fn copy_block_by_id(&self, block_id: u64) {
         let finished = self.finished_blocks.borrow();
         if let Some(block) = finished.iter().find(|b| b.id == block_id) {
-            let prompt_text = block.prompt_buffer.text(
-                &block.prompt_buffer.start_iter(),
-                &block.prompt_buffer.end_iter(),
-                true,
-            );
+            let prompt_text = block.prompt_text.clone();
             let cmd_text = block.command_buffer.text(
                 &block.command_buffer.start_iter(),
                 &block.command_buffer.end_iter(),
