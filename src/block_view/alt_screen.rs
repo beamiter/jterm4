@@ -331,6 +331,10 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
         .enable_sixel(true)
         .build();
     terminal.set_mouse_autohide(true);
+    // Backspace must emit ASCII DEL (0x7f), not BS (0x08). Our PTY isn't VTE-owned,
+    // so VTE's Auto binding can't read the tty erase char and falls back to 0x08,
+    // which readline-style line editors (incl. rsh) ignore — making Backspace dead.
+    terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
     terminal.set_colors(
         Some(&config.foreground),
