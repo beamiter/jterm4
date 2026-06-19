@@ -340,6 +340,13 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
+/// Hard cap on how many VTE rows the live block may grow to during a streaming
+/// command (cargo build, apt update, `seq 5000`, …). PTY rows stay pinned to the
+/// viewport via `pty_rows_override`, so the running child never sees this number;
+/// it bounds only the visual height. Beyond the cap, output keeps flowing into
+/// VTE's own scrollback and is captured in full for the finished block snapshot.
+const MAX_COLLECTING_ROWS: i64 = 4000;
+
 #[allow(dead_code)]
 /// One highlighted hit from a find-within-blocks pass. Offsets are TextBuffer
 /// character offsets, valid until the buffer is re-rendered (cleared on close).
@@ -502,6 +509,9 @@ struct ReaderCtx {
     /// sees the full viewport rows on its very first read, not the compact
     /// input-cell rows. Cleared on CommandEnd.
     pty_rows_override: Rc<Cell<Option<u16>>>,
+    /// Absolute VTE scrollback row captured at CommandStart. Read by the
+    /// live-cell sizing code to compute rows produced *by this command*.
+    collecting_start_row: Rc<Cell<i64>>,
 }
 
 impl ReaderCtx {
@@ -550,6 +560,7 @@ impl ReaderCtx {
             running_cmd_rc,
             resize_active,
             pty_rows_override,
+            collecting_start_row,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -1072,6 +1083,13 @@ impl ReaderCtx {
                                 pty_rows_override.set(Some(viewport_rows));
                                 pty_for_init.resize(cols, viewport_rows);
                             }
+                            // Anchor the live-cell sizing computation. Output
+                            // rows during this command = cursor_position().1 -
+                            // collecting_start_row + 1. We capture *before* any
+                            // output bytes are processed so the first measured
+                            // row count is 1, not whatever absolute scrollback
+                            // row the prior idle prompt left behind.
+                            collecting_start_row.set(active_vte.cursor_position().1);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1646,6 +1664,14 @@ impl TermView {
         // sizing closure below.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
+        // Absolute VTE scrollback row at the moment CollectingOutput started.
+        // Used by the live-cell sizing logic to compute "rows produced *by this
+        // command*" from `cursor_position().1 - start_row + 1`. We must NOT use
+        // the absolute cursor row directly: it climbs without bound across the
+        // session and would make a fresh command instantly request thousands of
+        // rows of empty allocation, pushing actual output off-screen.
+        let collecting_start_row: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+
         // Scroll-lock flags shared across the contents_changed pin, value_changed
         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
         // follow-bottom pin while the user is reading history; `programmatic_scroll`
@@ -1667,6 +1693,7 @@ impl TermView {
             let scroll = block_scroll.clone();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
+            let collecting_start_row = collecting_start_row.clone();
             Rc::new(move || {
                 let cell_h = (vte.char_height() as i32).max(1);
                 let page = scroll.vadjustment().page_size() as i32;
@@ -1679,10 +1706,28 @@ impl TermView {
                     // Full-screen apps & non-OSC133 shells behave like a normal
                     // terminal: give them the whole viewport.
                     BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
-                    // Running / draining a command: leave the height frozen so the
-                    // reported PTY rows stay stable for the command's lifetime.
+                    // Running / draining a command: grow the live block with
+                    // streaming output (cargo build, apt update, …). PTY rows
+                    // are pinned to viewport via `pty_rows_override` set at
+                    // CommandStart, so the child never sees these visual rows
+                    // and gets no SIGWINCH per chunk. Monotonic — never shrink
+                    // mid-command — to avoid grow/shrink jitter as the cursor
+                    // moves within already-emitted rows (CR/up-line progress
+                    // bars). Capped at MAX_COLLECTING_ROWS; overflow flows into
+                    // VTE's scrollback and is fully captured for the finished
+                    // block snapshot.
+                    //
+                    // We compute rows *relative to* `collecting_start_row` (the
+                    // absolute scrollback row at CommandStart). The raw cursor
+                    // row climbs without bound across the session, so using it
+                    // directly would size a fresh command's cell to thousands
+                    // of empty rows on the first frame.
                     BlockState::CollectingOutput | BlockState::PostCommand => {
-                        return;
+                        let cursor_now = vte.cursor_position().1;
+                        let start = collecting_start_row.get();
+                        let output_rows = (cursor_now - start + 1).max(1);
+                        let prev = vte.row_count();
+                        output_rows.max(prev).min(MAX_COLLECTING_ROWS)
                     }
                     // Idle: size to the typed command's line count (1 + newlines),
                     // clamped to a usable minimum. We must NOT use the VTE cursor
@@ -1903,6 +1948,7 @@ impl TermView {
                 running_cmd_rc: running_cmd.clone(),
                 resize_active: update_input_height.clone(),
                 pty_rows_override: pty_rows_override.clone(),
+                collecting_start_row: collecting_start_row.clone(),
             }
             .install(&pty);
         }
