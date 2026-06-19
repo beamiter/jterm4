@@ -182,6 +182,12 @@ pub struct Config {
     pub(crate) block_history_compress: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
+    /// Forward mouse button events (CSI ?1000/?1002/?1003/?1006 etc.) to apps.
+    pub(crate) mouse_reporting_enabled: bool,
+    /// Forward scroll-wheel events to alt-screen apps that requested mouse mode.
+    pub(crate) scroll_reporting_enabled: bool,
+    /// Forward window focus in/out (CSI ?1004) events to apps.
+    pub(crate) focus_reporting_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +382,9 @@ struct FileConfig {
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
+    mouse_reporting_enabled: Option<bool>,
+    scroll_reporting_enabled: Option<bool>,
+    focus_reporting_enabled: Option<bool>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -423,6 +432,9 @@ fn load_file_config() -> FileConfig {
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
         block_history_compress: table.get("block_history_compress").and_then(|v| v.as_bool()),
         remote_hosts,
+        mouse_reporting_enabled: table.get("mouse_reporting_enabled").and_then(|v| v.as_bool()),
+        scroll_reporting_enabled: table.get("scroll_reporting_enabled").and_then(|v| v.as_bool()),
+        focus_reporting_enabled: table.get("focus_reporting_enabled").and_then(|v| v.as_bool()),
     }
 }
 
@@ -613,6 +625,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         block_history_path,
         block_history_compress,
         remote_hosts: fc.remote_hosts,
+        mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
+        scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
+        focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();

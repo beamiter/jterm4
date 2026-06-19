@@ -11,7 +11,7 @@ use vte4::{TerminalExt, TerminalExtManual};
 use gtk4::gdk::RGBA;
 
 use crate::config::Config;
-use crate::parser::{Parser, ParserEvent};
+use crate::parser::{Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 
 mod ansi;
@@ -468,9 +468,6 @@ struct ReaderCtx {
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
-    pager_snapshots_rc: Rc<RefCell<Vec<String>>>,
-    pager_snapshot_generation_rc: Rc<Cell<u64>>,
-    pager_pre_clear_rc: Rc<RefCell<String>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
@@ -523,9 +520,6 @@ impl ReaderCtx {
             parser,
             block_data_for_cb,
             finished_blocks_for_cb,
-            pager_snapshots_rc,
-            pager_snapshot_generation_rc,
-            pager_pre_clear_rc,
             scroll_debouncer,
             widget_pool_for_cb,
             pty_synced_rc,
@@ -665,18 +659,8 @@ impl ReaderCtx {
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                 }
                                 BlockState::AltScreen => {
-                                    // A pager repainting a fresh page clears the screen
-                                    // first; snapshot the current grid before the clear
-                                    // lands so paged content is preserved.
-                                    if contains_clear_screen(bytes) {
-                                        record_pager_snapshot(&active_vte, &pager_snapshots_rc, &pager_pre_clear_rc);
-                                    }
-                                    schedule_pager_snapshot(
-                                        &active_vte,
-                                        &pager_snapshots_rc,
-                                        &pager_snapshot_generation_rc,
-                                        &pager_pre_clear_rc,
-                                    );
+                                    // Alt-screen bytes go to the live VTE only — they
+                                    // are not captured into block output (ephemeral).
                                 }
                                 _ => {}
                             }
@@ -1072,6 +1056,14 @@ impl ReaderCtx {
                                 osc133_depth_rc.set(osc133_depth_rc.get() - 1);
                                 continue;
                             }
+                            // Safety net (Warp parity): if the alt-screen app
+                            // crashed or exited without rmcup, force the UI back
+                            // to the block list so the next prompt is usable.
+                            if state == BlockState::AltScreen {
+                                active_vte.feed(b"\x1b[?1049l");
+                                exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
+                                resize_active();
+                            }
                             pending_exit_code_rc.set(*code);
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
@@ -1100,12 +1092,6 @@ impl ReaderCtx {
                             }
                             prev_state_rc.set(from_state);
                             bstate_rc.set(BlockState::AltScreen);
-                            pager_snapshot_generation_rc.set(
-                                pager_snapshot_generation_rc.get().wrapping_add(1),
-                            );
-                            pager_snapshots_rc.borrow_mut().clear();
-                            *pager_pre_clear_rc.borrow_mut() =
-                                normalize_pager_snapshot(&visible_vte_text(&active_vte));
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
@@ -1119,21 +1105,10 @@ impl ReaderCtx {
                             if bstate_rc.get() != BlockState::AltScreen {
                                 continue;
                             }
-                            // Capture the final visible frame synchronously before
-                            // switching back to the normal buffer.
-                            record_pager_snapshot(&active_vte, &pager_snapshots_rc, &pager_pre_clear_rc);
+                            // Warp parity: alt-screen content is ephemeral and is
+                            // NOT merged into the block. The active block keeps
+                            // just the command name + exit code.
                             active_vte.feed(b"\x1b[?1049l");
-                            pager_snapshot_generation_rc.set(
-                                pager_snapshot_generation_rc.get().wrapping_add(1),
-                            );
-                            let merged = drain_pager_snapshots(&pager_snapshots_rc);
-                            if !merged.is_empty() {
-                                let needs_separator = !active_rc.borrow().output_text().trim().is_empty();
-                                if needs_separator {
-                                    active_rc.borrow().accumulate_output(b"\n");
-                                }
-                                active_rc.borrow().accumulate_output(merged.as_bytes());
-                            }
                             exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
@@ -1759,14 +1734,6 @@ impl TermView {
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
-        let pager_snapshots: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let pager_snapshot_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        // Normalized text of the shared alt VTE captured *before* we reset/clear
-        // it on a new alt-screen entry. VTE feeds (reset + clear + new content)
-        // render asynchronously, so idle snapshots scheduled right after entry can
-        // read the *previous* command's still-rendered frame. Any snapshot equal
-        // to this baseline is a stale read and must be dropped.
-        let pager_pre_clear: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
         let pending_exit_code: Rc<Cell<i32>> = Rc::new(Cell::new(0));
 
@@ -1814,12 +1781,12 @@ impl TermView {
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let cursor_shape_rc = cursor_shape.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
-            let parser = Rc::new(RefCell::new(Parser::new()));
+            let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
+                mouse_reporting: config.mouse_reporting_enabled,
+                focus_reporting: config.focus_reporting_enabled,
+            })));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
-            let pager_snapshots_rc = pager_snapshots.clone();
-            let pager_snapshot_generation_rc = pager_snapshot_generation.clone();
-            let pager_pre_clear_rc = pager_pre_clear.clone();
             let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
                 user_scrolled_up.clone(),
                 programmatic_scroll.clone(),
@@ -1871,9 +1838,6 @@ impl TermView {
                 parser,
                 block_data_for_cb,
                 finished_blocks_for_cb,
-                pager_snapshots_rc,
-                pager_snapshot_generation_rc,
-                pager_pre_clear_rc,
                 scroll_debouncer,
                 widget_pool_for_cb,
                 pty_synced_rc,
@@ -2124,6 +2088,30 @@ impl TermView {
             .connect(&key_ctrl);
 
             active_vte.add_controller(key_ctrl);
+        }
+
+        // Scroll-reporting gate (Warp parity): when the alt-screen app has put
+        // the terminal into a mouse reporting mode, VTE would forward wheel
+        // events to the app. If the user has disabled scroll reporting, swallow
+        // those wheel events in the capture phase so VTE never sees them.
+        if !config.scroll_reporting_enabled {
+            let fullscreen_for_scroll = fullscreen.clone();
+            let mouse_mode_for_scroll = mouse_reporting_mode.clone();
+            let scroll_ctrl = gtk4::EventControllerScroll::new(
+                gtk4::EventControllerScrollFlags::VERTICAL
+                    | gtk4::EventControllerScrollFlags::HORIZONTAL,
+            );
+            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            scroll_ctrl.connect_scroll(move |_, _, _| {
+                if fullscreen_for_scroll.get()
+                    && mouse_mode_for_scroll.get() != MouseReportingMode::None
+                {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            active_vte.add_controller(scroll_ctrl);
         }
 
         let term_view = TermView {

@@ -48,10 +48,40 @@ enum State {
 pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
+    config: ParserConfig,
+}
+
+/// Runtime toggles for selectively swallowing reporting-enable sequences before
+/// they reach the downstream consumer (VTE). When a toggle is `false`, the
+/// matching `CSI ?…h`/`CSI ?…l` sequences are dropped from the byte stream so
+/// the terminal never enters that reporting mode and apps never receive the
+/// corresponding events.
+#[derive(Clone, Copy)]
+pub struct ParserConfig {
+    pub mouse_reporting: bool,
+    pub focus_reporting: bool,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self { mouse_reporting: true, focus_reporting: true }
+    }
 }
 
 fn is_alt_screen_mode(params: &[u8]) -> bool {
     matches!(params, b"?47" | b"?1047" | b"?1049")
+}
+
+fn is_mouse_reporting_mode(params: &[u8]) -> bool {
+    matches!(
+        params,
+        b"?9" | b"?1000" | b"?1001" | b"?1002" | b"?1003"
+            | b"?1005" | b"?1006" | b"?1015" | b"?1016"
+    )
+}
+
+fn is_focus_reporting_mode(params: &[u8]) -> bool {
+    matches!(params, b"?1004")
 }
 
 impl Default for Parser {
@@ -62,9 +92,14 @@ impl Default for Parser {
 
 impl Parser {
     pub fn new() -> Self {
+        Self::with_config(ParserConfig::default())
+    }
+
+    pub fn with_config(config: ParserConfig) -> Self {
         Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
+            config,
         }
     }
 
@@ -127,6 +162,16 @@ impl Parser {
                         } else if b == b'l' && is_alt_screen_mode(&params) {
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
+                        } else if !self.config.mouse_reporting
+                            && (b == b'h' || b == b'l')
+                            && is_mouse_reporting_mode(&params)
+                        {
+                            // Drop: keep VTE out of mouse reporting mode.
+                        } else if !self.config.focus_reporting
+                            && (b == b'h' || b == b'l')
+                            && is_focus_reporting_mode(&params)
+                        {
+                            // Drop: keep VTE out of focus reporting mode.
                         } else {
                             // Pass the complete sequence through as one contiguous run.
                             self.passthrough.push(0x1b);
