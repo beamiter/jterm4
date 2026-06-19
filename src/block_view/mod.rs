@@ -426,6 +426,12 @@ pub struct TermView {
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+    /// When `Some(rows)`, the resize tick uses `rows` for PTY winsize instead
+    /// of `vte.row_count()`. Set on CommandStart to viewport rows so launched
+    /// programs (notably `top`, which queries TIOCGWINSZ before painting) see
+    /// the full viewport on their very first read; cleared on CommandEnd so
+    /// idle prompt sizing returns to following the compact input cell.
+    pty_rows_override: Rc<Cell<Option<u16>>>,
 }
 
 impl Drop for TermView {
@@ -491,6 +497,11 @@ struct ReaderCtx {
     /// for the alt app's first `contents_changed` — which would otherwise let
     /// the app start drawing into the 6-row idle cell before the grid grows.
     resize_active: Rc<dyn Fn()>,
+    /// PTY-rows override used by the resize tick. We set it on CommandStart so
+    /// `top` (and any other program that queries TIOCGWINSZ before painting)
+    /// sees the full viewport rows on its very first read, not the compact
+    /// input-cell rows. Cleared on CommandEnd.
+    pty_rows_override: Rc<Cell<Option<u16>>>,
 }
 
 impl ReaderCtx {
@@ -538,6 +549,7 @@ impl ReaderCtx {
             cmd_running_rc,
             running_cmd_rc,
             resize_active,
+            pty_rows_override,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -1044,6 +1056,22 @@ impl ReaderCtx {
                             *running_cmd_rc.borrow_mut() = typed_cmd_rc.borrow().trim().to_string();
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
+                            // Decouple PTY rows from the compact input-cell rows
+                            // for the duration of this command. Programs that
+                            // query TIOCGWINSZ before painting (e.g. `top`) must
+                            // see the full viewport on their first read, not
+                            // the ~6-row idle cell. Set an override that the
+                            // resize tick honors instead of vte.row_count(),
+                            // and push TIOCSWINSZ synchronously now so the
+                            // child has the right size before its first read.
+                            let cell_h = (active_vte.char_height() as i32).max(1);
+                            let page = block_scroll_rc.vadjustment().page_size() as i32;
+                            if page > 1 {
+                                let viewport_rows = ((page / cell_h).max(1)) as u16;
+                                let cols = active_vte.column_count().max(1) as u16;
+                                pty_rows_override.set(Some(viewport_rows));
+                                pty_for_init.resize(cols, viewport_rows);
+                            }
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1067,6 +1095,15 @@ impl ReaderCtx {
                             pending_exit_code_rc.set(*code);
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
+                            // Release the PTY-rows override so the resize tick
+                            // resumes mirroring vte.row_count() (the compact
+                            // idle input cell). Push TIOCSWINSZ now so the
+                            // shell sees the new size before reading the next
+                            // prompt.
+                            pty_rows_override.set(None);
+                            let cols = active_vte.column_count().max(1) as u16;
+                            let rows = active_vte.row_count().max(1) as u16;
+                            pty_for_init.resize(cols, rows);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1757,6 +1794,7 @@ impl TermView {
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
+        let pty_rows_override: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
@@ -1864,6 +1902,7 @@ impl TermView {
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 resize_active: update_input_height.clone(),
+                pty_rows_override: pty_rows_override.clone(),
             }
             .install(&pty);
         }
@@ -2159,6 +2198,7 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
+            pty_rows_override,
         };
 
         // Load history if configured
@@ -2275,12 +2315,17 @@ impl TermView {
     /// re-derives its own column/row count from its allocation on every
     /// size_allocate, so we just mirror that onto the PTY whenever it changes —
     /// no pixel math, no chrome calibration.
+    ///
+    /// Exception: when `pty_rows_override` is Some, that value wins for the
+    /// PTY rows axis. This lets a running command see the full viewport in
+    /// TIOCGWINSZ even though the live VTE cell is visually compact.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
+        let override_rc = self.pty_rows_override.clone();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
             let cols = vte.column_count() as u16;
-            let rows = vte.row_count() as u16;
+            let rows = override_rc.get().unwrap_or(vte.row_count() as u16);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
                 pty_for_resize.resize(cols, rows);
