@@ -793,4 +793,107 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["A", "C", "D"]);
     }
+
+    // ── Regression tests for alt-screen detection on real-world TUIs ────────
+    //
+    // These pin the byte streams we captured from running `top` and `less` so
+    // a future parser change can't silently break the "first frame full-size"
+    // behavior we depend on for `top`, `git log`, `man`, etc. If you change
+    // the heuristic, you must keep these passing.
+
+    #[test]
+    fn top_startup_real_byte_stream_promotes_once() {
+        // Captured via `script -q -c top` (procps-ng 3.3.17). The order is:
+        //   smkx (?1h, =), hide cursor (?25l), home (H), full-clear (2J), then
+        //   SGR / charset setup. This combines BOTH heuristic paths (smkx pair
+        //   and [?25l]+[2J]). We must emit exactly one AltScreenEnter.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(
+            b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J\x1b(B\x1b[m\x1b[39;49m",
+            &mut events,
+        );
+        assert_eq!(
+            count_alt_screen_enters(&events),
+            1,
+            "real top startup must emit exactly one AltScreenEnter"
+        );
+    }
+
+    #[test]
+    fn less_startup_real_byte_stream_promotes_once() {
+        // less without smcup (`-X` / `LESS=FRX` — what git log uses by default)
+        // does not write ?1049h. Its startup is dominated by smkx: CSI ?1h
+        // followed shortly by ESC =. That pair is our trigger.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?1h\x1b=\x1b[?12;25h", &mut events);
+        assert_eq!(
+            count_alt_screen_enters(&events),
+            1,
+            "less -FRX startup must emit exactly one AltScreenEnter"
+        );
+    }
+
+    #[test]
+    fn top_then_command_end_then_top_both_promote() {
+        // Two top sessions in the same shell. After the first one ends
+        // (OSC 133 ;D), the second top must still promote — the heuristic
+        // state must reset on CommandStart. This is the regression that
+        // would silently break "running top twice in a row".
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        // session 1: prompt → command start → top → exit
+        p.feed(b"\x1b]133;A\x07\x1b]133;C\x07", &mut events);
+        p.feed(b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J", &mut events);
+        p.feed(b"\x1b[?1049l\x1b]133;D;0\x07", &mut events);
+        // session 2: prompt → command start → top again
+        p.feed(b"\x1b]133;A\x07\x1b]133;C\x07", &mut events);
+        p.feed(b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J", &mut events);
+        assert_eq!(
+            count_alt_screen_enters(&events),
+            2,
+            "each top invocation must promote independently"
+        );
+    }
+
+    #[test]
+    fn starship_prompt_cursor_toggle_does_not_promote() {
+        // Prompt frameworks (Starship, P10k) sometimes bracket their paint
+        // with [?25l]…[?25h] to avoid cursor flicker. They do NOT clear the
+        // screen, so no [2J. A later shell `clear` (which sends [H][2J) must
+        // not be retroactively promoted by the long-since-shown cursor.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?25l\x1b[1;1H\x1b[Kuser@host $ \x1b[?25h", &mut events);
+        p.feed(b"\x1b[H\x1b[2J", &mut events); // shell `clear` afterwards
+        assert_eq!(count_alt_screen_enters(&events), 0);
+    }
+
+    #[test]
+    fn alt_screen_leave_rearms_smkx_for_same_command() {
+        // A program that briefly enters alt-screen (?1049h … ?1049l) and
+        // then runs another smkx-using sub-pager in the same command must
+        // still re-promote. ?1049l clears tui_promoted so the next smkx
+        // pair fires AltScreenEnter again.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?1049h", &mut events); // first promotion
+        p.feed(b"\x1b[?1049l", &mut events); // leave clears tui_promoted
+        p.feed(b"\x1b[?1h\x1b=", &mut events); // smkx pager → re-promote
+        assert_eq!(count_alt_screen_enters(&events), 2);
+    }
+
+    #[test]
+    fn smkx_split_across_feeds_still_promotes() {
+        // Network/PTY chunking can split CSI ?1h and ESC = across reads.
+        // The flags persist on the Parser, so the pair still triggers.
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?1h", &mut events);
+        assert_eq!(count_alt_screen_enters(&events), 0);
+        p.feed(b"\x1b", &mut events);
+        p.feed(b"=", &mut events);
+        assert_eq!(count_alt_screen_enters(&events), 1);
+    }
 }
