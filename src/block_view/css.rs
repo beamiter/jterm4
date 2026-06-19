@@ -28,6 +28,45 @@ pub(crate) fn shorten_path(path: &str) -> String {
     }
 }
 
+/// Cheap git-branch lookup for the context chip: walk up from `cwd` to find a
+/// `.git` dir (or `.git` file for worktrees/submodules), then read `HEAD`. No
+/// subprocess, no dirty-state — just the branch name (or short SHA if detached).
+pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
+    use std::path::{Path, PathBuf};
+    let mut dir: Option<&Path> = Some(Path::new(cwd));
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        let head_path: Option<PathBuf> = if dot_git.is_dir() {
+            Some(dot_git.join("HEAD"))
+        } else if dot_git.is_file() {
+            // "gitdir: <path>" → real git dir lives elsewhere
+            std::fs::read_to_string(&dot_git).ok().and_then(|c| {
+                c.strip_prefix("gitdir:").map(|p| {
+                    let g = Path::new(p.trim());
+                    if g.is_absolute() { g.join("HEAD") } else { d.join(g).join("HEAD") }
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(hp) = head_path {
+            if let Ok(head) = std::fs::read_to_string(&hp) {
+                let head = head.trim();
+                if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+                    return Some(branch.to_string());
+                }
+                // Detached HEAD: show short SHA.
+                if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(head[..7].to_string());
+                }
+                return None;
+            }
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 pub(crate) fn chrono_local_offset_secs() -> i64 {
     use nix::libc;
     unsafe {
@@ -157,6 +196,13 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-failed {{
             border-left-color: {err_stripe};
+            background-color: rgba({err_r},{err_g},{err_b},0.055);
+        }}
+        .block-finished.block-failed .block-command-view,
+        .block-finished.block-failed .block-command-view text,
+        .block-finished.block-failed .block-output-view,
+        .block-finished.block-failed .block-output-view text {{
+            background-color: transparent;
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
@@ -166,8 +212,9 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
         }}
         .block-selected {{
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.07);
-            box-shadow: inset 3px 0 0 0 {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.35);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.12);
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            box-shadow: inset 0 0 0 2px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
         }}
         .block-active {{
             border: none;
@@ -180,8 +227,35 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: {font_size};
             font-weight: bold;
-            margin-left: 12px;
+            margin-left: 10px;
+            margin-right: 6px;
+        }}
+        .block-chip {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.07);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.10);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 9px;
+        }}
+        .block-bookmark-star {{
+            color: #e5c07b;
+            font-family: "{font_family}";
+            font-size: 0.82em;
             margin-right: 2px;
+        }}
+        .block-bookmarked {{
+            box-shadow: inset 3px 0 0 0 #e5c07b;
+        }}
+        .block-chip-git {{
+            color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.22);
+            border-radius: 999px;
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 1px 9px;
         }}
         .block-status-ok {{
             color: {ok_hex};
@@ -218,6 +292,22 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-action-btn:hover {{
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
+        }}
+        .block-filter-row {{
+            padding: 2px 0;
+        }}
+        .block-filter-toggle {{
+            color: {dim_fg};
+            min-width: 26px;
+            min-height: 24px;
+            padding: 0 4px;
+            border-radius: 6px;
+            font-family: "{font_family}";
+            font-size: 0.8em;
+        }}
+        .block-filter-toggle:checked {{
+            color: {fg_hex};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.35);
         }}
         .block-header {{
             border-radius: 6px 6px 0 0;

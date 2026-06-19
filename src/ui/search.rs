@@ -18,6 +18,9 @@ impl UiState {
             if let Some(term) = self.current_terminal() {
                 term.search_set_regex(None::<&vte4::Regex>, 0);
             }
+            if let Some(term_view) = self.current_term_view() {
+                term_view.clear_find();
+            }
             self.focus_current_terminal();
         }
     }
@@ -36,18 +39,12 @@ impl UiState {
             (text_str.to_string(), false)
         };
 
-        // Try block search first (in block mode)
+        // Block mode: highlight every in-text match and focus the first one
+        // (Warp's FindWithinBlock). Next/Prev step through them.
         if let Some(term_view) = self.current_term_view() {
-            let filters = crate::block_view::BlockFilters {
-                use_regex,
-                ..Default::default()
-            };
-            let matches = term_view.search_blocks_with_filters(&query, &filters);
-            if !matches.is_empty() {
-                if let Some(first_match) = matches.first() {
-                    term_view.scroll_to_block(*first_match);
-                    return;
-                }
+            let (_, total) = term_view.find_in_blocks(&query, use_regex);
+            if total > 0 {
+                return;
             }
         }
 
@@ -68,12 +65,24 @@ impl UiState {
     }
 
     pub(crate) fn search_next(&self) {
+        if let Some(term_view) = self.current_term_view() {
+            let (_, total) = term_view.find_next();
+            if total > 0 {
+                return;
+            }
+        }
         if let Some(term) = self.current_terminal() {
             term.search_find_next();
         }
     }
 
     pub(crate) fn search_prev(&self) {
+        if let Some(term_view) = self.current_term_view() {
+            let (_, total) = term_view.find_prev();
+            if total > 0 {
+                return;
+            }
+        }
         if let Some(term) = self.current_terminal() {
             term.search_find_previous();
         }

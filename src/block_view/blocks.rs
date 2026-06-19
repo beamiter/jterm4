@@ -301,6 +301,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk4::Button,
     pub(crate) header_row: gtk4::Box,
     pub(crate) action_box: gtk4::Box,
+    pub(crate) bookmark_star: gtk4::Label,
 }
 
 impl Clone for FinishedBlock {
@@ -321,8 +322,152 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            bookmark_star: self.bookmark_star.clone(),
         }
     }
+}
+
+/// Lightweight shell-command syntax highlighter (Warp-style). Emits an ANSI
+/// (SGR) string so it can flow through the same `set_active_output_buffer`
+/// rendering path as real shell output. Best-effort, dependency-free:
+///   - command name (first word, and first word after a pipe/operator): bold cyan
+///   - flags (`-x`, `--long`): dim/gray
+///   - quoted strings: green
+///   - operators (`| & ; > <`): magenta
+///   - `$VAR` references: cyan
+/// Whitespace and all other text are emitted verbatim in the default color, so
+/// the reconstructed buffer text matches the command exactly.
+pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
+    const RESET: &str = "\x1b[0m";
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut out = String::with_capacity(cmd.len() + 32);
+    let mut i = 0;
+    let mut expect_command = true;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            let quote = c;
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if quote == '"' && chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                let done = chars[i] == quote;
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            out.push_str("\x1b[32m");
+            out.extend(chars[start..i].iter());
+            out.push_str(RESET);
+            expect_command = false;
+            continue;
+        }
+        if matches!(c, '|' | '&' | ';' | '>' | '<') {
+            let start = i;
+            while i < chars.len() && matches!(chars[i], '|' | '&' | ';' | '>' | '<') {
+                i += 1;
+            }
+            out.push_str("\x1b[35m");
+            out.extend(chars[start..i].iter());
+            out.push_str(RESET);
+            expect_command = true;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() {
+            let cc = chars[i];
+            if cc.is_whitespace() || matches!(cc, '|' | '&' | ';' | '>' | '<' | '"' | '\'') {
+                break;
+            }
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        if word.starts_with('-') {
+            out.push_str("\x1b[90m");
+            out.push_str(&word);
+            out.push_str(RESET);
+        } else if word.starts_with('$') {
+            out.push_str("\x1b[36m");
+            out.push_str(&word);
+            out.push_str(RESET);
+        } else if expect_command {
+            out.push_str("\x1b[1;36m");
+            out.push_str(&word);
+            out.push_str(RESET);
+            expect_command = false;
+        } else {
+            out.push_str(&word);
+        }
+    }
+    out
+}
+
+/// Filter raw output (ANSI preserved) to the lines matching `query`, honoring
+/// regex / case / invert and `context` lines of surroundings (Warp's
+/// BlockFilterQuery). Empty query, or an invalid regex, returns `full` verbatim.
+fn filter_output_lines(
+    full: &str,
+    query: &str,
+    use_regex: bool,
+    case_sensitive: bool,
+    invert: bool,
+    context: usize,
+) -> String {
+    if query.is_empty() {
+        return full.to_string();
+    }
+    let re = if use_regex {
+        match regex::RegexBuilder::new(query)
+            .case_insensitive(!case_sensitive)
+            .build()
+        {
+            Ok(re) => Some(re),
+            Err(_) => return full.to_string(),
+        }
+    } else {
+        None
+    };
+    let lc_query = if case_sensitive {
+        String::new()
+    } else {
+        query.to_lowercase()
+    };
+    let lines: Vec<&str> = full.lines().collect();
+    let matches_line = |line: &str| -> bool {
+        let hit = if let Some(ref re) = re {
+            re.is_match(line)
+        } else if case_sensitive {
+            line.contains(query)
+        } else {
+            line.to_lowercase().contains(&lc_query)
+        };
+        hit ^ invert
+    };
+    let mut keep = vec![false; lines.len()];
+    for (i, line) in lines.iter().enumerate() {
+        if matches_line(line) {
+            let lo = i.saturating_sub(context);
+            let hi = (i + context + 1).min(lines.len());
+            for slot in keep.iter_mut().take(hi).skip(lo) {
+                *slot = true;
+            }
+        }
+    }
+    lines
+        .iter()
+        .zip(keep.iter())
+        .filter_map(|(l, k)| if *k { Some(*l) } else { None })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl FinishedBlock {
@@ -394,6 +539,13 @@ impl FinishedBlock {
         header_row.set_margin_top(6);
         header_row.set_margin_bottom(2);
 
+        // Bookmark star (gutter marker), hidden until the block is bookmarked.
+        let bookmark_star = gtk4::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
+        bookmark_star.add_css_class("block-bookmark-star");
+        bookmark_star.set_halign(gtk4::Align::Start);
+        bookmark_star.set_visible(false);
+        header_row.append(&bookmark_star);
+
         // Status icon: ✓ for success, ✗ for failure.
         // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
         let status_icon = gtk4::Label::new(Some(if exit_code == 0 { "\u{f00c}" } else { "\u{f00d}" }));
@@ -401,15 +553,26 @@ impl FinishedBlock {
         status_icon.set_halign(gtk4::Align::Start);
         header_row.append(&status_icon);
 
-        // CWD label (shortened to last 2 segments)
+        // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
             let shortened = shorten_path(cwd_path);
-            let cwd_label = gtk4::Label::new(Some(&shortened));
-            cwd_label.add_css_class("block-header-label");
-            cwd_label.set_halign(gtk4::Align::Start);
-            cwd_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
-            cwd_label.set_max_width_chars(40);
-            header_row.append(&cwd_label);
+            // nf-fa-folder () prefix
+            let cwd_chip = gtk4::Label::new(Some(&format!("\u{f07b} {}", shortened)));
+            cwd_chip.add_css_class("block-chip");
+            cwd_chip.set_halign(gtk4::Align::Start);
+            cwd_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+            cwd_chip.set_max_width_chars(40);
+            header_row.append(&cwd_chip);
+
+            // git-branch chip (nf-dev-git-branch )
+            if let Some(branch) = git_branch_for(cwd_path) {
+                let git_chip = gtk4::Label::new(Some(&format!("\u{e725} {}", branch)));
+                git_chip.add_css_class("block-chip-git");
+                git_chip.set_halign(gtk4::Align::Start);
+                git_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                git_chip.set_max_width_chars(28);
+                header_row.append(&git_chip);
+            }
         }
 
         // Spacer
@@ -463,7 +626,9 @@ impl FinishedBlock {
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
         rerun_btn.set_tooltip_text(Some("Re-run command"));
-        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn] {
+        let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
+        filter_btn.set_tooltip_text(Some("Filter output"));
+        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn, &filter_btn] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
             action_box.append(btn);
@@ -543,8 +708,14 @@ impl FinishedBlock {
                 set_active_output_buffer(&command_buffer, ansi, &config.palette, None);
             }
             _ => {
-                let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
-                command_buffer.set_text(cmd_display);
+                if cmd.is_empty() {
+                    command_buffer.set_text("(empty)");
+                } else {
+                    // No shell-provided ANSI echo: apply our own lightweight
+                    // syntax highlighting so finished commands look like Warp's.
+                    let highlighted = highlight_command_to_ansi(cmd);
+                    set_active_output_buffer(&command_buffer, &highlighted, &config.palette, None);
+                }
             }
         }
 
@@ -665,8 +836,19 @@ impl FinishedBlock {
             view.add_controller(motion_ctrl);
         }
 
+        // Command row: Warp-style accent prompt chevron + the command text.
+        // The chevron supplies the left indent, so trim the command view's own
+        // left margin to keep them visually adjacent.
+        command_view.set_left_margin(2);
+        let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
+        let chevron = gtk4::Label::new(Some("\u{276f}")); // ❯
+        chevron.add_css_class("block-prompt-chevron");
+        chevron.set_valign(gtk4::Align::Start);
+        cmd_row.append(&chevron);
+        cmd_row.append(&command_view);
+
         // Append views to outer box
-        outer.append(&command_view);
+        outer.append(&cmd_row);
         outer.append(&output_view);
 
         // "Show more" button for truncated output
@@ -729,6 +911,121 @@ impl FinishedBlock {
             collapse_btn.set_label("\u{f054}"); // nf-fa-chevron_right
         }
 
+        // Per-block output filter (Warp's BlockFilterQuery): the funnel button in
+        // the action box toggles a compact row that narrows the output to lines
+        // matching the query, honoring regex / case / invert / context-lines.
+        {
+            let filter_row = gtk4::Box::new(Orientation::Horizontal, 4);
+            filter_row.add_css_class("block-filter-row");
+            filter_row.set_visible(false);
+            filter_row.set_margin_start(12);
+            filter_row.set_margin_end(8);
+            filter_row.set_margin_top(2);
+            filter_row.set_margin_bottom(2);
+
+            let filter_entry = gtk4::SearchEntry::new();
+            filter_entry.set_placeholder_text(Some("Filter output…"));
+            filter_entry.set_hexpand(true);
+            let regex_tg = gtk4::ToggleButton::with_label(".*");
+            regex_tg.set_tooltip_text(Some("Regular expression"));
+            let case_tg = gtk4::ToggleButton::with_label("Aa");
+            case_tg.set_tooltip_text(Some("Case sensitive"));
+            let invert_tg = gtk4::ToggleButton::with_label("!");
+            invert_tg.set_tooltip_text(Some("Invert match (hide matching lines)"));
+            let ctx_spin = gtk4::SpinButton::with_range(0.0, 9.0, 1.0);
+            ctx_spin.set_tooltip_text(Some("Lines of context around each match"));
+            ctx_spin.set_value(0.0);
+            for w in [&regex_tg, &case_tg, &invert_tg] {
+                w.add_css_class("flat");
+                w.add_css_class("block-filter-toggle");
+            }
+            filter_row.append(&filter_entry);
+            filter_row.append(&regex_tg);
+            filter_row.append(&case_tg);
+            filter_row.append(&invert_tg);
+            filter_row.append(&ctx_spin);
+
+            outer.append(&filter_row);
+            outer.reorder_child_after(&filter_row, Some(&cmd_row));
+
+            let apply = {
+                let output_buffer = output_buffer.clone();
+                let output_view = output_view.clone();
+                let config = config.clone();
+                let palette = config.palette;
+                let full_output = full_output.clone();
+                let filter_entry = filter_entry.clone();
+                let regex_tg = regex_tg.clone();
+                let case_tg = case_tg.clone();
+                let invert_tg = invert_tg.clone();
+                let ctx_spin = ctx_spin.clone();
+                let show_more = show_more_btn.clone();
+                move || {
+                    let q = filter_entry.text().to_string();
+                    let full = full_output.borrow();
+                    if q.is_empty() {
+                        // Restore the initial (collapsed) view.
+                        let lines: Vec<&str> = full.lines().collect();
+                        let shown = if lines.len() > threshold {
+                            lines[..threshold].join("\n")
+                        } else {
+                            full.to_string()
+                        };
+                        set_active_output_buffer(&output_buffer, &shown, &palette, None);
+                        fit_output_height(&output_view, &shown, &config);
+                        if let Some(ref smb) = show_more {
+                            smb.set_visible(lines.len() > threshold);
+                            smb.set_label(&format!(
+                                "Show more ({} more lines)",
+                                lines.len().saturating_sub(threshold)
+                            ));
+                        }
+                    } else {
+                        let filtered = filter_output_lines(
+                            full.as_str(),
+                            &q,
+                            regex_tg.is_active(),
+                            case_tg.is_active(),
+                            invert_tg.is_active(),
+                            ctx_spin.value() as usize,
+                        );
+                        set_active_output_buffer(&output_buffer, &filtered, &palette, None);
+                        fit_output_height(&output_view, &filtered, &config);
+                        if let Some(ref smb) = show_more {
+                            smb.set_visible(false);
+                        }
+                    }
+                }
+            };
+            let apply = Rc::new(apply);
+            {
+                let a = apply.clone();
+                filter_entry.connect_search_changed(move |_| a());
+            }
+            for tg in [&regex_tg, &case_tg, &invert_tg] {
+                let a = apply.clone();
+                tg.connect_toggled(move |_| a());
+            }
+            {
+                let a = apply.clone();
+                ctx_spin.connect_value_changed(move |_| a());
+            }
+
+            let filter_row_for_btn = filter_row.clone();
+            let entry_for_btn = filter_entry.clone();
+            let apply_for_btn = apply.clone();
+            filter_btn.connect_clicked(move |_| {
+                let show = !filter_row_for_btn.is_visible();
+                filter_row_for_btn.set_visible(show);
+                if show {
+                    entry_for_btn.grab_focus();
+                } else {
+                    entry_for_btn.set_text("");
+                    apply_for_btn();
+                }
+            });
+        }
+
         FinishedBlock {
             id,
             widget: outer,
@@ -745,6 +1042,7 @@ impl FinishedBlock {
             rerun_btn,
             header_row,
             action_box,
+            bookmark_star,
         }
     }
 

@@ -341,6 +341,43 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MIN_INPUT_ROWS: i32 = 6;
 
 #[allow(dead_code)]
+/// One highlighted hit from a find-within-blocks pass. Offsets are TextBuffer
+/// character offsets, valid until the buffer is re-rendered (cleared on close).
+#[derive(Clone)]
+struct FindMatch {
+    block_id: u64,
+    /// false = command line buffer, true = output buffer.
+    is_output: bool,
+    start: i32,
+    end: i32,
+}
+
+#[derive(Default)]
+struct FindState {
+    matches: Vec<FindMatch>,
+    /// Index into `matches` of the currently focused hit.
+    current: usize,
+}
+
+/// Fetch (creating once) the find-highlight TextTag for a buffer. `current` is
+/// the bright "focused match" variant; otherwise the dim all-matches variant.
+fn find_tag(buffer: &gtk4::TextBuffer, current: bool) -> gtk4::TextTag {
+    let name = if current { "jt-find-current" } else { "jt-find" };
+    let table = buffer.tag_table();
+    if let Some(tag) = table.lookup(name) {
+        return tag;
+    }
+    let tag = gtk4::TextTag::new(Some(name));
+    if current {
+        tag.set_background(Some("#ff9e3b"));
+        tag.set_foreground(Some("#1a1a1a"));
+    } else {
+        tag.set_background(Some("#5c4a1f"));
+    }
+    table.add(&tag);
+    tag
+}
+
 pub struct TermView {
     root: gtk4::Box,
     block_scroll: ScrolledWindow,
@@ -380,6 +417,10 @@ pub struct TermView {
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     selected_block_id: Rc<Cell<Option<u64>>>,
+    /// Find-within-blocks state: every match across the finished blocks plus a
+    /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
+    /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
+    find_state: Rc<RefCell<FindState>>,
     current_cwd: Rc<RefCell<String>>,
     /// Per-frame resize tick installed on `root`. Held so it can be removed on
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
@@ -1180,6 +1221,7 @@ struct KeyCtx {
     block_list_for_key: gtk4::Box,
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
+    bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
 }
 
 impl KeyCtx {
@@ -1193,6 +1235,7 @@ impl KeyCtx {
             block_list_for_key,
             selected_block_id_for_key,
             block_scroll_for_key,
+            bookmarks_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
             use gtk4::gdk::Key;
@@ -1211,8 +1254,11 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+Shift+Up/Down: move the finished-block selection.
-            if ctrl && shift && matches!(keyval, Key::Up | Key::Down) {
+            // Ctrl+Shift+Up/Down: move the finished-block selection (Warp uses
+            // Ctrl+Up/Down, but VTE swallows plain Ctrl+arrow before the capture
+            // handler, so Shift is required in practice; the condition stays
+            // permissive so plain Ctrl+arrow also works where it is delivered).
+            if ctrl && !alt && matches!(keyval, Key::Up | Key::Down) {
                 let finished = finished_blocks_for_key.borrow();
                 if finished.is_empty() {
                     return glib::Propagation::Stop;
@@ -1280,6 +1326,86 @@ impl KeyCtx {
                 return glib::Propagation::Proceed;
             }
 
+            // Ctrl+B: toggle a bookmark on the selected block (Warp's
+            // ToggleBookmarkBlock). Shows the gutter star + accent stripe.
+            if ctrl && !shift && !alt && matches!(keyval, Key::b | Key::B) {
+                if let Some(sel_id) = selected_block_id_for_key.get() {
+                    let finished = finished_blocks_for_key.borrow();
+                    if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
+                        let mut marks = bookmarks_for_key.borrow_mut();
+                        let now_marked = if marks.remove(&sel_id) {
+                            false
+                        } else {
+                            marks.insert(sel_id);
+                            true
+                        };
+                        block.bookmark_star.set_visible(now_marked);
+                        if now_marked {
+                            block.widget().add_css_class("block-bookmarked");
+                        } else {
+                            block.widget().remove_css_class("block-bookmarked");
+                        }
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+
+            // Ctrl+,/Ctrl+. : jump to the previous/next bookmarked block (Warp's
+            // SelectBookmarkUp/Down). VTE swallows Alt+arrow and plain Ctrl+arrow
+            // before the capture handler sees them, so comma/period are used here.
+            if ctrl && !alt && !shift && matches!(keyval, Key::comma | Key::period) {
+                let finished = finished_blocks_for_key.borrow();
+                let marks = bookmarks_for_key.borrow();
+                if marks.is_empty() {
+                    return glib::Propagation::Stop;
+                }
+                let marked_idx: Vec<usize> = finished
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| marks.contains(&b.id))
+                    .map(|(i, _)| i)
+                    .collect();
+                if marked_idx.is_empty() {
+                    return glib::Propagation::Stop;
+                }
+                let cur = selected_block_id_for_key
+                    .get()
+                    .and_then(|id| finished.iter().position(|b| b.id == id));
+                let target = if keyval == Key::comma {
+                    marked_idx
+                        .iter()
+                        .rev()
+                        .find(|&&i| cur.map(|c| i < c).unwrap_or(true))
+                        .copied()
+                        .or_else(|| marked_idx.last().copied())
+                } else {
+                    marked_idx
+                        .iter()
+                        .find(|&&i| cur.map(|c| i > c).unwrap_or(true))
+                        .copied()
+                        .or_else(|| marked_idx.first().copied())
+                };
+                if let Some(idx) = target {
+                    let new_id = finished.get(idx).map(|b| b.id);
+                    select_finished_block(&finished, &selected_block_id_for_key, new_id);
+                    if let Some(block) = finished.get(idx) {
+                        let widget = block.widget().clone();
+                        let scroll = block_scroll_for_key.clone();
+                        glib::idle_add_local_once(move || {
+                            if let Some(point) = widget.compute_point(
+                                &scroll,
+                                &gtk4::graphene::Point::new(0.0, 0.0),
+                            ) {
+                                let adj = scroll.vadjustment();
+                                let target = (point.y() as f64) - adj.page_size() / 3.0;
+                                adj.set_value(target.max(0.0));
+                            }
+                        });
+                    }
+                }
+                return glib::Propagation::Stop;
+            }
+
             // Ctrl+L: clear visible finished blocks + send form feed to the shell.
             if ctrl && !shift && !alt && matches!(keyval, Key::l | Key::L) {
                 let mut blocks = finished_blocks_for_key.borrow_mut();
@@ -1290,8 +1416,24 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste against the live VTE.
+            // Ctrl+Shift+C: copy. If a block is selected, copy that block (Warp's
+            // CopyBlock); with Alt also held, copy its output only (CopyBlockOutput).
+            // Otherwise fall back to copying the live VTE selection.
             if ctrl && shift && matches!(keyval, Key::c | Key::C) {
+                if let Some(sel_id) = selected_block_id_for_key.get() {
+                    let bd = block_data_for_key.borrow();
+                    if let Some(b) = bd.iter().find(|b| b.id == sel_id) {
+                        let text = if alt {
+                            b.output.clone()
+                        } else if b.output.trim().is_empty() {
+                            b.cmd.clone()
+                        } else {
+                            format!("{}\n{}", b.cmd, b.output)
+                        };
+                        active_vte_for_key.clipboard().set_text(&text);
+                        return glib::Propagation::Stop;
+                    }
+                }
                 active_vte_for_key.copy_clipboard_format(vte4::Format::Text);
                 return glib::Propagation::Stop;
             }
@@ -1446,7 +1588,19 @@ impl TermView {
         }
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-        let mut env_extra: Vec<(&str, &str)> = vec![];
+        // Block mode renders each command's output into its own scrollable block,
+        // so an interactive pager is not just redundant — it's broken here. The
+        // live VTE stays compact (a few rows) during a command, so a pager queries
+        // a tiny terminal and paginates every few lines, and its screen-repaints
+        // get accumulated into the block as garbled overlapping pages. Neutralize
+        // auto-pagers so tools stream their full output straight into the block.
+        // `GIT_PAGER=cat` still keeps git's color (color.pager defaults on), and
+        // directly-invoked TUIs (less FILE, vim, htop) are unaffected — they use
+        // the alternate screen and are handled by the alt-screen path.
+        let mut env_extra: Vec<(&str, &str)> = vec![
+            ("GIT_PAGER", "cat"),
+            ("PAGER", "cat"),
+        ];
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
@@ -1619,6 +1773,10 @@ impl TermView {
         let widget_pool: Rc<RefCell<WidgetPool>> = Rc::new(RefCell::new(WidgetPool::new()));
         let pty_synced: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+B;
+        // navigated with Alt+Up/Down. Not persisted (avoids an rkyv schema bump).
+        let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
+            Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -1961,6 +2119,7 @@ impl TermView {
                 block_list_for_key,
                 selected_block_id_for_key,
                 block_scroll_for_key,
+                bookmarks_for_key: block_bookmarks.clone(),
             }
             .connect(&key_ctrl);
 
@@ -2001,6 +2160,7 @@ impl TermView {
             widget_pool,
             visible_indices,
             selected_block_id,
+            find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
         };
@@ -2457,6 +2617,171 @@ impl TermView {
             .collect();
 
         results
+    }
+
+    /// Highlight every occurrence of `query` across the finished blocks and
+    /// focus the first hit. Returns (current_1based, total); (0, 0) for no match.
+    /// Mirrors Warp's FindWithinBlock highlight pass.
+    pub fn find_in_blocks(&self, query: &str, use_regex: bool) -> (usize, usize) {
+        self.clear_find();
+        if query.is_empty() {
+            return (0, 0);
+        }
+        let pattern = if use_regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let re = match regex::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+        {
+            Ok(re) => re,
+            Err(_) => return (0, 0),
+        };
+
+        let mut matches: Vec<FindMatch> = Vec::new();
+        {
+            let finished = self.finished_blocks.borrow();
+            for block in finished.iter() {
+                for (is_output, buffer) in
+                    [(false, &block.command_buffer), (true, &block.output_buffer)]
+                {
+                    let text = buffer
+                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                        .to_string();
+                    for m in re.find_iter(&text) {
+                        if m.start() == m.end() {
+                            continue;
+                        }
+                        let start = text[..m.start()].chars().count() as i32;
+                        let end = start + text[m.start()..m.end()].chars().count() as i32;
+                        matches.push(FindMatch {
+                            block_id: block.id,
+                            is_output,
+                            start,
+                            end,
+                        });
+                        let tag = find_tag(buffer, false);
+                        buffer.apply_tag(
+                            &tag,
+                            &buffer.iter_at_offset(start),
+                            &buffer.iter_at_offset(end),
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return (0, 0);
+        }
+        let total = matches.len();
+        {
+            let mut st = self.find_state.borrow_mut();
+            st.matches = matches;
+            st.current = 0;
+        }
+        self.set_current_find_tag(0, true);
+        self.scroll_to_current_match();
+        (1, total)
+    }
+
+    /// Step to the next match (wrapping). Returns (current_1based, total).
+    pub fn find_next(&self) -> (usize, usize) {
+        self.step_find(1)
+    }
+
+    /// Step to the previous match (wrapping). Returns (current_1based, total).
+    pub fn find_prev(&self) -> (usize, usize) {
+        self.step_find(-1)
+    }
+
+    fn step_find(&self, delta: isize) -> (usize, usize) {
+        let (cur, total) = {
+            let st = self.find_state.borrow();
+            (st.current, st.matches.len())
+        };
+        if total == 0 {
+            return (0, 0);
+        }
+        self.set_current_find_tag(cur, false);
+        let next = ((cur as isize + delta).rem_euclid(total as isize)) as usize;
+        self.find_state.borrow_mut().current = next;
+        self.set_current_find_tag(next, true);
+        self.scroll_to_current_match();
+        (next + 1, total)
+    }
+
+    /// Apply (or remove) the bright "current match" tag on the hit at `idx`.
+    fn set_current_find_tag(&self, idx: usize, on: bool) {
+        let finished = self.finished_blocks.borrow();
+        let st = self.find_state.borrow();
+        let Some(fm) = st.matches.get(idx) else {
+            return;
+        };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+            return;
+        };
+        let buffer = if fm.is_output {
+            &block.output_buffer
+        } else {
+            &block.command_buffer
+        };
+        let tag = find_tag(buffer, true);
+        let s = buffer.iter_at_offset(fm.start);
+        let e = buffer.iter_at_offset(fm.end);
+        if on {
+            buffer.apply_tag(&tag, &s, &e);
+        } else {
+            buffer.remove_tag(&tag, &s, &e);
+        }
+    }
+
+    fn scroll_to_current_match(&self) {
+        let finished = self.finished_blocks.borrow();
+        let st = self.find_state.borrow();
+        let Some(fm) = st.matches.get(st.current) else {
+            return;
+        };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+            return;
+        };
+        let widget = block.widget().clone();
+        let scroll = self.block_scroll.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(point) =
+                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+            {
+                let adj = scroll.vadjustment();
+                let target = (point.y() as f64) - adj.page_size() / 3.0;
+                adj.set_value(target.max(0.0));
+            }
+        });
+    }
+
+    /// Remove all find highlights and reset the find cursor (call on close).
+    pub fn clear_find(&self) {
+        {
+            let finished = self.finished_blocks.borrow();
+            for block in finished.iter() {
+                for buffer in [&block.command_buffer, &block.output_buffer] {
+                    let table = buffer.tag_table();
+                    for name in ["jt-find", "jt-find-current"] {
+                        if let Some(tag) = table.lookup(name) {
+                            buffer.remove_tag(
+                                &tag,
+                                &buffer.start_iter(),
+                                &buffer.end_iter(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut st = self.find_state.borrow_mut();
+        st.matches.clear();
+        st.current = 0;
     }
 
     /// Get only failed blocks (exit_code != 0)

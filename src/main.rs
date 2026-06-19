@@ -587,12 +587,8 @@ fn main() -> glib::ExitCode {
             false.into()
         });
 
-        // Wire up search entry: activate (Enter) = next, Shift+Enter = prev
-        let ui_for_search_activate = ui.clone();
-        search_entry.connect_activate(move |_| {
-            ui_for_search_activate.search_apply();
-        });
-
+        // Enter/Shift+Enter are handled by the capture-phase key controller
+        // below (next/prev); incremental highlighting runs on search_changed.
         let ui_for_search_changed = ui.clone();
         search_entry.connect_search_changed(move |_| {
             ui_for_search_changed.search_apply();
@@ -613,8 +609,11 @@ fn main() -> glib::ExitCode {
             ui_for_search_close.toggle_search();
         });
 
-        // Search entry key handler for Shift+Enter (prev) and Escape
+        // Search entry key handler for Enter (next), Shift+Enter (prev), Escape.
+        // Capture phase so Enter is consumed before it can reach the live VTE
+        // (otherwise it submits a stray empty command to the shell).
         let search_key_controller = EventControllerKey::new();
+        search_key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let ui_for_search_key = ui.clone();
         search_key_controller.connect_key_pressed(move |_, keyval, _, state| {
             match keyval {
