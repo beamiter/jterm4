@@ -1098,6 +1098,21 @@ impl ReaderCtx {
                             // Grow the live VTE to the full viewport *before* the
                             // app draws, so it queries the right size right away.
                             resize_active();
+                            // Sync PTY winsize to the full viewport rows
+                            // synchronously. The tick_callback that mirrors
+                            // vte.row_count() onto the PTY only fires on the
+                            // next frame (after GTK lays out the grown holder);
+                            // until then `top` keeps its startup-time compact
+                            // rows and paints only a few lines into the alt
+                            // buffer. Pushing TIOCSWINSZ here delivers SIGWINCH
+                            // immediately so the app redraws full-screen.
+                            let cell_h = (active_vte.char_height() as i32).max(1);
+                            let page = block_scroll_rc.vadjustment().page_size() as i32;
+                            if page > 1 {
+                                let viewport_rows = ((page / cell_h).max(1)) as u16;
+                                let cols = active_vte.column_count().max(1) as u16;
+                                pty_for_init.resize(cols, viewport_rows);
+                            }
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1563,19 +1578,12 @@ impl TermView {
         }
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-        // Block mode renders each command's output into its own scrollable block,
-        // so an interactive pager is not just redundant — it's broken here. The
-        // live VTE stays compact (a few rows) during a command, so a pager queries
-        // a tiny terminal and paginates every few lines, and its screen-repaints
-        // get accumulated into the block as garbled overlapping pages. Neutralize
-        // auto-pagers so tools stream their full output straight into the block.
-        // `GIT_PAGER=cat` still keeps git's color (color.pager defaults on), and
-        // directly-invoked TUIs (less FILE, vim, htop) are unaffected — they use
-        // the alternate screen and are handled by the alt-screen path.
-        let mut env_extra: Vec<(&str, &str)> = vec![
-            ("GIT_PAGER", "cat"),
-            ("PAGER", "cat"),
-        ];
+        // Warp parity: do NOT override GIT_PAGER / PAGER. Pagers (less, etc.)
+        // enter the alternate screen via ?1049h, which the alt-screen path
+        // hands the full viewport to. Forcing `cat` was a workaround for an
+        // earlier compact-input-cell sizing bug; we now resize the PTY to the
+        // full viewport on alt-screen enter so pagers get a real terminal.
+        let mut env_extra: Vec<(&str, &str)> = vec![];
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
