@@ -1461,31 +1461,12 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+Shift+C: copy. If a block is selected, copy that block (Warp's
-            // CopyBlock); with Alt also held, copy its output only (CopyBlockOutput).
-            // Otherwise fall back to copying the live VTE selection.
-            if ctrl && shift && matches!(keyval, Key::c | Key::C) {
-                if let Some(sel_id) = selected_block_id_for_key.get() {
-                    let bd = block_data_for_key.borrow();
-                    if let Some(b) = bd.iter().find(|b| b.id == sel_id) {
-                        let text = if alt {
-                            b.output.clone()
-                        } else if b.output.trim().is_empty() {
-                            b.cmd.clone()
-                        } else {
-                            format!("{}\n{}", b.cmd, b.output)
-                        };
-                        active_vte_for_key.clipboard().set_text(&text);
-                        return glib::Propagation::Stop;
-                    }
-                }
-                active_vte_for_key.copy_clipboard_format(vte4::Format::Text);
-                return glib::Propagation::Stop;
-            }
-            if ctrl && shift && matches!(keyval, Key::v | Key::V) {
-                active_vte_for_key.paste_clipboard();
-                return glib::Propagation::Stop;
-            }
+            // Ctrl+Shift+C / Ctrl+Shift+V are handled at the window-level
+            // capture handler in main.rs (via TermView::copy_to_clipboard /
+            // paste_from_clipboard) so they work regardless of which child
+            // widget currently has focus — in particular after the user
+            // mouse-selects text inside a finished block's TextView, focus
+            // sits there and this per-VTE controller never fires.
 
             // Ctrl+P: fuzzy command-history palette. Build a deduped, most-recent
             // -first entry list from block_data (which carries exit code + duration
@@ -2418,64 +2399,86 @@ impl TermView {
     }
 
     /// Copy selected text to clipboard.
-    /// In block mode: tries to copy from GTK's selection (PRIMARY clipboard).
-    /// In alt-screen mode: copies from VTE terminal.
+    /// Priority: (1) live VTE selection (alt-screen apps + idle input cell),
+    /// (2) any finished-block TextBuffer with an active selection, (3) PRIMARY
+    /// clipboard as a last-resort fallback. Step 2 is what makes Ctrl+Shift+C
+    /// work for mouse-selected text inside finished command/output views —
+    /// PRIMARY alone is unreliable across compositors (notably Wayland).
     pub fn copy_to_clipboard(&self) {
-        log::debug!(">>> TermView::copy_to_clipboard called");
-        // First try VTE (for alt-screen mode)
-        let vte_text = self.active_vte.text_selected(vte4::Format::Text);
-        let has_vte_text = vte_text.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+        self.copy_to_clipboard_with_modifier(false);
+    }
 
-        if has_vte_text {
-            let text = vte_text.unwrap();
-            log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
-            let clipboard = self.active_vte.clipboard();
-            clipboard.set_text(&text);
-            log::debug!(">>> TermView copy: set VTE text to clipboard");
-        } else {
-            log::debug!(">>> TermView copy: VTE text empty or None, trying PRIMARY");
-            // Fall back to PRIMARY clipboard (selected text in labels)
-            let display = self.root.display();
-            let root_clone = self.root.clone();
-            let primary = display.primary_clipboard();
-            log::debug!(">>> TermView copy: got PRIMARY clipboard, calling read_text_async");
-            primary.read_text_async(
-                None::<&gtk4::gio::Cancellable>,
-                move |result: Result<Option<gtk4::glib::GString>, _>| {
-                    log::warn!(
-                        ">>> TermView copy callback: result={:?}",
-                        result
-                            .as_ref()
-                            .map(|opt| opt.as_ref().map(|s| (s.len(), s.as_str())))
-                    );
-                    match result {
-                        Ok(text_opt) => {
-                            if let Some(text_str) = text_opt {
-                                if !text_str.is_empty() {
-                                    log::warn!(
-                                        ">>> TermView copy: got {} chars from PRIMARY: {:?}",
-                                        text_str.len(),
-                                        &text_str[..text_str.len().min(50)]
-                                    );
-                                    // Copy to regular clipboard (CLIPBOARD)
-                                    let display2 = root_clone.display();
-                                    let cb = display2.clipboard();
-                                    cb.set_text(&text_str);
-                                    log::debug!(">>> TermView copy: copied to CLIPBOARD");
-                                } else {
-                                    log::debug!(">>> TermView copy: PRIMARY text is empty");
-                                }
-                            } else {
-                                log::debug!(">>> TermView copy: PRIMARY is None - no text selected");
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!(">>> TermView copy: error reading PRIMARY: {}", e);
-                        }
-                    }
-                },
-            );
+    /// Same as `copy_to_clipboard` but also honors the Warp "copy block output
+    /// only" modifier (Alt+Ctrl+Shift+C) when a whole block is selected.
+    pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
+        log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
+
+        // (0) Whole-block selection (Warp's CopyBlock; +Alt → output only).
+        if let Some(sel_id) = self.selected_block_id.get() {
+            let bd = self.block_data.borrow();
+            if let Some(b) = bd.iter().find(|b| b.id == sel_id) {
+                let text = if alt_held {
+                    b.output.clone()
+                } else if b.output.trim().is_empty() {
+                    b.cmd.clone()
+                } else {
+                    format!("{}\n{}", b.cmd, b.output)
+                };
+                log::debug!(
+                    ">>> TermView copy: copied whole block {} ({} chars)",
+                    sel_id,
+                    text.len()
+                );
+                self.active_vte.clipboard().set_text(&text);
+                return;
+            }
         }
+
+        // (1) Live VTE selection
+        if let Some(text) = self.active_vte.text_selected(vte4::Format::Text) {
+            if !text.is_empty() {
+                log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
+                self.active_vte.clipboard().set_text(&text);
+                return;
+            }
+        }
+
+        // (2) Finished-block TextBuffers (command_buffer / output_buffer)
+        for blk in self.finished_blocks.borrow().iter() {
+            for buf in [&blk.output_buffer, &blk.command_buffer] {
+                if let Some((start, end)) = buf.selection_bounds() {
+                    let text = buf.text(&start, &end, false);
+                    if !text.is_empty() {
+                        log::debug!(
+                            ">>> TermView copy: got {} chars from finished block TextBuffer",
+                            text.len()
+                        );
+                        self.active_vte.clipboard().set_text(&text);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // (3) PRIMARY clipboard fallback (legacy path for any other selection)
+        log::debug!(">>> TermView copy: no widget selection, falling back to PRIMARY");
+        let display = self.root.display();
+        let root_clone = self.root.clone();
+        let primary = display.primary_clipboard();
+        primary.read_text_async(
+            None::<&gtk4::gio::Cancellable>,
+            move |result: Result<Option<gtk4::glib::GString>, _>| match result {
+                Ok(Some(text_str)) if !text_str.is_empty() => {
+                    log::debug!(
+                        ">>> TermView copy: got {} chars from PRIMARY",
+                        text_str.len()
+                    );
+                    root_clone.display().clipboard().set_text(&text_str);
+                }
+                Ok(_) => log::debug!(">>> TermView copy: PRIMARY empty / no selection"),
+                Err(e) => log::debug!(">>> TermView copy: error reading PRIMARY: {}", e),
+            },
+        );
     }
 
     /// Paste from clipboard to PTY.

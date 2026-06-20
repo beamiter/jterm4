@@ -564,16 +564,26 @@ fn main() -> glib::ExitCode {
             };
 
             if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
-                // For Copy/Paste in block mode, let the event propagate to block_view's handler
-                // so that text selection in block mode works correctly
                 match action {
-                    Action::Copy | Action::Paste => {
-                        // Check if current tab is using block mode (TermView)
-                        if ui_clone.current_term_view().is_some() {
-                            // Block mode: let event propagate to block_view's key handler
-                            return false.into();
+                    Action::Copy => {
+                        // Handle at the window level so the shortcut works no
+                        // matter which child has focus — in particular, after
+                        // mouse-selecting text inside a finished block,
+                        // focus lives on that TextView and the per-VTE
+                        // block-mode handler never fires.
+                        // copy_to_clipboard handles Warp block-selection,
+                        // VTE selection, TextBuffer selection, and PRIMARY
+                        // fallback in priority order. Pass Alt for the
+                        // CopyBlockOutput variant.
+                        if let Some(term_view) = ui_clone.current_term_view() {
+                            let alt_held = state.contains(ModifierType::ALT_MASK);
+                            term_view.copy_to_clipboard_with_modifier(alt_held);
+                            return true.into();
                         }
-                        // Legacy VTE: handle at window level
+                        ui_clone.execute_action(action);
+                        return true.into();
+                    }
+                    Action::Paste => {
                         ui_clone.execute_action(action);
                         return true.into();
                     }
