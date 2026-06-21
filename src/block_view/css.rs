@@ -196,7 +196,8 @@ pub(crate) fn install_block_css(config: &Config) {
         }}
         .block-failed {{
             border-left-color: {err_stripe};
-            background-color: rgba({err_r},{err_g},{err_b},0.055);
+            background-color: rgba({err_r},{err_g},{err_b},0.11);
+            box-shadow: inset 2px 0 0 0 {err_stripe};
         }}
         .block-finished.block-failed .block-command-view,
         .block-finished.block-failed .block-command-view text,
@@ -217,9 +218,11 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: inset 0 0 0 2px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
         }}
         .block-active {{
-            border: none;
-            margin: 0;
-            padding: 0;
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.18);
+            border-left: 3px solid rgba({acc_r},{acc_g},{acc_b},0.65);
+            border-radius: 10px;
+            margin: 4px 8px;
+            padding: 2px 0;
             background-color: {bg_hex};
         }}
         .block-prompt-chevron {{

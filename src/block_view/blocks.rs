@@ -620,6 +620,10 @@ impl FinishedBlock {
         // wired by the caller, which has access to the clipboard + active block.
         let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
         action_box.set_visible(false);
+        // Small gap between the meta badges (timestamp/duration/exit) on the
+        // right and the action button group, so they read as separate units
+        // rather than one undifferentiated cluster.
+        action_box.set_margin_start(6);
         let copy_cmd_btn = gtk4::Button::with_label("\u{f0c5}"); // nf-fa-copy  copy command
         copy_cmd_btn.set_tooltip_text(Some("Copy command"));
         let copy_output_btn = gtk4::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output

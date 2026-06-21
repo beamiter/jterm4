@@ -153,7 +153,7 @@ fn main() -> glib::ExitCode {
         let css_provider = CssProvider::new();
         css_provider.load_from_data(
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
-             .tab-strip-btn:checked { font-weight: bold; border: 1px solid currentColor; border-radius: 4px; }
+             .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid #8be9fd; outline-offset: -2px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .sidebar-box { min-width: 140px; padding: 2px 4px; }
              .top-bar { padding: 2px 4px; }
@@ -170,7 +170,7 @@ fn main() -> glib::ExitCode {
              .tab-drop-target { background-color: alpha(currentColor, 0.15); }
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
-             .tab-selected { background-color: alpha(currentColor, 0.1); }
+             .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid #8be9fd; outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
              .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
