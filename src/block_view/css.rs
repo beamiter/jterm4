@@ -218,12 +218,13 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: inset 0 0 0 2px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
         }}
         .block-active {{
-            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.18);
-            border-left: 3px solid rgba({acc_r},{acc_g},{acc_b},0.65);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.32);
+            border-left: 3px solid rgba({acc_r},{acc_g},{acc_b},0.85);
             border-radius: 10px;
             margin: 4px 8px;
             padding: 2px 0;
             background-color: {bg_hex};
+            box-shadow: 0 2px 8px rgba(0,0,0,0.18);
         }}
         .block-prompt-chevron {{
             color: {accent};
