@@ -43,6 +43,12 @@ enum State {
     ApcEsc { payload: Vec<u8> },
     /// Inside DCS/PM — just consume until ST
     Ignore,
+    /// Saw ESC while in Ignore — next byte is the second half of ST
+    /// (typically `\`). Must be consumed too, otherwise it leaks into
+    /// Ground state and is emitted as a literal — vim's many XTGETTCAP
+    /// queries each ended with `ESC \`, so this leaked one `\` per
+    /// query into the display.
+    IgnoreEsc,
 }
 
 pub struct Parser {
@@ -408,7 +414,23 @@ impl Parser {
                 }
 
                 State::Ignore => {
-                    if b == 0x07 || b == 0x1b {
+                    if b == 0x07 {
+                        // BEL — single-byte ST.
+                        self.state = State::Ground;
+                    } else if b == 0x1b {
+                        // ESC — first byte of `ESC \` two-byte ST. Wait for
+                        // the `\` (or any final byte) before returning to
+                        // Ground so it doesn't leak as a literal.
+                        self.state = State::IgnoreEsc;
+                    }
+                }
+
+                State::IgnoreEsc => {
+                    // Consume the byte after ESC inside an ignored DCS/PM,
+                    // regardless of what it is (well-formed sequences send
+                    // `\`). If it's another ESC, stay in IgnoreEsc; otherwise
+                    // we're done.
+                    if b != 0x1b {
                         self.state = State::Ground;
                     }
                 }
