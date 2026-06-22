@@ -340,13 +340,6 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-/// Hard cap on how many VTE rows the live block may grow to during a streaming
-/// command (cargo build, apt update, `seq 5000`, …). PTY rows stay pinned to the
-/// viewport via `pty_rows_override`, so the running child never sees this number;
-/// it bounds only the visual height. Beyond the cap, output keeps flowing into
-/// VTE's own scrollback and is captured in full for the finished block snapshot.
-const MAX_COLLECTING_ROWS: i64 = 4000;
-
 #[allow(dead_code)]
 /// One highlighted hit from a find-within-blocks pass. Offsets are TextBuffer
 /// character offsets, valid until the buffer is re-rendered (cleared on close).
@@ -684,7 +677,14 @@ impl ReaderCtx {
                                     for cb in activity_cbs.borrow().iter() {
                                         cb();
                                     }
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                    // No synchronous pin here. The live cell is
+                                    // capped at viewport rows during collection,
+                                    // so `upper` stops growing once the cell
+                                    // fills the page — further output rolls in
+                                    // VTE's own scrollback and the deferred
+                                    // idle pin in `connect_contents_changed`
+                                    // handles the (no-op) follow-bottom without
+                                    // racing layout per chunk.
                                 }
                                 BlockState::AltScreen => {
                                     // Alt-screen bytes go to the live VTE only — they
@@ -1733,9 +1733,14 @@ impl TermView {
                     // and gets no SIGWINCH per chunk. Monotonic — never shrink
                     // mid-command — to avoid grow/shrink jitter as the cursor
                     // moves within already-emitted rows (CR/up-line progress
-                    // bars). Capped at MAX_COLLECTING_ROWS; overflow flows into
-                    // VTE's scrollback and is fully captured for the finished
-                    // block snapshot.
+                    // bars). Capped at `viewport_rows`: once the live cell
+                    // fills the visible area we freeze it and let VTE's own
+                    // scrollback handle further rolling — exactly how a normal
+                    // terminal (terminator/xterm) behaves. Past the cap there
+                    // is nothing more to show in the viewport anyway, and
+                    // growing the holder further only burns layout/scroll
+                    // work per chunk. Output continues into VTE scrollback
+                    // and is captured in full for the finished-block snapshot.
                     //
                     // We compute rows *relative to* `collecting_start_row` (the
                     // absolute scrollback row at CommandStart). The raw cursor
@@ -1747,7 +1752,7 @@ impl TermView {
                         let start = collecting_start_row.get();
                         let output_rows = (cursor_now - start + 1).max(1);
                         let prev = vte.row_count();
-                        output_rows.max(prev).min(MAX_COLLECTING_ROWS)
+                        output_rows.max(prev).min(viewport_rows)
                     }
                     // Idle: size to the typed command's line count (1 + newlines),
                     // clamped to a usable minimum. We must NOT use the VTE cursor
