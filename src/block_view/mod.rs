@@ -406,10 +406,7 @@ pub struct TermView {
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
-    bracketed_paste_mode: Rc<Cell<bool>>,
-    application_cursor_mode: Rc<Cell<bool>>,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
-    cursor_shape: Rc<Cell<TermCursorShape>>,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -467,13 +464,9 @@ struct ReaderCtx {
     block_scroll_rc: ScrolledWindow,
     cwd_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
-    bell_cbs: VoidCallbacks,
     title_cbs: StrCallbacks,
     activity_cbs: VoidCallbacks,
-    bracketed_paste_rc: Rc<Cell<bool>>,
-    application_cursor_rc: Rc<Cell<bool>>,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
-    cursor_shape_rc: Rc<Cell<TermCursorShape>>,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
@@ -528,13 +521,9 @@ impl ReaderCtx {
             block_scroll_rc,
             cwd_cbs,
             exited_cbs,
-            bell_cbs,
             title_cbs,
             activity_cbs,
-            bracketed_paste_rc,
-            application_cursor_rc,
             mouse_reporting_rc,
-            cursor_shape_rc,
             config_for_cb,
             parser,
             block_data_for_cb,
@@ -569,92 +558,23 @@ impl ReaderCtx {
                 for event in events.iter() {
                     let state = bstate_rc.get();
                     match event {
+                        ParserEvent::DecsetMode { mode, set } => {
+                            // VTE handles paste/cursor/etc. natively from its
+                            // own bytes; block_view only needs mouse-reporting
+                            // state for wheel suppression in alt-screen apps.
+                            let new_mode = match (*mode, *set) {
+                                (1000, true) => Some(MouseReportingMode::Click),
+                                (1002, true) => Some(MouseReportingMode::Button),
+                                (1003, true) => Some(MouseReportingMode::Motion),
+                                (1006, true) => Some(MouseReportingMode::Sgr),
+                                (1000 | 1002 | 1003 | 1006, false) => Some(MouseReportingMode::None),
+                                _ => None,
+                            };
+                            if let Some(m) = new_mode {
+                                mouse_reporting_rc.set(m);
+                            }
+                        }
                         ParserEvent::Bytes(bytes) => {
-                            // Bell (real BEL, not an OSC terminator).
-                            if contains_bell(bytes) {
-                                for cb in bell_cbs.borrow().iter() {
-                                    cb();
-                                }
-                            }
-
-                            // Single-pass byte scan for control sequences
-                            {
-                                let mut i = 0;
-                                while i < bytes.len() {
-                                    if bytes[i] == 0x1b && i + 1 < bytes.len() {
-                                        match bytes[i + 1] {
-                                            b'[' => {
-                                                if i + 2 < bytes.len() && bytes[i + 2] == b'?' {
-                                                    let seq_start = i + 3;
-                                                    let mut seq_end = seq_start;
-                                                    while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b';') {
-                                                        seq_end += 1;
-                                                    }
-                                                    if seq_end < bytes.len() {
-                                                        let final_byte = bytes[seq_end];
-                                                        let param_slice = &bytes[seq_start..seq_end];
-                                                        match (param_slice, final_byte) {
-                                                            (b"2004", b'h') => bracketed_paste_rc.set(true),
-                                                            (b"2004", b'l') => bracketed_paste_rc.set(false),
-                                                            (b"1", b'h') => application_cursor_rc.set(true),
-                                                            (b"1", b'l') => application_cursor_rc.set(false),
-                                                            (b"1000", b'h') => mouse_reporting_rc.set(MouseReportingMode::Click),
-                                                            (b"1002", b'h') => mouse_reporting_rc.set(MouseReportingMode::Button),
-                                                            (b"1003", b'h') => mouse_reporting_rc.set(MouseReportingMode::Motion),
-                                                            (b"1006", b'h') => mouse_reporting_rc.set(MouseReportingMode::Sgr),
-                                                            (b"1000", b'l') => {
-                                                                if mouse_reporting_rc.get() == MouseReportingMode::Click {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
-                                                            }
-                                                            (b"1002", b'l') => {
-                                                                if mouse_reporting_rc.get() == MouseReportingMode::Button {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
-                                                            }
-                                                            (b"1003", b'l') => {
-                                                                if mouse_reporting_rc.get() == MouseReportingMode::Motion {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
-                                                            }
-                                                            (b"1006", b'l') => {
-                                                                if mouse_reporting_rc.get() == MouseReportingMode::Sgr {
-                                                                    mouse_reporting_rc.set(MouseReportingMode::None);
-                                                                }
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                        i = seq_end;
-                                                    }
-                                                } else {
-                                                    let seq_start = i + 2;
-                                                    let mut seq_end = seq_start;
-                                                    while seq_end < bytes.len() && (bytes[seq_end].is_ascii_digit() || bytes[seq_end] == b' ') {
-                                                        seq_end += 1;
-                                                    }
-                                                    if seq_end < bytes.len() && bytes[seq_end] == b'q' {
-                                                        let param_slice = &bytes[seq_start..seq_end];
-                                                        let param_str = param_slice.iter()
-                                                            .filter(|b| b.is_ascii_digit())
-                                                            .copied()
-                                                            .collect::<Vec<u8>>();
-                                                        match param_str.as_slice() {
-                                                            b"0" | b"1" | b"2" => cursor_shape_rc.set(TermCursorShape::Block),
-                                                            b"3" | b"4" => cursor_shape_rc.set(TermCursorShape::Underline),
-                                                            b"5" | b"6" => cursor_shape_rc.set(TermCursorShape::Bar),
-                                                            _ => {}
-                                                        }
-                                                        i = seq_end;
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    i += 1;
-                                }
-                            }
-
                             // No shell integration seen yet: once real output flows,
                             // stream everything into the live VTE (raw fallback).
                             if state == BlockState::Idle {
@@ -1471,8 +1391,10 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+L: clear visible finished blocks + send form feed to the shell.
-            if ctrl && !shift && !alt && matches!(keyval, Key::l | Key::L) {
+            // Ctrl+Shift+L: clear visible finished blocks + send form feed to
+            // the shell. (Plain Ctrl+L is left to the shell so readline's
+            // clear-screen still works as users expect inside the live cell.)
+            if ctrl && shift && !alt && matches!(keyval, Key::l | Key::L) {
                 let mut blocks = finished_blocks_for_key.borrow_mut();
                 for block in blocks.drain(..) {
                     block_list_for_key.remove(block.widget());
@@ -1840,12 +1762,20 @@ impl TermView {
         let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
         let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        // Bell signal is delivered natively by VTE — no need to scan the byte
+        // stream for BEL ourselves (and disambiguate it from OSC string
+        // terminators). VTE already does that disambiguation inside its parser.
+        {
+            let bell_cbs = bell_callbacks.clone();
+            active_vte.connect_bell(move |_| {
+                for cb in bell_cbs.borrow().iter() {
+                    cb();
+                }
+            });
+        }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
-        let bracketed_paste_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let application_cursor_mode: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
-        let cursor_shape: Rc<Cell<TermCursorShape>> = Rc::new(Cell::new(TermCursorShape::Block));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1889,13 +1819,9 @@ impl TermView {
             let block_scroll_rc = block_scroll.clone();
             let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
-            let bell_cbs = bell_callbacks.clone();
             let title_cbs = title_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
-            let bracketed_paste_rc = bracketed_paste_mode.clone();
-            let application_cursor_rc = application_cursor_mode.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
-            let cursor_shape_rc = cursor_shape.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
@@ -1944,13 +1870,9 @@ impl TermView {
                 block_scroll_rc,
                 cwd_cbs,
                 exited_cbs,
-                bell_cbs,
                 title_cbs,
                 activity_cbs,
-                bracketed_paste_rc,
-                application_cursor_rc,
                 mouse_reporting_rc,
-                cursor_shape_rc,
                 config_for_cb,
                 parser,
                 block_data_for_cb,
@@ -2270,10 +2192,7 @@ impl TermView {
             bell_callbacks,
             title_callbacks,
             activity_callbacks,
-            bracketed_paste_mode,
-            application_cursor_mode,
             mouse_reporting_mode,
-            cursor_shape,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
@@ -2523,64 +2442,21 @@ impl TermView {
             }
         }
 
-        // (3) PRIMARY clipboard fallback (legacy path for any other selection)
-        log::debug!(">>> TermView copy: no widget selection, falling back to PRIMARY");
-        let display = self.root.display();
-        let root_clone = self.root.clone();
-        let primary = display.primary_clipboard();
-        primary.read_text_async(
-            None::<&gtk4::gio::Cancellable>,
-            move |result: Result<Option<gtk4::glib::GString>, _>| match result {
-                Ok(Some(text_str)) if !text_str.is_empty() => {
-                    log::debug!(
-                        ">>> TermView copy: got {} chars from PRIMARY",
-                        text_str.len()
-                    );
-                    root_clone.display().clipboard().set_text(&text_str);
-                }
-                Ok(_) => log::debug!(">>> TermView copy: PRIMARY empty / no selection"),
-                Err(e) => log::debug!(">>> TermView copy: error reading PRIMARY: {}", e),
-            },
-        );
+        // No live VTE / finished-block selection. We deliberately do NOT
+        // fall back to PRIMARY — on Wayland it is empty for our own widgets
+        // anyway, and on X11 GTK already mirrors widget selections into both
+        // clipboards so the path was never actually load-bearing. Bailing out
+        // here keeps Ctrl+Shift+C deterministic: it copies what the user can
+        // see is selected, and only that.
+        log::debug!(">>> TermView copy: no selection found, nothing to copy");
     }
 
-    /// Paste from clipboard to PTY.
+    /// Paste from clipboard to PTY via VTE's native `paste_clipboard()`.
+    /// VTE tracks its own bracketed-paste state from the same byte stream the
+    /// shell sent it, so this honors mode 2004 automatically — no need to
+    /// duplicate the state machine in block_view.
     pub fn paste_from_clipboard(&self) {
-        log::debug!(">>> TermView::paste_from_clipboard called");
-        let clipboard = self.active_vte.clipboard();
-        let pty = self.pty.clone();
-        let bracketed_paste = self.bracketed_paste_mode.get();
-        log::debug!(">>> TermView paste: got clipboard, calling read_text_async");
-        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
-            log::warn!(
-                ">>> TermView paste callback: result={:?}",
-                result.as_ref().map(|opt| opt.as_ref().map(|s| s.len()))
-            );
-            match result {
-                Ok(text_opt) => {
-                    if let Some(text_str) = text_opt {
-                        log::warn!(
-                            ">>> TermView paste: got {} chars from clipboard",
-                            text_str.len()
-                        );
-                        // Wrap paste with bracketed paste mode if enabled
-                        if bracketed_paste {
-                            pty.write_bytes(b"\x1b[200~");
-                            pty.write_bytes(text_str.as_bytes());
-                            pty.write_bytes(b"\x1b[201~");
-                        } else {
-                            pty.write_bytes(text_str.as_bytes());
-                        }
-                        log::debug!(">>> TermView paste: wrote {} bytes to PTY", text_str.len());
-                    } else {
-                        log::debug!(">>> TermView paste: clipboard is None");
-                    }
-                }
-                Err(e) => {
-                    log::error!(">>> TermView paste: error: {}", e);
-                }
-            }
-        });
+        self.active_vte.paste_clipboard();
     }
 
     pub fn connect_cwd_changed<F: Fn(&str) + 'static>(&self, f: F) {
@@ -2601,10 +2477,6 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
-    }
-
-    pub fn cursor_shape(&self) -> TermCursorShape {
-        self.cursor_shape.get()
     }
 
     /// Apply updated theme colors to the block widgets and the live VTE.
@@ -2986,20 +2858,8 @@ impl TermView {
                 vec![
                     ("Block state".to_string(), format!("{:?}", self.bstate.get())),
                     (
-                        "Bracketed paste".to_string(),
-                        self.bracketed_paste_mode.get().to_string(),
-                    ),
-                    (
-                        "Application cursor".to_string(),
-                        self.application_cursor_mode.get().to_string(),
-                    ),
-                    (
                         "Mouse reporting".to_string(),
                         format!("{:?}", self.mouse_reporting_mode.get()),
-                    ),
-                    (
-                        "Cursor shape".to_string(),
-                        format!("{:?}", self.cursor_shape.get()),
                     ),
                     (
                         "Alt screen visible".to_string(),

@@ -11,18 +11,6 @@ use crate::terminal::open_uri;
 use super::*;
 
 
-// ─── Cursor Shape ─────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
-pub enum TermCursorShape {
-    #[default]
-    Block,      // 0 or 1: block cursor
-    Underline,  // 3 or 4: underline cursor
-    Bar,        // 5 or 6: bar/vertical cursor
-}
-
-
 /// Display width of a single character in terminal cells. Coarse but covers the
 /// common cases: zero-width combining marks / joiners, double-width CJK & emoji,
 /// everything else single-width. Used only to reproduce the terminal's wrap column.

@@ -23,6 +23,11 @@ pub enum ParserEvent {
     ClipboardSet(String),
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
+    /// CSI ? <mode> h / l — DEC private mode change. Emitted in addition to
+    /// pass-through so block_view can react to a few modes (notably mouse
+    /// reporting for wheel-suppression) without re-scanning the byte stream.
+    /// `set` = true for `h`, false for `l`.
+    DecsetMode { mode: u32, set: bool },
 }
 
 #[derive(Default)]
@@ -107,6 +112,16 @@ fn is_mouse_reporting_mode(params: &[u8]) -> bool {
 
 fn is_focus_reporting_mode(params: &[u8]) -> bool {
     matches!(params, b"?1004")
+}
+
+/// Parse the digit groups in a DECSET parameter slice (with the leading `?`
+/// already stripped) into mode numbers. Handles `1000`, `1000;1006`, etc.
+fn parse_decset_modes(rest: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    rest.split(|&b| b == b';').filter_map(|seg| {
+        std::str::from_utf8(seg)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    })
 }
 
 impl Default for Parser {
@@ -244,6 +259,17 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
+                        // Observe DEC private mode set/reset for downstream
+                        // consumers (block_view tracks mouse-reporting state
+                        // for wheel suppression). Emitted before any pending
+                        // passthrough is flushed so the Cell is current when
+                        // VTE sees the bytes that put it into the mode.
+                        if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
+                            let set = b == b'h';
+                            for mode in parse_decset_modes(&params[1..]) {
+                                events.push(ParserEvent::DecsetMode { mode, set });
+                            }
+                        }
                         if b == b'h' && is_alt_screen_mode(&params) {
                             // Recognized alt-screen enter: drop the sequence bytes
                             // (never passed through) and emit the semantic event.
