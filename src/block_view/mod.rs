@@ -463,6 +463,10 @@ struct ReaderCtx {
     cmd_buf_rc: Rc<RefCell<String>>,
     /// Keystroke-reconstructed command line (built in connect_commit).
     typed_cmd_rc: Rc<RefCell<String>>,
+    /// Sticky-invalid flag for typed_cmd_rc: set when an escape sequence
+    /// (arrow keys, etc.) was seen during the current AwaitingCommand window.
+    /// When set, finalize must ignore typed_cmd_rc and use cmd_buf scraping.
+    typed_cmd_invalid_rc: Rc<Cell<bool>>,
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
@@ -525,6 +529,7 @@ impl ReaderCtx {
             prompt_buf_rc,
             cmd_buf_rc,
             typed_cmd_rc,
+            typed_cmd_invalid_rc,
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
@@ -702,7 +707,14 @@ impl ReaderCtx {
                             if state == BlockState::PostCommand {
                                 // Command: prefer the keystroke-reconstructed line,
                                 // fall back to scraping the last echoed line.
-                                let typed = typed_cmd_rc.borrow().trim().to_string();
+                                // If the reconstruction is invalidated (escape
+                                // sequence seen, e.g. rsh autosuggestion accept),
+                                // always use the scrape.
+                                let typed = if typed_cmd_invalid_rc.get() {
+                                    String::new()
+                                } else {
+                                    typed_cmd_rc.borrow().trim().to_string()
+                                };
                                 let cmd = if !typed.is_empty() {
                                     typed
                                 } else {
@@ -1037,6 +1049,7 @@ impl ReaderCtx {
                             prompt_buf_rc.borrow_mut().clear();
                             cmd_buf_rc.borrow_mut().clear();
                             typed_cmd_rc.borrow_mut().clear();
+                            typed_cmd_invalid_rc.set(false);
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
 
@@ -1644,6 +1657,13 @@ impl TermView {
         // idle input-cell height (line count), so it is declared before the
         // sizing closure below.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // Sticky flag: any escape sequence (arrows / Home / End / F-keys ...) in
+        // the current AwaitingCommand window invalidates the keystroke
+        // reconstruction — the shell may rewrite the visible line in ways we
+        // cannot replay (rsh's Right-arrow "accept autosuggestion" is the
+        // motivating case). When set, finalize ignores typed_cmd and scrapes
+        // the actually-echoed line from cmd_buf instead. Reset at PromptEnd.
+        let typed_cmd_invalid: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         // Absolute VTE scrollback row at the moment CollectingOutput started.
         // Used by the live-cell sizing logic to compute "rows produced *by this
@@ -1894,6 +1914,7 @@ impl TermView {
                 prompt_buf_rc,
                 cmd_buf_rc,
                 typed_cmd_rc,
+                typed_cmd_invalid_rc: typed_cmd_invalid.clone(),
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
@@ -2116,17 +2137,35 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
+            let typed_cmd_invalid_for_commit = typed_cmd_invalid.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 pty_for_commit.write_bytes(text.as_bytes());
                 if bstate_for_commit.get() == BlockState::AwaitingCommand {
                     let mut cmd = typed_cmd_for_commit.borrow_mut();
+                    // Any escape sequence (arrows / Home / End / F-keys ...) means
+                    // the shell may rewrite the visible line in ways we cannot
+                    // reconstruct from keystrokes alone — most notably rsh's
+                    // Right-arrow "accept autosuggestion". Set the sticky-invalid
+                    // flag so finalize ignores typed_cmd entirely and scrapes the
+                    // actually-echoed cmd_buf line. Flag is reset at PromptEnd.
+                    if text.as_bytes().contains(&0x1b) {
+                        typed_cmd_invalid_for_commit.set(true);
+                        cmd.clear();
+                        return;
+                    }
+                    if typed_cmd_invalid_for_commit.get() {
+                        // Once invalidated, don't bother accumulating further
+                        // keystrokes — they would be merged with the scraped
+                        // line at finalize and produce garbage.
+                        return;
+                    }
                     for ch in text.chars() {
                         if ch == '\r' || ch == '\n' {
                             // Submit — leave the reconstructed line intact for finalize.
                         } else if ch == '\x7f' || ch == '\x08' {
                             cmd.pop();
                         } else if (ch as u32) < 0x20 {
-                            // Control bytes (Tab, Ctrl-*, escape sequences): ignore.
+                            // Control bytes (Tab, Ctrl-*): ignore.
                         } else {
                             cmd.push(ch);
                         }
