@@ -1091,7 +1091,11 @@ impl ReaderCtx {
                             let cell_h = (active_vte.char_height() as i32).max(1);
                             let page = block_scroll_rc.vadjustment().page_size() as i32;
                             if page > 1 {
-                                let viewport_rows = ((page / cell_h).max(1)) as u16;
+                                // Match update_input_height's chrome-adjusted
+                                // calculation so the PTY rows reported to the
+                                // child equal the VTE alt-buffer row count.
+                                let usable = (page - 14).max(cell_h);
+                                let viewport_rows = ((usable / cell_h).max(1)) as u16;
                                 let cols = active_vte.column_count().max(1) as u16;
                                 pty_rows_override.set(Some(viewport_rows));
                                 pty_for_init.resize(cols, viewport_rows);
@@ -1177,7 +1181,10 @@ impl ReaderCtx {
                             let cell_h = (active_vte.char_height() as i32).max(1);
                             let page = block_scroll_rc.vadjustment().page_size() as i32;
                             if page > 1 {
-                                let viewport_rows = ((page / cell_h).max(1)) as u16;
+                                // Match update_input_height's chrome-adjusted
+                                // calculation (see comment there).
+                                let usable = (page - 14).max(cell_h);
+                                let viewport_rows = ((usable / cell_h).max(1)) as u16;
                                 let cols = active_vte.column_count().max(1) as u16;
                                 pty_for_init.resize(cols, viewport_rows);
                             }
@@ -1701,7 +1708,19 @@ impl TermView {
                 if page <= 1 {
                     return;
                 }
-                let viewport_rows = ((page / cell_h).max(1)) as i64;
+                // The .block-active holder (block_view/css.rs:220-228) adds
+                // vertical chrome around the VTE: 8px margin + 2px border + 4px
+                // padding = 14px. When alt-screen / RawFallback runs with all
+                // finished blocks hidden, the live cell is the only content; if
+                // we size the VTE to page_size / cell_h, the holder ends up
+                // 14 px taller than page_size and the ScrolledWindow's
+                // pin-to-bottom hides the top ~14 px — clipping the first row
+                // of the alt-screen app (e.g. the topmost "commit <hash>" line
+                // of `git log` paged by less). Subtract the chrome so the
+                // holder TOTAL fits in page_size.
+                const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
+                let usable = (page - BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+                let viewport_rows = ((usable / cell_h).max(1)) as i64;
                 let cols = vte.column_count().max(1);
                 let target_rows = match bstate.get() {
                     // Full-screen apps & non-OSC133 shells behave like a normal
