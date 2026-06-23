@@ -39,6 +39,27 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Rebuild raw PTY output into a CRLF-terminated string suitable for feeding a
+/// finished VTE widget.
+///
+/// Why: PTY ONLCR delivers `\r\n` from the child, but Rust's `lines()` strips
+/// both `\n` and `\r\n`. If we push back only `\n`, VTE (LNM off by default)
+/// moves the cursor down without returning to column 0, scattering tabular
+/// output like `ls`. Within each line, an in-line `\r` is treated as an
+/// overwrite — keep only what follows the last `\r`.
+pub(crate) fn reconstruct_finished_output(raw: &str) -> String {
+    let mut result = String::new();
+    for line in raw.lines() {
+        if let Some(pos) = line.rfind('\r') {
+            result.push_str(&line[pos + 1..]);
+        } else {
+            result.push_str(line);
+        }
+        result.push_str("\r\n");
+    }
+    result.trim().to_string()
+}
+
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
@@ -635,20 +656,7 @@ impl ReaderCtx {
 
                                 let raw_output_text = active_rc.borrow().output_text();
 
-                                // Preserve ANSI codes for colored display, only handle
-                                // \r overwrites within a line.
-                                let output_with_ansi = {
-                                    let mut result = String::new();
-                                    for line in raw_output_text.lines() {
-                                        if let Some(pos) = line.rfind('\r') {
-                                            result.push_str(&line[pos + 1..]);
-                                        } else {
-                                            result.push_str(line);
-                                        }
-                                        result.push('\n');
-                                    }
-                                    result.trim().to_string()
-                                };
+                                let output_with_ansi = reconstruct_finished_output(&raw_output_text);
 
                                 let output_plain = strip_ansi(&output_with_ansi).to_string();
 
@@ -3077,7 +3085,67 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, strip_ansi_with_clear_detect};
+    use super::{reconstruct_finished_output, strip_ansi, strip_ansi_with_clear_detect};
+
+    // ── reconstruct_finished_output: CRLF preservation for finished VTE ─────
+
+    #[test]
+    fn reconstruct_preserves_crlf_between_lines() {
+        // Regression: PTY ONLCR delivers \r\n; we must emit \r\n so the
+        // finished VTE (LNM off) carriage-returns before each new line.
+        // Without this, `ls` output staircases across the block.
+        let raw = "Downloads\r\nMusic\r\nPictures\r\n";
+        let out = reconstruct_finished_output(raw);
+        assert_eq!(out, "Downloads\r\nMusic\r\nPictures");
+    }
+
+    #[test]
+    fn reconstruct_adds_cr_to_bare_lf_input() {
+        // If accumulated bytes happen to use bare \n (no ONLCR), still emit
+        // CRLF for the finished VTE.
+        let raw = "a\nb\nc\n";
+        let out = reconstruct_finished_output(raw);
+        assert_eq!(out, "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn reconstruct_collapses_in_line_carriage_returns() {
+        // Progress-bar / spinner pattern: only the segment after the last
+        // in-line \r survives, but line terminators stay CRLF.
+        let raw = "10%\r50%\r100%\r\ndone\r\n";
+        let out = reconstruct_finished_output(raw);
+        assert_eq!(out, "100%\r\ndone");
+    }
+
+    #[test]
+    fn reconstruct_handles_empty_input() {
+        assert_eq!(reconstruct_finished_output(""), "");
+    }
+
+    #[test]
+    fn reconstruct_preserves_ansi_escapes() {
+        // Color codes must pass through untouched — the finished VTE
+        // interprets them.
+        let raw = "\u{1b}[31mred\u{1b}[0m\r\n\u{1b}[32mgreen\u{1b}[0m\r\n";
+        let out = reconstruct_finished_output(raw);
+        assert_eq!(out, "\u{1b}[31mred\u{1b}[0m\r\n\u{1b}[32mgreen\u{1b}[0m");
+    }
+
+    #[test]
+    fn reconstruct_ls_column_layout_shape() {
+        // Simulate what `ls` actually puts on the master FD: space-padded
+        // columns separated by \r\n. Each rebuilt line must begin with the
+        // first entry (no inherited column offset from the previous line),
+        // which only holds if CRLF is preserved.
+        let raw = "Downloads   Music       Pictures\r\nVideos      snap        projects\r\n";
+        let out = reconstruct_finished_output(raw);
+        for line in out.split("\r\n") {
+            assert!(
+                !line.starts_with(' '),
+                "line started with whitespace, would scatter in VTE: {line:?}"
+            );
+        }
+    }
 
     #[test]
     fn strips_charset_designation_from_output() {
