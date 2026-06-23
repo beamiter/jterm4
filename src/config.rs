@@ -176,6 +176,10 @@ pub struct Config {
     pub(crate) max_visible_blocks: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
+    /// Visible rows per finished block's VTE widget. Output beyond this height
+    /// lives in the block's own VTE scrollback so the user can scroll inside a
+    /// long block (`git log`, `cargo build`) without expanding the page.
+    pub(crate) finished_block_viewport_rows: u32,
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
@@ -377,6 +381,7 @@ struct FileConfig {
     max_visible_blocks: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
+    finished_block_viewport_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
@@ -427,6 +432,7 @@ fn load_file_config() -> FileConfig {
         max_visible_blocks: table.get("max_visible_blocks").and_then(|v| v.as_integer()).map(|v| v as u32),
         lazy_load_threshold: table.get("lazy_load_threshold").and_then(|v| v.as_integer()).map(|v| v as u32),
         truncation_threshold_lines: table.get("truncation_threshold_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
+        finished_block_viewport_rows: table.get("finished_block_viewport_rows").and_then(|v| v.as_integer()).map(|v| v as u32),
         max_collapsed_output_lines: table.get("max_collapsed_output_lines").and_then(|v| v.as_integer()).map(|v| v as u32),
         virtual_scroll_margin: table.get("virtual_scroll_margin").and_then(|v| v.as_integer()).map(|v| v as u32),
         block_history_path: table.get("block_history_path").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -574,6 +580,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let truncation_threshold_lines = env_u32("JTERM4_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000);
+    let finished_block_viewport_rows = env_u32("JTERM4_FINISHED_VIEWPORT_ROWS")
+        .or(fc.finished_block_viewport_rows)
+        .unwrap_or(30)
+        .clamp(3, 200);
     let max_collapsed_output_lines = env_u32("JTERM4_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25);
@@ -620,6 +630,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         max_visible_blocks,
         lazy_load_threshold,
         truncation_threshold_lines,
+        finished_block_viewport_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
         block_history_path,

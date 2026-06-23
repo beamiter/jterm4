@@ -31,6 +31,24 @@ pub(crate) enum MouseReportingMode {
 
 // ─── VTE builder ─────────────────────────────────────────────────────────────
 
+/// Apply colors + font + font scale from `config` onto an existing Terminal.
+/// Single source of truth for VTE theming so the live VTE and read-only
+/// finished-block VTEs stay visually identical.
+pub(crate) fn apply_theme_to_vte(terminal: &Terminal, config: &Config) {
+    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
+    terminal.set_color_bold(None);
+    terminal.set_color_cursor(Some(&config.cursor));
+    terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
+    let font_desc = FontDescription::from_string(&config.font_desc);
+    terminal.set_font(Some(&font_desc));
+    terminal.set_font_scale(config.default_font_scale);
+}
+
 /// The single persistent live VTE for block mode. It keeps `input_enabled(true)`
 /// so the VTE translates keypresses into terminal byte sequences and emits them
 /// via its `commit` signal (which we forward to our PTY). It also owns IME
@@ -56,15 +74,52 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
     // so VTE's Auto binding can't read the tty erase char and falls back to 0x08,
     // which readline-style line editors (incl. rsh) ignore — making Backspace dead.
     terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
-    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-    terminal.set_colors(
-        Some(&config.foreground),
-        Some(&config.background),
-        &palette_refs,
-    );
-    terminal.set_color_cursor(Some(&config.cursor));
-    terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
-    let font_desc = FontDescription::from_string(&config.font_desc);
-    terminal.set_font(Some(&font_desc));
+    apply_theme_to_vte(&terminal, config);
+    terminal
+}
+
+/// A read-only PTY-less VTE used as the renderer for a single finished block.
+/// Input is disabled; cursor is hidden (block widget shows completed output, not
+/// a live prompt). `output_rows` sizes the widget to exactly the captured row
+/// count up to `viewport_cap`; anything beyond goes into the widget's own
+/// scrollback so the user can scroll within a long block (e.g. `git log`).
+pub(crate) fn create_finished_terminal(
+    config: &Config,
+    cols: i64,
+    output_rows: i64,
+    viewport_cap: i64,
+) -> Terminal {
+    let visible_rows = output_rows.min(viewport_cap).max(1);
+    let scrollback = output_rows.max(visible_rows) as u32;
+    let terminal = Terminal::builder()
+        .hexpand(true)
+        .vexpand(false)
+        .can_focus(true)
+        .allow_hyperlink(true)
+        .bold_is_bright(true)
+        .input_enabled(false)
+        .scrollback_lines(scrollback)
+        .cursor_blink_mode(CursorBlinkMode::Off)
+        .cursor_shape(CursorShape::Block)
+        .font_scale(config.default_font_scale)
+        .opacity(1.0)
+        .pointer_autohide(true)
+        .enable_sixel(true)
+        .build();
+    terminal.set_mouse_autohide(true);
+    apply_theme_to_vte(&terminal, config);
+    // Hide the read-only block's cursor — the completed output should not show a
+    // blinking caret at the end of the last line.
+    let mut transparent = config.background;
+    transparent.set_alpha(0.0);
+    terminal.set_color_cursor(Some(&transparent));
+    terminal.set_size(cols.max(1), visible_rows);
+    // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
+    if let Ok(regex) = vte4::Regex::for_match(
+        r"[a-z]+://[[:graph:]]+",
+        pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+    ) {
+        terminal.match_add_regex(&regex, 0);
+    }
     terminal
 }

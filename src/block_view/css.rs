@@ -90,7 +90,6 @@ pub(crate) fn install_block_css(config: &Config) {
         (fg.green() * 255.0) as u8,
         (fg.blue() * 255.0) as u8,
     );
-    let cursor_hex = rgba_to_hex(&config.cursor);
     // Accent color for active chevron (use palette color 2 = green-ish)
     let accent = rgba_to_hex(&config.palette[2]);
     // Error color for bad exit codes — use the theme's red (palette 1) so it
@@ -198,12 +197,6 @@ pub(crate) fn install_block_css(config: &Config) {
             border-left-color: {err_stripe};
             background-color: rgba({err_r},{err_g},{err_b},0.11);
             box-shadow: inset 2px 0 0 0 {err_stripe};
-        }}
-        .block-finished.block-failed .block-command-view,
-        .block-finished.block-failed .block-command-view text,
-        .block-finished.block-failed .block-output-view,
-        .block-finished.block-failed .block-output-view text {{
-            background-color: transparent;
         }}
         .block-hovered {{
             background-color: rgba({fg_r},{fg_g},{fg_b},0.05);
@@ -340,48 +333,6 @@ pub(crate) fn install_block_css(config: &Config) {
             font-size: {font_size};
             line-height: 1.0;
             margin: 0;
-        }}
-        .block-command-view {{
-            color: {fg_hex};
-            font-family: "{font_family}";
-            font-size: {font_size};
-            padding: 0;
-            line-height: 1.2;
-            margin: 0;
-            background-color: {bg_hex};
-            min-height: 24px;
-            caret-color: {cursor_hex};
-        }}
-        .block-command-view text {{
-            color: {fg_hex};
-            background-color: {bg_hex};
-            caret-color: {cursor_hex};
-        }}
-        .block-output-view {{
-            color: {fg_hex};
-            font-family: "{font_family}";
-            font-size: {font_size};
-            padding: 0;
-            line-height: 1.2;
-            margin: 0;
-            background-color: {bg_hex};
-            min-height: 0;
-        }}
-        .block-output-view text {{
-            color: {fg_hex};
-            background-color: {bg_hex};
-        }}
-        .block-finished .block-command-view {{
-            background-color: {block_bg_hex};
-        }}
-        .block-finished .block-command-view text {{
-            background-color: {block_bg_hex};
-        }}
-        .block-finished .block-output-view {{
-            background-color: {block_bg_hex};
-        }}
-        .block-finished .block-output-view text {{
-            background-color: {block_bg_hex};
         }}
         .block-cmd {{
             color: {fg_hex};

@@ -19,15 +19,11 @@ mod alt_screen;
 mod blocks;
 mod css;
 mod scroll;
-mod select;
-mod url;
 pub(crate) use ansi::*;
 pub(crate) use alt_screen::*;
 pub(crate) use blocks::*;
 pub(crate) use css::*;
 pub(crate) use scroll::*;
-pub(crate) use select::*;
-pub(crate) use url::*;
 
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
@@ -340,16 +336,15 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
-#[allow(dead_code)]
-/// One highlighted hit from a find-within-blocks pass. Offsets are TextBuffer
-/// character offsets, valid until the buffer is re-rendered (cleared on close).
+/// One hit from a find-within-blocks pass. With VTE-backed blocks the match
+/// position lives inside the VTE itself (highlighted automatically by
+/// `search_set_regex`); we only remember which (block, surface) it belongs
+/// to so navigation can move the per-VTE search cursor to the right widget.
 #[derive(Clone)]
 struct FindMatch {
     block_id: u64,
-    /// false = command line buffer, true = output buffer.
+    /// false = command VTE, true = output VTE.
     is_output: bool,
-    start: i32,
-    end: i32,
 }
 
 #[derive(Default)]
@@ -357,25 +352,6 @@ struct FindState {
     matches: Vec<FindMatch>,
     /// Index into `matches` of the currently focused hit.
     current: usize,
-}
-
-/// Fetch (creating once) the find-highlight TextTag for a buffer. `current` is
-/// the bright "focused match" variant; otherwise the dim all-matches variant.
-fn find_tag(buffer: &gtk4::TextBuffer, current: bool) -> gtk4::TextTag {
-    let name = if current { "jt-find-current" } else { "jt-find" };
-    let table = buffer.tag_table();
-    if let Some(tag) = table.lookup(name) {
-        return tag;
-    }
-    let tag = gtk4::TextTag::new(Some(name));
-    if current {
-        tag.set_background(Some("#ff9e3b"));
-        tag.set_foreground(Some("#1a1a1a"));
-    } else {
-        tag.set_background(Some("#5c4a1f"));
-    }
-    table.add(&tag);
-    tag
 }
 
 pub struct TermView {
@@ -720,6 +696,12 @@ impl ReaderCtx {
                                 // the GTK FinishedBlock so id-keyed lookups (export,
                                 // delete) resolve in both lists.
                                 let block_id = next_block_id();
+                                // Capture cols now (live VTE is allocated by the time
+                                // a command finishes) and store it on BlockData so
+                                // session restore can recreate the finished VTE at
+                                // the same width — preserving column-formatted output
+                                // (ls, git log, etc.) instead of reflowing it.
+                                let cols = active_rc.borrow().grid_cols() as i64;
                                 let block_data = BlockData {
                                     id: block_id,
                                     prompt: prompt.clone(),
@@ -733,20 +715,15 @@ impl ReaderCtx {
                                     end_time_ms,
                                     duration_ms,
                                     cwd: block_cwd.clone(),
+                                    cols: cols.clamp(1, u16::MAX as i64) as u16,
                                 };
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
-                                // Pre-wrap the finished output at the SAME column the
-                                // live VTE wrapped at, so the completed block keeps the
-                                // identical line breaks (no reflow jump on completion).
-                                let wrap_cols = active_rc.borrow().grid_cols();
-                                let display_output_ansi = blocks::wrap_ansi_at(&output_with_ansi, wrap_cols);
-
                                 let recycled = widget_pool_for_cb.borrow_mut().acquire();
                                 let finished = FinishedBlock::new_with_pool(
-                                    block_id, &prompt, &cmd, None, &display_output_ansi, exit_code, &config_for_cb.borrow(),
-                                    duration_ms, end_time_ms, block_cwd.as_deref(), recycled,
+                                    block_id, &prompt, &cmd, None, &output_with_ansi, exit_code, &config_for_cb.borrow(),
+                                    duration_ms, end_time_ms, block_cwd.as_deref(), cols, recycled,
                                 );
 
                                 finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
@@ -812,16 +789,8 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let prompt_text = finished_for_copy.prompt_text.clone();
-                                            let cmd_text = finished_for_copy.command_buffer.text(
-                                                &finished_for_copy.command_buffer.start_iter(),
-                                                &finished_for_copy.command_buffer.end_iter(),
-                                                true,
-                                            );
-                                            let output_text = finished_for_copy.output_buffer.text(
-                                                &finished_for_copy.output_buffer.start_iter(),
-                                                &finished_for_copy.output_buffer.end_iter(),
-                                                true,
-                                            );
+                                            let cmd_text = finished_for_copy.cmd_text.clone();
+                                            let output_text = strip_ansi(&finished_for_copy.full_output.borrow());
                                             let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
                                             vte_for_action.clipboard().set_text(&full_text);
                                         });
@@ -1139,8 +1108,14 @@ impl ReaderCtx {
                         }
 
                         ParserEvent::ApcSequence(payload) => {
+                            // Forward Kitty graphics (APC G ...) to the live VTE
+                            // regardless of block state — tools like `kitten icat`
+                            // emit them at the shell prompt (main screen), not
+                            // only inside alt-screen apps. Limiting to AltScreen
+                            // dropped images that appeared as part of a finished
+                            // block's output.
                             let is_kitty = payload.first() == Some(&b'G');
-                            if is_kitty && bstate_rc.get() == BlockState::AltScreen {
+                            if is_kitty {
                                 let mut seq = Vec::with_capacity(payload.len() + 4);
                                 seq.push(0x1b);
                                 seq.push(b'_');
@@ -2213,11 +2188,17 @@ impl TermView {
         // Load history if configured
         let _ = term_view.load_history();
 
-        // Create widgets for loaded blocks
+        // Create widgets for loaded blocks. Each block's `cols` is what the live
+        // VTE was wrapping at when the command ran; restoring at the same cols
+        // reproduces the exact line breaks (so `ls` columns don't get split
+        // mid-word). For old saves without a cols field (cols == 0), fall back
+        // to the live VTE's current column count.
         {
             let block_data_ref = term_view.block_data.borrow();
             let config = term_view.config.borrow();
+            let fallback_cols = term_view.active.borrow().grid_cols() as i64;
             for block in block_data_ref.iter() {
+                let cols = if block.cols > 0 { block.cols as i64 } else { fallback_cols };
                 let finished = FinishedBlock::new(
                     block.id,
                     &block.prompt,
@@ -2229,6 +2210,7 @@ impl TermView {
                     block.duration_ms,
                     block.end_time_ms,
                     block.cwd.as_deref(),
+                    cols,
                 );
                 finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
                 finished.connect_actions(&term_view.active_vte, &term_view.pty, &pty_synced, &term_view.active);
@@ -2425,17 +2407,19 @@ impl TermView {
             }
         }
 
-        // (2) Finished-block TextBuffers (command_buffer / output_buffer)
+        // (2) Finished-block VTEs (output_vte / command_vte). GTK4 selection is
+        // per-widget so only one block can have a live selection at a time —
+        // that's the one we copy.
         for blk in self.finished_blocks.borrow().iter() {
-            for buf in [&blk.output_buffer, &blk.command_buffer] {
-                if let Some((start, end)) = buf.selection_bounds() {
-                    let text = buf.text(&start, &end, false);
-                    if !text.is_empty() {
+            for vte in [&blk.output_vte, &blk.command_vte] {
+                if let Some(text) = vte.text_selected(vte4::Format::Text) {
+                    let s = text.to_string();
+                    if !s.is_empty() {
                         log::debug!(
-                            ">>> TermView copy: got {} chars from finished block TextBuffer",
-                            text.len()
+                            ">>> TermView copy: got {} chars from finished block VTE",
+                            s.len()
                         );
-                        self.active_vte.clipboard().set_text(&text);
+                        self.active_vte.clipboard().set_text(&s);
                         return;
                     }
                 }
@@ -2665,34 +2649,35 @@ impl TermView {
             Err(_) => return (0, 0),
         };
 
+        // Compile the same pattern for VTE (PCRE2) so its native highlighter
+        // paints every hit and its search cursor can step within each block.
+        let vte_re = match vte4::Regex::for_search(
+            &pattern,
+            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+        ) {
+            Ok(r) => r,
+            Err(_) => return (0, 0),
+        };
+
         let mut matches: Vec<FindMatch> = Vec::new();
         {
             let finished = self.finished_blocks.borrow();
             for block in finished.iter() {
-                for (is_output, buffer) in
-                    [(false, &block.command_buffer), (true, &block.output_buffer)]
-                {
-                    let text = buffer
-                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                        .to_string();
-                    for m in re.find_iter(&text) {
-                        if m.start() == m.end() {
-                            continue;
-                        }
-                        let start = text[..m.start()].chars().count() as i32;
-                        let end = start + text[m.start()..m.end()].chars().count() as i32;
-                        matches.push(FindMatch {
-                            block_id: block.id,
-                            is_output,
-                            start,
-                            end,
-                        });
-                        let tag = find_tag(buffer, false);
-                        buffer.apply_tag(
-                            &tag,
-                            &buffer.iter_at_offset(start),
-                            &buffer.iter_at_offset(end),
-                        );
+                let cmd_count = re.find_iter(&block.cmd_text).count();
+                let out_stripped = strip_ansi(&block.full_output.borrow());
+                let out_count = re.find_iter(&out_stripped).count();
+                if cmd_count > 0 {
+                    block.command_vte.search_set_regex(Some(&vte_re), 0);
+                    block.command_vte.search_set_wrap_around(true);
+                    for _ in 0..cmd_count {
+                        matches.push(FindMatch { block_id: block.id, is_output: false });
+                    }
+                }
+                if out_count > 0 {
+                    block.output_vte.search_set_regex(Some(&vte_re), 0);
+                    block.output_vte.search_set_wrap_around(true);
+                    for _ in 0..out_count {
+                        matches.push(FindMatch { block_id: block.id, is_output: true });
                     }
                 }
             }
@@ -2707,7 +2692,7 @@ impl TermView {
             st.matches = matches;
             st.current = 0;
         }
-        self.set_current_find_tag(0, true);
+        self.focus_current_match();
         self.scroll_to_current_match();
         (1, total)
     }
@@ -2730,37 +2715,37 @@ impl TermView {
         if total == 0 {
             return (0, 0);
         }
-        self.set_current_find_tag(cur, false);
         let next = ((cur as isize + delta).rem_euclid(total as isize)) as usize;
         self.find_state.borrow_mut().current = next;
-        self.set_current_find_tag(next, true);
+        self.focus_current_match_step(delta);
         self.scroll_to_current_match();
         (next + 1, total)
     }
 
-    /// Apply (or remove) the bright "current match" tag on the hit at `idx`.
-    fn set_current_find_tag(&self, idx: usize, on: bool) {
+    /// Move the VTE search cursor on the block backing the current match.
+    /// Used after the find_state index is updated; `delta` direction tells
+    /// VTE which way to step its internal cursor.
+    fn focus_current_match_step(&self, delta: isize) {
         let finished = self.finished_blocks.borrow();
         let st = self.find_state.borrow();
-        let Some(fm) = st.matches.get(idx) else {
-            return;
-        };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
-            return;
-        };
-        let buffer = if fm.is_output {
-            &block.output_buffer
+        let Some(fm) = st.matches.get(st.current) else { return; };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else { return; };
+        let vte = if fm.is_output { &block.output_vte } else { &block.command_vte };
+        if delta >= 0 {
+            vte.search_find_next();
         } else {
-            &block.command_buffer
-        };
-        let tag = find_tag(buffer, true);
-        let s = buffer.iter_at_offset(fm.start);
-        let e = buffer.iter_at_offset(fm.end);
-        if on {
-            buffer.apply_tag(&tag, &s, &e);
-        } else {
-            buffer.remove_tag(&tag, &s, &e);
+            vte.search_find_previous();
         }
+    }
+
+    /// Move VTE's search cursor to the very first match of the current pass.
+    fn focus_current_match(&self) {
+        let finished = self.finished_blocks.borrow();
+        let st = self.find_state.borrow();
+        let Some(fm) = st.matches.get(st.current) else { return; };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else { return; };
+        let vte = if fm.is_output { &block.output_vte } else { &block.command_vte };
+        vte.search_find_next();
     }
 
     fn scroll_to_current_match(&self) {
@@ -2790,18 +2775,8 @@ impl TermView {
         {
             let finished = self.finished_blocks.borrow();
             for block in finished.iter() {
-                for buffer in [&block.command_buffer, &block.output_buffer] {
-                    let table = buffer.tag_table();
-                    for name in ["jt-find", "jt-find-current"] {
-                        if let Some(tag) = table.lookup(name) {
-                            buffer.remove_tag(
-                                &tag,
-                                &buffer.start_iter(),
-                                &buffer.end_iter(),
-                            );
-                        }
-                    }
-                }
+                block.command_vte.search_set_regex(None::<&vte4::Regex>, 0);
+                block.output_vte.search_set_regex(None::<&vte4::Regex>, 0);
             }
         }
         let mut st = self.find_state.borrow_mut();
@@ -2973,12 +2948,7 @@ impl TermView {
         let finished = self.finished_blocks.borrow();
         if let Some(block) = finished.iter().find(|b| b.id == block_id) {
             let prompt_text = block.prompt_text.clone();
-            let cmd_text = block.command_buffer.text(
-                &block.command_buffer.start_iter(),
-                &block.command_buffer.end_iter(),
-                true,
-            );
-            // Use the full output (ANSI stripped), not the collapsed buffer.
+            let cmd_text = block.cmd_text.clone();
             let output_text = strip_ansi(&block.full_output.borrow());
 
             let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
@@ -3107,121 +3077,11 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ansi_text_runs, strip_ansi, strip_ansi_with_clear_detect};
-    use gtk4::gdk::RGBA;
-
-    fn palette() -> [RGBA; 16] {
-        [RGBA::new(0.0, 0.0, 0.0, 1.0); 16]
-    }
+    use super::{strip_ansi, strip_ansi_with_clear_detect};
 
     #[test]
     fn strips_charset_designation_from_output() {
         assert_eq!(strip_ansi("\u{1b}(Btop"), "top");
-    }
-
-    #[test]
-    fn preserves_colored_output_runs() {
-        let runs = ansi_text_runs("a\u{1b}[31mred\u{1b}[0mz", &palette());
-        assert_eq!(
-            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
-            "aredz"
-        );
-        assert!(runs
-            .iter()
-            .any(|run| run.text == "red" && run.style.foreground.is_some()));
-    }
-
-    fn render(input: &str) -> String {
-        ansi_text_runs(input, &palette())
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect()
-    }
-
-    #[test]
-    fn carriage_return_overwrites_from_column_zero() {
-        assert_eq!(render("Loading...\r50%"), "50%ding...");
-    }
-
-    #[test]
-    fn cursor_up_repaints_previous_row() {
-        // aaa\n bbb, back 2, up 1, write Z → row0 col1 = Z.
-        assert_eq!(render("aaa\nbbb\u{1b}[2D\u{1b}[AZ"), "aZa\nbbb");
-    }
-
-    #[test]
-    fn cursor_up_count_and_column_address() {
-        // Three rows; CUU 2 then CHA col1 then write X overwrites row0 col0.
-        assert_eq!(render("r0\nr1\nr2\u{1b}[2A\u{1b}[1GX"), "X0\nr1\nr2");
-    }
-
-    #[test]
-    fn double_width_chars_round_trip() {
-        assert_eq!(render("日本"), "日本");
-    }
-
-    #[test]
-    fn double_width_advances_two_columns() {
-        // After a wide char (cols 0-1), CHA to col3 (0-based 2) writes adjacent.
-        assert_eq!(render("日\u{1b}[3GX"), "日X");
-    }
-
-    #[test]
-    fn tab_pads_to_next_stop() {
-        assert_eq!(render("a\tb"), format!("a{}b", " ".repeat(7)));
-    }
-
-    #[test]
-    fn erase_chars_blanks_in_place() {
-        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[2X"), "abc  f");
-    }
-
-    #[test]
-    fn delete_chars_shifts_left() {
-        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[2P"), "abcf");
-    }
-
-    #[test]
-    fn insert_chars_shifts_right() {
-        assert_eq!(render("abc\u{1b}[1G\u{1b}[2@"), "  abc");
-    }
-
-    #[test]
-    fn combining_mark_attaches_to_base() {
-        assert_eq!(render("e\u{0301}"), "e\u{0301}");
-    }
-
-    #[test]
-    fn repeat_last_char() {
-        assert_eq!(render("a\u{1b}[3b"), "aaaa");
-    }
-
-    #[test]
-    fn erase_line_to_end() {
-        assert_eq!(render("abcdef\u{1b}[3D\u{1b}[0K"), "abc");
-    }
-
-    #[test]
-    fn newline_starts_fresh_row() {
-        assert_eq!(render("ab\ncd"), "ab\ncd");
-    }
-
-    #[test]
-    fn dec_line_drawing_maps_box_chars() {
-        // ESC(0 selects line-drawing G0; lqk → ┌─┐ ; ESC(B restores ASCII.
-        assert_eq!(render("\u{1b}(0lqk\u{1b}(B"), "┌─┐");
-    }
-
-    #[test]
-    fn dec_line_drawing_restored_by_ascii_charset() {
-        // After ESC(B, lqk are plain letters again.
-        assert_eq!(render("\u{1b}(0l\u{1b}(Blqk"), "┌lqk");
-    }
-
-    #[test]
-    fn shift_in_out_toggle_line_drawing() {
-        // SO (0x0e) selects G1; designate G1 as line-drawing; SI (0x0f) back to G0.
-        assert_eq!(render("\u{1b})0\u{0e}x\u{0f}x"), "│x");
     }
 
     #[test]
@@ -3392,36 +3252,6 @@ mod tests {
             strip_ansi_with_clear_detect("\u{1b}[0J"),
             ("".to_string(), false)
         );
-    }
-
-    #[test]
-    fn output_cursor_col_end_of_line() {
-        // Plain text: cursor at end of last line
-        assert_eq!(super::output_cursor_col("hello"), (5, false));
-    }
-
-    #[test]
-    fn output_cursor_col_after_newline() {
-        // After \n: cursor at start of new (empty) line, after_newline=true
-        assert_eq!(super::output_cursor_col("hello\n"), (0, true));
-    }
-
-    #[test]
-    fn output_cursor_col_carriage_return() {
-        // After \r: cursor at start of current line, after_newline=false
-        assert_eq!(super::output_cursor_col("hello\r"), (0, false));
-    }
-
-    #[test]
-    fn output_cursor_col_progress_update() {
-        // \r then overwrite: cursor ends at col 8 (length of "50% done")
-        assert_eq!(super::output_cursor_col("Loading...\r50% done"), (8, false));
-    }
-
-    #[test]
-    fn output_cursor_col_multiline() {
-        // Multi-line: cursor at end of last line
-        assert_eq!(super::output_cursor_col("line1\nline2\nend"), (3, false));
     }
 
     // ── IME / Chinese input support tests ────────────────────────────────

@@ -1,6 +1,6 @@
-//! blocks — extracted from block_view (mechanical split, no logic changes)
+//! blocks — finished-block widgets (VTE-backed) and the live ActiveBlock.
 use gtk4::prelude::*;
-use gtk4::{Orientation, TextView};
+use gtk4::Orientation;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -11,194 +11,6 @@ use crate::terminal::open_uri;
 use super::*;
 
 
-/// Display width of a single character in terminal cells. Coarse but covers the
-/// common cases: zero-width combining marks / joiners, double-width CJK & emoji,
-/// everything else single-width. Used only to reproduce the terminal's wrap column.
-pub(crate) fn char_display_width(c: char) -> usize {
-    let cp = c as u32;
-    if cp == 0 {
-        return 0;
-    }
-    if (0x0300..=0x036F).contains(&cp)      // combining diacriticals
-        || (0x0483..=0x0489).contains(&cp)  // Cyrillic combining
-        || (0x0591..=0x05BD).contains(&cp)  // Hebrew points
-        || cp == 0x05BF || cp == 0x05C1 || cp == 0x05C2 || cp == 0x05C4 || cp == 0x05C5 || cp == 0x05C7
-        || (0x0610..=0x061A).contains(&cp)  // Arabic combining
-        || (0x064B..=0x065F).contains(&cp)  // Arabic diacritics
-        || cp == 0x0670                      // Arabic superscript alef
-        || (0x06D6..=0x06DC).contains(&cp)  // Arabic small high marks
-        || (0x06DF..=0x06E4).contains(&cp)
-        || (0x06E7..=0x06E8).contains(&cp)
-        || (0x06EA..=0x06ED).contains(&cp)
-        || (0x0900..=0x0902).contains(&cp)  // Devanagari combining (subset)
-        || cp == 0x093C || (0x0941..=0x0948).contains(&cp) || cp == 0x094D
-        || (0x0951..=0x0957).contains(&cp)
-        || (0x1AB0..=0x1AFF).contains(&cp)  // combining diacriticals extended
-        || (0x1DC0..=0x1DFF).contains(&cp)  // combining diacriticals supplement
-        || (0x200B..=0x200F).contains(&cp)  // zero-width space .. RLM
-        || cp == 0x200D                      // zero-width joiner
-        || (0x20D0..=0x20FF).contains(&cp)  // combining marks for symbols
-        || (0xFE00..=0xFE0F).contains(&cp)  // variation selectors
-        || (0xFE20..=0xFE2F).contains(&cp)  // combining half marks
-    {
-        return 0;
-    }
-    if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
-        || (0x2E80..=0xA4CF).contains(&cp)   // CJK radicals .. Yi
-        || (0xAC00..=0xD7A3).contains(&cp)   // Hangul syllables
-        || (0xF900..=0xFAFF).contains(&cp)   // CJK compatibility ideographs
-        || (0xFE30..=0xFE4F).contains(&cp)   // CJK compatibility forms
-        || (0xFF00..=0xFF60).contains(&cp)   // fullwidth forms
-        || (0xFFE0..=0xFFE6).contains(&cp)   // fullwidth signs
-        || (0x1F300..=0x1FAFF).contains(&cp) // emoji & symbols
-        || (0x20000..=0x3FFFD).contains(&cp) // CJK ext B+
-    {
-        return 2;
-    }
-    1
-}
-
-/// Soft-wrap ANSI-bearing text at `cols` display columns, inserting a hard newline
-/// at each wrap point. ANSI/OSC escape sequences pass through untouched and don't
-/// count toward the column, tabs expand to 8-column stops, and double-width glyphs
-/// count as two — exactly matching how the live output VTE (and a real terminal)
-/// wrapped the same bytes. The result is rendered in the finished block's TextView
-/// with no further reflow, so a completed command keeps the identical line breaks
-/// the user just watched, instead of the TextView's own pixel-based wrap column.
-pub(crate) fn wrap_ansi_at(input: &str, cols: usize) -> String {
-    if cols == 0 {
-        return input.to_string();
-    }
-    let mut out = String::with_capacity(input.len() + input.len() / cols + 8);
-    let mut col = 0usize;
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
-                out.push(c);
-                match chars.peek() {
-                    Some('[') => {
-                        out.push(chars.next().unwrap());
-                        // CSI: consume until a final byte in 0x40..=0x7E.
-                        while let Some(&p) = chars.peek() {
-                            out.push(chars.next().unwrap());
-                            if ('\x40'..='\x7e').contains(&p) {
-                                break;
-                            }
-                        }
-                    }
-                    Some(']') => {
-                        out.push(chars.next().unwrap());
-                        // OSC: consume until BEL or ST (ESC \).
-                        while let Some(&p) = chars.peek() {
-                            if p == '\x07' {
-                                out.push(chars.next().unwrap());
-                                break;
-                            }
-                            if p == '\x1b' {
-                                out.push(chars.next().unwrap());
-                                if let Some('\\') = chars.peek() {
-                                    out.push(chars.next().unwrap());
-                                }
-                                break;
-                            }
-                            out.push(chars.next().unwrap());
-                        }
-                    }
-                    Some('(') | Some(')') => {
-                        // Charset designation ESC(<f> / ESC)<f>: two more bytes,
-                        // zero display width.
-                        out.push(chars.next().unwrap());
-                        if let Some(f) = chars.next() {
-                            out.push(f);
-                        }
-                    }
-                    Some(_) => {
-                        out.push(chars.next().unwrap());
-                    }
-                    None => {}
-                }
-            }
-            // SI / SO (charset shift): zero width.
-            '\x0e' | '\x0f' => {
-                out.push(c);
-            }
-            '\n' => {
-                out.push('\n');
-                col = 0;
-            }
-            '\r' => {
-                out.push('\r');
-                col = 0;
-            }
-            '\t' => {
-                // VTE clamps a tab to the right margin rather than wrapping: it fills
-                // spaces to the line edge and parks the cursor there; the *next* glyph
-                // wraps. Discarding the filler used to make the finished line shorter
-                // than the live render. Fill to min(next_stop, cols).
-                let next_stop = ((col / 8 + 1) * 8).min(cols);
-                for _ in col..next_stop {
-                    out.push(' ');
-                }
-                col = next_stop;
-            }
-            _ => {
-                let w = char_display_width(c);
-                if w == 0 {
-                    out.push(c);
-                } else {
-                    if col + w > cols {
-                        out.push('\n');
-                        col = 0;
-                    }
-                    out.push(c);
-                    col += w;
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Reserve the correct height on a finished block's output TextView *before* it is
-/// realized. A freshly appended GtkTextView reports a too-small natural height
-/// (~1 line) until its layout is validated on a later frame, which made multi-line
-/// output visibly "expand" row by row after the block appeared. Setting an explicit
-/// height request makes the natural height correct from the first measure, so the
-/// block snaps to full size in one shot.
-fn fit_output_height(view: &TextView, display_output: &str, config: &Config) {
-    let line_count = display_output.lines().count().max(1) as i32;
-
-    // Mirror css.rs: derive the scaled font (family + size) used for these views.
-    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
-    let (family, base_size) = if parts.len() >= 2 {
-        if let Ok(size) = parts[parts.len() - 1].parse::<i32>() {
-            (parts[..parts.len() - 1].join(" "), size)
-        } else {
-            (config.font_desc.clone(), 14)
-        }
-    } else {
-        (config.font_desc.clone(), 14)
-    };
-    let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
-    let mut font_desc = gtk4::pango::FontDescription::from_string(&family);
-    font_desc.set_size(scaled_size * gtk4::pango::SCALE);
-
-    // Measure via a private context that inherits the widget's resolution/DPI.
-    let metrics = view.create_pango_context().metrics(Some(&font_desc), None);
-    let line_units = if metrics.height() > 0 {
-        metrics.height()
-    } else {
-        metrics.ascent() + metrics.descent()
-    };
-    // CSS line-height: 1.2 on .block-output-view.
-    let per_line = ((line_units as f64 / gtk4::pango::SCALE as f64) * 1.2).ceil() as i32;
-    let per_line = per_line.max(1);
-
-    // top + bottom view margins, plus 1px slack against rounding.
-    let height = per_line * line_count + 4 + 1;
-    view.set_size_request(-1, height);
-}
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
@@ -222,6 +34,13 @@ pub(crate) struct BlockData {
     pub(crate) duration_ms: Option<u64>,
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Live-VTE column count at the time this block was finalized. Restored
+    /// blocks render at the same cols so their byte stream (which was formatted
+    /// for this width, e.g. by `ls`) reproduces the original line breaks
+    /// instead of being reflowed at the current window's width. 0 = unknown
+    /// (old saves before this field existed) — caller should fall back.
+    #[serde(default)]
+    pub(crate) cols: u16,
 }
 
 impl BlockData {
@@ -277,11 +96,15 @@ pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
     pub(crate) widget: gtk4::Box,
     pub(crate) prompt_text: String,
-    pub(crate) command_view: gtk4::TextView,
-    pub(crate) command_buffer: gtk4::TextBuffer,
-    pub(crate) output_view: gtk4::TextView,
-    pub(crate) output_buffer: gtk4::TextBuffer,
-    pub(crate) show_more_btn: Option<gtk4::Button>,
+    /// Read-only VTE displaying the executed command line (single-row typically).
+    pub(crate) command_vte: vte4::Terminal,
+    /// Read-only VTE displaying the captured output. Full output is fed once;
+    /// rows beyond viewport_cap live in this VTE's own scrollback so the user
+    /// can scroll inside long blocks (e.g. `git log`).
+    pub(crate) output_vte: vte4::Terminal,
+    /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
+    /// copy-output action. Mutable so filter can swap the displayed slice
+    /// without losing the original.
     pub(crate) full_output: Rc<RefCell<String>>,
     pub(crate) cmd_text: String,
     pub(crate) copy_cmd_btn: gtk4::Button,
@@ -290,6 +113,10 @@ pub(crate) struct FinishedBlock {
     pub(crate) header_row: gtk4::Box,
     pub(crate) action_box: gtk4::Box,
     pub(crate) bookmark_star: gtk4::Label,
+    /// Column count the output VTE is sized to — needed for re-feed (filter).
+    pub(crate) cols: i64,
+    /// Visible-row cap (config.finished_block_viewport_rows).
+    pub(crate) viewport_cap: i64,
 }
 
 impl Clone for FinishedBlock {
@@ -298,11 +125,8 @@ impl Clone for FinishedBlock {
             id: self.id,
             widget: self.widget.clone(),
             prompt_text: self.prompt_text.clone(),
-            command_view: self.command_view.clone(),
-            command_buffer: self.command_buffer.clone(),
-            output_view: self.output_view.clone(),
-            output_buffer: self.output_buffer.clone(),
-            show_more_btn: self.show_more_btn.clone(),
+            command_vte: self.command_vte.clone(),
+            output_vte: self.output_vte.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
             copy_cmd_btn: self.copy_cmd_btn.clone(),
@@ -311,6 +135,8 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             bookmark_star: self.bookmark_star.clone(),
+            cols: self.cols,
+            viewport_cap: self.viewport_cap,
         }
     }
 }
@@ -458,6 +284,32 @@ fn filter_output_lines(
         .join("\n")
 }
 
+/// Render `bytes` into a read-only finished VTE: reset the grid, resize to the
+/// new visible-row count (so the chrome shrinks/grows on filter), then feed
+/// the bytes in one shot. Used for filter changes — the initial feed happens
+/// once at construction.
+pub(crate) fn render_bytes_into_finished_vte(
+    vte: &vte4::Terminal,
+    bytes: &[u8],
+    cols: i64,
+    output_rows: i64,
+    viewport_cap: i64,
+) {
+    let visible_rows = output_rows.min(viewport_cap).max(1);
+    let scrollback = (output_rows.max(visible_rows) as u32).saturating_add(64);
+    // Set size BEFORE reset/feed so VTE's internal grid is sized correctly when
+    // bytes are processed. If we feed first and resize later, VTE wraps lines
+    // at the pre-resize default width (root cause of the ls-output misalignment
+    // bug: `ls` formats for N cols but VTE wrapped at a narrower width,
+    // producing mid-word splits like "ta\nuri-sandbox").
+    vte.set_size(cols.max(1), visible_rows);
+    vte.set_scrollback_lines(scrollback as i64);
+    vte.reset(true, true);
+    // reset() can clamp dimensions on some VTE builds — re-assert.
+    vte.set_size(cols.max(1), visible_rows);
+    vte.feed(bytes);
+}
+
 impl FinishedBlock {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -471,8 +323,9 @@ impl FinishedBlock {
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
+        cols: i64,
     ) -> Self {
-        Self::new_with_pool(id, prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, None)
+        Self::new_with_pool(id, prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, cols, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -487,10 +340,10 @@ impl FinishedBlock {
         duration_ms: Option<u64>,
         end_time_ms: Option<u64>,
         cwd: Option<&str>,
+        cols: i64,
         recycled: Option<gtk4::Box>,
     ) -> Self {
-        let view_margin_top = 2;
-        let view_margin_bottom = 2;
+        let viewport_cap = config.finished_block_viewport_rows.max(3) as i64;
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -653,250 +506,101 @@ impl FinishedBlock {
 
         outer.append(&header_row);
 
-        // ── Text Views ──────────────────────────────────────────────────────
-        // Helper to create TextView
-        let create_textview = |css_class: &str| -> (gtk4::TextView, gtk4::TextBuffer) {
-            let buffer = gtk4::TextBuffer::new(None);
-            let view = gtk4::TextView::with_buffer(&buffer);
-            view.add_css_class(css_class);
-            view.set_editable(false);
-            view.set_cursor_visible(false);
-            view.set_can_focus(true);
-            view.set_focusable(true);
-            view.set_hexpand(true);
-            view.set_vexpand(false);
-            view.set_valign(gtk4::Align::Start);
-            view.set_wrap_mode(gtk4::WrapMode::Char);
-            view.set_left_margin(12);
-            view.set_right_margin(8);
-            view.set_top_margin(view_margin_top);
-            view.set_bottom_margin(view_margin_bottom);
-            view.set_monospace(true);
-            view.set_accepts_tab(false);
-            (view, buffer)
+        // ── VTE-rendered command + output ─────────────────────────────────
+        // Command VTE: single-row read-only renderer for the executed command.
+        let cmd_bytes: Vec<u8> = match cmd_ansi {
+            Some(ansi) if !ansi.is_empty() && !cmd.is_empty() => ansi.as_bytes().to_vec(),
+            _ if cmd.is_empty() => b"(empty)".to_vec(),
+            _ => highlight_command_to_ansi(cmd).into_bytes(),
         };
-
-        let (command_view, command_buffer) = create_textview("block-command-view");
-        let (output_view, output_buffer) = create_textview("block-output-view");
-        // The live output is rendered in a VTE appended flush to the block's left
-        // edge (no indent), while prompt/command keep the 12px indent. Match that
-        // here so a finished block's output starts at the same x the user just saw
-        // and gets the full container width — its lines are already pre-wrapped at
-        // the live grid's column count, so the wider area prevents the TextView's
-        // own pixel wrap from re-breaking them.
-        output_view.set_left_margin(2);
-        output_view.set_right_margin(2);
-        // The text is already wrapped at the live grid's exact column, so the view
-        // must NOT re-wrap: GtkTextView's pixel-based Char wrap breaks a hair earlier
-        // than the VTE cell grid (its glyph advance is slightly wider), which would
-        // re-break each full-width line one column early. Disabling wrap keeps the
-        // identical line structure the user saw live.
-        output_view.set_wrap_mode(gtk4::WrapMode::None);
-
-        // Render the command line with the shell's own ANSI syntax highlighting
-        // when it's available; otherwise fall back to plain text.
-        match cmd_ansi {
-            Some(ansi) if !ansi.is_empty() && !cmd.is_empty() => {
-                set_active_output_buffer(&command_buffer, ansi, &config.palette, None);
-            }
-            _ => {
-                if cmd.is_empty() {
-                    command_buffer.set_text("(empty)");
-                } else {
-                    // No shell-provided ANSI echo: apply our own lightweight
-                    // syntax highlighting so finished commands look like Warp's.
-                    let highlighted = highlight_command_to_ansi(cmd);
-                    set_active_output_buffer(&command_buffer, &highlighted, &config.palette, None);
-                }
-            }
+        // Command typically fits one line; allow a few in case of multiline pastes.
+        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count().max(0) as i64 + 1;
+        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
+        // Defer feeds until the widget is actually mapped — VTE's internal
+        // grid resize from set_size() doesn't take effect until the widget is
+        // realized, so feeding immediately wraps content at a smaller default
+        // width (the ls-output misalignment bug). connect_map fires once the
+        // widget has been allocated, when the grid actually matches set_size.
+        // One-shot: re-mapping during scroll must not re-feed.
+        {
+            let cmd_bytes_for_map = cmd_bytes.clone();
+            let cols_for_map = cols.max(1);
+            let cmd_rows_for_map = cmd_rows.max(1).min(5);
+            let fed = Cell::new(false);
+            command_vte.connect_map(move |w| {
+                if fed.get() { return; }
+                fed.set(true);
+                w.set_size(cols_for_map, cmd_rows_for_map);
+                w.feed(&cmd_bytes_for_map);
+            });
         }
 
-        // Explicitly remove any cursor tags from finished block command buffer
-        let tag_table = command_buffer.tag_table();
-        if let Some(cursor_tag) = tag_table.lookup("cursor") {
-            let start = command_buffer.start_iter();
-            let end = command_buffer.end_iter();
-            command_buffer.remove_tag(&cursor_tag, &start, &end);
-        }
-
-        // Output truncation: show first N lines with "Show more" button for long output
-        let threshold = config.max_collapsed_output_lines as usize;
-        let output_lines: Vec<&str> = output.lines().collect();
-        let total_lines = output_lines.len();
-        let is_truncated = total_lines > threshold;
+        // Output VTE: full output fed once; rows beyond the viewport cap live
+        // in this widget's scrollback so the user can scroll inside the block.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
-
-        let display_output = if is_truncated {
-            output_lines[..threshold].join("\n")
-        } else {
-            output.to_string()
-        };
-        set_active_output_buffer(&output_buffer, &display_output, &config.palette, None);
-        fit_output_height(&output_view, &display_output, config);
-
-        // Add Ctrl+Click handler to open URLs in command and output views
-        for (view, buffer) in [(&command_view, &command_buffer), (&output_view, &output_buffer)] {
-            let click_controller = gtk4::GestureClick::new();
-            click_controller.set_button(1); // left click
-            click_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
-
-            let buffer_clone = buffer.clone();
-            let view_clone = view.clone();
-            click_controller.connect_pressed(move |controller, n_press, x, y| {
-                let (bx, by) = view_clone.window_to_buffer_coords(
-                    gtk4::TextWindowType::Widget,
-                    x as i32,
-                    y as i32,
-                );
-                let iter = view_clone.iter_at_location(bx, by);
-                if n_press == 1 {
-                    let state = controller.current_event_state();
-                    if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                        if let Some(iter) = iter {
-                            if let Some(url) = get_url_at_position(&buffer_clone, &iter) {
-                                open_uri(&url);
-                                controller.set_state(gtk4::EventSequenceState::Claimed);
-                                return;
-                            }
-                        }
-                    }
-                } else if n_press == 2 {
-                    // Smart selection: grab the whole semantic token (path, URL,
-                    // file:line, …) instead of GTK's default plain-word select.
-                    if let Some(iter) = iter {
-                        if let Some((start, end)) =
-                            get_semantic_bounds_at_position(&buffer_clone, &iter)
-                        {
-                            buffer_clone.select_range(&start, &end);
-                            controller.set_state(gtk4::EventSequenceState::Claimed);
-                            return;
-                        }
-                    }
-                }
-                controller.set_state(gtk4::EventSequenceState::Denied);
+        let output_rows = output.lines().count().max(1) as i64;
+        let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
+        {
+            let output_bytes = output.as_bytes().to_vec();
+            let cols_for_map = cols.max(1);
+            let visible_rows_for_map = output_rows.min(viewport_cap).max(1);
+            let fed = Cell::new(false);
+            output_vte.connect_map(move |w| {
+                if fed.get() { return; }
+                fed.set(true);
+                w.set_size(cols_for_map, visible_rows_for_map);
+                w.feed(&output_bytes);
             });
-
-            view.add_controller(click_controller);
-
-            // URL hover: underline + pointer cursor on mouse over
-            let url_tag = gtk4::TextTag::new(Some("url-hover"));
-            url_tag.set_underline(gtk4::pango::Underline::Single);
-            buffer.tag_table().add(&url_tag);
-
-            let motion_ctrl = gtk4::EventControllerMotion::new();
-            let view_for_motion = view.clone();
-            let buffer_for_motion = buffer.clone();
-            let tag_for_motion = url_tag.clone();
-            motion_ctrl.connect_motion(move |_ctrl, x, y| {
-                let (bx, by) = view_for_motion.window_to_buffer_coords(
-                    gtk4::TextWindowType::Widget,
-                    x as i32,
-                    y as i32,
-                );
-                let start = buffer_for_motion.start_iter();
-                let end = buffer_for_motion.end_iter();
-                buffer_for_motion.remove_tag(&tag_for_motion, &start, &end);
-
-                if let Some(iter) = view_for_motion.iter_at_location(bx, by) {
-                    if let Some((url_start, url_end, _)) =
-                        get_url_bounds_at_position(&buffer_for_motion, &iter)
-                    {
-                        buffer_for_motion.apply_tag(&tag_for_motion, &url_start, &url_end);
-                        view_for_motion.set_cursor(
-                            gtk4::gdk::Cursor::from_name("pointer", None).as_ref(),
-                        );
-                        return;
-                    }
-                }
-                view_for_motion.set_cursor(
-                    gtk4::gdk::Cursor::from_name("text", None).as_ref(),
-                );
-            });
-
-            let view_for_leave = view.clone();
-            let buffer_for_leave = buffer.clone();
-            let tag_for_leave = url_tag;
-            motion_ctrl.connect_leave(move |_| {
-                let start = buffer_for_leave.start_iter();
-                let end = buffer_for_leave.end_iter();
-                buffer_for_leave.remove_tag(&tag_for_leave, &start, &end);
-                view_for_leave.set_cursor(
-                    gtk4::gdk::Cursor::from_name("text", None).as_ref(),
-                );
-            });
-
-            view.add_controller(motion_ctrl);
         }
 
-        // Command row: Warp-style accent prompt chevron + the command text.
-        // The chevron supplies the left indent, so trim the command view's own
-        // left margin to keep them visually adjacent.
-        command_view.set_left_margin(2);
+        // Command row: Warp-style accent prompt chevron + the command VTE.
         let cmd_row = gtk4::Box::new(Orientation::Horizontal, 0);
         let chevron = gtk4::Label::new(Some("\u{276f}")); // ❯
         chevron.add_css_class("block-prompt-chevron");
         chevron.set_valign(gtk4::Align::Start);
         cmd_row.append(&chevron);
-        cmd_row.append(&command_view);
+        cmd_row.append(&command_vte);
 
-        // Append views to outer box
         outer.append(&cmd_row);
-        outer.append(&output_view);
+        outer.append(&output_vte);
 
-        // "Show more" button for truncated output
-        let show_more_btn = if is_truncated {
-            let remaining = total_lines - threshold;
-            let btn = gtk4::Button::with_label(&format!("Show more ({} more lines)", remaining));
-            btn.add_css_class("block-show-more");
-            btn.add_css_class("flat");
-            outer.append(&btn);
-
-            let is_expanded = Rc::new(Cell::new(false));
-            let output_buffer_clone = output_buffer.clone();
-            let output_view_clone = output_view.clone();
-            let config_clone = config.clone();
-            let palette = config.palette;
-            let full_output_clone = full_output.clone();
-            let is_expanded_clone = is_expanded.clone();
-
-            btn.connect_clicked(move |btn| {
-                let expanded = is_expanded_clone.get();
-                if expanded {
-                    let full = full_output_clone.borrow();
-                    let lines: Vec<&str> = full.lines().collect();
-                    let truncated = lines[..threshold].join("\n");
-                    set_active_output_buffer(&output_buffer_clone, &truncated, &palette, None);
-                    fit_output_height(&output_view_clone, &truncated, &config_clone);
-                    let remaining = lines.len() - threshold;
-                    btn.set_label(&format!("Show more ({} more lines)", remaining));
-                    is_expanded_clone.set(false);
-                } else {
-                    let full = full_output_clone.borrow();
-                    set_active_output_buffer(&output_buffer_clone, &full, &palette, None);
-                    fit_output_height(&output_view_clone, &full, &config_clone);
-                    btn.set_label("Show less");
-                    is_expanded_clone.set(true);
+        // Ctrl+click on a URL inside the output VTE → open in browser.
+        // VTE's `match_add_regex` (registered in create_finished_terminal) makes
+        // `check_match_at` return the matching URL at the pointer position;
+        // VTE handles word/line double/triple-click selection natively.
+        {
+            let click = gtk4::GestureClick::new();
+            click.set_button(1);
+            let vte_for_click = output_vte.clone();
+            click.connect_pressed(move |controller, n_press, x, y| {
+                if n_press != 1 {
+                    return;
+                }
+                let state = controller.current_event_state();
+                if !state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                    return;
+                }
+                let (uri, _tag) = vte_for_click.check_match_at(x, y);
+                if let Some(uri) = uri {
+                    let s = uri.to_string();
+                    if !s.is_empty() {
+                        open_uri(&s);
+                        controller.set_state(gtk4::EventSequenceState::Claimed);
+                    }
                 }
             });
+            output_vte.add_controller(click);
+        }
 
-            Some(btn)
-        } else {
-            None
-        };
-
-        // Wire collapse button to toggle output visibility
-        let output_view_for_collapse = output_view.clone();
-        let show_more_for_collapse = show_more_btn.clone();
         let has_output = !output.trim().is_empty();
         if !has_output {
-            output_view.set_visible(false);
+            output_vte.set_visible(false);
         }
+        // Wire collapse button to toggle output visibility.
+        let output_vte_for_collapse = output_vte.clone();
         collapse_btn.connect_clicked(move |btn| {
-            let visible = output_view_for_collapse.is_visible();
-            output_view_for_collapse.set_visible(!visible);
-            if let Some(ref smb) = show_more_for_collapse {
-                smb.set_visible(!visible);
-            }
+            let visible = output_vte_for_collapse.is_visible();
+            output_vte_for_collapse.set_visible(!visible);
             btn.set_label(if visible { "\u{f054}" } else { "\u{f078}" }); // chevron right / down
         });
         if !has_output {
@@ -941,52 +645,36 @@ impl FinishedBlock {
             outer.reorder_child_after(&filter_row, Some(&cmd_row));
 
             let apply = {
-                let output_buffer = output_buffer.clone();
-                let output_view = output_view.clone();
-                let config = config.clone();
-                let palette = config.palette;
+                let output_vte = output_vte.clone();
                 let full_output = full_output.clone();
                 let filter_entry = filter_entry.clone();
                 let regex_tg = regex_tg.clone();
                 let case_tg = case_tg.clone();
                 let invert_tg = invert_tg.clone();
                 let ctx_spin = ctx_spin.clone();
-                let show_more = show_more_btn.clone();
                 move || {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
-                    if q.is_empty() {
-                        // Restore the initial (collapsed) view.
-                        let lines: Vec<&str> = full.lines().collect();
-                        let shown = if lines.len() > threshold {
-                            lines[..threshold].join("\n")
-                        } else {
-                            full.to_string()
-                        };
-                        set_active_output_buffer(&output_buffer, &shown, &palette, None);
-                        fit_output_height(&output_view, &shown, &config);
-                        if let Some(ref smb) = show_more {
-                            smb.set_visible(lines.len() > threshold);
-                            smb.set_label(&format!(
-                                "Show more ({} more lines)",
-                                lines.len().saturating_sub(threshold)
-                            ));
-                        }
+                    let shown = if q.is_empty() {
+                        full.to_string()
                     } else {
-                        let filtered = filter_output_lines(
+                        filter_output_lines(
                             full.as_str(),
                             &q,
                             regex_tg.is_active(),
                             case_tg.is_active(),
                             invert_tg.is_active(),
                             ctx_spin.value() as usize,
-                        );
-                        set_active_output_buffer(&output_buffer, &filtered, &palette, None);
-                        fit_output_height(&output_view, &filtered, &config);
-                        if let Some(ref smb) = show_more {
-                            smb.set_visible(false);
-                        }
-                    }
+                        )
+                    };
+                    let shown_rows = shown.lines().count().max(1) as i64;
+                    render_bytes_into_finished_vte(
+                        &output_vte,
+                        shown.as_bytes(),
+                        cols,
+                        shown_rows,
+                        viewport_cap,
+                    );
                 }
             };
             let apply = Rc::new(apply);
@@ -1022,11 +710,8 @@ impl FinishedBlock {
             id,
             widget: outer,
             prompt_text: prompt.to_string(),
-            command_view,
-            command_buffer,
-            output_view,
-            output_buffer,
-            show_more_btn,
+            command_vte,
+            output_vte,
             full_output,
             cmd_text: cmd.to_string(),
             copy_cmd_btn,
@@ -1035,6 +720,8 @@ impl FinishedBlock {
             header_row,
             action_box,
             bookmark_star,
+            cols,
+            viewport_cap,
         }
     }
 
@@ -1217,65 +904,3 @@ pub(crate) enum BlockState {
     RawFallback,
 }
 
-#[cfg(test)]
-mod char_width_tests {
-    use super::char_display_width;
-
-    #[test]
-    fn ascii_is_one() {
-        assert_eq!(char_display_width('a'), 1);
-        assert_eq!(char_display_width('Z'), 1);
-        assert_eq!(char_display_width('5'), 1);
-    }
-
-    #[test]
-    fn cjk_and_emoji_are_two() {
-        assert_eq!(char_display_width('中'), 2);
-        assert_eq!(char_display_width('한'), 2);
-        assert_eq!(char_display_width('\u{1F600}'), 2); // 😀
-    }
-
-    #[test]
-    fn combining_marks_are_zero() {
-        assert_eq!(char_display_width('\u{0301}'), 0); // combining acute accent
-        assert_eq!(char_display_width('\u{200D}'), 0); // zero-width joiner
-        assert_eq!(char_display_width('\u{0591}'), 0); // Hebrew accent (newly added range)
-        assert_eq!(char_display_width('\u{064B}'), 0); // Arabic fathatan (newly added range)
-        assert_eq!(char_display_width('\u{FE0F}'), 0); // variation selector-16
-    }
-}
-
-#[cfg(test)]
-mod wrap_ansi_tests {
-    use super::wrap_ansi_at;
-
-    #[test]
-    fn wraps_at_column_boundary() {
-        assert_eq!(wrap_ansi_at("abcdef", 3), "abc\ndef");
-    }
-
-    #[test]
-    fn zero_cols_is_passthrough() {
-        assert_eq!(wrap_ansi_at("abcdef", 0), "abcdef");
-    }
-
-    #[test]
-    fn ansi_escapes_do_not_count_toward_width() {
-        // The SGR sequence is zero-width: the 6 visible chars wrap at col 3.
-        let input = "\x1b[31mabcdef\x1b[0m";
-        assert_eq!(wrap_ansi_at(input, 3), "\x1b[31mabc\ndef\x1b[0m");
-    }
-
-    #[test]
-    fn tab_fills_to_stop_not_past_edge() {
-        // Tab from col 0 fills to next 8-stop, clamped to cols=5: 5 spaces, then 'x'
-        // wraps onto a new line.
-        assert_eq!(wrap_ansi_at("\tx", 5), "     \nx");
-    }
-
-    #[test]
-    fn double_width_glyph_wraps_as_two_columns() {
-        // cols=3: '中'(2) + 'a'(1) fills the line, second '中' wraps.
-        assert_eq!(wrap_ansi_at("中a中", 3), "中a\n中");
-    }
-}
