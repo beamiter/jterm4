@@ -535,21 +535,44 @@ impl FinishedBlock {
             });
         }
 
-        // Output VTE: full output fed once; rows beyond the viewport cap live
-        // in this widget's scrollback so the user can scroll inside the block.
+        // Output VTE: full output fed once on first map; rows beyond the
+        // viewport cap live in this widget's scrollback so the user can
+        // scroll inside the block. When the block scrolls out of view it's
+        // unmapped — at that point we reset the VTE's grid + scrollback so
+        // its per-widget buffer memory is reclaimed. A subsequent map (block
+        // scrolls back in) re-feeds from `displayed_output`, which the filter
+        // path keeps in sync with whatever the user wants to see.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
+        let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_rows = output.lines().count().max(1) as i64;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
         {
-            let output_bytes = output.as_bytes().to_vec();
+            let fed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let cols_for_map = cols.max(1);
-            let visible_rows_for_map = output_rows.min(viewport_cap).max(1);
-            let fed = Cell::new(false);
+            let cap_for_map = viewport_cap;
+            let displayed_for_map = displayed_output.clone();
+            let fed_for_map = fed.clone();
             output_vte.connect_map(move |w| {
-                if fed.get() { return; }
-                fed.set(true);
-                w.set_size(cols_for_map, visible_rows_for_map);
-                w.feed(&output_bytes);
+                if fed_for_map.get() {
+                    return;
+                }
+                fed_for_map.set(true);
+                let text = displayed_for_map.borrow();
+                let rows = text.lines().count().max(1) as i64;
+                let visible_rows = rows.min(cap_for_map).max(1);
+                w.set_size(cols_for_map, visible_rows);
+                w.feed(text.as_bytes());
+            });
+            let fed_for_unmap = fed.clone();
+            output_vte.connect_unmap(move |w| {
+                if !fed_for_unmap.get() {
+                    return;
+                }
+                fed_for_unmap.set(false);
+                // Clear the grid + scrollback so the off-screen block's per-widget
+                // buffer memory is reclaimed. Tabstops and theming persist (they
+                // are configured via separate setters in alt_screen::apply_theme).
+                w.reset(false, true);
             });
         }
 
@@ -647,6 +670,7 @@ impl FinishedBlock {
             let apply = {
                 let output_vte = output_vte.clone();
                 let full_output = full_output.clone();
+                let displayed_output = displayed_output.clone();
                 let filter_entry = filter_entry.clone();
                 let regex_tg = regex_tg.clone();
                 let case_tg = case_tg.clone();
@@ -675,6 +699,10 @@ impl FinishedBlock {
                         shown_rows,
                         viewport_cap,
                     );
+                    // Keep `displayed_output` in sync so a later unmap → remap
+                    // (block scrolls out of view, then back) re-feeds the
+                    // filtered text, not the full output.
+                    *displayed_output.borrow_mut() = shown;
                 }
             };
             let apply = Rc::new(apply);
