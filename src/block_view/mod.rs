@@ -17,11 +17,13 @@ use crate::pty::OwnedPty;
 mod ansi;
 mod alt_screen;
 mod blocks;
+mod cross_selection;
 mod css;
 mod scroll;
 pub(crate) use ansi::*;
 pub(crate) use alt_screen::*;
 pub(crate) use blocks::*;
+pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use scroll::*;
 
@@ -399,6 +401,9 @@ pub struct TermView {
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+    /// Tracks per-VTE selections so a drag that crosses block boundaries can be
+    /// copied as one contiguous string via Ctrl+Shift+C.
+    cross_selection: Rc<CrossSelection>,
 }
 
 impl Drop for TermView {
@@ -434,9 +439,7 @@ struct ReaderCtx {
     prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
-    cwd_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
-    title_cbs: StrCallbacks,
     activity_cbs: VoidCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
     config_for_cb: Rc<RefCell<Config>>,
@@ -482,9 +485,7 @@ impl ReaderCtx {
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
-            cwd_cbs,
             exited_cbs,
-            title_cbs,
             activity_cbs,
             mouse_reporting_rc,
             config_for_cb,
@@ -602,7 +603,8 @@ impl ReaderCtx {
 
                                 if cmd.is_empty() {
                                     // Nothing meaningful to record; just reset.
-                                    active_rc.borrow().reset_active();
+                                    let preserve = config_for_cb.borrow().preserve_live_scrollback;
+                                    active_rc.borrow().reset_active(preserve);
                                     bstate_rc.set(BlockState::CollectingPrompt);
                                     prompt_buf_rc.borrow_mut().clear();
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
@@ -881,7 +883,8 @@ impl ReaderCtx {
                                     block_data_for_cb.borrow_mut().pop_front();
                                 }
 
-                                active_rc.borrow().reset_active();
+                                let preserve = config_for_cb.borrow().preserve_live_scrollback;
+                                active_rc.borrow().reset_active(preserve);
                                 scroll_debouncer.reset_scroll_lock();
                             }
                             bstate_rc.set(BlockState::CollectingPrompt);
@@ -890,10 +893,7 @@ impl ReaderCtx {
                             // now that no command is running. Sync the PTY size
                             // so the shell sees the new winsize before it reads
                             // anything past the prompt.
-                            resize_active();
-                            let cols = active_vte.column_count().max(1) as u16;
-                            let rows = active_vte.row_count().max(1) as u16;
-                            pty_for_init.resize(cols, rows);
+                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -979,13 +979,8 @@ impl ReaderCtx {
                             bstate_rc.set(BlockState::CollectingOutput);
                             // Snap the live VTE to viewport rows immediately so
                             // the child sees a real-terminal-shaped grid on its
-                            // very first read. The resize_tick would mirror this
-                            // onto the PTY on the next frame, but `top` queries
-                            // TIOCGWINSZ before painting, so push synchronously.
-                            resize_active();
-                            let cols = active_vte.column_count().max(1) as u16;
-                            let rows = active_vte.row_count().max(1) as u16;
-                            pty_for_init.resize(cols, rows);
+                            // very first read (see sync_active_to_pty doc).
+                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1012,19 +1007,6 @@ impl ReaderCtx {
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
-                        ParserEvent::CwdUpdate(path) => {
-                            *current_cwd_for_cb.borrow_mut() = path.clone();
-                            for cb in cwd_cbs.borrow().iter() {
-                                cb(path);
-                            }
-                        }
-
-                        ParserEvent::TitleUpdate(title) => {
-                            for cb in title_cbs.borrow().iter() {
-                                cb(title);
-                            }
-                        }
-
                         ParserEvent::AltScreenEnter => {
                             let from_state = bstate_rc.get();
                             if from_state != BlockState::CollectingOutput
@@ -1038,12 +1020,8 @@ impl ReaderCtx {
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
                             // Grow the live VTE to the full viewport before the
-                            // app draws and push TIOCSWINSZ synchronously so the
-                            // child sees the right size on its first read.
-                            resize_active();
-                            let cols = active_vte.column_count().max(1) as u16;
-                            let rows = active_vte.row_count().max(1) as u16;
-                            pty_for_init.resize(cols, rows);
+                            // app draws (see sync_active_to_pty doc).
+                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1060,10 +1038,7 @@ impl ReaderCtx {
                             bstate_rc.set(prev_state_rc.get());
                             // Collapse the live VTE back to the compact input cell
                             // now that the alt app has released the viewport.
-                            resize_active();
-                            let cols = active_vte.column_count().max(1) as u16;
-                            let rows = active_vte.row_count().max(1) as u16;
-                            pty_for_init.resize(cols, rows);
+                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             let active_for_idle = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_idle.borrow().grab_focus();
@@ -1106,6 +1081,23 @@ impl ReaderCtx {
             },
         );
     }
+}
+
+/// Run `resize_active` (recompute target rows from layout + state) and then push
+/// the resulting (cols, rows) to the PTY synchronously. Used at state
+/// transitions where the child needs to see a correct winsize on its very first
+/// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
+/// Without the synchronous push the per-frame resize tick would catch up only
+/// on the next frame, racing with the child.
+fn sync_active_to_pty(
+    resize_active: &Rc<dyn Fn()>,
+    vte: &Terminal,
+    pty: &OwnedPty,
+) {
+    resize_active();
+    let cols = vte.column_count().max(1) as u16;
+    let rows = vte.row_count().max(1) as u16;
+    pty.resize(cols, rows);
 }
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
@@ -1567,18 +1559,13 @@ impl TermView {
                 if page <= 1 {
                     return;
                 }
-                // The .block-active holder (block_view/css.rs:220-228) adds
-                // vertical chrome around the VTE: 8px margin + 2px border + 4px
-                // padding = 14px. When alt-screen / RawFallback runs with all
-                // finished blocks hidden, the live cell is the only content; if
-                // we size the VTE to page_size / cell_h, the holder ends up
-                // 14 px taller than page_size and the ScrolledWindow's
-                // pin-to-bottom hides the top ~14 px — clipping the first row
-                // of the alt-screen app (e.g. the topmost "commit <hash>" line
-                // of `git log` paged by less). Subtract the chrome so the
-                // holder TOTAL fits in page_size.
-                const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
-                let usable = (page - BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+                // .block-active wraps the VTE with margin+border+padding; subtract
+                // it from page_size so the holder TOTAL fits — otherwise the live
+                // VTE sized to page_size/cell_h is BLOCK_ACTIVE_VCHROME_PX taller
+                // than page_size and the ScrolledWindow's pin-to-bottom clips the
+                // top row (e.g. the topmost "commit <hash>" line of `git log` paged
+                // by less). See css::BLOCK_ACTIVE_VCHROME_PX for the source rule.
+                let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
                 let viewport_rows = ((usable / cell_h).max(1)) as i64;
                 let cols = vte.column_count().max(1);
                 let target_rows = match bstate.get() {
@@ -1717,6 +1704,44 @@ impl TermView {
             cwd.unwrap_or("").to_string()
         ));
 
+        // CWD updates come from VTE's native OSC 7 signal (the parser passes
+        // OSC 7 through unchanged, see parser.rs). Title updates likewise come
+        // from VTE's window-title-changed (OSC 0/2).
+        {
+            let cwd_cbs = cwd_callbacks.clone();
+            let current_cwd_for_signal = current_cwd.clone();
+            let vte_for_cwd = active_vte.clone();
+            active_vte.connect_current_directory_uri_notify(move |_| {
+                if let Some(uri) = vte_for_cwd.current_directory_uri() {
+                    let file = gtk4::gio::File::for_uri(uri.as_str());
+                    if let Some(path) = file
+                        .path()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty())
+                    {
+                        *current_cwd_for_signal.borrow_mut() = path.clone();
+                        for cb in cwd_cbs.borrow().iter() {
+                            cb(&path);
+                        }
+                    }
+                }
+            });
+        }
+        {
+            let title_cbs = title_callbacks.clone();
+            let vte_for_title = active_vte.clone();
+            active_vte.connect_window_title_changed(move |_| {
+                if let Some(title) = vte_for_title.window_title() {
+                    let title_str = title.to_string();
+                    if !title_str.is_empty() {
+                        for cb in title_cbs.borrow().iter() {
+                            cb(&title_str);
+                        }
+                    }
+                }
+            });
+        }
+
         // ── Wire PTY → parser → block events ─────────────────────────────
         {
             let active_rc = active.clone();
@@ -1731,9 +1756,7 @@ impl TermView {
             let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
-            let cwd_cbs = cwd_callbacks.clone();
             let exited_cbs = exited_callbacks.clone();
-            let title_cbs = title_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
@@ -1782,9 +1805,7 @@ impl TermView {
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
-                cwd_cbs,
                 exited_cbs,
-                title_cbs,
                 activity_cbs,
                 mouse_reporting_rc,
                 config_for_cb,
@@ -2050,29 +2071,71 @@ impl TermView {
             active_vte.add_controller(key_ctrl);
         }
 
-        // Scroll-reporting gate (Warp parity): when the alt-screen app has put
-        // the terminal into a mouse reporting mode, VTE would forward wheel
-        // events to the app. If the user has disabled scroll reporting, swallow
-        // those wheel events in the capture phase so VTE never sees them.
-        if !config.scroll_reporting_enabled {
+        // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
+        // htop). VTE only synthesizes mouse-wheel CSI sequences when it owns the
+        // PTY; ours is fed by our reader, so we synthesize and write the bytes
+        // ourselves. The pointer cell under the cursor is tracked via a motion
+        // controller so the column/row in the report matches what the user sees.
+        //
+        // - alt-screen + mouse mode + scroll_reporting_enabled → encode wheel,
+        //   write to PTY, stop propagation (so block_scroll doesn't also scroll).
+        // - alt-screen + mouse mode + !scroll_reporting_enabled → swallow wheel
+        //   (user has opted out of mouse-driven paging).
+        // - otherwise → let the event bubble to block_scroll for normal scroll.
+        {
+            // Track pointer position over the live VTE in cell coordinates so
+            // wheel events emitted below can include accurate col/row.
+            let pointer_cell: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((1, 1)));
+            {
+                let pointer_for_motion = pointer_cell.clone();
+                let vte_for_motion = active_vte.clone();
+                let motion = gtk4::EventControllerMotion::new();
+                motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
+                motion.connect_motion(move |_, x, y| {
+                    let cw = (vte_for_motion.char_width() as f64).max(1.0);
+                    let ch = (vte_for_motion.char_height() as f64).max(1.0);
+                    let col = (x / cw).floor() as i64 + 1;
+                    let row = (y / ch).floor() as i64 + 1;
+                    pointer_for_motion.set((col.max(1), row.max(1)));
+                });
+                active_vte.add_controller(motion);
+            }
+
             let fullscreen_for_scroll = fullscreen.clone();
             let mouse_mode_for_scroll = mouse_reporting_mode.clone();
+            let scroll_enabled = config.scroll_reporting_enabled;
+            let pty_for_scroll = pty.clone();
+            let pointer_for_scroll = pointer_cell.clone();
             let scroll_ctrl = gtk4::EventControllerScroll::new(
                 gtk4::EventControllerScrollFlags::VERTICAL
                     | gtk4::EventControllerScrollFlags::HORIZONTAL,
             );
             scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            scroll_ctrl.connect_scroll(move |_, _, _| {
-                if fullscreen_for_scroll.get()
-                    && mouse_mode_for_scroll.get() != MouseReportingMode::None
-                {
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                let in_mouse_app = fullscreen_for_scroll.get()
+                    && mouse_mode_for_scroll.get() != MouseReportingMode::None;
+                if !in_mouse_app {
+                    return glib::Propagation::Proceed;
                 }
+                if !scroll_enabled {
+                    return glib::Propagation::Stop;
+                }
+                let (col, row) = pointer_for_scroll.get();
+                if let Some(bytes) =
+                    encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
+                {
+                    pty_for_scroll.write_bytes(&bytes);
+                }
+                glib::Propagation::Stop
             });
             active_vte.add_controller(scroll_ctrl);
         }
+
+        let cross_selection = CrossSelection::install(
+            &block_scroll,
+            finished_blocks_rc.clone(),
+            active_vte.clone(),
+        );
 
         let term_view = TermView {
             root,
@@ -2107,6 +2170,7 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
+            cross_selection,
         };
 
         // Load history if configured
@@ -2314,6 +2378,20 @@ impl TermView {
                 log::debug!(
                     ">>> TermView copy: copied whole block {} ({} chars)",
                     sel_id,
+                    text.len()
+                );
+                self.active_vte.clipboard().set_text(&text);
+                return;
+            }
+        }
+
+        // (0.5) Cross-block drag: if more than one VTE has a selection (the
+        // user dragged across block boundaries, see cross_selection.rs), copy
+        // the concatenated text in widget order instead of just one widget's.
+        if self.cross_selection.has_cross_selection() {
+            if let Some(text) = self.cross_selection.copy_text() {
+                log::debug!(
+                    ">>> TermView copy: got {} chars from cross-block selection",
                     text.len()
                 );
                 self.active_vte.clipboard().set_text(&text);

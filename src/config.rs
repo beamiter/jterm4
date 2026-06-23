@@ -192,6 +192,13 @@ pub struct Config {
     pub(crate) scroll_reporting_enabled: bool,
     /// Forward window focus in/out (CSI ?1004) events to apps.
     pub(crate) focus_reporting_enabled: bool,
+    /// Block mode only: keep the live VTE's buffer + scrollback across commands
+    /// (default `false` resets it on each PromptStart). When `true`, the user
+    /// can PageUp inside the live cell to see the previous command's output
+    /// tail — mirroring a traditional VTE. Trade-off: prompts may visually
+    /// abut the previous command's last line, and finished blocks already
+    /// preserve the same content above so there's redundant display.
+    pub(crate) preserve_live_scrollback: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +397,7 @@ struct FileConfig {
     mouse_reporting_enabled: Option<bool>,
     scroll_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
+    preserve_live_scrollback: Option<bool>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -441,6 +449,7 @@ fn load_file_config() -> FileConfig {
         mouse_reporting_enabled: table.get("mouse_reporting_enabled").and_then(|v| v.as_bool()),
         scroll_reporting_enabled: table.get("scroll_reporting_enabled").and_then(|v| v.as_bool()),
         focus_reporting_enabled: table.get("focus_reporting_enabled").and_then(|v| v.as_bool()),
+        preserve_live_scrollback: table.get("preserve_live_scrollback").and_then(|v| v.as_bool()),
     }
 }
 
@@ -639,6 +648,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
+        preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();

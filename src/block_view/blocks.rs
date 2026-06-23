@@ -932,9 +932,20 @@ impl ActiveBlock {
     /// Reset the live VTE for the next prompt (jterm1 block.rs:1028-1044). `reset`
     /// acts immediately, but already-queued feed() bytes are processed async, so the
     /// in-stream clear (fed after them) wipes stale output in the correct order.
-    pub(crate) fn reset_active(&self) {
-        self.active_vte.reset(true, true);
-        self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+    ///
+    /// `preserve_scrollback`: when true, keep the VTE's buffer + scrollback intact
+    /// (only the accumulated raw_output snapshot for the *next* block is cleared,
+    /// and SGR state is soft-reset). This mirrors a traditional VTE where PageUp
+    /// at a prompt reveals the previous command's output tail. The default (false)
+    /// wipes the live VTE on every PromptStart, since the finished blocks above
+    /// already hold the authoritative scrollback.
+    pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
+        if preserve_scrollback {
+            self.active_vte.feed(b"\x1b[0m");
+        } else {
+            self.active_vte.reset(true, true);
+            self.active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        }
         self.raw_output.borrow_mut().clear();
     }
 

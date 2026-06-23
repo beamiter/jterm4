@@ -3,6 +3,15 @@ use gtk4::gdk::RGBA;
 use std::cell::RefCell;
 use crate::config::Config;
 
+/// Vertical chrome the `.block-active` holder adds around the live VTE:
+/// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
+/// 2px top padding + 2px bottom padding = 14px.
+///
+/// Used by `update_input_height` to subtract this from the visible page size
+/// before computing how many VTE rows fit. Must stay in sync with the
+/// `.block-active` rule below; if the margin/border/padding here changes,
+/// update this constant too.
+pub(crate) const BLOCK_ACTIVE_VCHROME_PX: i32 = 14;
 
 pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     format!(

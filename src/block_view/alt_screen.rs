@@ -29,6 +29,87 @@ pub(crate) enum MouseReportingMode {
     Sgr,
 }
 
+/// Encode a wheel-scroll event as a mouse-reporting byte sequence appropriate
+/// for `mode`. Returns `None` if the mode has no wheel reporting (e.g. `None`,
+/// or a mode where wheel deltas don't translate).
+///
+/// `delta_y` follows the GTK convention (negative = up, positive = down).
+/// `col` / `row` are 1-based cell coordinates under the pointer; if you don't
+/// have them, pass 1/1 — pagers (less/vim) look at the button code, not the
+/// coordinate.
+///
+/// VTE 4 normally encodes wheel events itself, but only when it owns the PTY;
+/// jterm4's live VTE is fed by our own reader so we synthesize the bytes here.
+pub(crate) fn encode_mouse_wheel(
+    mode: MouseReportingMode,
+    delta_y: f64,
+    col: i64,
+    row: i64,
+) -> Option<Vec<u8>> {
+    if delta_y == 0.0 {
+        return None;
+    }
+    // Buttons per xterm: 64 = wheel up, 65 = wheel down.
+    let button: u32 = if delta_y < 0.0 { 64 } else { 65 };
+    let c = col.max(1);
+    let r = row.max(1);
+    match mode {
+        MouseReportingMode::None => None,
+        MouseReportingMode::Sgr => {
+            Some(format!("\x1b[<{};{};{}M", button, c, r).into_bytes())
+        }
+        // X10-style modes encode each field as `value + 32` in a single byte.
+        // Wheel reporting requires at least Button-event tracking (1002), but
+        // xterm's de-facto behavior also forwards wheel under plain Click
+        // (1000), so we emit for any non-None, non-SGR mode.
+        MouseReportingMode::Click
+        | MouseReportingMode::Button
+        | MouseReportingMode::Motion => {
+            // Clamp to the legacy 223-column limit (255 - 32).
+            let cb = (button + 32).min(255) as u8;
+            let cc = (c as u32 + 32).min(255) as u8;
+            let cr = (r as u32 + 32).min(255) as u8;
+            Some(vec![0x1b, b'[', b'M', cb, cc, cr])
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgr_wheel_up_encodes_button_64() {
+        // delta_y < 0 → wheel up → button 64 (xterm convention).
+        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, -1.0, 10, 5).unwrap();
+        assert_eq!(seq, b"\x1b[<64;10;5M");
+    }
+
+    #[test]
+    fn sgr_wheel_down_encodes_button_65() {
+        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, 1.0, 1, 1).unwrap();
+        assert_eq!(seq, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn x10_wheel_up_uses_value_plus_32() {
+        // Legacy mode: each field encoded as byte = value + 32.
+        let seq = encode_mouse_wheel(MouseReportingMode::Button, -1.0, 1, 1).unwrap();
+        assert_eq!(seq, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
+    }
+
+    #[test]
+    fn none_mode_returns_no_bytes() {
+        assert!(encode_mouse_wheel(MouseReportingMode::None, -1.0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn zero_delta_returns_no_bytes() {
+        // Spurious 0 delta from GTK shouldn't paginate the app.
+        assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+    }
+}
+
 // ─── VTE builder ─────────────────────────────────────────────────────────────
 
 /// Apply colors + font + font scale from `config` onto an existing Terminal.

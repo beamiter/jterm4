@@ -11,15 +11,13 @@ pub enum ParserEvent {
     CommandStart,
     /// OSC 133 ;D;<code> — command finished with exit code.
     CommandEnd(i32),
-    /// OSC 7 — shell reported new CWD.
-    CwdUpdate(String),
-    /// OSC 0 / OSC 2 — window title set by the application.
-    TitleUpdate(String),
     /// CSI ? 1049 h — alt screen entered (vim, less, etc.)
     AltScreenEnter,
     /// CSI ? 1049 l — alt screen left.
     AltScreenLeave,
     /// OSC 52 — application set clipboard content.
+    /// VTE 4 does not expose an OSC 52 "application-set" hook (only user paste),
+    /// so this remains hand-parsed instead of routed through a VTE signal.
     ClipboardSet(String),
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
@@ -342,21 +340,9 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // OSC 7 ; file://host/path — CWD update (path is percent-encoded per RFC 3986).
-    if let Some(rest) = s.strip_prefix("7;") {
-        let raw = if let Some(uri) = rest.strip_prefix("file://") {
-            if let Some(idx) = uri.find('/') { &uri[idx..] } else { uri }
-        } else {
-            rest
-        };
-        let path = percent_decode(raw);
-        if !path.is_empty() {
-            events.push(ParserEvent::CwdUpdate(path));
-        }
-        return;
-    }
-
-    // OSC 52 ; <selection> ; <base64-data> — clipboard set
+    // OSC 52 ; <selection> ; <base64-data> — clipboard set.
+    // VTE doesn't expose an OSC 52 application-set hook, so we hand-parse and
+    // route to the system clipboard ourselves.
     if let Some(rest) = s.strip_prefix("52;") {
         if let Some(data_start) = rest.find(';') {
             let b64_data = &rest[data_start + 1..];
@@ -371,45 +357,16 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // OSC 0 ; <title> (icon + window title) and OSC 2 ; <title> (window title).
-    // OSC 1 sets only the icon name, which we don't surface, so it's left to the
-    // pass-through path below. Emitting a semantic event here lets the reader drop
-    // its hand-rolled title byte-scan.
-    if let Some(rest) = s.strip_prefix("0;").or_else(|| s.strip_prefix("2;")) {
-        events.push(ParserEvent::TitleUpdate(rest.to_string()));
-        return;
-    }
-
-    // All other OSC sequences: reconstruct and pass through
+    // OSC 7 (cwd), OSC 0 / 1 / 2 (title/icon), and everything else: pass through
+    // unchanged. VTE consumes them natively and fires
+    // current-directory-uri-notify / window-title-changed signals, which the
+    // block_view subscribes to instead of re-parsing here.
     let mut bytes = Vec::with_capacity(payload.len() + 4);
     bytes.push(0x1b);
     bytes.push(b']');
     bytes.extend_from_slice(payload);
     bytes.push(0x07);
     events.push(ParserEvent::Bytes(bytes));
-}
-
-/// Percent-decode an OSC 7 path (e.g. "/home/me/My%20Docs" → "/home/me/My Docs").
-/// Decoded bytes are interpreted as UTF-8; invalid sequences fall back to the
-/// raw input unchanged.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }
 
 fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
@@ -548,27 +505,26 @@ mod tests {
     }
 
     #[test]
-    fn osc7_cwd_update() {
+    fn osc7_cwd_passes_through_to_vte() {
+        // OSC 7 is consumed by VTE natively (current-directory-uri-notify);
+        // the parser must NOT swallow it — VTE never sees it otherwise.
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b]7;file://host/home/me/dir\x07", &mut events);
-        let cwd = events.iter().find_map(|e| match e {
-            ParserEvent::CwdUpdate(s) => Some(s.as_str()),
-            _ => None,
-        });
-        assert_eq!(cwd, Some("/home/me/dir"));
+        let input = b"\x1b]7;file://host/home/me/dir\x07";
+        p.feed(input, &mut events);
+        let bytes = collect_bytes(&events);
+        assert_eq!(bytes, input, "OSC 7 must reach VTE verbatim");
     }
 
     #[test]
-    fn osc2_title_update() {
+    fn osc2_title_passes_through_to_vte() {
+        // Same as OSC 7: VTE's window-title-changed signal handles it.
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b]2;my title\x07", &mut events);
-        let title = events.iter().find_map(|e| match e {
-            ParserEvent::TitleUpdate(s) => Some(s.as_str()),
-            _ => None,
-        });
-        assert_eq!(title, Some("my title"));
+        let input = b"\x1b]2;my title\x07";
+        p.feed(input, &mut events);
+        let bytes = collect_bytes(&events);
+        assert_eq!(bytes, input);
     }
 
     #[test]
