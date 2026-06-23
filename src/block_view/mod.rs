@@ -39,27 +39,6 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Rebuild raw PTY output into a CRLF-terminated string suitable for feeding a
-/// finished VTE widget.
-///
-/// Why: PTY ONLCR delivers `\r\n` from the child, but Rust's `lines()` strips
-/// both `\n` and `\r\n`. If we push back only `\n`, VTE (LNM off by default)
-/// moves the cursor down without returning to column 0, scattering tabular
-/// output like `ls`. Within each line, an in-line `\r` is treated as an
-/// overwrite — keep only what follows the last `\r`.
-pub(crate) fn reconstruct_finished_output(raw: &str) -> String {
-    let mut result = String::new();
-    for line in raw.lines() {
-        if let Some(pos) = line.rfind('\r') {
-            result.push_str(&line[pos + 1..]);
-        } else {
-            result.push_str(line);
-        }
-        result.push_str("\r\n");
-    }
-    result.trim().to_string()
-}
-
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
@@ -385,9 +364,9 @@ pub struct TermView {
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
     prompt_buf: Rc<RefCell<String>>,
-    cmd_buf: Rc<RefCell<String>>,
-    /// Command line reconstructed from VTE `commit` keystrokes while awaiting a
-    /// command — the source the finalize path styles into the finished block.
+    /// Keystroke shadow used only to size the idle input cell (line count). The
+    /// authoritative finished-command text is read off the live VTE at
+    /// CommandStart, so this never has to round-trip to display.
     typed_cmd: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Rc<Cell<bool>>,
@@ -420,12 +399,6 @@ pub struct TermView {
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
-    /// When `Some(rows)`, the resize tick uses `rows` for PTY winsize instead
-    /// of `vte.row_count()`. Set on CommandStart to viewport rows so launched
-    /// programs (notably `top`, which queries TIOCGWINSZ before painting) see
-    /// the full viewport on their very first read; cleared on CommandEnd so
-    /// idle prompt sizing returns to following the compact input cell.
-    pty_rows_override: Rc<Cell<Option<u16>>>,
 }
 
 impl Drop for TermView {
@@ -447,13 +420,15 @@ struct ReaderCtx {
     prev_state_rc: Rc<Cell<BlockState>>,
     osc133_depth_rc: Rc<Cell<u32>>,
     prompt_buf_rc: Rc<RefCell<String>>,
-    cmd_buf_rc: Rc<RefCell<String>>,
-    /// Keystroke-reconstructed command line (built in connect_commit).
+    /// Keystroke-shadow input line, used only as a fallback if the VTE-text
+    /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
-    /// Sticky-invalid flag for typed_cmd_rc: set when an escape sequence
-    /// (arrow keys, etc.) was seen during the current AwaitingCommand window.
-    /// When set, finalize must ignore typed_cmd_rc and use cmd_buf scraping.
-    typed_cmd_invalid_rc: Rc<Cell<bool>>,
+    /// Command text read from the live VTE at CommandStart; primary source
+    /// for the finished block.
+    vte_typed_cmd_rc: Rc<RefCell<String>>,
+    /// VTE cursor position (col, row) captured at PromptEnd; the start anchor
+    /// for the text-range read that produces `vte_typed_cmd_rc`.
+    prompt_end_pos_rc: Rc<Cell<(i64, i64)>>,
     /// Rendered prompt (last non-empty line) captured at PromptEnd, used by the
     /// finalize path since prompt_buf is cleared once the prompt ends.
     prompt_display_rc: Rc<RefCell<String>>,
@@ -485,20 +460,11 @@ struct ReaderCtx {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
-    /// Re-runs the input-cell sizing (`update_input_height`). Called at
-    /// alt-screen enter/leave so the live VTE is driven to the full viewport
-    /// (or back to compact) synchronously on the transition, instead of waiting
-    /// for the alt app's first `contents_changed` — which would otherwise let
-    /// the app start drawing into the 6-row idle cell before the grid grows.
+    /// Re-runs the input-cell sizing (`update_input_height`). Called at every
+    /// FTCS state transition so the live VTE switches between compact (idle)
+    /// and viewport (running / alt-screen) deterministically — without waiting
+    /// for the next `contents_changed` to race with the child's first draw.
     resize_active: Rc<dyn Fn()>,
-    /// PTY-rows override used by the resize tick. We set it on CommandStart so
-    /// `top` (and any other program that queries TIOCGWINSZ before painting)
-    /// sees the full viewport rows on its very first read, not the compact
-    /// input-cell rows. Cleared on CommandEnd.
-    pty_rows_override: Rc<Cell<Option<u16>>>,
-    /// Absolute VTE scrollback row captured at CommandStart. Read by the
-    /// live-cell sizing code to compute rows produced *by this command*.
-    collecting_start_row: Rc<Cell<i64>>,
 }
 
 impl ReaderCtx {
@@ -510,9 +476,9 @@ impl ReaderCtx {
             prev_state_rc,
             osc133_depth_rc,
             prompt_buf_rc,
-            cmd_buf_rc,
             typed_cmd_rc,
-            typed_cmd_invalid_rc,
+            vte_typed_cmd_rc,
+            prompt_end_pos_rc,
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
@@ -543,8 +509,6 @@ impl ReaderCtx {
             cmd_running_rc,
             running_cmd_rc,
             resize_active,
-            pty_rows_override,
-            collecting_start_row,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -585,8 +549,9 @@ impl ReaderCtx {
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                 }
                                 BlockState::AwaitingCommand => {
-                                    let text = String::from_utf8_lossy(bytes);
-                                    cmd_buf_rc.borrow_mut().push_str(&text);
+                                    // The command text is read off the live VTE
+                                    // at CommandStart (`text_range_format`), so
+                                    // no shadow accumulation is needed here.
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                 }
                                 BlockState::CollectingOutput | BlockState::PostCommand => {
@@ -622,25 +587,17 @@ impl ReaderCtx {
                             }
                             // Finalize the previous command (deferred from CommandEnd).
                             if state == BlockState::PostCommand {
-                                // Command: prefer the keystroke-reconstructed line,
-                                // fall back to scraping the last echoed line.
-                                // If the reconstruction is invalidated (escape
-                                // sequence seen, e.g. rsh autosuggestion accept),
-                                // always use the scrape.
-                                let typed = if typed_cmd_invalid_rc.get() {
-                                    String::new()
+                                // The VTE-text capture taken at CommandStart is
+                                // authoritative — it reflects what was on screen
+                                // when the user pressed Enter. Fall back to the
+                                // keystroke shadow only if the VTE read came back
+                                // empty (which would indicate the prompt-end
+                                // anchor never captured a valid cursor position).
+                                let vte_cmd = vte_typed_cmd_rc.borrow().trim().to_string();
+                                let cmd = if !vte_cmd.is_empty() {
+                                    vte_cmd
                                 } else {
                                     typed_cmd_rc.borrow().trim().to_string()
-                                };
-                                let cmd = if !typed.is_empty() {
-                                    typed
-                                } else {
-                                    strip_ansi(&cmd_buf_rc.borrow())
-                                        .lines()
-                                        .next_back()
-                                        .unwrap_or("")
-                                        .trim()
-                                        .to_string()
                                 };
 
                                 if cmd.is_empty() {
@@ -654,9 +611,14 @@ impl ReaderCtx {
 
                                 let prompt = prompt_display_rc.borrow().clone();
 
-                                let raw_output_text = active_rc.borrow().output_text();
-
-                                let output_with_ansi = reconstruct_finished_output(&raw_output_text);
+                                // The raw bytes already carry CRLF — the PTY's
+                                // ONLCR turns `\n` into `\r\n` on the master side
+                                // before we ever see them — and the finished VTE
+                                // handles in-line CR overwrites natively, just
+                                // like the live VTE did while the command ran. So
+                                // we feed the captured bytes verbatim, with no
+                                // reconstruction pass.
+                                let output_with_ansi = active_rc.borrow().output_text();
 
                                 let output_plain = strip_ansi(&output_with_ansi).to_string();
 
@@ -750,6 +712,7 @@ impl ReaderCtx {
                                 let finished_widget = finished_clone.widget().clone();
 
                                 finished_clone.connect_actions(&active_vte, &pty_for_init, &pty_synced_rc, &active_rc);
+                                finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
 
@@ -923,6 +886,14 @@ impl ReaderCtx {
                             }
                             bstate_rc.set(BlockState::CollectingPrompt);
                             prompt_buf_rc.borrow_mut().clear();
+                            // Live VTE collapses back to the compact input cell
+                            // now that no command is running. Sync the PTY size
+                            // so the shell sees the new winsize before it reads
+                            // anything past the prompt.
+                            resize_active();
+                            let cols = active_vte.column_count().max(1) as u16;
+                            let rows = active_vte.row_count().max(1) as u16;
+                            pty_for_init.resize(cols, rows);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -944,9 +915,15 @@ impl ReaderCtx {
                             };
                             *prompt_display_rc.borrow_mut() = prompt_line;
                             prompt_buf_rc.borrow_mut().clear();
-                            cmd_buf_rc.borrow_mut().clear();
                             typed_cmd_rc.borrow_mut().clear();
-                            typed_cmd_invalid_rc.set(false);
+                            vte_typed_cmd_rc.borrow_mut().clear();
+                            // Snapshot the live VTE cursor at the moment the
+                            // prompt finishes drawing — this is where the user's
+                            // command starts. CommandStart will read text from
+                            // here to the cursor's then-position to recover the
+                            // command as it really appeared on screen.
+                            let (col, row) = active_vte.cursor_position();
+                            prompt_end_pos_rc.set((col, row));
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
 
@@ -973,37 +950,42 @@ impl ReaderCtx {
                             osc133_depth_rc.set(0);
                             active_rc.borrow().reset_output_buffer();
                             block_start_time_for_cb.set(Some(SystemTime::now()));
-                            // Capture the command text for the sticky running-header.
-                            *running_cmd_rc.borrow_mut() = typed_cmd_rc.borrow().trim().to_string();
+                            // Read the typed command directly off the live VTE,
+                            // not from a shadow keystroke buffer. The VTE shows
+                            // what the user actually saw — including history
+                            // recalls and rsh autosuggestion accepts — so what we
+                            // capture here is faithful to the run. Range goes
+                            // from the cursor position captured at PromptEnd to
+                            // the current cursor position (right before the
+                            // shell echoes a newline and starts the command).
+                            let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
+                            let (start_col, start_row) = prompt_end_pos_rc.get();
+                            let cmd_from_vte = active_vte
+                                .text_range_format(
+                                    vte4::Format::Text,
+                                    start_row,
+                                    start_col,
+                                    cmd_end_row,
+                                    cmd_end_col,
+                                )
+                                .0
+                                .map(|gs| gs.to_string())
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            *vte_typed_cmd_rc.borrow_mut() = cmd_from_vte.clone();
+                            *running_cmd_rc.borrow_mut() = cmd_from_vte;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
-                            // Decouple PTY rows from the compact input-cell rows
-                            // for the duration of this command. Programs that
-                            // query TIOCGWINSZ before painting (e.g. `top`) must
-                            // see the full viewport on their first read, not
-                            // the ~6-row idle cell. Set an override that the
-                            // resize tick honors instead of vte.row_count(),
-                            // and push TIOCSWINSZ synchronously now so the
-                            // child has the right size before its first read.
-                            let cell_h = (active_vte.char_height() as i32).max(1);
-                            let page = block_scroll_rc.vadjustment().page_size() as i32;
-                            if page > 1 {
-                                // Match update_input_height's chrome-adjusted
-                                // calculation so the PTY rows reported to the
-                                // child equal the VTE alt-buffer row count.
-                                let usable = (page - 14).max(cell_h);
-                                let viewport_rows = ((usable / cell_h).max(1)) as u16;
-                                let cols = active_vte.column_count().max(1) as u16;
-                                pty_rows_override.set(Some(viewport_rows));
-                                pty_for_init.resize(cols, viewport_rows);
-                            }
-                            // Anchor the live-cell sizing computation. Output
-                            // rows during this command = cursor_position().1 -
-                            // collecting_start_row + 1. We capture *before* any
-                            // output bytes are processed so the first measured
-                            // row count is 1, not whatever absolute scrollback
-                            // row the prior idle prompt left behind.
-                            collecting_start_row.set(active_vte.cursor_position().1);
+                            // Snap the live VTE to viewport rows immediately so
+                            // the child sees a real-terminal-shaped grid on its
+                            // very first read. The resize_tick would mirror this
+                            // onto the PTY on the next frame, but `top` queries
+                            // TIOCGWINSZ before painting, so push synchronously.
+                            resize_active();
+                            let cols = active_vte.column_count().max(1) as u16;
+                            let rows = active_vte.row_count().max(1) as u16;
+                            pty_for_init.resize(cols, rows);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1027,15 +1009,6 @@ impl ReaderCtx {
                             pending_exit_code_rc.set(*code);
                             cmd_running_rc.set(false);
                             bstate_rc.set(BlockState::PostCommand);
-                            // Release the PTY-rows override so the resize tick
-                            // resumes mirroring vte.row_count() (the compact
-                            // idle input cell). Push TIOCSWINSZ now so the
-                            // shell sees the new size before reading the next
-                            // prompt.
-                            pty_rows_override.set(None);
-                            let cols = active_vte.column_count().max(1) as u16;
-                            let rows = active_vte.row_count().max(1) as u16;
-                            pty_for_init.resize(cols, rows);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1064,27 +1037,13 @@ impl ReaderCtx {
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
-                            // Grow the live VTE to the full viewport *before* the
-                            // app draws, so it queries the right size right away.
+                            // Grow the live VTE to the full viewport before the
+                            // app draws and push TIOCSWINSZ synchronously so the
+                            // child sees the right size on its first read.
                             resize_active();
-                            // Sync PTY winsize to the full viewport rows
-                            // synchronously. The tick_callback that mirrors
-                            // vte.row_count() onto the PTY only fires on the
-                            // next frame (after GTK lays out the grown holder);
-                            // until then `top` keeps its startup-time compact
-                            // rows and paints only a few lines into the alt
-                            // buffer. Pushing TIOCSWINSZ here delivers SIGWINCH
-                            // immediately so the app redraws full-screen.
-                            let cell_h = (active_vte.char_height() as i32).max(1);
-                            let page = block_scroll_rc.vadjustment().page_size() as i32;
-                            if page > 1 {
-                                // Match update_input_height's chrome-adjusted
-                                // calculation (see comment there).
-                                let usable = (page - 14).max(cell_h);
-                                let viewport_rows = ((usable / cell_h).max(1)) as u16;
-                                let cols = active_vte.column_count().max(1) as u16;
-                                pty_for_init.resize(cols, viewport_rows);
-                            }
+                            let cols = active_vte.column_count().max(1) as u16;
+                            let rows = active_vte.row_count().max(1) as u16;
+                            pty_for_init.resize(cols, rows);
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1102,6 +1061,9 @@ impl ReaderCtx {
                             // Collapse the live VTE back to the compact input cell
                             // now that the alt app has released the viewport.
                             resize_active();
+                            let cols = active_vte.column_count().max(1) as u16;
+                            let rows = active_vte.row_count().max(1) as u16;
+                            pty_for_init.resize(cols, rows);
                             let active_for_idle = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_idle.borrow().grab_focus();
@@ -1565,25 +1527,18 @@ impl TermView {
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
 
-        // Command line reconstructed from VTE commit keystrokes; also drives the
-        // idle input-cell height (line count), so it is declared before the
-        // sizing closure below.
+        // Keystroke-shadow command line; kept only to drive the idle input-cell
+        // height (newline count). The authoritative command text is read off the
+        // VTE at CommandStart, so this shadow is no longer load-bearing — it
+        // does not need to match the rendered line in edge cases.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        // Sticky flag: any escape sequence (arrows / Home / End / F-keys ...) in
-        // the current AwaitingCommand window invalidates the keystroke
-        // reconstruction — the shell may rewrite the visible line in ways we
-        // cannot replay (rsh's Right-arrow "accept autosuggestion" is the
-        // motivating case). When set, finalize ignores typed_cmd and scrapes
-        // the actually-echoed line from cmd_buf instead. Reset at PromptEnd.
-        let typed_cmd_invalid: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
-        // Absolute VTE scrollback row at the moment CollectingOutput started.
-        // Used by the live-cell sizing logic to compute "rows produced *by this
-        // command*" from `cursor_position().1 - start_row + 1`. We must NOT use
-        // the absolute cursor row directly: it climbs without bound across the
-        // session and would make a fresh command instantly request thousands of
-        // rows of empty allocation, pushing actual output off-screen.
-        let collecting_start_row: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+        // Command text snapshot taken at CommandStart from the VTE itself,
+        // between `prompt_end_pos` and the current cursor. This is what
+        // finalize uses to record the run.
+        let vte_typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        // VTE cursor position (col, row) right after the prompt finished
+        // drawing — anchor for the text-range read at CommandStart.
+        let prompt_end_pos: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
 
         // Scroll-lock flags shared across the contents_changed pin, value_changed
         // detector, FAB, and ScrollDebouncer. `user_scrolled_up` suppresses the
@@ -1606,7 +1561,6 @@ impl TermView {
             let scroll = block_scroll.clone();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
-            let collecting_start_row = collecting_start_row.clone();
             Rc::new(move || {
                 let cell_h = (vte.char_height() as i32).max(1);
                 let page = scroll.vadjustment().page_size() as i32;
@@ -1628,42 +1582,20 @@ impl TermView {
                 let viewport_rows = ((usable / cell_h).max(1)) as i64;
                 let cols = vte.column_count().max(1);
                 let target_rows = match bstate.get() {
-                    // Full-screen apps & non-OSC133 shells behave like a normal
-                    // terminal: give them the whole viewport.
-                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
-                    // Running / draining a command: grow the live block with
-                    // streaming output (cargo build, apt update, …). PTY rows
-                    // are pinned to viewport via `pty_rows_override` set at
-                    // CommandStart, so the child never sees these visual rows
-                    // and gets no SIGWINCH per chunk. Monotonic — never shrink
-                    // mid-command — to avoid grow/shrink jitter as the cursor
-                    // moves within already-emitted rows (CR/up-line progress
-                    // bars). Capped at `viewport_rows`: once the live cell
-                    // fills the visible area we freeze it and let VTE's own
-                    // scrollback handle further rolling — exactly how a normal
-                    // terminal (terminator/xterm) behaves. Past the cap there
-                    // is nothing more to show in the viewport anyway, and
-                    // growing the holder further only burns layout/scroll
-                    // work per chunk. Output continues into VTE scrollback
-                    // and is captured in full for the finished-block snapshot.
-                    //
-                    // We compute rows *relative to* `collecting_start_row` (the
-                    // absolute scrollback row at CommandStart). The raw cursor
-                    // row climbs without bound across the session, so using it
-                    // directly would size a fresh command's cell to thousands
-                    // of empty rows on the first frame.
-                    BlockState::CollectingOutput | BlockState::PostCommand => {
-                        let cursor_now = vte.cursor_position().1;
-                        let start = collecting_start_row.get();
-                        let output_rows = (cursor_now - start + 1).max(1);
-                        let prev = vte.row_count();
-                        output_rows.max(prev).min(viewport_rows)
-                    }
-                    // Idle: size to the typed command's line count (1 + newlines),
-                    // clamped to a usable minimum. We must NOT use the VTE cursor
-                    // row: cursor_position().1 is the ABSOLUTE scrollback row, which
-                    // climbs without bound as content accumulates and triggers a
-                    // grow→redraw→grow runaway that fills the viewport.
+                    // A real terminal's grid is the viewport, always. While a
+                    // command is running, while an alt-screen app owns the
+                    // screen, or while we fall back to raw VTE (no OSC-133),
+                    // we keep the live VTE pinned to the full viewport — the
+                    // child sees a stable winsize, old rows scroll into VTE's
+                    // own scrollback, and there is no per-chunk grid resize.
+                    BlockState::CollectingOutput
+                    | BlockState::PostCommand
+                    | BlockState::AltScreen
+                    | BlockState::RawFallback => viewport_rows,
+                    // Between prompts the live cell collapses to fit the
+                    // typed command (warp-style compact input). Must NOT use
+                    // cursor_position().1 here: it's the absolute scrollback
+                    // row and climbs without bound across the session.
                     BlockState::Idle
                     | BlockState::CollectingPrompt
                     | BlockState::AwaitingCommand => {
@@ -1736,7 +1668,6 @@ impl TermView {
         let prev_state: Rc<Cell<BlockState>> = Rc::new(Cell::new(BlockState::Idle));
         let osc133_depth: Rc<Cell<u32>> = Rc::new(Cell::new(0));
         let prompt_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cmd_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // Rendered prompt captured at PromptEnd (prompt_buf is cleared once the
         // prompt ends, so the finalize path reads this instead).
         let prompt_display: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
@@ -1777,7 +1708,6 @@ impl TermView {
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let running_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         let block_start_time: Rc<Cell<Option<SystemTime>>> = Rc::new(Cell::new(None));
-        let pty_rows_override: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
         let visible_indices: Rc<RefCell<std::collections::HashSet<usize>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
@@ -1795,8 +1725,9 @@ impl TermView {
             let prev_state_rc = prev_state.clone();
             let osc133_depth_rc = osc133_depth.clone();
             let prompt_buf_rc = prompt_buf.clone();
-            let cmd_buf_rc = cmd_buf.clone();
             let typed_cmd_rc = typed_cmd.clone();
+            let vte_typed_cmd_rc = vte_typed_cmd.clone();
+            let prompt_end_pos_rc = prompt_end_pos.clone();
             let prompt_display_rc = prompt_display.clone();
             let block_list_rc = block_list.clone();
             let block_scroll_rc = block_scroll.clone();
@@ -1845,9 +1776,9 @@ impl TermView {
                 prev_state_rc,
                 osc133_depth_rc,
                 prompt_buf_rc,
-                cmd_buf_rc,
                 typed_cmd_rc,
-                typed_cmd_invalid_rc: typed_cmd_invalid.clone(),
+                vte_typed_cmd_rc,
+                prompt_end_pos_rc,
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
@@ -1878,8 +1809,6 @@ impl TermView {
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 resize_active: update_input_height.clone(),
-                pty_rows_override: pty_rows_override.clone(),
-                collecting_start_row: collecting_start_row.clone(),
             }
             .install(&pty);
         }
@@ -2066,35 +1995,24 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
-            let typed_cmd_invalid_for_commit = typed_cmd_invalid.clone();
             active_vte.connect_commit(move |_, text, _size| {
                 pty_for_commit.write_bytes(text.as_bytes());
+                // The finished-block command text comes from a live-VTE
+                // text_range read at CommandStart (see PromptEnd / CommandStart
+                // handlers), so this shadow buffer is only used to size the
+                // input cell while idle (line count). We do not need to track
+                // escape sequences or replay deletes — newline count is what
+                // drives `update_input_height`.
                 if bstate_for_commit.get() == BlockState::AwaitingCommand {
                     let mut cmd = typed_cmd_for_commit.borrow_mut();
-                    // Any escape sequence (arrows / Home / End / F-keys ...) means
-                    // the shell may rewrite the visible line in ways we cannot
-                    // reconstruct from keystrokes alone — most notably rsh's
-                    // Right-arrow "accept autosuggestion". Set the sticky-invalid
-                    // flag so finalize ignores typed_cmd entirely and scrapes the
-                    // actually-echoed cmd_buf line. Flag is reset at PromptEnd.
-                    if text.as_bytes().contains(&0x1b) {
-                        typed_cmd_invalid_for_commit.set(true);
-                        cmd.clear();
-                        return;
-                    }
-                    if typed_cmd_invalid_for_commit.get() {
-                        // Once invalidated, don't bother accumulating further
-                        // keystrokes — they would be merged with the scraped
-                        // line at finalize and produce garbage.
-                        return;
-                    }
                     for ch in text.chars() {
                         if ch == '\r' || ch == '\n' {
-                            // Submit — leave the reconstructed line intact for finalize.
+                            // Submitted — leave whatever is in the buffer; it
+                            // is cleared at PromptEnd for the next prompt.
                         } else if ch == '\x7f' || ch == '\x08' {
                             cmd.pop();
                         } else if (ch as u32) < 0x20 {
-                            // Control bytes (Tab, Ctrl-*): ignore.
+                            // Control bytes: ignore.
                         } else {
                             cmd.push(ch);
                         }
@@ -2164,7 +2082,6 @@ impl TermView {
             active,
             bstate,
             prompt_buf,
-            cmd_buf,
             typed_cmd,
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
@@ -2190,7 +2107,6 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
-            pty_rows_override,
         };
 
         // Load history if configured
@@ -2222,6 +2138,7 @@ impl TermView {
                 );
                 finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
                 finished.connect_actions(&term_view.active_vte, &term_view.pty, &pty_synced, &term_view.active);
+                finished.connect_scroll_forwarding(&term_view.block_scroll);
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
         }
@@ -2313,18 +2230,16 @@ impl TermView {
     /// Keep the PTY grid in sync with the live VTE (jterm1 model). The VTE
     /// re-derives its own column/row count from its allocation on every
     /// size_allocate, so we just mirror that onto the PTY whenever it changes —
-    /// no pixel math, no chrome calibration.
-    ///
-    /// Exception: when `pty_rows_override` is Some, that value wins for the
-    /// PTY rows axis. This lets a running command see the full viewport in
-    /// TIOCGWINSZ even though the live VTE cell is visually compact.
+    /// no pixel math, no chrome calibration. State-driven sizing (compact
+    /// when idle, viewport when running) is handled in `update_input_height`,
+    /// and FTCS transitions push TIOCSWINSZ synchronously from the reader so
+    /// the child never sees a stale winsize on its first read.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
-        let override_rc = self.pty_rows_override.clone();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
             let cols = vte.column_count() as u16;
-            let rows = override_rc.get().unwrap_or(vte.row_count() as u16);
+            let rows = vte.row_count() as u16;
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
                 pty_for_resize.resize(cols, rows);
@@ -3085,67 +3000,7 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{reconstruct_finished_output, strip_ansi, strip_ansi_with_clear_detect};
-
-    // ── reconstruct_finished_output: CRLF preservation for finished VTE ─────
-
-    #[test]
-    fn reconstruct_preserves_crlf_between_lines() {
-        // Regression: PTY ONLCR delivers \r\n; we must emit \r\n so the
-        // finished VTE (LNM off) carriage-returns before each new line.
-        // Without this, `ls` output staircases across the block.
-        let raw = "Downloads\r\nMusic\r\nPictures\r\n";
-        let out = reconstruct_finished_output(raw);
-        assert_eq!(out, "Downloads\r\nMusic\r\nPictures");
-    }
-
-    #[test]
-    fn reconstruct_adds_cr_to_bare_lf_input() {
-        // If accumulated bytes happen to use bare \n (no ONLCR), still emit
-        // CRLF for the finished VTE.
-        let raw = "a\nb\nc\n";
-        let out = reconstruct_finished_output(raw);
-        assert_eq!(out, "a\r\nb\r\nc");
-    }
-
-    #[test]
-    fn reconstruct_collapses_in_line_carriage_returns() {
-        // Progress-bar / spinner pattern: only the segment after the last
-        // in-line \r survives, but line terminators stay CRLF.
-        let raw = "10%\r50%\r100%\r\ndone\r\n";
-        let out = reconstruct_finished_output(raw);
-        assert_eq!(out, "100%\r\ndone");
-    }
-
-    #[test]
-    fn reconstruct_handles_empty_input() {
-        assert_eq!(reconstruct_finished_output(""), "");
-    }
-
-    #[test]
-    fn reconstruct_preserves_ansi_escapes() {
-        // Color codes must pass through untouched — the finished VTE
-        // interprets them.
-        let raw = "\u{1b}[31mred\u{1b}[0m\r\n\u{1b}[32mgreen\u{1b}[0m\r\n";
-        let out = reconstruct_finished_output(raw);
-        assert_eq!(out, "\u{1b}[31mred\u{1b}[0m\r\n\u{1b}[32mgreen\u{1b}[0m");
-    }
-
-    #[test]
-    fn reconstruct_ls_column_layout_shape() {
-        // Simulate what `ls` actually puts on the master FD: space-padded
-        // columns separated by \r\n. Each rebuilt line must begin with the
-        // first entry (no inherited column offset from the previous line),
-        // which only holds if CRLF is preserved.
-        let raw = "Downloads   Music       Pictures\r\nVideos      snap        projects\r\n";
-        let out = reconstruct_finished_output(raw);
-        for line in out.split("\r\n") {
-            assert!(
-                !line.starts_with(' '),
-                "line started with whitespace, would scatter in VTE: {line:?}"
-            );
-        }
-    }
+    use super::{strip_ansi, strip_ansi_with_clear_detect};
 
     #[test]
     fn strips_charset_designation_from_output() {

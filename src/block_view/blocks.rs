@@ -729,6 +729,44 @@ impl FinishedBlock {
         &self.widget
     }
 
+    /// Forward wheel events on the output VTE to the outer ScrolledWindow once
+    /// the VTE's internal scrollback can't move further in the wheel direction.
+    /// Without this the user's scroll "sticks" at a long block's edge: VTE
+    /// silently swallows wheels that no longer scroll its own buffer, and the
+    /// page never resumes. Closes the perceptual gap with a single-scrollback
+    /// VTE pane (terminator/xterm).
+    pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
+        let scroll_ctrl = gtk4::EventControllerScroll::new(
+            gtk4::EventControllerScrollFlags::VERTICAL,
+        );
+        // Bubble phase: VTE's own controller runs first and consumes the event
+        // when it can scroll. We only see what's left over.
+        let vte = self.output_vte.clone();
+        let outer = outer.clone();
+        scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+            let Some(inner_adj) = vte.vadjustment() else {
+                return glib::Propagation::Proceed;
+            };
+            let at_top = inner_adj.value() <= inner_adj.lower() + f64::EPSILON;
+            let at_bottom = inner_adj.value() + inner_adj.page_size()
+                >= inner_adj.upper() - f64::EPSILON;
+            let going_up = dy < 0.0;
+            let going_down = dy > 0.0;
+            if (going_up && !at_top) || (going_down && !at_bottom) {
+                // VTE still has room to scroll itself; let it.
+                return glib::Propagation::Proceed;
+            }
+            // Drive the outer ScrolledWindow by one step in the wheel direction.
+            let outer_adj = outer.vadjustment();
+            let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
+            let target = (outer_adj.value() + dy * step)
+                .clamp(outer_adj.lower(), outer_adj.upper() - outer_adj.page_size());
+            outer_adj.set_value(target);
+            glib::Propagation::Stop
+        });
+        self.output_vte.add_controller(scroll_ctrl);
+    }
+
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
     /// Kept separate from construction because handlers need the clipboard, PTY,
     /// and active block, which only the owning `TermView` has.

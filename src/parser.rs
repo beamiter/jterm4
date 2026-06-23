@@ -60,25 +60,6 @@ pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
     config: ParserConfig,
-    /// True while we have seen `CSI ?25 l` (cursor hidden) without a matching
-    /// `CSI ?25 h`. Cleared on CommandStart (OSC 133 ;C) and on real ?1049h/l.
-    cursor_hidden: bool,
-    /// True if any printable byte has arrived since cursor was hidden. Gates
-    /// the `[?25l → [2J` heuristic to consecutive control sequences only.
-    printable_since_hide: bool,
-    /// True once this command has been promoted to alt-screen (via the
-    /// heuristic OR via a real ?1049h). Suppresses duplicate AltScreenEnter
-    /// from a TUI that redraws via `[2J` every frame. Reset on CommandStart
-    /// and on ?1049l.
-    tui_promoted: bool,
-    /// True after `CSI ?1 h` (DECCKM, application cursor keys). Together
-    /// with `app_keypad` this is the standard "smkx" combo emitted by
-    /// curses-like TUIs (vim, less, top, htop, mc, fzf). Cleared on
-    /// `CSI ?1 l` and on CommandStart.
-    app_cursor_keys: bool,
-    /// True after `ESC =` (DECPAM, application keypad). Cleared on `ESC >`
-    /// and on CommandStart.
-    app_keypad: bool,
 }
 
 /// Runtime toggles for selectively swallowing reporting-enable sequences before
@@ -140,44 +121,6 @@ impl Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
             config,
-            cursor_hidden: false,
-            printable_since_hide: false,
-            tui_promoted: false,
-            app_cursor_keys: false,
-            app_keypad: false,
-        }
-    }
-
-    /// Promote to alt-screen if smkx (app cursor keys + app keypad) just
-    /// completed. Called after either flag is set; emits at most one
-    /// synthetic AltScreenEnter per command. The caller is responsible for
-    /// flushing prior passthrough first.
-    fn maybe_promote_smkx(&mut self, events: &mut Vec<ParserEvent>) {
-        if self.app_cursor_keys && self.app_keypad && !self.tui_promoted {
-            // Order matters: passthrough may already contain the just-pushed
-            // sequence bytes. Emit any bytes first so they reach VTE on the
-            // main screen (harmless: smkx affects key encoding, not display),
-            // then emit AltScreenEnter so block_view feeds [?1049h to VTE.
-            if !self.passthrough.is_empty() {
-                events.push(ParserEvent::Bytes(std::mem::take(&mut self.passthrough)));
-            }
-            events.push(ParserEvent::AltScreenEnter);
-            self.tui_promoted = true;
-        }
-    }
-
-    /// If `handle_osc` emitted a CommandStart event, reset the TUI-detection
-    /// state so the next command starts fresh (the same parser instance lives
-    /// for the entire shell session).
-    fn maybe_reset_tui_state(&mut self, events: &[ParserEvent], pre_len: usize) {
-        for ev in &events[pre_len..] {
-            if matches!(ev, ParserEvent::CommandStart) {
-                self.cursor_hidden = false;
-                self.printable_since_hide = false;
-                self.tui_promoted = false;
-                self.app_cursor_keys = false;
-                self.app_keypad = false;
-            }
         }
     }
 
@@ -199,17 +142,6 @@ impl Parser {
                         self.state = State::Esc;
                     }
                     _ => {
-                        // While the cursor is hidden via [?25l, any printable
-                        // byte (or whitespace) disqualifies a later [2J from
-                        // being treated as a TUI signature — that's a spinner
-                        // or similar, not a full-screen redraw.
-                        if self.cursor_hidden && !self.printable_since_hide {
-                            let printable = b == b'\t' || b == b'\n' || b == b'\r'
-                                || (b >= 0x20 && b != 0x7f);
-                            if printable {
-                                self.printable_since_hide = true;
-                            }
-                        }
                         self.passthrough.push(b);
                     }
                 },
@@ -230,22 +162,6 @@ impl Parser {
                     }
                     b'P' | b'^' => {
                         self.state = State::Ignore;
-                    }
-                    b'=' => {
-                        // DECPAM — application keypad mode. Half of the smkx
-                        // pair; promote when the cursor-keys half also seen.
-                        self.passthrough.push(0x1b);
-                        self.passthrough.push(b);
-                        self.state = State::Ground;
-                        self.app_keypad = true;
-                        self.maybe_promote_smkx(events);
-                    }
-                    b'>' => {
-                        // DECPNM — normal keypad. Disarms the smkx half.
-                        self.passthrough.push(0x1b);
-                        self.passthrough.push(b);
-                        self.state = State::Ground;
-                        self.app_keypad = false;
                     }
                     _ => {
                         self.passthrough.push(0x1b);
@@ -275,76 +191,9 @@ impl Parser {
                             // (never passed through) and emit the semantic event.
                             flush!();
                             events.push(ParserEvent::AltScreenEnter);
-                            // Real alt-screen takes precedence: prevent the
-                            // [?25l→[2J or smkx heuristics from re-firing
-                            // inside this app.
-                            self.tui_promoted = true;
-                            self.cursor_hidden = false;
-                            self.printable_since_hide = false;
-                            self.app_cursor_keys = false;
-                            self.app_keypad = false;
                         } else if b == b'l' && is_alt_screen_mode(&params) {
                             flush!();
                             events.push(ParserEvent::AltScreenLeave);
-                            self.tui_promoted = false;
-                            self.app_cursor_keys = false;
-                            self.app_keypad = false;
-                        } else if b == b'h' && params == b"?1" {
-                            // DECCKM — application cursor keys (smkx half).
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
-                            self.passthrough.extend_from_slice(&params);
-                            self.passthrough.push(b);
-                            self.app_cursor_keys = true;
-                            self.maybe_promote_smkx(events);
-                        } else if b == b'l' && params == b"?1" {
-                            // DECCKM off — disarms the smkx half.
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
-                            self.passthrough.extend_from_slice(&params);
-                            self.passthrough.push(b);
-                            self.app_cursor_keys = false;
-                        } else if b == b'l' && params == b"?25" {
-                            // Hide cursor — arm the main-screen-TUI heuristic.
-                            // Pass through unchanged so VTE still hides cursor.
-                            self.cursor_hidden = true;
-                            self.printable_since_hide = false;
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
-                            self.passthrough.extend_from_slice(&params);
-                            self.passthrough.push(b);
-                        } else if b == b'h' && params == b"?25" {
-                            // Show cursor — disarm.
-                            self.cursor_hidden = false;
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
-                            self.passthrough.extend_from_slice(&params);
-                            self.passthrough.push(b);
-                        } else if b == b'J'
-                            && (params.is_empty() || params == b"2")
-                            && self.cursor_hidden
-                            && !self.printable_since_hide
-                            && !self.tui_promoted
-                        {
-                            // Main-screen TUI signature: cursor was hidden
-                            // and no printable bytes since — `[2J` here is a
-                            // full-screen redraw, not a shell `clear`.
-                            // Promote to alt-screen so the live VTE/PTY get
-                            // the full viewport.
-                            //
-                            // Order: flush prior bytes (they reach VTE on
-                            // the *main* screen — harmless; usually just
-                            // [?25l + cursor home), then emit AltScreenEnter
-                            // (block_view feeds [?1049h to VTE), then push
-                            // the [2J back into passthrough so it clears
-                            // the alt buffer.
-                            flush!();
-                            events.push(ParserEvent::AltScreenEnter);
-                            self.tui_promoted = true;
-                            self.passthrough.push(0x1b);
-                            self.passthrough.push(b'[');
-                            self.passthrough.extend_from_slice(&params);
-                            self.passthrough.push(b);
                         } else if !self.config.mouse_reporting
                             && (b == b'h' || b == b'l')
                             && is_mouse_reporting_mode(&params)
@@ -382,9 +231,7 @@ impl Parser {
                             let payload = std::mem::take(buf);
                             self.state = State::Ground;
                             flush!();
-                            let pre_len = events.len();
                             handle_osc(&payload, events);
-                            self.maybe_reset_tui_state(events, pre_len);
                         }
                         0x1b => {
                             let payload = std::mem::take(buf);
@@ -400,9 +247,7 @@ impl Parser {
                     let payload = std::mem::take(payload);
                     self.state = State::Ground;
                     flush!();
-                    let pre_len = events.len();
                     handle_osc(&payload, events);
-                    self.maybe_reset_tui_state(events, pre_len);
                     if b != b'\\' {
                         self.passthrough.push(b);
                     }
@@ -667,8 +512,9 @@ mod tests {
         let mut events = Vec::new();
         p.feed(b"\x1b[?1049h\x1b[?1049l", &mut events);
         // Both semantic events fire and the raw mode bytes are NOT passed through.
-        assert!(matches!(events[0], ParserEvent::AltScreenEnter));
-        assert!(matches!(events[1], ParserEvent::AltScreenLeave));
+        // DecsetMode for 1049 may interleave; we only assert both AltScreen events appear.
+        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenEnter)));
+        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenLeave)));
         assert!(collect_bytes(&events).is_empty());
     }
 
@@ -682,147 +528,6 @@ mod tests {
         p.feed(b"49h", &mut events);
         assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenEnter)));
         assert!(collect_bytes(&events).is_empty());
-    }
-
-    fn count_alt_screen_enters(events: &[ParserEvent]) -> usize {
-        events.iter().filter(|e| matches!(e, ParserEvent::AltScreenEnter)).count()
-    }
-
-    #[test]
-    fn top_signature_promotes_to_alt_screen() {
-        // procps-ng top startup: hide cursor, home, full clear. Should promote.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25l\x1b[H\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1, "expected one synthetic AltScreenEnter");
-        // [?25l + [H reach VTE on the main screen (harmless), [2J reaches the alt buffer.
-        let bytes = collect_bytes(&events);
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[?25l"));
-        assert!(bytes.windows(3).any(|w| w == b"\x1b[H"));
-        assert!(bytes.windows(3).any(|w| w == b"\x1b[J") || bytes.windows(4).any(|w| w == b"\x1b[2J"));
-    }
-
-    #[test]
-    fn shell_clear_does_not_promote() {
-        // Shell `clear` / prompt redraw — no [?25l. Must not trigger TUI mode.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[H\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn progress_bar_does_not_promote() {
-        // Spinner: hide cursor, write printable bytes, then [2J would be a TUI
-        // signal but our heuristic disqualifies it because text appeared.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25lLoading...\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn tui_redraw_does_not_double_promote() {
-        // Top redraws every frame via [2J. Only the first should promote.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25l\x1b[2J", &mut events);
-        p.feed(b"\x1b[H\x1b[2J\x1b[H\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1);
-    }
-
-    #[test]
-    fn command_start_resets_state() {
-        // After OSC 133 ;C (a new command begins), the [?25l state from the
-        // previous command must not carry over.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25l", &mut events);
-        p.feed(b"\x1b]133;C\x07", &mut events);
-        p.feed(b"\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn real_alt_screen_followed_by_2j_does_not_double_promote() {
-        // A real ?1049h app may also emit [?25l + [2J. Only one AltScreenEnter.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1049h\x1b[?25l\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1);
-    }
-
-    #[test]
-    fn smkx_promotes_to_alt_screen() {
-        // less -FRX (and any smkx-using TUI without smcup): CSI ?1h then ESC =.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1h\x1b=", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1, "smkx pair must promote");
-    }
-
-    #[test]
-    fn smkx_promotes_in_either_order() {
-        // ESC = arrives before CSI ?1h — still promote when both are seen.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b=\x1b[?1h", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1);
-    }
-
-    #[test]
-    fn smkx_only_one_signal_does_not_promote() {
-        // CSI ?1h alone (without ESC =) is too weak — some apps flip cursor
-        // keys without being TUIs.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1h", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b=", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn smkx_after_real_alt_screen_does_not_double_promote() {
-        // vim sends ?1049h then smkx — only one AltScreenEnter should fire.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1049h\x1b[?1h\x1b=", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1);
-    }
-
-    #[test]
-    fn smkx_resets_on_command_start() {
-        // If [?1h leaks across commands somehow, CommandStart clears it so
-        // the next command doesn't get an unwanted promotion.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1h", &mut events);
-        p.feed(b"\x1b]133;C\x07", &mut events);
-        p.feed(b"\x1b=", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn smkx_disarmed_by_rmkx() {
-        // [?1l then ESC > — exit signals — must NOT count toward promotion.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1l\x1b>", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn cursor_show_disarms_heuristic() {
-        // [?25l followed by [?25h must clear the hidden flag, so a later
-        // [2J does not promote.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25l\x1b[?25h\x1b[2J", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
     }
 
     #[test]
@@ -842,106 +547,39 @@ mod tests {
         assert_eq!(kinds, vec!["A", "C", "D"]);
     }
 
-    // ── Regression tests for alt-screen detection on real-world TUIs ────────
-    //
-    // These pin the byte streams we captured from running `top` and `less` so
-    // a future parser change can't silently break the "first frame full-size"
-    // behavior we depend on for `top`, `git log`, `man`, etc. If you change
-    // the heuristic, you must keep these passing.
-
     #[test]
-    fn top_startup_real_byte_stream_promotes_once() {
-        // Captured via `script -q -c top` (procps-ng 3.3.17). The order is:
-        //   smkx (?1h, =), hide cursor (?25l), home (H), full-clear (2J), then
-        //   SGR / charset setup. This combines BOTH heuristic paths (smkx pair
-        //   and [?25l]+[2J]). We must emit exactly one AltScreenEnter.
+    fn osc7_cwd_update() {
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(
-            b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J\x1b(B\x1b[m\x1b[39;49m",
-            &mut events,
-        );
-        assert_eq!(
-            count_alt_screen_enters(&events),
-            1,
-            "real top startup must emit exactly one AltScreenEnter"
-        );
+        p.feed(b"\x1b]7;file://host/home/me/dir\x07", &mut events);
+        let cwd = events.iter().find_map(|e| match e {
+            ParserEvent::CwdUpdate(s) => Some(s.as_str()),
+            _ => None,
+        });
+        assert_eq!(cwd, Some("/home/me/dir"));
     }
 
     #[test]
-    fn less_startup_real_byte_stream_promotes_once() {
-        // less without smcup (`-X` / `LESS=FRX` — what git log uses by default)
-        // does not write ?1049h. Its startup is dominated by smkx: CSI ?1h
-        // followed shortly by ESC =. That pair is our trigger.
+    fn osc2_title_update() {
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b[?1h\x1b=\x1b[?12;25h", &mut events);
-        assert_eq!(
-            count_alt_screen_enters(&events),
-            1,
-            "less -FRX startup must emit exactly one AltScreenEnter"
-        );
+        p.feed(b"\x1b]2;my title\x07", &mut events);
+        let title = events.iter().find_map(|e| match e {
+            ParserEvent::TitleUpdate(s) => Some(s.as_str()),
+            _ => None,
+        });
+        assert_eq!(title, Some("my title"));
     }
 
     #[test]
-    fn top_then_command_end_then_top_both_promote() {
-        // Two top sessions in the same shell. After the first one ends
-        // (OSC 133 ;D), the second top must still promote — the heuristic
-        // state must reset on CommandStart. This is the regression that
-        // would silently break "running top twice in a row".
-        let mut p = Parser::new();
+    fn mouse_reporting_dropped_when_disabled() {
+        // With mouse_reporting=false, the mode-set sequence is swallowed —
+        // VTE never sees it, so it never enters mouse-reporting mode.
+        let mut p = Parser::with_config(ParserConfig { mouse_reporting: false, focus_reporting: true });
         let mut events = Vec::new();
-        // session 1: prompt → command start → top → exit
-        p.feed(b"\x1b]133;A\x07\x1b]133;C\x07", &mut events);
-        p.feed(b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J", &mut events);
-        p.feed(b"\x1b[?1049l\x1b]133;D;0\x07", &mut events);
-        // session 2: prompt → command start → top again
-        p.feed(b"\x1b]133;A\x07\x1b]133;C\x07", &mut events);
-        p.feed(b"\x1b[?1h\x1b=\x1b[?25l\x1b[H\x1b[2J", &mut events);
-        assert_eq!(
-            count_alt_screen_enters(&events),
-            2,
-            "each top invocation must promote independently"
-        );
-    }
-
-    #[test]
-    fn starship_prompt_cursor_toggle_does_not_promote() {
-        // Prompt frameworks (Starship, P10k) sometimes bracket their paint
-        // with [?25l]…[?25h] to avoid cursor flicker. They do NOT clear the
-        // screen, so no [2J. A later shell `clear` (which sends [H][2J) must
-        // not be retroactively promoted by the long-since-shown cursor.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?25l\x1b[1;1H\x1b[Kuser@host $ \x1b[?25h", &mut events);
-        p.feed(b"\x1b[H\x1b[2J", &mut events); // shell `clear` afterwards
-        assert_eq!(count_alt_screen_enters(&events), 0);
-    }
-
-    #[test]
-    fn alt_screen_leave_rearms_smkx_for_same_command() {
-        // A program that briefly enters alt-screen (?1049h … ?1049l) and
-        // then runs another smkx-using sub-pager in the same command must
-        // still re-promote. ?1049l clears tui_promoted so the next smkx
-        // pair fires AltScreenEnter again.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1049h", &mut events); // first promotion
-        p.feed(b"\x1b[?1049l", &mut events); // leave clears tui_promoted
-        p.feed(b"\x1b[?1h\x1b=", &mut events); // smkx pager → re-promote
-        assert_eq!(count_alt_screen_enters(&events), 2);
-    }
-
-    #[test]
-    fn smkx_split_across_feeds_still_promotes() {
-        // Network/PTY chunking can split CSI ?1h and ESC = across reads.
-        // The flags persist on the Parser, so the pair still triggers.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"\x1b[?1h", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 0);
-        p.feed(b"\x1b", &mut events);
-        p.feed(b"=", &mut events);
-        assert_eq!(count_alt_screen_enters(&events), 1);
+        p.feed(b"\x1b[?1000h", &mut events);
+        assert!(collect_bytes(&events).is_empty());
+        // The semantic DecsetMode event still fires so downstream can track state.
+        assert!(events.iter().any(|e| matches!(e, ParserEvent::DecsetMode { mode: 1000, set: true })));
     }
 }
