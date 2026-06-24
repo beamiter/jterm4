@@ -218,6 +218,13 @@ pub struct Config {
     /// off only if the noise of mass `[REDACTED:...]` markers in a session
     /// full of legitimately-looking-secret-shaped data outweighs the risk.
     pub(crate) ai_redact_secrets: bool,
+    /// When a block runs longer than `notify_long_block_threshold_ms`, post a
+    /// desktop notification on completion via `notify-send`. The terminal
+    /// emulator equivalent of the "your build is done" toast.
+    pub(crate) notify_long_blocks: bool,
+    /// Threshold (in milliseconds) above which `notify_long_blocks` fires.
+    /// Set high enough that interactive commands don't generate noise.
+    pub(crate) notify_long_block_threshold_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +430,8 @@ struct FileConfig {
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
     ai_redact_secrets: Option<bool>,
+    notify_long_blocks: Option<bool>,
+    notify_long_block_threshold_ms: Option<u64>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -481,6 +490,8 @@ fn load_file_config() -> FileConfig {
         ai_model: table.get("ai_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
         ai_max_tokens: table.get("ai_max_tokens").and_then(|v| v.as_integer()).map(|v| v as u32),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
+        notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
+        notify_long_block_threshold_ms: table.get("notify_long_block_threshold_ms").and_then(|v| v.as_integer()).map(|v| v as u64),
     }
 }
 
@@ -695,6 +706,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or(1024)
             .clamp(64, 8192),
         ai_redact_secrets: fc.ai_redact_secrets.unwrap_or(true),
+        notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
+        notify_long_block_threshold_ms: fc
+            .notify_long_block_threshold_ms
+            .unwrap_or(10_000),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
@@ -748,6 +763,8 @@ pub(crate) fn save_config(config: &Config) {
     table.insert("ai_model".into(), toml::Value::String(config.ai_model.clone()));
     table.insert("ai_max_tokens".into(), toml::Value::Integer(config.ai_max_tokens as i64));
     table.insert("ai_redact_secrets".into(), toml::Value::Boolean(config.ai_redact_secrets));
+    table.insert("notify_long_blocks".into(), toml::Value::Boolean(config.notify_long_blocks));
+    table.insert("notify_long_block_threshold_ms".into(), toml::Value::Integer(config.notify_long_block_threshold_ms as i64));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));

@@ -8,6 +8,7 @@ mod terminal;
 mod ui;
 mod ai;
 mod redact;
+mod notify;
 
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;

@@ -513,6 +513,17 @@ impl ReaderCtx {
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
 
+                                {
+                                    let cfg = config_for_cb.borrow();
+                                    if cfg.notify_long_blocks {
+                                        if let Some(ms) = duration_ms {
+                                            if ms >= cfg.notify_long_block_threshold_ms {
+                                                crate::notify::long_block_finished(&cmd, exit_code, ms);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Right-click context menu.
                                 let finished_blocks_for_menu = finished_blocks_for_cb.clone();
                                 let block_list_for_menu = block_list_rc.clone();

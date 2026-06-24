@@ -9,3 +9,4 @@ pub mod block_view;
 pub mod terminal;
 pub mod ai;
 pub mod redact;
+pub mod notify;
