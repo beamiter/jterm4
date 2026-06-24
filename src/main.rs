@@ -7,6 +7,7 @@ mod state;
 mod terminal;
 mod ui;
 mod ai;
+mod redact;
 
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;

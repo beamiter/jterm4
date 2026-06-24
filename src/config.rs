@@ -213,6 +213,11 @@ pub struct Config {
     pub(crate) ai_model: String,
     /// Per-request max output tokens.
     pub(crate) ai_max_tokens: u32,
+    /// Run AI-bound text (system prompt block context + chat turns) through
+    /// the secrets redactor before posting to the API. On by default; flip
+    /// off only if the noise of mass `[REDACTED:...]` markers in a session
+    /// full of legitimately-looking-secret-shaped data outweighs the risk.
+    pub(crate) ai_redact_secrets: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +422,7 @@ struct FileConfig {
     ai_panel_width: Option<u32>,
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
+    ai_redact_secrets: Option<bool>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -474,6 +480,7 @@ fn load_file_config() -> FileConfig {
         ai_panel_width: table.get("ai_panel_width").and_then(|v| v.as_integer()).map(|v| v as u32),
         ai_model: table.get("ai_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
         ai_max_tokens: table.get("ai_max_tokens").and_then(|v| v.as_integer()).map(|v| v as u32),
+        ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
     }
 }
 
@@ -687,6 +694,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
             .clamp(64, 8192),
+        ai_redact_secrets: fc.ai_redact_secrets.unwrap_or(true),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
@@ -739,6 +747,7 @@ pub(crate) fn save_config(config: &Config) {
     table.insert("ai_panel_width".into(), toml::Value::Integer(config.ai_panel_width as i64));
     table.insert("ai_model".into(), toml::Value::String(config.ai_model.clone()));
     table.insert("ai_max_tokens".into(), toml::Value::Integer(config.ai_max_tokens as i64));
+    table.insert("ai_redact_secrets".into(), toml::Value::Boolean(config.ai_redact_secrets));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));

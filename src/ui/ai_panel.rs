@@ -272,6 +272,25 @@ impl AiPanel {
     /// Core send path. Appends to the visible transcript + the API history,
     /// spawns a worker thread, posts the result back via glib channel.
     fn send_with_context(&self, user_text: String, ctx: Option<BlockContext>) {
+        // Redact secrets before anything else — the visible transcript shows
+        // exactly what gets sent, so a leaked AWS key in the input box stays
+        // visible nowhere from this point on. Opt-out via `ai_redact_secrets`.
+        let (user_text, ctx) = {
+            let cfg = self.config.borrow();
+            if cfg.ai_redact_secrets {
+                let user_text = crate::redact::redact_secrets(&user_text);
+                let ctx = ctx.map(|c| BlockContext {
+                    cmd: crate::redact::redact_secrets(&c.cmd),
+                    output: crate::redact::redact_secrets(&c.output),
+                    cwd: c.cwd,
+                    exit_code: c.exit_code,
+                });
+                (user_text, ctx)
+            } else {
+                (user_text, ctx)
+            }
+        };
+
         // Show what we sent.
         let visible_user = match &ctx {
             Some(c) => format!("{user_text}\n[context: `{}`, exit {}]", c.cmd, c.exit_code),

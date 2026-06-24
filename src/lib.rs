@@ -8,3 +8,4 @@ pub mod pty;
 pub mod block_view;
 pub mod terminal;
 pub mod ai;
+pub mod redact;
