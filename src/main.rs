@@ -442,6 +442,7 @@ fn main() -> glib::ExitCode {
             command_palette_dialog: Rc::new(RefCell::new(None)),
             remote_picker_dialog: Rc::new(RefCell::new(None)),
             history_palette_dialog: Rc::new(RefCell::new(None)),
+            cross_block_search_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),

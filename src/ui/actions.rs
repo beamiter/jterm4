@@ -254,6 +254,10 @@ impl UiState {
                 log::debug!("Show history palette");
                 self.show_history_palette();
             }
+            Action::CrossBlockSearch => {
+                log::debug!("Show cross-block search palette");
+                self.show_cross_block_search();
+            }
         }
     }
 

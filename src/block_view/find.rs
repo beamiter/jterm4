@@ -30,6 +30,53 @@ pub(crate) struct FindState {
     pub(crate) current: usize,
 }
 
+/// One result row from a cross-block ripgrep-style scan. Carries enough
+/// context for a flat result list — block id (for jump), surface flag (so
+/// the per-block VTE search cursor goes to the right widget), the 1-based
+/// line number inside that surface, the line snippet itself (trimmed/
+/// truncated for display), and a one-line cmd preview for context.
+#[derive(Clone, Debug)]
+pub struct CrossBlockHit {
+    pub block_id: u64,
+    pub is_output: bool,
+    pub line_no: usize,
+    pub line_text: String,
+    pub cmd_preview: String,
+}
+
+/// Trim a line to a reasonable display width — the palette row is one
+/// horizontal line so an unbounded long line (think bundled JSON) would
+/// just blow out the dialog width. We truncate with a leading ellipsis if
+/// the match isn't near the start, but for the MVP we just hard-cap.
+fn snippet(line: &str) -> String {
+    const CAP: usize = 240;
+    if line.len() <= CAP {
+        line.to_string()
+    } else {
+        let mut s = line[..CAP].to_string();
+        s.push('…');
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet;
+
+    #[test]
+    fn snippet_passes_through_short_line() {
+        assert_eq!(snippet("hello world"), "hello world");
+    }
+
+    #[test]
+    fn snippet_truncates_long_line_with_ellipsis() {
+        let long: String = "a".repeat(500);
+        let out = snippet(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().filter(|&c| c == 'a').count(), 240);
+    }
+}
+
 #[allow(dead_code)]
 impl TermView {
     /// Search blocks for a query string (case-insensitive).
@@ -250,6 +297,137 @@ impl TermView {
                 adj.set_value(target.max(0.0));
             }
         });
+    }
+
+    /// Cross-block ripgrep-style flat-result scan over cached stripped output
+    /// + command text. Caller passes a literal substring (case-insensitive)
+    /// when `is_regex == false`, else a regex. Returns at most `max_hits`
+    /// hits in block-list order; each hit carries enough context (line
+    /// number + the raw line + cmd preview) to drive a palette UI that lets
+    /// the user pick one and jump to it.
+    ///
+    /// Errors only on invalid regex; an empty pattern returns `Ok(vec![])`
+    /// so the caller can clear results without a special branch.
+    pub fn cross_block_search(
+        &self,
+        pattern: &str,
+        is_regex: bool,
+        max_hits: usize,
+    ) -> Result<Vec<CrossBlockHit>, String> {
+        if pattern.is_empty() {
+            return Ok(Vec::new());
+        }
+        let compiled_pattern = if is_regex {
+            pattern.to_string()
+        } else {
+            regex::escape(pattern)
+        };
+        let re = regex::RegexBuilder::new(&compiled_pattern)
+            .case_insensitive(true)
+            .multi_line(true)
+            .build()
+            .map_err(|e| format!("{e}"))?;
+
+        let finished = self.finished_blocks.borrow();
+        let mut hits: Vec<CrossBlockHit> = Vec::new();
+
+        for block in finished.iter() {
+            if hits.len() >= max_hits {
+                break;
+            }
+            let cmd_preview = block.cmd_text.lines().next().unwrap_or(&block.cmd_text).to_string();
+
+            // Cmd surface — usually 1 line, but multiline commands exist.
+            for (ln_idx, line) in block.cmd_text.lines().enumerate() {
+                if hits.len() >= max_hits {
+                    break;
+                }
+                if re.is_match(line) {
+                    hits.push(CrossBlockHit {
+                        block_id: block.id,
+                        is_output: false,
+                        line_no: ln_idx + 1,
+                        line_text: snippet(line),
+                        cmd_preview: cmd_preview.clone(),
+                    });
+                }
+            }
+
+            // Output surface — uses the cached ANSI-stripped view.
+            block.with_stripped_output(|s| {
+                for (ln_idx, line) in s.lines().enumerate() {
+                    if hits.len() >= max_hits {
+                        break;
+                    }
+                    if re.is_match(line) {
+                        hits.push(CrossBlockHit {
+                            block_id: block.id,
+                            is_output: true,
+                            line_no: ln_idx + 1,
+                            line_text: snippet(line),
+                            cmd_preview: cmd_preview.clone(),
+                        });
+                    }
+                }
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Scroll the named block into view (by stable id, not list index).
+    /// Returns `false` if the id is unknown — likely evicted by the
+    /// `max_blocks` cap or deleted via the per-block menu.
+    pub fn scroll_to_block_id(&self, block_id: u64) -> bool {
+        let finished = self.finished_blocks.borrow();
+        let Some(block) = finished.iter().find(|b| b.id == block_id) else {
+            return false;
+        };
+        block.widget().grab_focus();
+        let adj = self.block_scroll.vadjustment();
+        if let Some(value) = block
+            .widget()
+            .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+        {
+            adj.set_value(value.y() as f64);
+        }
+        true
+    }
+
+    /// Light up the chosen block's command/output VTE with a PCRE2 search
+    /// for `pattern` and advance its internal search cursor to the first
+    /// hit. Other blocks keep whatever highlight state they had — this is
+    /// the "jump to this hit" companion for `cross_block_search`. Returns
+    /// `false` when the id is unknown or the pattern can't compile.
+    pub fn focus_match_in_block(
+        &self,
+        block_id: u64,
+        pattern: &str,
+        is_regex: bool,
+        is_output: bool,
+    ) -> bool {
+        if pattern.is_empty() {
+            return false;
+        }
+        let compiled = if is_regex {
+            pattern.to_string()
+        } else {
+            regex::escape(pattern)
+        };
+        let Ok(vte_re) = vte4::Regex::for_search(
+            &compiled,
+            pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
+        ) else {
+            return false;
+        };
+        let finished = self.finished_blocks.borrow();
+        let Some(block) = finished.iter().find(|b| b.id == block_id) else {
+            return false;
+        };
+        let vte = if is_output { &block.output_vte } else { &block.command_vte };
+        vte.search_set_regex(Some(&vte_re), 0);
+        vte.search_set_wrap_around(true);
+        vte.search_find_next();
+        true
     }
 
     /// Remove all find highlights and reset the find cursor (call on close).

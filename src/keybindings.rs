@@ -59,6 +59,9 @@ pub(crate) enum Action {
     /// Open a fuzzy palette over this tab's finished-block command history.
     /// Enter pastes the selected command into the live input cell.
     HistoryPalette,
+    /// Cross-block ripgrep palette — flat list of every line that matches
+    /// the query across all finished blocks; Enter jumps to that hit.
+    CrossBlockSearch,
 }
 
 impl Action {
@@ -123,6 +126,7 @@ impl Action {
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::HistoryPalette => "Command history palette",
+            Action::CrossBlockSearch => "Search across blocks (ripgrep)",
         }
     }
 
@@ -176,6 +180,7 @@ impl Action {
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::HistoryPalette => Some("history_palette"),
+            Action::CrossBlockSearch => Some("cross_block_search"),
         }
     }
 
@@ -228,6 +233,7 @@ impl Action {
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
             Action::HistoryPalette,
+            Action::CrossBlockSearch,
         ]
     }
 }
@@ -452,6 +458,9 @@ impl KeybindingMap {
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
         bind("Ctrl+Shift+H", Action::HistoryPalette);
+        // Ctrl+Shift+G — "grep" — cross-block ripgrep palette. Ctrl+Shift+F
+        // already drives the within-block VTE highlighter (different UX).
+        bind("Ctrl+Shift+G", Action::CrossBlockSearch);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
         bind("Alt+Up", Action::FocusPaneUp);
@@ -671,6 +680,8 @@ mod tests {
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
+            // Cross-block ripgrep palette.
+            ("Ctrl+Shift+G", Action::CrossBlockSearch),
         ];
         for (chord, want_action) in expectations {
             let combo = parse_key_combo(chord).expect("chord must parse");

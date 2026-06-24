@@ -4,8 +4,10 @@ use gtk4::gdk::ModifierType;
 use gtk4::pango::FontDescription;
 use gtk4::{Adjustment, Label, ListBox, Orientation, Scale, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchEntry};
+use gtk4::glib;
 use libadwaita as adw;
 use adw::prelude::*;
+use std::cell::RefCell;
 use std::rc::Rc;
 use vte4::Format;
 use vte4::{Terminal};
@@ -593,6 +595,256 @@ impl UiState {
         });
 
         *self.history_palette_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+        filter_entry.grab_focus();
+    }
+
+    /// Cross-block ripgrep palette. Search-as-you-type over every finished
+    /// block's command line + cached ANSI-stripped output; each hit gets a
+    /// flat row (cmd preview as title, "Lnn: snippet" as subtitle). Enter
+    /// scrolls the target block into view and lights its VTE search
+    /// highlighter on the chord-shifted hit so the user can step further
+    /// with the existing find-next chord.
+    ///
+    /// Default mode is case-insensitive substring; ".*" toggle switches to
+    /// regex. Hit count is capped at 500 to keep the palette responsive on
+    /// massive scrollbacks (`cargo build` etc.).
+    pub(crate) fn show_cross_block_search(&self) {
+        let dialog_to_close = self.cross_block_search_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
+            dialog.force_close();
+            return;
+        }
+
+        let Some(term_view) = self.current_term_view() else {
+            log::debug!("[xsearch] no active block-mode tab");
+            return;
+        };
+
+        let dialog = adw::Dialog::builder()
+            .title("Search Blocks (ripgrep)")
+            .content_width(720)
+            .content_height(520)
+            .build();
+
+        let header_bar = adw::HeaderBar::new();
+        let regex_toggle = gtk4::ToggleButton::builder()
+            .label(".*")
+            .tooltip_text("Treat the query as a regular expression")
+            .build();
+        header_bar.pack_end(&regex_toggle);
+
+        let filter_entry = SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Search across blocks…"));
+        filter_entry.set_hexpand(true);
+
+        let list_box = ListBox::new();
+        list_box.set_selection_mode(gtk4::SelectionMode::Single);
+        list_box.add_css_class("boxed-list");
+        list_box.set_margin_start(12);
+        list_box.set_margin_end(12);
+        list_box.set_margin_bottom(12);
+
+        let status_label = Label::new(None);
+        status_label.add_css_class("dim-label");
+        status_label.set_xalign(0.0);
+        status_label.set_margin_start(12);
+        status_label.set_margin_end(12);
+        status_label.set_margin_bottom(6);
+
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&list_box)
+            .build();
+
+        let search_box = gtk4::Box::new(Orientation::Vertical, 0);
+        filter_entry.set_margin_start(12);
+        filter_entry.set_margin_end(12);
+        filter_entry.set_margin_top(8);
+        filter_entry.set_margin_bottom(8);
+        search_box.append(&filter_entry);
+        search_box.append(&status_label);
+        search_box.append(&scrolled);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&search_box));
+        dialog.set_child(Some(&toolbar_view));
+
+        // Hits live in a RefCell so both the live-filter closure and the
+        // activation closure see the current pass; rebuilt on every
+        // keystroke / regex-toggle change.
+        let hits: Rc<RefCell<Vec<crate::block_view::CrossBlockHit>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        let rebuild = {
+            let term_view = term_view.clone();
+            let list_box = list_box.clone();
+            let hits = hits.clone();
+            let status_label = status_label.clone();
+            let filter_entry = filter_entry.clone();
+            let regex_toggle = regex_toggle.clone();
+            Rc::new(move || {
+                let query = filter_entry.text().to_string();
+                let is_regex = regex_toggle.is_active();
+
+                while let Some(child) = list_box.first_child() {
+                    list_box.remove(&child);
+                }
+                if query.is_empty() {
+                    hits.borrow_mut().clear();
+                    status_label.set_text("Type to search across blocks.");
+                    return;
+                }
+
+                match term_view.cross_block_search(&query, is_regex, 500) {
+                    Ok(results) => {
+                        let total = results.len();
+                        if total == 0 {
+                            status_label.set_text("No matches.");
+                        } else if total == 500 {
+                            status_label.set_text(
+                                "500 matches (capped) — refine your query.",
+                            );
+                        } else {
+                            status_label.set_text(&format!("{total} matches"));
+                        }
+                        for hit in results.iter() {
+                            let surface = if hit.is_output { "out" } else { "cmd" };
+                            let subtitle = format!(
+                                "{surface} L{}: {}",
+                                hit.line_no,
+                                glib::markup_escape_text(&hit.line_text)
+                            );
+                            let row = adw::ActionRow::builder()
+                                .title(glib::markup_escape_text(&hit.cmd_preview).as_str())
+                                .subtitle(&subtitle)
+                                .activatable(true)
+                                .build();
+                            list_box.append(&row);
+                        }
+                        *hits.borrow_mut() = results;
+                        if let Some(first_row) = list_box.row_at_index(0) {
+                            list_box.select_row(Some(&first_row));
+                        }
+                    }
+                    Err(e) => {
+                        hits.borrow_mut().clear();
+                        status_label.set_text(&format!("Bad regex: {e}"));
+                    }
+                }
+            })
+        };
+
+        // Initial state.
+        status_label.set_text("Type to search across blocks.");
+
+        let rebuild_for_change = rebuild.clone();
+        filter_entry.connect_search_changed(move |_| {
+            rebuild_for_change();
+        });
+
+        let rebuild_for_toggle = rebuild.clone();
+        regex_toggle.connect_toggled(move |_| {
+            rebuild_for_toggle();
+        });
+
+        // Jump-to-hit: scroll the target block into view AND turn on its
+        // per-VTE search highlight at the matching hit. Closes the palette
+        // so the user lands on the block they picked.
+        let jump = {
+            let term_view = term_view.clone();
+            let hits = hits.clone();
+            let filter_entry = filter_entry.clone();
+            let regex_toggle = regex_toggle.clone();
+            move |idx: usize| {
+                let pattern = filter_entry.text().to_string();
+                let is_regex = regex_toggle.is_active();
+                let hit = match hits.borrow().get(idx) {
+                    Some(h) => h.clone(),
+                    None => return,
+                };
+                if term_view.scroll_to_block_id(hit.block_id) {
+                    term_view.focus_match_in_block(
+                        hit.block_id,
+                        &pattern,
+                        is_regex,
+                        hit.is_output,
+                    );
+                }
+            }
+        };
+
+        let jump_for_activate = jump.clone();
+        let dialog_for_activate = dialog.clone();
+        list_box.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            dialog_for_activate.force_close();
+            jump_for_activate(idx);
+        });
+
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref = self.cross_block_search_dialog.clone();
+        let list_box_for_key = list_box.clone();
+        let dialog_for_key = dialog.clone();
+        let jump_for_key = jump.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == Key::Escape
+                || (matches!(keyval, Key::G | Key::g)
+                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
+                    d.force_close();
+                }
+                return true.into();
+            }
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(row) = list_box_for_key.selected_row() {
+                    let idx = row.index() as usize;
+                    dialog_for_key.force_close();
+                    jump_for_key(idx);
+                }
+                return true.into();
+            }
+            if keyval == Key::Down {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let mut next = current + 1;
+                while let Some(row) = list_box_for_key.row_at_index(next) {
+                    if row.is_visible() {
+                        list_box_for_key.select_row(Some(&row));
+                        break;
+                    }
+                    next += 1;
+                }
+                return true.into();
+            }
+            if keyval == Key::Up {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let mut prev = current - 1;
+                while prev >= 0 {
+                    if let Some(row) = list_box_for_key.row_at_index(prev) {
+                        if row.is_visible() {
+                            list_box_for_key.select_row(Some(&row));
+                            break;
+                        }
+                    }
+                    prev -= 1;
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        let dialog_ref = self.cross_block_search_dialog.clone();
+        dialog.connect_closed(move |_| {
+            *dialog_ref.borrow_mut() = None;
+        });
+
+        *self.cross_block_search_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         filter_entry.grab_focus();
     }
