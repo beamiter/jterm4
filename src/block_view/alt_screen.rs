@@ -186,6 +186,15 @@ pub(crate) fn create_finished_terminal(
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
+        // Finished blocks are fed once; the view should anchor at the TOP of
+        // the captured output so the user reads it head-down (e.g. `git log`'s
+        // first `commit <hash>` line stays visible). With the VTE default
+        // (`scroll-on-output = true`) the post-feed cursor at end snaps the
+        // view to the bottom, hiding the first rows in scrollback whenever
+        // output_rows > viewport_cap — which is exactly the wide-terminal
+        // case where there's room to show them.
+        .scroll_on_output(false)
+        .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
     apply_theme_to_vte(&terminal, config);
