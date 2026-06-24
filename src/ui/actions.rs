@@ -242,7 +242,55 @@ impl UiState {
                 log::debug!("Toggle debug dashboard");
                 self.toggle_debug_dashboard();
             }
+            Action::ToggleAiPanel => {
+                log::debug!("Toggle AI panel");
+                self.toggle_ai_panel();
+            }
+            Action::AskAiAboutSelectedBlock => {
+                log::debug!("Ask AI about selected block");
+                self.ask_ai_about_selected_block();
+            }
         }
+    }
+
+    /// Show or hide the right-side AI chat panel. Persists the choice in
+    /// `config.ai_panel_visible` so the panel state survives restart.
+    pub(crate) fn toggle_ai_panel(&self) {
+        let next = !self.ai_panel_visible.get();
+        self.ai_panel_visible.set(next);
+        if next {
+            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
+            // Place the splitter so the AI panel gets its configured width
+            // (Paned position is measured from the left edge).
+            let width = self.ai_paned.width();
+            let panel_w = self.config.borrow().ai_panel_width as i32;
+            if width > panel_w + 200 {
+                self.ai_paned.set_position(width - panel_w);
+            }
+        } else {
+            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
+        }
+        self.config.borrow_mut().ai_panel_visible = next;
+        crate::config::save_config(&self.config.borrow());
+    }
+
+    /// Grab the selected block's context (cmd + output + cwd + exit) from
+    /// the active TermView and hand it to the AI panel. Opens the panel
+    /// first if it's hidden; no-ops cleanly when nothing's selected or the
+    /// active tab is VTE-mode.
+    pub(crate) fn ask_ai_about_selected_block(&self) {
+        let Some(term_view) = self.current_term_view() else {
+            log::debug!("AI: no active block-mode tab");
+            return;
+        };
+        let Some(ctx) = term_view.selected_block_context(80) else {
+            log::debug!("AI: no block selected");
+            return;
+        };
+        if !self.ai_panel_visible.get() {
+            self.toggle_ai_panel();
+        }
+        self.ai_panel.ask_about_block(ctx);
     }
 
     pub(crate) fn focus_current_terminal(&self) {

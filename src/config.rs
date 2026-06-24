@@ -203,6 +203,16 @@ pub struct Config {
     /// abut the previous command's last line, and finished blocks already
     /// preserve the same content above so there's redundant display.
     pub(crate) preserve_live_scrollback: bool,
+    /// Show the right-side AI chat panel (Anthropic Messages API). Toggled
+    /// via Ctrl+Shift+A; persisted across sessions.
+    pub(crate) ai_panel_visible: bool,
+    /// Width in pixels of the AI panel when visible (right Paned position is
+    /// computed from window width minus this).
+    pub(crate) ai_panel_width: u32,
+    /// Anthropic model id (default `claude-sonnet-4-6`).
+    pub(crate) ai_model: String,
+    /// Per-request max output tokens.
+    pub(crate) ai_max_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +413,10 @@ struct FileConfig {
     scroll_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
+    ai_panel_visible: Option<bool>,
+    ai_panel_width: Option<u32>,
+    ai_model: Option<String>,
+    ai_max_tokens: Option<u32>,
 }
 
 fn load_file_config() -> FileConfig {
@@ -456,6 +470,10 @@ fn load_file_config() -> FileConfig {
         scroll_reporting_enabled: table.get("scroll_reporting_enabled").and_then(|v| v.as_bool()),
         focus_reporting_enabled: table.get("focus_reporting_enabled").and_then(|v| v.as_bool()),
         preserve_live_scrollback: table.get("preserve_live_scrollback").and_then(|v| v.as_bool()),
+        ai_panel_visible: table.get("ai_panel_visible").and_then(|v| v.as_bool()),
+        ai_panel_width: table.get("ai_panel_width").and_then(|v| v.as_integer()).map(|v| v as u32),
+        ai_model: table.get("ai_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        ai_max_tokens: table.get("ai_max_tokens").and_then(|v| v.as_integer()).map(|v| v as u32),
     }
 }
 
@@ -660,6 +678,15 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
+        ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
+        ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
+        ai_model: env_string("JTERM4_AI_MODEL")
+            .or(fc.ai_model)
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+        ai_max_tokens: env_u32("JTERM4_AI_MAX_TOKENS")
+            .or(fc.ai_max_tokens)
+            .unwrap_or(1024)
+            .clamp(64, 8192),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
@@ -708,6 +735,10 @@ pub(crate) fn save_config(config: &Config) {
     table.insert("tab_placement".into(), toml::Value::String(config.tab_placement.as_str().to_string()));
     table.insert("sidebar_view".into(), toml::Value::String(config.sidebar_view.as_str().to_string()));
     table.insert("sidebar_width".into(), toml::Value::Integer(config.sidebar_width as i64));
+    table.insert("ai_panel_visible".into(), toml::Value::Boolean(config.ai_panel_visible));
+    table.insert("ai_panel_width".into(), toml::Value::Integer(config.ai_panel_width as i64));
+    table.insert("ai_model".into(), toml::Value::String(config.ai_model.clone()));
+    table.insert("ai_max_tokens".into(), toml::Value::Integer(config.ai_max_tokens as i64));
 
     let mut colors = toml::Table::new();
     colors.insert("foreground".into(), toml::Value::String(rgba_to_hex(&config.foreground)));

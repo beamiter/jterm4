@@ -2448,6 +2448,28 @@ impl TermView {
         }
     }
 
+    /// Snapshot the currently selected finished block as an `ai::BlockContext`,
+    /// truncating the output to `head + tail = 2*lines_per_side + 1` lines so
+    /// a `cargo build` block doesn't blow the request budget. Returns `None`
+    /// when no block is selected (Ctrl+Shift+Q from the live cell etc.).
+    pub fn selected_block_context(&self, lines_per_side: usize) -> Option<crate::ai::BlockContext> {
+        let id = self.selected_block_id.get()?;
+        let finished = self.finished_blocks.borrow();
+        let block = finished.iter().find(|b| b.id == id)?;
+        let data = self.block_data.borrow();
+        let bd = data.iter().find(|b| b.id == id);
+
+        let output = block.with_stripped_output(|s| {
+            crate::ai::truncate_for_context(s, lines_per_side)
+        });
+        Some(crate::ai::BlockContext {
+            cmd: block.cmd_text.clone(),
+            output,
+            cwd: bd.and_then(|b| b.cwd.clone()),
+            exit_code: bd.map(|b| b.exit_code).unwrap_or(0),
+        })
+    }
+
 }
 
 #[cfg(test)]

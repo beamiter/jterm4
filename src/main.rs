@@ -6,6 +6,7 @@ mod pty;
 mod state;
 mod terminal;
 mod ui;
+mod ai;
 
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
@@ -374,11 +375,29 @@ fn main() -> glib::ExitCode {
         right_col.append(&notebook);
         right_col.append(&search_bar);
 
+        // AI sidebar: wraps `right_col` in another horizontal Paned so the
+        // chat panel can dock on the right edge without disturbing the
+        // existing sidebar / notebook layout. Built always; visibility is
+        // controlled by adding/removing it as `ai_paned`'s end_child.
+        let ai_panel_widget = ui::AiPanel::build(config.clone());
+        let ai_paned = gtk4::Paned::new(Orientation::Horizontal);
+        ai_paned.set_vexpand(true);
+        ai_paned.set_wide_handle(true);
+        ai_paned.set_start_child(Some(&right_col));
+        ai_paned.set_resize_start_child(true);
+        ai_paned.set_resize_end_child(false);
+        ai_paned.set_shrink_start_child(true);
+        ai_paned.set_shrink_end_child(false);
+        let ai_initially_visible = config.borrow().ai_panel_visible;
+        if ai_initially_visible {
+            ai_paned.set_end_child(Some(&ai_panel_widget.root));
+        }
+
         let content_box = gtk4::Paned::new(Orientation::Horizontal);
         content_box.set_vexpand(true);
         content_box.set_wide_handle(true);
         content_box.set_start_child(Some(&sidebar));
-        content_box.set_end_child(Some(&right_col));
+        content_box.set_end_child(Some(&ai_paned));
         content_box.set_resize_start_child(false);
         content_box.set_resize_end_child(true);
         content_box.set_shrink_start_child(false);
@@ -429,6 +448,9 @@ fn main() -> glib::ExitCode {
             scrollbar_css: CssProvider::new(),
             session_ids: Rc::new(RefCell::new(HashMap::new())),
             tab_connections: Rc::new(RefCell::new(HashMap::new())),
+            ai_panel: ai_panel_widget.clone(),
+            ai_paned: ai_paned.clone(),
+            ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
         });
 
         // Register the dynamic scrollbar CSS provider and apply initial colors

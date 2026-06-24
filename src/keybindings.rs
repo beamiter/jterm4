@@ -51,6 +51,11 @@ pub(crate) enum Action {
     FilterSlowBlocks,
     ClearBlockFilter,
     ToggleDebugDashboard,
+    /// Show/hide the right-side AI chat panel.
+    ToggleAiPanel,
+    /// Send the currently selected finished block (cmd + output + exit) to the
+    /// AI panel as a fresh "explain this" question.
+    AskAiAboutSelectedBlock,
 }
 
 impl Action {
@@ -112,6 +117,8 @@ impl Action {
             Action::FilterSlowBlocks => "Filter slow blocks",
             Action::ClearBlockFilter => "Clear block filter",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
+            Action::ToggleAiPanel => "Toggle AI panel",
+            Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
         }
     }
 
@@ -162,6 +169,8 @@ impl Action {
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
+            Action::ToggleAiPanel => Some("toggle_ai_panel"),
+            Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
         }
     }
 
@@ -211,6 +220,8 @@ impl Action {
             Action::FilterSlowBlocks,
             Action::ClearBlockFilter,
             Action::ToggleDebugDashboard,
+            Action::ToggleAiPanel,
+            Action::AskAiAboutSelectedBlock,
         ]
     }
 }
@@ -430,6 +441,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
+        bind("Ctrl+Shift+A", Action::ToggleAiPanel);
+        bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
         bind("Alt+Up", Action::FocusPaneUp);
@@ -644,6 +657,9 @@ mod tests {
             ("Ctrl+backslash", Action::ToggleSidebar),
             // Tab filter palette.
             ("Ctrl+Shift+L", Action::FilterTabs),
+            // AI sidebar.
+            ("Ctrl+Shift+A", Action::ToggleAiPanel),
+            ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
         ];
         for (chord, want_action) in expectations {
             let combo = parse_key_combo(chord).expect("chord must parse");

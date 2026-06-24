@@ -13,6 +13,7 @@ use crate::block_view::TermView;
 use crate::terminal::VteTerminalView;
 
 mod actions;
+mod ai_panel;
 mod config_apply;
 mod dialogs;
 mod file_tree;
@@ -23,6 +24,8 @@ mod session;
 mod tab_strip;
 mod tabs;
 mod zoom;
+
+pub(crate) use ai_panel::AiPanel;
 
 
 #[derive(Clone)]
@@ -105,4 +108,11 @@ pub(crate) struct UiState {
     pub(crate) session_ids: Rc<RefCell<HashMap<u32, String>>>,
     /// Maps tab_num → remote connection record (status + reconnect info).
     pub(crate) tab_connections: Rc<RefCell<HashMap<u32, TabConnection>>>,
+    /// Right-side AI chat panel. Always built; visibility lives in the
+    /// outer `ai_paned` (and `config.ai_panel_visible` for persistence).
+    pub(crate) ai_panel: AiPanel,
+    /// Horizontal Paned that puts the AI panel to the right of the notebook
+    /// area. Toggling visibility flips the end child + resize start_child.
+    pub(crate) ai_paned: gtk4::Paned,
+    pub(crate) ai_panel_visible: Rc<Cell<bool>>,
 }
