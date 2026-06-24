@@ -363,6 +363,7 @@ impl FinishedBlock {
         recycled: Option<gtk4::Box>,
     ) -> Self {
         let viewport_cap = config.finished_block_viewport_rows.max(3) as i64;
+        let max_expanded_cap = (config.finished_block_max_expanded_rows as i64).max(viewport_cap);
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -492,7 +493,13 @@ impl FinishedBlock {
         rerun_btn.set_tooltip_text(Some("Re-run command"));
         let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
-        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn, &filter_btn] {
+        // Expand button: appears only when output_rows > viewport_cap; toggles
+        // the output VTE between the capped height and a roomier expanded height
+        // (`finished_block_max_expanded_rows`). Wired below once output_rows and
+        // the output VTE exist.
+        let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
+        expand_btn.set_tooltip_text(Some("Expand block"));
+        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn, &filter_btn, &expand_btn] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
             action_box.append(btn);
@@ -565,12 +572,17 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_rows = output.lines().count().max(1) as i64;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
+        // Tracks whether the user has toggled this block to its expanded
+        // height. Survives unmap/remap so re-feeding picks the right cap.
+        let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
             let fed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let cols_for_map = cols.max(1);
             let cap_for_map = viewport_cap;
+            let max_for_map = max_expanded_cap;
             let displayed_for_map = displayed_output.clone();
             let fed_for_map = fed.clone();
+            let expanded_for_map = expanded.clone();
             output_vte.connect_map(move |w| {
                 if fed_for_map.get() {
                     return;
@@ -578,7 +590,8 @@ impl FinishedBlock {
                 fed_for_map.set(true);
                 let text = displayed_for_map.borrow();
                 let rows = text.lines().count().max(1) as i64;
-                let visible_rows = rows.min(cap_for_map).max(1);
+                let cap = if expanded_for_map.get() { max_for_map } else { cap_for_map };
+                let visible_rows = rows.min(cap).max(1);
                 w.set_size(cols_for_map, visible_rows);
                 w.feed(text.as_bytes());
             });
@@ -593,6 +606,31 @@ impl FinishedBlock {
                 // are configured via separate setters in alt_screen::apply_theme).
                 w.reset(false, true);
             });
+        }
+
+        // Show the expand toggle only when there's content beyond the cap.
+        // Click swaps the output VTE between capped and expanded heights and
+        // updates the icon (expand ↔ compress). The map handler reads the
+        // shared `expanded` flag so a re-feed after scroll-off/on respects it.
+        if output_rows > viewport_cap {
+            let expand_for_btn = expanded.clone();
+            let output_vte_for_btn = output_vte.clone();
+            let cols_for_btn = cols.max(1);
+            expand_btn.connect_clicked(move |btn| {
+                let now_expanded = !expand_for_btn.get();
+                expand_for_btn.set(now_expanded);
+                let cap = if now_expanded { max_expanded_cap } else { viewport_cap };
+                let visible_rows = output_rows.min(cap).max(1);
+                output_vte_for_btn.set_size(cols_for_btn, visible_rows);
+                btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
+                btn.set_tooltip_text(Some(if now_expanded {
+                    "Collapse to default height"
+                } else {
+                    "Expand block"
+                }));
+            });
+        } else {
+            expand_btn.set_visible(false);
         }
 
         // Command row: Warp-style accent prompt chevron + the command VTE.
