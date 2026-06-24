@@ -211,6 +211,53 @@ struct ReaderCtx {
     resize_active: Rc<dyn Fn()>,
 }
 
+/// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
+/// into a single Bytes event whose payload is the concatenation. Preserves
+/// the relative order of all other event kinds. The reader callback dispatches
+/// per-event side effects (active_vte.feed, mark_dirty, accumulate_output,
+/// activity_cbs), so coalescing replaces N feeds + N mark_dirty calls inside
+/// one chunk with one of each per stretch — a win on `top` redraws, `cargo
+/// build` spew, and any sustained byte-only output. Safe because boundary
+/// events (PromptStart/End, AltScreen*, CommandStart/End) are NOT merged and
+/// keep their own synchronous mark_dirty.
+fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
+    if events.len() < 2 {
+        return;
+    }
+    let mut write = 0usize;
+    let mut i = 0usize;
+    let n = events.len();
+    while i < n {
+        if matches!(events[i], ParserEvent::Bytes(_)) {
+            // Move the first Bytes payload out so we can extend it in place.
+            let placeholder = ParserEvent::Bytes(Vec::new());
+            let first = std::mem::replace(&mut events[i], placeholder);
+            let mut merged = match first {
+                ParserEvent::Bytes(b) => b,
+                _ => unreachable!(),
+            };
+            i += 1;
+            while i < n {
+                if let ParserEvent::Bytes(b) = &events[i] {
+                    merged.extend_from_slice(b);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            events[write] = ParserEvent::Bytes(merged);
+            write += 1;
+        } else {
+            if write != i {
+                events.swap(write, i);
+            }
+            write += 1;
+            i += 1;
+        }
+    }
+    events.truncate(write);
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -257,6 +304,13 @@ impl ReaderCtx {
                 let mut events = event_buf.borrow_mut();
                 events.clear();
                 parser.borrow_mut().feed(&data, &mut events);
+                // Fold runs of consecutive `Bytes` events into one so the live
+                // VTE feed, autoscroll mark-dirty, and accumulate_output happen
+                // once per stretch instead of once per parser chunk. Boundary
+                // events (PromptStart/End, AltScreen*, CommandStart/End) still
+                // run their synchronous mark_dirty between stretches, keeping
+                // the scroll-invariant from [[scroll_synchronous_autoscroll]].
+                coalesce_bytes_events(&mut events);
 
                 for event in events.iter() {
                     let state = bstate_rc.get();
@@ -2398,7 +2452,90 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, strip_ansi_with_clear_detect};
+    use super::{coalesce_bytes_events, strip_ansi, strip_ansi_with_clear_detect};
+    use crate::parser::ParserEvent;
+
+    fn ev_summary(events: &[ParserEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| match e {
+                ParserEvent::Bytes(b) => format!("B({})", String::from_utf8_lossy(b)),
+                ParserEvent::PromptStart => "PS".to_string(),
+                ParserEvent::PromptEnd => "PE".to_string(),
+                ParserEvent::CommandStart => "CS".to_string(),
+                ParserEvent::CommandEnd(c) => format!("CE({})", c),
+                ParserEvent::AltScreenEnter => "ALT+".to_string(),
+                ParserEvent::AltScreenLeave => "ALT-".to_string(),
+                _ => "?".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalesce_merges_consecutive_bytes() {
+        let mut events = vec![
+            ParserEvent::Bytes(b"hello ".to_vec()),
+            ParserEvent::Bytes(b"world".to_vec()),
+            ParserEvent::Bytes(b"!".to_vec()),
+        ];
+        coalesce_bytes_events(&mut events);
+        assert_eq!(ev_summary(&events), vec!["B(hello world!)"]);
+    }
+
+    #[test]
+    fn coalesce_preserves_boundary_events_in_order() {
+        let mut events = vec![
+            ParserEvent::Bytes(b"$ ".to_vec()),
+            ParserEvent::PromptEnd,
+            ParserEvent::Bytes(b"ls".to_vec()),
+            ParserEvent::Bytes(b" -la".to_vec()),
+            ParserEvent::CommandStart,
+            ParserEvent::Bytes(b"file1\n".to_vec()),
+            ParserEvent::Bytes(b"file2\n".to_vec()),
+            ParserEvent::CommandEnd(0),
+            ParserEvent::PromptStart,
+        ];
+        coalesce_bytes_events(&mut events);
+        assert_eq!(
+            ev_summary(&events),
+            vec![
+                "B($ )",
+                "PE",
+                "B(ls -la)",
+                "CS",
+                "B(file1\nfile2\n)",
+                "CE(0)",
+                "PS",
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_noop_on_empty_or_single() {
+        let mut empty: Vec<ParserEvent> = Vec::new();
+        coalesce_bytes_events(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut one = vec![ParserEvent::Bytes(b"x".to_vec())];
+        coalesce_bytes_events(&mut one);
+        assert_eq!(ev_summary(&one), vec!["B(x)"]);
+
+        let mut one_boundary = vec![ParserEvent::PromptStart];
+        coalesce_bytes_events(&mut one_boundary);
+        assert_eq!(ev_summary(&one_boundary), vec!["PS"]);
+    }
+
+    #[test]
+    fn coalesce_handles_only_boundary_events() {
+        let mut events = vec![
+            ParserEvent::PromptStart,
+            ParserEvent::PromptEnd,
+            ParserEvent::CommandStart,
+            ParserEvent::CommandEnd(1),
+        ];
+        coalesce_bytes_events(&mut events);
+        assert_eq!(ev_summary(&events), vec!["PS", "PE", "CS", "CE(1)"]);
+    }
 
     #[test]
     fn strips_charset_designation_from_output() {
