@@ -9,6 +9,7 @@ mod ui;
 mod ai;
 mod redact;
 mod notify;
+mod git_meta;
 
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;

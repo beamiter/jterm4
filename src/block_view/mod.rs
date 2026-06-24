@@ -58,6 +58,26 @@ fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
     }
 }
 
+/// Probe the cwd for git metadata and update the strip label. Hides the
+/// label when cwd is empty, missing, or not inside a repo — the user
+/// shouldn't see a stale branch from a previous pane state.
+fn refresh_repo_strip(label: &gtk4::Label, cwd: &str) {
+    if cwd.is_empty() {
+        label.set_visible(false);
+        return;
+    }
+    let path = std::path::Path::new(cwd);
+    match crate::git_meta::read(path) {
+        Some(meta) => {
+            label.set_text(&crate::git_meta::format_strip(&meta));
+            label.set_visible(true);
+        }
+        None => {
+            label.set_visible(false);
+        }
+    }
+}
+
 /// Move the finished-block selection to `new_id` (or clear it with `None`),
 /// updating the selected CSS class and persistent quick-action visibility on both
 /// the previously-selected and newly-selected blocks. Shared by click selection
@@ -209,6 +229,10 @@ struct ReaderCtx {
     /// and viewport (running / alt-screen) deterministically — without waiting
     /// for the next `contents_changed` to race with the child's first draw.
     resize_active: Rc<dyn Fn()>,
+    /// Bottom-of-pane repo metadata label. Re-probed every time a block
+    /// finishes (the user may have just run `git commit`, `git pull`,
+    /// or anything else that changes branch/dirty/ahead-behind).
+    repo_strip: gtk4::Label,
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -298,6 +322,7 @@ impl ReaderCtx {
             cmd_running_rc,
             running_cmd_rc,
             resize_active,
+            repo_strip,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -521,6 +546,12 @@ impl ReaderCtx {
                                                 crate::notify::long_block_finished(&cmd, exit_code, ms);
                                             }
                                         }
+                                    }
+                                    // Re-probe git state — the command that just
+                                    // finished may have changed branch/dirty/upstream.
+                                    if cfg.show_repo_strip {
+                                        let cwd = current_cwd_for_cb.borrow().clone();
+                                        refresh_repo_strip(&repo_strip, &cwd);
                                     }
                                 }
 
@@ -1279,6 +1310,21 @@ impl TermView {
         scroll_overlay.add_overlay(&jump_fab);
         root.append(&scroll_overlay);
 
+        // ── Repo-status strip ────────────────────────────────────────────
+        // A thin always-visible label at the bottom showing the current
+        // pane's git branch + dirty marker + ahead/behind. Refreshed on
+        // cwd change and on every finished block (the user may have just
+        // run `git commit` or `git pull`). Hidden when cwd isn't a repo.
+        let repo_strip = gtk4::Label::new(None);
+        repo_strip.set_halign(gtk4::Align::Start);
+        repo_strip.set_xalign(0.0);
+        repo_strip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        repo_strip.add_css_class("repo-strip");
+        repo_strip.set_visible(false);
+        if config.show_repo_strip {
+            root.append(&repo_strip);
+        }
+
         let unread_count: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 
         // ── PTY ───────────────────────────────────────────────────────────
@@ -1517,6 +1563,7 @@ impl TermView {
             let cwd_cbs = cwd_callbacks.clone();
             let current_cwd_for_signal = current_cwd.clone();
             let vte_for_cwd = active_vte.clone();
+            let repo_strip_for_cwd = repo_strip.clone();
             active_vte.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = vte_for_cwd.current_directory_uri() {
                     let file = gtk4::gio::File::for_uri(uri.as_str());
@@ -1526,12 +1573,21 @@ impl TermView {
                         .filter(|s| !s.is_empty())
                     {
                         *current_cwd_for_signal.borrow_mut() = path.clone();
+                        refresh_repo_strip(&repo_strip_for_cwd, &path);
                         for cb in cwd_cbs.borrow().iter() {
                             cb(&path);
                         }
                     }
                 }
             });
+        }
+
+        // Initial probe so the strip is populated for the starting cwd
+        // before the user has cd'd anywhere (the OSC 7 above only fires
+        // on a change).
+        {
+            let initial_cwd = current_cwd.borrow().clone();
+            refresh_repo_strip(&repo_strip, &initial_cwd);
         }
         {
             let title_cbs = title_callbacks.clone();
@@ -1636,6 +1692,7 @@ impl TermView {
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 resize_active: update_input_height.clone(),
+                repo_strip: repo_strip.clone(),
             }
             .install(&pty);
         }
