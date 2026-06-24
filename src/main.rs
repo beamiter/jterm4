@@ -10,6 +10,7 @@ mod ai;
 mod redact;
 mod notify;
 mod git_meta;
+mod workflows;
 
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
@@ -446,6 +447,7 @@ fn main() -> glib::ExitCode {
             remote_picker_dialog: Rc::new(RefCell::new(None)),
             history_palette_dialog: Rc::new(RefCell::new(None)),
             cross_block_search_dialog: Rc::new(RefCell::new(None)),
+            workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),

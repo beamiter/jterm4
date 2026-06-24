@@ -258,6 +258,10 @@ impl UiState {
                 log::debug!("Show cross-block search palette");
                 self.show_cross_block_search();
             }
+            Action::WorkflowsPalette => {
+                log::debug!("Show workflows palette");
+                self.show_workflows_palette();
+            }
         }
     }
 

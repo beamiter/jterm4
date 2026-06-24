@@ -62,6 +62,10 @@ pub(crate) enum Action {
     /// Cross-block ripgrep palette — flat list of every line that matches
     /// the query across all finished blocks; Enter jumps to that hit.
     CrossBlockSearch,
+    /// Workflows palette — fuzzy list of saved command templates; Enter
+    /// opens an arg-entry dialog that substitutes placeholders and writes
+    /// the resolved command into the live PTY (no auto-Enter).
+    WorkflowsPalette,
 }
 
 impl Action {
@@ -127,6 +131,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
             Action::HistoryPalette => "Command history palette",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
+            Action::WorkflowsPalette => "Workflows palette",
         }
     }
 
@@ -181,6 +186,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
             Action::HistoryPalette => Some("history_palette"),
             Action::CrossBlockSearch => Some("cross_block_search"),
+            Action::WorkflowsPalette => Some("workflows_palette"),
         }
     }
 
@@ -234,6 +240,7 @@ impl Action {
             Action::AskAiAboutSelectedBlock,
             Action::HistoryPalette,
             Action::CrossBlockSearch,
+            Action::WorkflowsPalette,
         ]
     }
 }
@@ -461,6 +468,9 @@ impl KeybindingMap {
         // Ctrl+Shift+G — "grep" — cross-block ripgrep palette. Ctrl+Shift+F
         // already drives the within-block VTE highlighter (different UX).
         bind("Ctrl+Shift+G", Action::CrossBlockSearch);
+        // Ctrl+Shift+M — "macros" / workflows palette over saved command
+        // templates. (Ctrl+Shift+W is ClosePaneOrTab in browser muscle memory.)
+        bind("Ctrl+Shift+M", Action::WorkflowsPalette);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
         bind("Alt+Up", Action::FocusPaneUp);
@@ -682,6 +692,8 @@ mod tests {
             ("Ctrl+Shift+H", Action::HistoryPalette),
             // Cross-block ripgrep palette.
             ("Ctrl+Shift+G", Action::CrossBlockSearch),
+            // Workflows palette (parameterized templates).
+            ("Ctrl+Shift+M", Action::WorkflowsPalette),
         ];
         for (chord, want_action) in expectations {
             let combo = parse_key_combo(chord).expect("chord must parse");

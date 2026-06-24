@@ -1273,4 +1273,329 @@ impl UiState {
 
         terminal.add_controller(right_click);
     }
+
+    /// Workflows palette — fuzzy-filterable list of saved command
+    /// templates from `~/.config/jterm4/workflows/`. Enter on a row
+    /// either writes the command directly (no args) or opens an
+    /// args-entry dialog. Same toggle-to-close model as the other
+    /// palettes: re-pressing Ctrl+Shift+W with the palette open closes it.
+    pub(crate) fn show_workflows_palette(&self) {
+        let dialog_to_close = self.workflows_palette_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
+            dialog.force_close();
+            return;
+        }
+
+        let Some(term_view) = self.current_term_view() else {
+            log::debug!("[workflows] no active block-mode tab");
+            return;
+        };
+
+        let workflows: Rc<Vec<crate::workflows::Workflow>> =
+            Rc::new(crate::workflows::load_all());
+        if workflows.is_empty() {
+            log::debug!(
+                "[workflows] no workflows in {}",
+                crate::workflows::workflows_dir().display()
+            );
+            // Toast-like hint via a one-shot message dialog. Otherwise the
+            // user gets no feedback at all and concludes the chord is dead.
+            let dialog = adw::MessageDialog::builder()
+                .heading("No workflows yet")
+                .body(format!(
+                    "Add `*.toml` workflow files to:\n\n{}",
+                    crate::workflows::workflows_dir().display()
+                ))
+                .build();
+            dialog.add_response("ok", "OK");
+            dialog.set_transient_for(Some(&self.window));
+            dialog.present();
+            return;
+        }
+
+        let dialog = adw::Dialog::builder()
+            .title("Workflows")
+            .content_width(620)
+            .content_height(480)
+            .build();
+
+        let header_bar = adw::HeaderBar::new();
+        let filter_entry = SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Filter workflows…"));
+        filter_entry.set_hexpand(true);
+
+        let list_box = ListBox::new();
+        list_box.set_selection_mode(gtk4::SelectionMode::Single);
+        list_box.add_css_class("boxed-list");
+        list_box.set_margin_start(12);
+        list_box.set_margin_end(12);
+        list_box.set_margin_bottom(12);
+
+        // Haystack = name + description + command, all lowercased.
+        let haystacks: Rc<Vec<String>> = Rc::new(
+            workflows
+                .iter()
+                .map(|w| format!("{} {} {}", w.name, w.description, w.command).to_lowercase())
+                .collect(),
+        );
+
+        for wf in workflows.iter() {
+            let subtitle = if wf.description.is_empty() {
+                wf.command.clone()
+            } else {
+                wf.description.clone()
+            };
+            let row = adw::ActionRow::builder()
+                .title(&wf.name)
+                .subtitle(&subtitle)
+                .activatable(true)
+                .build();
+            list_box.append(&row);
+        }
+        if let Some(first_row) = list_box.row_at_index(0) {
+            list_box.select_row(Some(&first_row));
+        }
+
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&list_box)
+            .build();
+
+        let search_box = gtk4::Box::new(Orientation::Vertical, 0);
+        filter_entry.set_margin_start(12);
+        filter_entry.set_margin_end(12);
+        filter_entry.set_margin_top(8);
+        filter_entry.set_margin_bottom(8);
+        search_box.append(&filter_entry);
+        search_box.append(&scrolled);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&search_box));
+        dialog.set_child(Some(&toolbar_view));
+
+        let list_box_for_filter = list_box.clone();
+        let haystacks_for_filter = haystacks.clone();
+        filter_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string().to_lowercase();
+            let mut first_visible: Option<gtk4::ListBoxRow> = None;
+            for (idx, hay) in haystacks_for_filter.iter().enumerate() {
+                if let Some(row) = list_box_for_filter.row_at_index(idx as i32) {
+                    let visible = query.is_empty() || hay.contains(&query);
+                    row.set_visible(visible);
+                    if visible && first_visible.is_none() {
+                        first_visible = Some(row);
+                    }
+                }
+            }
+            if let Some(row) = first_visible {
+                list_box_for_filter.select_row(Some(&row));
+            }
+        });
+
+        // Pick is the only verb here: either write the command directly
+        // (no args) or hand off to the args dialog. Cloning the Vec is
+        // cheap relative to the dialog work that follows.
+        let workflows_for_pick = workflows.clone();
+        let ui_self = self.clone();
+        let term_view_for_pick = term_view.clone();
+        let pick = Rc::new(move |idx: usize| {
+            let Some(wf) = workflows_for_pick.get(idx).cloned() else { return };
+            if wf.args.is_empty() {
+                term_view_for_pick.grab_focus();
+                term_view_for_pick.write_input(wf.command.as_bytes());
+            } else {
+                ui_self.show_workflow_args_dialog(wf, term_view_for_pick.clone());
+            }
+        });
+
+        let pick_for_activate = pick.clone();
+        let dialog_for_activate = dialog.clone();
+        list_box.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            dialog_for_activate.force_close();
+            pick_for_activate(idx);
+        });
+
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref = self.workflows_palette_dialog.clone();
+        let list_box_for_key = list_box.clone();
+        let dialog_for_key = dialog.clone();
+        let pick_for_key = pick.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == Key::Escape
+                || (matches!(keyval, Key::M | Key::m)
+                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
+                    d.force_close();
+                }
+                return true.into();
+            }
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(row) = list_box_for_key.selected_row() {
+                    let idx = row.index() as usize;
+                    dialog_for_key.force_close();
+                    pick_for_key(idx);
+                }
+                return true.into();
+            }
+            if keyval == Key::Down {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let mut next = current + 1;
+                while let Some(row) = list_box_for_key.row_at_index(next) {
+                    if row.is_visible() {
+                        list_box_for_key.select_row(Some(&row));
+                        break;
+                    }
+                    next += 1;
+                }
+                return true.into();
+            }
+            if keyval == Key::Up {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let mut prev = current - 1;
+                while prev >= 0 {
+                    if let Some(row) = list_box_for_key.row_at_index(prev) {
+                        if row.is_visible() {
+                            list_box_for_key.select_row(Some(&row));
+                            break;
+                        }
+                    }
+                    prev -= 1;
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        let dialog_ref = self.workflows_palette_dialog.clone();
+        dialog.connect_closed(move |_| {
+            *dialog_ref.borrow_mut() = None;
+        });
+
+        *self.workflows_palette_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+        filter_entry.grab_focus();
+    }
+
+    /// Modal arg-entry dialog for a workflow. One Entry per arg, default
+    /// pre-filled; "Run" substitutes and writes the resolved command into
+    /// the live PTY (without a trailing newline — user reviews and hits
+    /// Enter). Cancel/Escape exits without touching the terminal.
+    pub(crate) fn show_workflow_args_dialog(
+        &self,
+        wf: crate::workflows::Workflow,
+        term_view: Rc<crate::block_view::TermView>,
+    ) {
+        let dialog = adw::Dialog::builder()
+            .title(&format!("Workflow: {}", wf.name))
+            .content_width(520)
+            .build();
+
+        let header_bar = adw::HeaderBar::new();
+        let body = gtk4::Box::new(Orientation::Vertical, 8);
+        body.set_margin_start(16);
+        body.set_margin_end(16);
+        body.set_margin_top(12);
+        body.set_margin_bottom(12);
+
+        if !wf.description.is_empty() {
+            let desc = Label::new(Some(&wf.description));
+            desc.set_xalign(0.0);
+            desc.set_wrap(true);
+            desc.add_css_class("dim-label");
+            body.append(&desc);
+        }
+
+        // Preview of the template (so the user sees which placeholders
+        // they're filling). Monospace-leaning.
+        let preview = Label::new(Some(&wf.command));
+        preview.set_xalign(0.0);
+        preview.set_wrap(true);
+        preview.set_selectable(true);
+        preview.add_css_class("monospace");
+        body.append(&preview);
+
+        // One row per arg.
+        let entries: Rc<RefCell<Vec<(String, gtk4::Entry)>>> = Rc::new(RefCell::new(Vec::new()));
+        for arg in wf.args.iter() {
+            let row = adw::EntryRow::builder()
+                .title(&arg.name)
+                .text(&arg.default)
+                .build();
+            if !arg.description.is_empty() {
+                row.set_tooltip_text(Some(&arg.description));
+            }
+            body.append(&row);
+            // EntryRow doesn't expose a stable `Entry` handle in this
+            // gtk-rs version, so we stash a gtk4::Entry mirror that we
+            // bind two-way. Simpler than digging the inner Entry out.
+            let entry = gtk4::Entry::new();
+            entry.set_text(&arg.default);
+            entry.set_visible(false);
+            body.append(&entry);
+            {
+                let entry_clone = entry.clone();
+                row.connect_changed(move |r| {
+                    entry_clone.set_text(&r.text());
+                });
+            }
+            entries.borrow_mut().push((arg.name.clone(), entry));
+        }
+
+        let run_btn = gtk4::Button::with_label("Run");
+        run_btn.add_css_class("suggested-action");
+        run_btn.set_halign(gtk4::Align::End);
+        run_btn.set_margin_top(8);
+        body.append(&run_btn);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&body));
+        dialog.set_child(Some(&toolbar_view));
+
+        let entries_for_run = entries.clone();
+        let term_view_for_run = term_view.clone();
+        let dialog_for_run = dialog.clone();
+        let template = wf.command.clone();
+        run_btn.connect_clicked(move |_| {
+            let bindings: Vec<(String, String)> = entries_for_run
+                .borrow()
+                .iter()
+                .map(|(n, e)| (n.clone(), e.text().to_string()))
+                .collect();
+            let resolved = crate::workflows::substitute(&template, &bindings);
+            dialog_for_run.force_close();
+            term_view_for_run.grab_focus();
+            term_view_for_run.write_input(resolved.as_bytes());
+        });
+
+        // Escape closes; Ctrl+Enter from any field triggers Run for
+        // keyboard-only operation.
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_for_key = dialog.clone();
+        let run_btn_for_key = run_btn.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            if keyval == Key::Escape {
+                dialog_for_key.force_close();
+                return true.into();
+            }
+            if matches!(keyval, Key::Return | Key::KP_Enter)
+                && state.contains(ModifierType::CONTROL_MASK)
+            {
+                run_btn_for_key.emit_clicked();
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        dialog.present(Some(&self.window));
+    }
 }

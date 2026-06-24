@@ -11,3 +11,4 @@ pub mod ai;
 pub mod redact;
 pub mod notify;
 pub mod git_meta;
+pub mod workflows;
