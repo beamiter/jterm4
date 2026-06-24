@@ -10,7 +10,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, strip_ansi, BlockFilters, TermView};
+use super::{contains_case_insensitive, BlockFilters, TermView};
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -147,7 +147,7 @@ impl TermView {
             let finished = self.finished_blocks.borrow();
             for block in finished.iter() {
                 let cmd_count = re.find_iter(&block.cmd_text).count();
-                let out_count = re.find_iter(&strip_ansi(&block.full_output.borrow())).count();
+                let out_count = block.with_stripped_output(|s| re.find_iter(s).count());
                 if cmd_count > 0 {
                     block.command_vte.search_set_regex(Some(&vte_re), 0);
                     block.command_vte.search_set_wrap_around(true);

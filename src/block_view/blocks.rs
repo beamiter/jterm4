@@ -106,6 +106,11 @@ pub(crate) struct FinishedBlock {
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
     pub(crate) full_output: Rc<RefCell<String>>,
+    /// Lazy-populated ANSI-stripped view of `full_output`, used as the haystack
+    /// for find-within-blocks. Avoids re-stripping on every keystroke. Cleared
+    /// when `full_output` is rewritten by a filter action; otherwise kept for
+    /// the lifetime of the block (finished blocks are append-once in practice).
+    pub(crate) stripped_output: Rc<RefCell<Option<String>>>,
     pub(crate) cmd_text: String,
     pub(crate) copy_cmd_btn: gtk4::Button,
     pub(crate) copy_output_btn: gtk4::Button,
@@ -129,6 +134,7 @@ impl Clone for FinishedBlock {
             output_vte: self.output_vte.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
+            stripped_output: self.stripped_output.clone(),
             copy_cmd_btn: self.copy_cmd_btn.clone(),
             copy_output_btn: self.copy_output_btn.clone(),
             rerun_btn: self.rerun_btn.clone(),
@@ -311,6 +317,19 @@ pub(crate) fn render_bytes_into_finished_vte(
 }
 
 impl FinishedBlock {
+    /// Returns the ANSI-stripped view of `full_output`, populating the cache on
+    /// first call. Caller passes a closure to handle the cached string by ref to
+    /// avoid an extra clone — `stripped_output` lives in a `RefCell` so we can't
+    /// hand out a `Ref` that outlives the borrow.
+    pub(crate) fn with_stripped_output<R>(&self, f: impl FnOnce(&str) -> R) -> R {
+        if self.stripped_output.borrow().is_none() {
+            let s = strip_ansi(&self.full_output.borrow());
+            *self.stripped_output.borrow_mut() = Some(s);
+        }
+        let guard = self.stripped_output.borrow();
+        f(guard.as_deref().unwrap_or(""))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u64,
@@ -741,6 +760,7 @@ impl FinishedBlock {
             command_vte,
             output_vte,
             full_output,
+            stripped_output: Rc::new(RefCell::new(None)),
             cmd_text: cmd.to_string(),
             copy_cmd_btn,
             copy_output_btn,
