@@ -489,3 +489,241 @@ impl KeybindingMap {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Table-driven regression tests over the default keybinding map. Pure
+    //! data — no GTK runtime — so they run in CI without a display. They
+    //! pin the two failure modes we've actually hit:
+    //!
+    //! - An action loses its default binding during a refactor (the
+    //!   `bind!` call gets dropped or the `Action::` variant is renamed)
+    //!   and silently becomes unreachable from the UI.
+    //! - parse_key_combo / key_combo_to_string drift apart and config
+    //!   round-trip breaks (`Ctrl+Shift++`, digit keys, named keys).
+    //!
+    //! They do NOT cover the runtime "VTE swallow" question (whether the
+    //! live VTE consumes a chord before the block-mode capture phase sees
+    //! it) — that needs a GTK event loop and is tracked separately.
+    use super::*;
+
+    /// Every action advertised by `all_actions()` either has a default
+    /// binding or is on the explicit "palette / TOML-only" allowlist
+    /// below. The allowlist exists so a newly-added Action without a
+    /// default still trips this test — forcing the author to either add
+    /// a chord or consciously declare it palette-only.
+    #[test]
+    fn every_advertised_action_has_a_default_binding_or_is_allowlisted() {
+        // Actions intentionally reachable only from the command palette
+        // and/or user TOML overrides — they have no default chord on
+        // purpose (chord exhaustion + low frequency of use).
+        let palette_only: &[Action] = &[
+            Action::CloseTab,
+            Action::CloseSelectedTabs,
+            Action::MoveTabLeft,
+            Action::MoveTabRight,
+            Action::DuplicateTab,
+            Action::ToggleTabMarked,
+            Action::ToggleTabPinned,
+            Action::FilterFailedBlocks,
+            Action::FilterSlowBlocks,
+            Action::ClearBlockFilter,
+        ];
+
+        let map = KeybindingMap::from_defaults();
+        let bound_actions: std::collections::HashSet<Action> =
+            map.bindings.values().copied().collect();
+        let allowed: std::collections::HashSet<Action> =
+            palette_only.iter().copied().collect();
+
+        let missing: Vec<_> = Action::all_actions()
+            .into_iter()
+            .filter(|a| !bound_actions.contains(a) && !allowed.contains(a))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "actions advertised by all_actions() but neither bound nor \
+             marked palette-only: {missing:?} — either add a default chord \
+             in `from_defaults()` or extend the `palette_only` allowlist here."
+        );
+
+        // Symmetric guard: allowlist must not list actions that DO have a
+        // default binding (otherwise the allowlist drifts and stops being
+        // a source of truth).
+        let stale: Vec<_> = palette_only
+            .iter()
+            .copied()
+            .filter(|a| bound_actions.contains(a))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "palette_only allowlist contains actions that DO have a default \
+             chord: {stale:?} — remove them from the allowlist."
+        );
+    }
+
+    /// Defaults round-trip through the string parser. If
+    /// key_combo_to_string emits a form parse_key_combo can't read, the
+    /// user's settings export silently drops bindings on every reload.
+    #[test]
+    fn every_default_combo_round_trips_through_string_form() {
+        let map = KeybindingMap::from_defaults();
+        for (combo, action) in &map.bindings {
+            let s = key_combo_to_string(combo);
+            let parsed = parse_key_combo(&s).unwrap_or_else(|e| {
+                panic!("round-trip failed for {action:?} → {s:?}: {e}")
+            });
+            assert_eq!(
+                parsed, *combo,
+                "round-trip mismatch for {action:?}: {combo:?} → {s:?} → {parsed:?}"
+            );
+        }
+    }
+
+    /// Frozen list of chord strings the docs and settings UI publish.
+    /// Adding more accepted forms is fine; removing one breaks config
+    /// files in the wild.
+    #[test]
+    fn published_chord_strings_all_parse() {
+        let known_good = [
+            "Ctrl+Shift+T",
+            "Ctrl+Shift+W",
+            "Ctrl+Shift+C",
+            "Ctrl+Shift+V",
+            "Ctrl+Shift++",
+            "Ctrl+Shift+!",
+            "Ctrl+backslash",
+            "Ctrl+minus",
+            "Ctrl+Up",
+            "Ctrl+Down",
+            "Ctrl+PageUp",
+            "Ctrl+PageDown",
+            "Ctrl+Tab",
+            "Ctrl+Shift+Tab",
+            "Alt+Tab",
+            "Alt+Shift+Tab",
+            "Alt+Left",
+            "Alt+Right",
+            "Alt+Up",
+            "Alt+Down",
+            "F12",
+            "Ctrl+0",
+            "Ctrl+9",
+        ];
+        for s in known_good {
+            assert!(
+                parse_key_combo(s).is_ok(),
+                "documented chord {s:?} must parse"
+            );
+        }
+    }
+
+    /// Load-bearing block-mode (chord → action) pairs. The list lives
+    /// here on purpose: when you intentionally rebind one, you'll fix
+    /// this test in the same commit and a reviewer can spot the change.
+    #[test]
+    fn frozen_block_mode_chord_table() {
+        let map = KeybindingMap::from_defaults();
+        let expectations: &[(&str, Action)] = &[
+            // Block list scroll.
+            ("Ctrl+Up", Action::ScrollUp),
+            ("Ctrl+Down", Action::ScrollDown),
+            // Pane focus (used in block mode to jump between paned block lists).
+            ("Alt+Left", Action::FocusPaneLeft),
+            ("Alt+Right", Action::FocusPaneRight),
+            ("Alt+Up", Action::FocusPaneUp),
+            ("Alt+Down", Action::FocusPaneDown),
+            // Block-discovery surface.
+            ("Ctrl+Shift+F", Action::ToggleSearch),
+            ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Shift+R", Action::ShowRemotePicker),
+            // Selection copy out of finished blocks.
+            ("Ctrl+Shift+C", Action::Copy),
+            // Tab placement / sidebar — adjacent to the block list.
+            ("Ctrl+Shift+B", Action::ToggleTabPlacement),
+            ("Ctrl+backslash", Action::ToggleSidebar),
+            // Tab filter palette.
+            ("Ctrl+Shift+L", Action::FilterTabs),
+        ];
+        for (chord, want_action) in expectations {
+            let combo = parse_key_combo(chord).expect("chord must parse");
+            match map.lookup(&combo) {
+                Some(actual) => assert_eq!(
+                    actual, *want_action,
+                    "{chord} expected {want_action:?}, got {actual:?}"
+                ),
+                None => panic!("{chord} is unbound in the default map"),
+            }
+        }
+    }
+
+    /// Quick-switch tab digits 0..=9 must each map to a distinct
+    /// QuickSwitchTab(N). This used to drift from the 0..=9 loop; assert
+    /// via lookup so a future refactor can't silently drop a digit.
+    #[test]
+    fn ctrl_digit_quick_switch_tab_bound_for_all_digits() {
+        let map = KeybindingMap::from_defaults();
+        for n in 0u8..=9 {
+            let chord = format!("Ctrl+{n}");
+            let combo = parse_key_combo(&chord).expect("digit chord must parse");
+            match map.lookup(&combo) {
+                Some(Action::QuickSwitchTab(got)) => assert_eq!(got, n),
+                other => panic!("{chord} expected QuickSwitchTab({n}), got {other:?}"),
+            }
+        }
+    }
+
+    /// `+` is also the chord separator, so it needs special-casing in
+    /// parse_key_combo. Both documented forms must produce the same combo.
+    #[test]
+    fn plus_key_chord_special_cases_agree() {
+        let a = parse_key_combo("Ctrl+Shift++").expect("'Ctrl+Shift++' form");
+        let b = parse_key_combo("Ctrl+Shift+plus").expect("'Ctrl+Shift+plus' form");
+        assert_eq!(a, b);
+    }
+
+    /// Shift+Tab arrives from GTK as ISO_Left_Tab. normalize_key rewrites
+    /// it to Tab so a single chord entry covers both; the display must
+    /// also surface as Tab so the settings UI shows one canonical form.
+    #[test]
+    fn shift_tab_normalises_to_tab_in_display() {
+        let combo = parse_key_combo("Ctrl+Shift+Tab").expect("must parse");
+        let s = key_combo_to_string(&combo);
+        assert!(s.ends_with("+Tab"), "expected ends-with `+Tab`, got {s:?}");
+    }
+
+    /// Each Action variant's config_key must be unique — otherwise the
+    /// TOML override path silently rebinds the wrong action.
+    #[test]
+    fn config_keys_are_unique_across_actions() {
+        let mut seen: HashMap<&'static str, Action> = HashMap::new();
+        for action in Action::all_actions() {
+            if let Some(key) = action.config_key() {
+                if let Some(prev) = seen.insert(key, action) {
+                    panic!(
+                        "config_key {key:?} reused: {prev:?} vs {action:?} — \
+                         TOML override path would silently rebind one of them"
+                    );
+                }
+            }
+        }
+    }
+
+    /// User-override path: applying a one-entry table drops the old
+    /// binding and installs the new one. Guards against the rebind path
+    /// losing its "drop old binding" step.
+    #[test]
+    fn user_override_replaces_default_binding() {
+        let mut map = KeybindingMap::from_defaults();
+
+        // ScrollUp is bound to Ctrl+Up by default; remap to F11.
+        let mut table = toml::Table::new();
+        table.insert("scroll_up".into(), toml::Value::String("F11".into()));
+        map.apply_user_overrides(&table);
+
+        let old = parse_key_combo("Ctrl+Up").unwrap();
+        let new = parse_key_combo("F11").unwrap();
+        assert_eq!(map.lookup(&old), None, "old default must be removed");
+        assert_eq!(map.lookup(&new), Some(Action::ScrollUp));
+    }
+}
