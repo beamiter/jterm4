@@ -56,6 +56,9 @@ pub(crate) enum Action {
     /// Send the currently selected finished block (cmd + output + exit) to the
     /// AI panel as a fresh "explain this" question.
     AskAiAboutSelectedBlock,
+    /// Open a fuzzy palette over this tab's finished-block command history.
+    /// Enter pastes the selected command into the live input cell.
+    HistoryPalette,
 }
 
 impl Action {
@@ -119,6 +122,7 @@ impl Action {
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
+            Action::HistoryPalette => "Command history palette",
         }
     }
 
@@ -171,6 +175,7 @@ impl Action {
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
+            Action::HistoryPalette => Some("history_palette"),
         }
     }
 
@@ -222,6 +227,7 @@ impl Action {
             Action::ToggleDebugDashboard,
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
+            Action::HistoryPalette,
         ]
     }
 }
@@ -443,6 +449,9 @@ impl KeybindingMap {
         bind("F12", Action::ToggleDebugDashboard);
         bind("Ctrl+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
+        // Ctrl+R is consumed by bash readline in the live VTE, so the chord
+        // for our block-history palette is Ctrl+Shift+H ("history").
+        bind("Ctrl+Shift+H", Action::HistoryPalette);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
         bind("Alt+Up", Action::FocusPaneUp);
@@ -660,6 +669,8 @@ mod tests {
             // AI sidebar.
             ("Ctrl+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
+            // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
+            ("Ctrl+Shift+H", Action::HistoryPalette),
         ];
         for (chord, want_action) in expectations {
             let combo = parse_key_combo(chord).expect("chord must parse");

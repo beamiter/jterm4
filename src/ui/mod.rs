@@ -99,6 +99,7 @@ pub(crate) struct UiState {
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
     pub(crate) command_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) remote_picker_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    pub(crate) history_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,

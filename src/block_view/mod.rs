@@ -2448,6 +2448,25 @@ impl TermView {
         }
     }
 
+    /// Most-recent-first deduplicated list of finished-block command lines.
+    /// Used to populate the Ctrl+Shift+H history palette. The first entry is
+    /// the most recent unique command; whitespace-only commands are dropped.
+    pub fn command_history(&self) -> Vec<String> {
+        let finished = self.finished_blocks.borrow();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for block in finished.iter().rev() {
+            let cmd = block.cmd_text.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+            if seen.insert(cmd.to_string()) {
+                out.push(cmd.to_string());
+            }
+        }
+        out
+    }
+
     /// Snapshot the currently selected finished block as an `ai::BlockContext`,
     /// truncating the output to `head + tail = 2*lines_per_side + 1` lines so
     /// a `cargo build` block doesn't blow the request budget. Returns `None`

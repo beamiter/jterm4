@@ -413,6 +413,190 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
+    /// Fuzzy palette over the active block-mode tab's finished-command
+    /// history. Enter pastes the selected command into the live VTE (with
+    /// honor for whatever bracketed-paste/readline state the shell sits in).
+    /// Toggle: a second invocation closes an open palette. No-op when the
+    /// active tab is VTE-mode or has no finished blocks yet.
+    pub(crate) fn show_history_palette(&self) {
+        let dialog_to_close = self.history_palette_dialog.borrow_mut().take();
+        if let Some(dialog) = dialog_to_close {
+            dialog.force_close();
+            return;
+        }
+
+        let Some(term_view) = self.current_term_view() else {
+            log::debug!("[history] no active block-mode tab");
+            return;
+        };
+        let history: Rc<Vec<String>> = Rc::new(term_view.command_history());
+        if history.is_empty() {
+            log::debug!("[history] no finished commands to show");
+            return;
+        }
+
+        let dialog = adw::Dialog::builder()
+            .title("Command History")
+            .content_width(560)
+            .content_height(480)
+            .build();
+
+        let header_bar = adw::HeaderBar::new();
+        let filter_entry = SearchEntry::new();
+        filter_entry.set_placeholder_text(Some("Filter history…"));
+        filter_entry.set_hexpand(true);
+
+        let list_box = ListBox::new();
+        list_box.set_selection_mode(gtk4::SelectionMode::Single);
+        list_box.add_css_class("boxed-list");
+        list_box.set_margin_start(12);
+        list_box.set_margin_end(12);
+        list_box.set_margin_bottom(12);
+
+        // Lowercase haystack mirrors the displayed list for substring filter.
+        let haystacks: Rc<Vec<String>> =
+            Rc::new(history.iter().map(|c| c.to_lowercase()).collect());
+
+        for cmd in history.iter() {
+            // Long commands wrap inside the row; keep the first line as the
+            // title so the palette stays scannable.
+            let first_line = cmd.lines().next().unwrap_or(cmd);
+            let row = adw::ActionRow::builder()
+                .title(first_line)
+                .activatable(true)
+                .build();
+            list_box.append(&row);
+        }
+        if let Some(first_row) = list_box.row_at_index(0) {
+            list_box.select_row(Some(&first_row));
+        }
+
+        let scrolled = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .child(&list_box)
+            .build();
+
+        let search_box = gtk4::Box::new(Orientation::Vertical, 0);
+        filter_entry.set_margin_start(12);
+        filter_entry.set_margin_end(12);
+        filter_entry.set_margin_top(8);
+        filter_entry.set_margin_bottom(8);
+        search_box.append(&filter_entry);
+        search_box.append(&scrolled);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&search_box));
+        dialog.set_child(Some(&toolbar_view));
+
+        let list_box_for_filter = list_box.clone();
+        let haystacks_for_filter = haystacks.clone();
+        filter_entry.connect_search_changed(move |entry| {
+            let query = entry.text().to_string().to_lowercase();
+            let mut first_visible: Option<gtk4::ListBoxRow> = None;
+            for (idx, hay) in haystacks_for_filter.iter().enumerate() {
+                if let Some(row) = list_box_for_filter.row_at_index(idx as i32) {
+                    let visible = query.is_empty() || hay.contains(&query);
+                    row.set_visible(visible);
+                    if visible && first_visible.is_none() {
+                        first_visible = Some(row);
+                    }
+                }
+            }
+            if let Some(row) = first_visible {
+                list_box_for_filter.select_row(Some(&row));
+            }
+        });
+
+        // Paste the selected command into the live VTE. Does NOT append a
+        // trailing newline — user reviews/edits, then presses Enter — which
+        // matches how bash's reverse-i-search behaves.
+        let paste = {
+            let history = history.clone();
+            let term_view = term_view.clone();
+            move |idx: usize| {
+                if let Some(cmd) = history.get(idx) {
+                    term_view.grab_focus();
+                    term_view.write_input(cmd.as_bytes());
+                }
+            }
+        };
+
+        let paste_for_activate = paste.clone();
+        let dialog_for_activate = dialog.clone();
+        list_box.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            dialog_for_activate.force_close();
+            paste_for_activate(idx);
+        });
+
+        let key_controller = EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let dialog_ref = self.history_palette_dialog.clone();
+        let list_box_for_key = list_box.clone();
+        let dialog_for_key = dialog.clone();
+        let paste_for_key = paste.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, state| {
+            // Escape, or the same chord that opened the palette, closes it.
+            if keyval == Key::Escape
+                || (matches!(keyval, Key::H | Key::h)
+                    && state.contains(ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK))
+            {
+                let dialog_to_close = dialog_ref.borrow_mut().take();
+                if let Some(d) = dialog_to_close {
+                    d.force_close();
+                }
+                return true.into();
+            }
+            if matches!(keyval, Key::Return | Key::KP_Enter) {
+                if let Some(row) = list_box_for_key.selected_row() {
+                    let idx = row.index() as usize;
+                    dialog_for_key.force_close();
+                    paste_for_key(idx);
+                }
+                return true.into();
+            }
+            if keyval == Key::Down {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let mut next = current + 1;
+                while let Some(row) = list_box_for_key.row_at_index(next) {
+                    if row.is_visible() {
+                        list_box_for_key.select_row(Some(&row));
+                        break;
+                    }
+                    next += 1;
+                }
+                return true.into();
+            }
+            if keyval == Key::Up {
+                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let mut prev = current - 1;
+                while prev >= 0 {
+                    if let Some(row) = list_box_for_key.row_at_index(prev) {
+                        if row.is_visible() {
+                            list_box_for_key.select_row(Some(&row));
+                            break;
+                        }
+                    }
+                    prev -= 1;
+                }
+                return true.into();
+            }
+            false.into()
+        });
+        dialog.add_controller(key_controller);
+
+        let dialog_ref = self.history_palette_dialog.clone();
+        dialog.connect_closed(move |_| {
+            *dialog_ref.borrow_mut() = None;
+        });
+
+        *self.history_palette_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present(Some(&self.window));
+        filter_entry.grab_focus();
+    }
+
     pub(crate) fn toggle_debug_dashboard(&self) {
         let dialog_to_close = self.debug_dashboard_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {

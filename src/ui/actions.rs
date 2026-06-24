@@ -250,6 +250,10 @@ impl UiState {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
             }
+            Action::HistoryPalette => {
+                log::debug!("Show history palette");
+                self.show_history_palette();
+            }
         }
     }
 
