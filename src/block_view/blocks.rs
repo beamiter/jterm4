@@ -594,6 +594,18 @@ impl FinishedBlock {
                 let visible_rows = rows.min(cap).max(1);
                 w.set_size(cols_for_map, visible_rows);
                 w.feed(text.as_bytes());
+                // Pin a minimum pixel height so GTK's vertical Box layout cannot
+                // shrink this VTE below what set_size requested. Without this,
+                // when the live (`active`) block claims full-viewport height
+                // during CollectingOutput state, the finished VTEs above are
+                // squeezed to ~1 row of allocation — VTE then auto-resizes its
+                // grid down to match, scrolling all rendered output into its
+                // own (invisible-by-default) scrollback. Pinning the request
+                // forces the ScrolledWindow to actually scroll instead.
+                let ch = w.char_height() as i32;
+                if ch > 0 {
+                    w.set_height_request((visible_rows as i32) * ch);
+                }
             });
             let fed_for_unmap = fed.clone();
             output_vte.connect_unmap(move |w| {
@@ -622,6 +634,10 @@ impl FinishedBlock {
                 let cap = if now_expanded { max_expanded_cap } else { viewport_cap };
                 let visible_rows = output_rows.min(cap).max(1);
                 output_vte_for_btn.set_size(cols_for_btn, visible_rows);
+                let ch = output_vte_for_btn.char_height() as i32;
+                if ch > 0 {
+                    output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
+                }
                 btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
                 btn.set_tooltip_text(Some(if now_expanded {
                     "Collapse to default height"
