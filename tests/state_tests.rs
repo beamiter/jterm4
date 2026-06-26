@@ -1,6 +1,6 @@
 mod common;
 
-use jterm4::state::{PaneLayout, escape_tab_state, unescape_tab_state, parse_tabs_state};
+use jterm4::state::{escape_tab_state, parse_tabs_state, unescape_tab_state, PaneLayout};
 
 #[test]
 fn test_escape_unescape_roundtrip() {
@@ -96,7 +96,9 @@ fn test_pane_layout_split_serialization() {
             assert_eq!(position, 500);
 
             match *start {
-                PaneLayout::Leaf { ref dir, ref sid, .. } => {
+                PaneLayout::Leaf {
+                    ref dir, ref sid, ..
+                } => {
                     assert_eq!(dir, "/tmp");
                     assert_eq!(sid, "123-456");
                 }
@@ -104,7 +106,12 @@ fn test_pane_layout_split_serialization() {
             }
 
             match *end {
-                PaneLayout::Leaf { ref dir, ref sid, ref cmds, .. } => {
+                PaneLayout::Leaf {
+                    ref dir,
+                    ref sid,
+                    ref cmds,
+                    ..
+                } => {
                     assert_eq!(dir, "/home");
                     assert_eq!(sid, "789-012");
                     assert_eq!(cmds, &Some("nix develop".to_string()));

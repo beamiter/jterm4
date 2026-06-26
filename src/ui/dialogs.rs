@@ -1,25 +1,24 @@
 //! dialogs — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
+use gtk4::glib;
 use gtk4::pango::FontDescription;
 use gtk4::{Adjustment, Label, ListBox, Orientation, Scale, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchEntry};
-use gtk4::glib;
 use libadwaita as adw;
-use adw::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use vte4::Format;
-use vte4::{Terminal};
+use vte4::Terminal;
 use vte4::TerminalExt;
 
+use super::*;
 use crate::config::save_config;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
-use super::*;
 
 impl UiState {
-
     pub(crate) async fn confirm_close_tab_with_process(
         window: &adw::ApplicationWindow,
         process_info: &str,
@@ -81,13 +80,17 @@ impl UiState {
 
         // Store action data for filtering and execution
         let actions_data: Rc<Vec<(Option<Action>, String, String)>> = Rc::new(
-            bound_actions.iter().map(|(action, binding)| {
-                (Some(*action), action.name().to_string(), binding.clone())
-            }).chain(
-                extra_hints.iter().map(|(shortcut, desc)| {
-                    (None, desc.to_string(), shortcut.to_string())
+            bound_actions
+                .iter()
+                .map(|(action, binding)| {
+                    (Some(*action), action.name().to_string(), binding.clone())
                 })
-            ).collect()
+                .chain(
+                    extra_hints
+                        .iter()
+                        .map(|(shortcut, desc)| (None, desc.to_string(), shortcut.to_string())),
+                )
+                .collect(),
         );
 
         for (_, description, binding) in actions_data.iter() {
@@ -195,7 +198,10 @@ impl UiState {
             }
             // Up/Down arrow navigate the list while keeping focus on the search entry
             if keyval == Key::Down {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(-1);
                 let mut next = current + 1;
                 while let Some(row) = list_box_for_key.row_at_index(next) {
                     if row.is_visible() {
@@ -207,7 +213,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Up {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(0);
                 let mut prev = current - 1;
                 while prev >= 0 {
                     if let Some(row) = list_box_for_key.row_at_index(prev) {
@@ -271,13 +280,16 @@ impl UiState {
 
         // Searchable haystack per row: "name user@host".
         let haystacks: Rc<Vec<String>> = Rc::new(
-            hosts.iter().map(|h| {
-                let target = match &h.user {
-                    Some(u) => format!("{u}@{}", h.host),
-                    None => h.host.clone(),
-                };
-                format!("{} {}", h.name, target).to_lowercase()
-            }).collect()
+            hosts
+                .iter()
+                .map(|h| {
+                    let target = match &h.user {
+                        Some(u) => format!("{u}@{}", h.host),
+                        None => h.host.clone(),
+                    };
+                    format!("{} {}", h.name, target).to_lowercase()
+                })
+                .collect(),
         );
 
         for h in hosts.iter() {
@@ -376,7 +388,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Down {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(-1);
                 let mut next = current + 1;
                 while let Some(row) = list_box_for_key.row_at_index(next) {
                     if row.is_visible() {
@@ -388,7 +403,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Up {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(0);
                 let mut prev = current - 1;
                 while prev >= 0 {
                     if let Some(row) = list_box_for_key.row_at_index(prev) {
@@ -560,7 +578,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Down {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(-1);
                 let mut next = current + 1;
                 while let Some(row) = list_box_for_key.row_at_index(next) {
                     if row.is_visible() {
@@ -572,7 +593,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Up {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(0);
                 let mut prev = current - 1;
                 while prev >= 0 {
                     if let Some(row) = list_box_for_key.row_at_index(prev) {
@@ -704,9 +728,7 @@ impl UiState {
                         if total == 0 {
                             status_label.set_text("No matches.");
                         } else if total == 500 {
-                            status_label.set_text(
-                                "500 matches (capped) — refine your query.",
-                            );
+                            status_label.set_text("500 matches (capped) — refine your query.");
                         } else {
                             status_label.set_text(&format!("{total} matches"));
                         }
@@ -766,12 +788,7 @@ impl UiState {
                     None => return,
                 };
                 if term_view.scroll_to_block_id(hit.block_id) {
-                    term_view.focus_match_in_block(
-                        hit.block_id,
-                        &pattern,
-                        is_regex,
-                        hit.is_output,
-                    );
+                    term_view.focus_match_in_block(hit.block_id, &pattern, is_regex, hit.is_output);
                 }
             }
         };
@@ -810,7 +827,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Down {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(-1);
                 let mut next = current + 1;
                 while let Some(row) = list_box_for_key.row_at_index(next) {
                     if row.is_visible() {
@@ -822,7 +842,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Up {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(0);
                 let mut prev = current - 1;
                 while prev >= 0 {
                     if let Some(row) = list_box_for_key.row_at_index(prev) {
@@ -961,13 +984,20 @@ impl UiState {
         let config = self.config.borrow();
 
         // --- Theme ---
-        let theme_names: Vec<String> = self.available_themes.iter().map(|t| t.name.clone()).collect();
-        let theme_model = gtk4::StringList::new(&theme_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let theme_names: Vec<String> = self
+            .available_themes
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        let theme_model =
+            gtk4::StringList::new(&theme_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         let theme_row = adw::ComboRow::builder()
             .title("Theme")
             .model(&theme_model)
             .build();
-        let current_theme_idx = self.available_themes.iter()
+        let current_theme_idx = self
+            .available_themes
+            .iter()
             .position(|t| t.name == config.theme_name)
             .unwrap_or(0);
         theme_row.set_selected(current_theme_idx as u32);
@@ -976,23 +1006,27 @@ impl UiState {
         // --- Font (monospace fonts from Pango) ---
         let pango_ctx = self.window.pango_context();
         let families = pango_ctx.list_families();
-        let mut mono_fonts: Vec<String> = families.iter()
+        let mut mono_fonts: Vec<String> = families
+            .iter()
             .filter(|f| f.is_monospace())
             .map(|f| f.name().to_string())
             .collect();
         mono_fonts.sort_by_key(|a| a.to_lowercase());
 
         let current_font_desc = FontDescription::from_string(&config.font_desc);
-        let current_family = current_font_desc.family()
+        let current_family = current_font_desc
+            .family()
             .map(|f| f.to_string())
             .unwrap_or_default();
 
-        let font_model = gtk4::StringList::new(&mono_fonts.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let font_model =
+            gtk4::StringList::new(&mono_fonts.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         let font_row = adw::ComboRow::builder()
             .title("Font")
             .model(&font_model)
             .build();
-        let current_font_idx = mono_fonts.iter()
+        let current_font_idx = mono_fonts
+            .iter()
             .position(|f| f == &current_family)
             .unwrap_or(0);
         font_row.set_selected(current_font_idx as u32);
@@ -1012,9 +1046,7 @@ impl UiState {
         group.add(&font_scale_row);
 
         // --- Opacity ---
-        let opacity_row = adw::ActionRow::builder()
-            .title("Opacity")
-            .build();
+        let opacity_row = adw::ActionRow::builder().title("Opacity").build();
         let opacity_scale = Scale::with_range(Orientation::Horizontal, 0.01, 1.0, 0.025);
         opacity_scale.set_value(self.window_opacity.get());
         opacity_scale.set_hexpand(true);
@@ -1024,7 +1056,11 @@ impl UiState {
         // --- Scrollback ---
         let scrollback_adj = Adjustment::new(
             config.terminal_scrollback_lines as f64,
-            0.0, 1_000_000.0, 100.0, 1000.0, 0.0,
+            0.0,
+            1_000_000.0,
+            100.0,
+            1000.0,
+            0.0,
         );
         let scrollback_row = adw::SpinRow::new(Some(&scrollback_adj), 100.0, 0);
         scrollback_row.set_title("Scrollback Lines");
@@ -1067,7 +1103,8 @@ impl UiState {
         let font_row_clone = font_row.clone();
         font_size_row.connect_notify_local(Some("value"), move |row, _| {
             let idx = font_row_clone.selected() as usize;
-            let family = mono_fonts_clone2.get(idx)
+            let family = mono_fonts_clone2
+                .get(idx)
                 .map(|s| s.as_str())
                 .unwrap_or("Monospace");
             let size = row.value() as i32;
@@ -1291,8 +1328,7 @@ impl UiState {
             return;
         };
 
-        let workflows: Rc<Vec<crate::workflows::Workflow>> =
-            Rc::new(crate::workflows::load_all());
+        let workflows: Rc<Vec<crate::workflows::Workflow>> = Rc::new(crate::workflows::load_all());
         if workflows.is_empty() {
             log::debug!(
                 "[workflows] no workflows in {}",
@@ -1401,7 +1437,9 @@ impl UiState {
         let ui_self = self.clone();
         let term_view_for_pick = term_view.clone();
         let pick = Rc::new(move |idx: usize| {
-            let Some(wf) = workflows_for_pick.get(idx).cloned() else { return };
+            let Some(wf) = workflows_for_pick.get(idx).cloned() else {
+                return;
+            };
             if wf.args.is_empty() {
                 term_view_for_pick.grab_focus();
                 term_view_for_pick.write_input(wf.command.as_bytes());
@@ -1444,7 +1482,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Down {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(-1);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(-1);
                 let mut next = current + 1;
                 while let Some(row) = list_box_for_key.row_at_index(next) {
                     if row.is_visible() {
@@ -1456,7 +1497,10 @@ impl UiState {
                 return true.into();
             }
             if keyval == Key::Up {
-                let current = list_box_for_key.selected_row().map(|r| r.index()).unwrap_or(0);
+                let current = list_box_for_key
+                    .selected_row()
+                    .map(|r| r.index())
+                    .unwrap_or(0);
                 let mut prev = current - 1;
                 while prev >= 0 {
                     if let Some(row) = list_box_for_key.row_at_index(prev) {

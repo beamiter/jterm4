@@ -1,34 +1,36 @@
+mod ai;
 mod block_view;
 mod config;
+mod git_meta;
 mod keybindings;
+mod notify;
 mod parser;
 mod pty;
+mod redact;
 mod state;
 mod terminal;
 mod ui;
-mod ai;
-mod redact;
-mod notify;
-mod git_meta;
 mod workflows;
 
+use adw::prelude::*;
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
 use gtk4::gio::{self, Cancellable};
-use gtk4::{glib, Notebook, Orientation, CssProvider, EventControllerKey, EventControllerScroll,
-           EventControllerScrollFlags, ScrolledWindow, SearchBar, SearchEntry};
+use gtk4::{
+    glib, CssProvider, EventControllerKey, EventControllerScroll, EventControllerScrollFlags,
+    Notebook, Orientation, ScrolledWindow, SearchBar, SearchEntry,
+};
 use libadwaita as adw;
-use adw::prelude::*;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::rc::Rc;
 
-use config::{load_config, config_file_path, choose_shell_argv};
-use keybindings::{Action, KeyCombo, normalize_key};
-use state::{load_tabs_state, save_tabs_state, kill_all_terminal_children};
-use terminal::{terminal_working_directory, find_first_terminal};
+use config::{choose_shell_argv, config_file_path, load_config};
+use keybindings::{normalize_key, Action, KeyCombo};
+use state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
+use terminal::{find_first_terminal, terminal_working_directory};
 use ui::UiState;
 
 struct SimpleStderrLogger {
@@ -85,7 +87,9 @@ fn main() -> glib::ExitCode {
             Ok(existing) => existing,
             Err(_) => fcitx5_path.to_string(),
         };
-        unsafe { std::env::set_var("GTK_PATH", &gtk_path); }
+        unsafe {
+            std::env::set_var("GTK_PATH", &gtk_path);
+        }
     }
 
     init_logging();

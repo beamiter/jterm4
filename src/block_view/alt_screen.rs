@@ -5,16 +5,15 @@
 //! and renders full-viewport; when it sends `?1049l`, the alt-screen content
 //! is **discarded** — the active block keeps only the command name + exit code.
 //! No frame-merge / pager-snapshot path runs, matching Warp.
+use crate::config::Config;
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
-use crate::config::Config;
 
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum MouseReportingMode {
     /// No mouse reporting (CSI ?1000l, etc.)
     #[default]
@@ -55,16 +54,12 @@ pub(crate) fn encode_mouse_wheel(
     let r = row.max(1);
     match mode {
         MouseReportingMode::None => None,
-        MouseReportingMode::Sgr => {
-            Some(format!("\x1b[<{};{};{}M", button, c, r).into_bytes())
-        }
+        MouseReportingMode::Sgr => Some(format!("\x1b[<{};{};{}M", button, c, r).into_bytes()),
         // X10-style modes encode each field as `value + 32` in a single byte.
         // Wheel reporting requires at least Button-event tracking (1002), but
         // xterm's de-facto behavior also forwards wheel under plain Click
         // (1000), so we emit for any non-None, non-SGR mode.
-        MouseReportingMode::Click
-        | MouseReportingMode::Button
-        | MouseReportingMode::Motion => {
+        MouseReportingMode::Click | MouseReportingMode::Button | MouseReportingMode::Motion => {
             // Clamp to the legacy 223-column limit (255 - 32).
             let cb = (button + 32).min(255) as u8;
             let cc = (c as u32 + 32).min(255) as u8;

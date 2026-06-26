@@ -31,7 +31,8 @@ impl UiState {
     pub(crate) fn set_file_tree_root(&self, root: PathBuf) {
         self.file_tree_store.clear();
         self.file_tree_root_label.set_text(&display_path(&root));
-        self.file_tree_root_label.set_tooltip_text(Some(&root.to_string_lossy()));
+        self.file_tree_root_label
+            .set_tooltip_text(Some(&root.to_string_lossy()));
         self.populate_dir(None, &root);
         *self.file_tree_root.borrow_mut() = root;
     }
@@ -149,7 +150,11 @@ impl UiState {
         });
 
         for (name, path, is_dir) in entries {
-            let icon = if is_dir { "folder-symbolic" } else { "text-x-generic-symbolic" };
+            let icon = if is_dir {
+                "folder-symbolic"
+            } else {
+                "text-x-generic-symbolic"
+            };
             let path_str = path.to_string_lossy().to_string();
             let iter = self.file_tree_store.insert_with_values(
                 parent,

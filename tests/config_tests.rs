@@ -39,4 +39,3 @@ fn test_terminal_mode_clone() {
         _ => panic!("Clone failed"),
     }
 }
-

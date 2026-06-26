@@ -1,3 +1,4 @@
+use gtk4::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
@@ -5,7 +6,6 @@ use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc;
-use gtk4::glib;
 
 use crate::state::terminate_terminal_process;
 
@@ -44,7 +44,11 @@ extern "C" fn fd_watch_callback<F: FnMut() -> bool>(
     user_data: *mut std::ffi::c_void,
 ) -> i32 {
     let data = unsafe { &mut *(user_data as *mut FdWatchData<F>) };
-    if (data.callback)() { 1 } else { 0 }
+    if (data.callback)() {
+        1
+    } else {
+        0
+    }
 }
 
 extern "C" fn fd_watch_destroy<F: FnMut() -> bool>(user_data: *mut std::ffi::c_void) {
@@ -75,11 +79,7 @@ impl OwnedPty {
         }
     }
 
-    pub fn spawn(
-        argv: &[&str],
-        cwd: Option<&str>,
-        env_extra: &[(&str, &str)],
-    ) -> io::Result<Self> {
+    pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -114,10 +114,7 @@ impl OwnedPty {
                 }
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
 
-                let c_argv: Vec<CString> = argv
-                    .iter()
-                    .map(|a| CString::new(*a).unwrap())
-                    .collect();
+                let c_argv: Vec<CString> = argv.iter().map(|a| CString::new(*a).unwrap()).collect();
                 let _ = unistd::execvp(&c_argv[0], &c_argv);
                 std::process::exit(127);
             }
@@ -175,9 +172,12 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        let fd = match self.master.lock().ok().and_then(|guard| {
-            guard.as_ref().map(|fd| fd.as_raw_fd())
-        }) {
+        let fd = match self
+            .master
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|fd| fd.as_raw_fd()))
+        {
             Some(fd) => fd,
             None => return,
         };
@@ -216,7 +216,8 @@ impl OwnedPty {
 
             let max_wait_secs = 5;
             for _ in 0..(max_wait_secs * 10) {
-                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+                {
                     Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
                         let _ = tx.send(PtyMsg::Exit(code));
                         signal_eventfd(efd_for_thread);
@@ -265,14 +266,18 @@ impl OwnedPty {
                         if let Some(f) = on_exit.take() {
                             f(code);
                         }
-                        unsafe { libc::close(efd); }
+                        unsafe {
+                            libc::close(efd);
+                        }
                         return false; // Remove source
                     }
                     Err(mpsc::TryRecvError::Empty) => {
                         return true; // Keep watching
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        unsafe { libc::close(efd); }
+                        unsafe {
+                            libc::close(efd);
+                        }
                         return false;
                     }
                 }
@@ -312,7 +317,8 @@ impl OwnedPty {
 
             let max_wait_secs = 5;
             for _ in 0..(max_wait_secs * 10) {
-                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                match nix::sys::wait::waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
+                {
                     Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
                         let _ = tx.send(PtyMsg::Exit(code));
                         return;
@@ -343,24 +349,22 @@ impl OwnedPty {
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
 
-        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
-            loop {
-                match rx.borrow().try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
+        glib::timeout_add_local(std::time::Duration::from_millis(1), move || loop {
+            match rx.borrow().try_recv() {
+                Ok(PtyMsg::Data(data)) => {
+                    callback(data);
+                }
+                Ok(PtyMsg::Exit(code)) => {
+                    if let Some(f) = on_exit.take() {
+                        f(code);
                     }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
-                        }
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        return glib::ControlFlow::Continue;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return glib::ControlFlow::Break;
-                    }
+                    return glib::ControlFlow::Break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return glib::ControlFlow::Continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return glib::ControlFlow::Break;
                 }
             }
         });

@@ -26,7 +26,10 @@ fn patterns() -> &'static [(&'static str, Regex)] {
         let pats: &[(&str, &str)] = &[
             // PEM private key block (any flavor): RSA, EC, OPENSSH, plain
             // PRIVATE KEY. Span includes body so the whole secret is gone.
-            ("private-key", r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
+            (
+                "private-key",
+                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            ),
             // AWS access key ids (long-lived + STS). Format is fixed.
             ("aws-access-key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
             // GitHub fine-grained PAT (long form).
@@ -37,7 +40,10 @@ fn patterns() -> &'static [(&'static str, Regex)] {
             ("slack-token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
             // JWT (header.payload.signature). Loose but the three-segment
             // base64url structure with `eyJ` header prefix is distinctive.
-            ("jwt", r"\beyJ[A-Za-z0-9_=-]{8,}\.eyJ[A-Za-z0-9_=-]{8,}\.[A-Za-z0-9_=.+/-]{8,}\b"),
+            (
+                "jwt",
+                r"\beyJ[A-Za-z0-9_=-]{8,}\.eyJ[A-Za-z0-9_=-]{8,}\.[A-Za-z0-9_=.+/-]{8,}\b",
+            ),
             // Anthropic API keys — protect the user's own key if it shows
             // up in `env | grep` output etc. Format: sk-ant-<base64ish>.
             ("anthropic-key", r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
@@ -59,7 +65,9 @@ pub fn redact_secrets(input: &str) -> String {
     for (kind, re) in patterns() {
         if re.is_match(&current) {
             let replacement = format!("[REDACTED:{kind}]");
-            current = std::borrow::Cow::Owned(re.replace_all(&current, replacement.as_str()).into_owned());
+            current = std::borrow::Cow::Owned(
+                re.replace_all(&current, replacement.as_str()).into_owned(),
+            );
         }
     }
     current.into_owned()

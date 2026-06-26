@@ -1,3 +1,4 @@
+use adw::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::gdk::ModifierType;
 use gtk4::gdk::RGBA;
@@ -5,10 +6,9 @@ use gtk4::gio::{self, Cancellable};
 use gtk4::glib::translate::IntoGlib;
 use gtk4::glib::SpawnFlags;
 use gtk4::pango::FontDescription;
-use gtk4::{glib, Entry, Label, Orientation, Paned};
 use gtk4::GestureClick;
+use gtk4::{glib, Entry, Label, Orientation, Paned};
 use libadwaita as adw;
-use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
@@ -39,7 +39,11 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 
     // Set colors
     let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-    terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
     terminal.set_color_bold(None);
     terminal.set_color_cursor(Some(&config.cursor));
     terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
@@ -105,7 +109,11 @@ impl VteTerminalView {
         terminal.connect_current_directory_uri_notify(move |_| {
             if let Some(uri) = terminal_for_cwd.current_directory_uri() {
                 let file = gio::File::for_uri(uri.as_str());
-                if let Some(path) = file.path().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()) {
+                if let Some(path) = file
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .filter(|s| !s.is_empty())
+                {
                     for callback in cwd_callbacks_clone.borrow().iter() {
                         callback(&path);
                     }
@@ -152,7 +160,13 @@ impl VteTerminalView {
         });
 
         // Spawn shell
-        spawn_shell(&terminal, shell_argv, working_directory, session_id, initial_commands);
+        spawn_shell(
+            &terminal,
+            shell_argv,
+            working_directory,
+            session_id,
+            initial_commands,
+        );
 
         VteTerminalView {
             root,
@@ -218,7 +232,9 @@ impl VteTerminalView {
     where
         F: Fn() + 'static,
     {
-        self.activity_callbacks.borrow_mut().push(Box::new(callback));
+        self.activity_callbacks
+            .borrow_mut()
+            .push(Box::new(callback));
     }
 
     pub fn set_font(&self, font_desc: &FontDescription) {
@@ -232,10 +248,15 @@ impl VteTerminalView {
     pub fn apply_theme(&self) {
         let config = self.config.borrow();
         let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-        self.terminal.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+        self.terminal.set_colors(
+            Some(&config.foreground),
+            Some(&config.background),
+            &palette_refs,
+        );
         self.terminal.set_color_bold(None);
         self.terminal.set_color_cursor(Some(&config.cursor));
-        self.terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
+        self.terminal
+            .set_color_cursor_foreground(Some(&config.cursor_foreground));
     }
 
     pub fn write_input(&self, data: &[u8]) {
@@ -260,7 +281,8 @@ impl VteTerminalView {
 
     pub fn pid_i32(&self) -> i32 {
         unsafe {
-            self.terminal.data::<i32>("child-pid")
+            self.terminal
+                .data::<i32>("child-pid")
                 .map(|pid| *pid.as_ref())
                 .unwrap_or(0)
         }
@@ -273,10 +295,7 @@ pub(crate) fn wrap_with_scrollbar(terminal: &Terminal) -> gtk4::Box {
     hbox.set_hexpand(true);
     hbox.set_vexpand(true);
     hbox.add_css_class("terminal-box");
-    let scrollbar = gtk4::Scrollbar::new(
-        Orientation::Vertical,
-        terminal.vadjustment().as_ref(),
-    );
+    let scrollbar = gtk4::Scrollbar::new(Orientation::Vertical, terminal.vadjustment().as_ref());
     hbox.append(terminal);
     hbox.append(&scrollbar);
     hbox
@@ -297,7 +316,11 @@ pub(crate) fn terminal_working_directory(terminal: &Terminal) -> Option<String> 
     // Prefer OSC 7 reported directory
     if let Some(uri) = terminal.current_directory_uri() {
         let file = gio::File::for_uri(uri.as_str());
-        if let Some(path) = file.path().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(path) = file
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+        {
             return Some(path);
         }
     }
@@ -318,7 +341,8 @@ pub(crate) fn spawn_shell(
     // Append --session <id> to argv when restoring a session (only for rsh)
     let mut argv_vec: Vec<String> = argv_owned.to_vec();
     if let Some(sid) = session_id {
-        let is_rsh = argv_vec.first()
+        let is_rsh = argv_vec
+            .first()
             .and_then(|s| std::path::Path::new(s).file_name())
             .and_then(|f| f.to_str())
             .map(|name| name == "rsh")
@@ -367,13 +391,16 @@ pub(crate) fn spawn_shell(
             if let Some(ref cmds) = init_cmds {
                 if !cmds.is_empty() {
                     let cmds = cmds.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-                        let lines: Vec<&str> = cmds.split(", ").collect();
-                        for line in lines {
-                            let text = format!("{}\r", line.trim());
-                            terminal_for_init.feed_child(text.as_bytes());
-                        }
-                    });
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(500),
+                        move || {
+                            let lines: Vec<&str> = cmds.split(", ").collect();
+                            for line in lines {
+                                let text = format!("{}\r", line.trim());
+                                terminal_for_init.feed_child(text.as_bytes());
+                            }
+                        },
+                    );
                 }
             }
         },
@@ -386,7 +413,11 @@ pub(crate) fn open_uri(uri: &str) {
     }
 }
 
-pub(crate) fn show_rename_dialog(window: &adw::ApplicationWindow, label: &Label, custom_title: Rc<Cell<bool>>) {
+pub(crate) fn show_rename_dialog(
+    window: &adw::ApplicationWindow,
+    label: &Label,
+    custom_title: Rc<Cell<bool>>,
+) {
     let dialog = adw::AlertDialog::new(Some("Rename tab"), None);
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("rename", "Rename");
@@ -454,7 +485,9 @@ pub(crate) fn show_rename_dialog_with_strip(
 }
 
 pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option<&str>) -> String {
-    let mut resolved_dir = working_directory.filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
+    let mut resolved_dir = working_directory
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
 
     // If no directory is known (e.g. first launch), default to HOME so the tab has a meaningful title.
     if resolved_dir.is_none() {
@@ -545,7 +578,6 @@ pub(crate) fn default_tab_title(tab_index_1based: u32, working_directory: Option
     format!("{prefix}{}", out_parts.join("/"))
 }
 
-
 pub(crate) fn setup_terminal_click_handler(terminal: &Terminal) {
     // Use a click gesture in Capture phase to intercept Ctrl+Click before VTE sees it
     // For normal clicks, let them pass through to VTE for text selection
@@ -623,7 +655,10 @@ pub(crate) fn collect_terminals(widget: &gtk4::Widget, out: &mut Vec<Terminal>) 
 }
 
 /// Walk the Paned tree and reattach a terminal to the first None child slot found.
-pub(crate) fn reattach_terminal_to_tree(widget: &gtk4::Widget, child_to_reattach: &gtk4::Widget) -> bool {
+pub(crate) fn reattach_terminal_to_tree(
+    widget: &gtk4::Widget,
+    child_to_reattach: &gtk4::Widget,
+) -> bool {
     if let Ok(paned) = widget.clone().downcast::<Paned>() {
         if paned.start_child().is_none() {
             paned.set_start_child(Some(child_to_reattach));

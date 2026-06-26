@@ -124,7 +124,10 @@ pub(crate) fn send_blocking(
 
     let msgs: Vec<ReqMessage> = history
         .iter()
-        .map(|t| ReqMessage { role: t.role.as_str(), content: &t.text })
+        .map(|t| ReqMessage {
+            role: t.role.as_str(),
+            content: &t.text,
+        })
         .collect();
     let body = Request {
         model,
@@ -144,13 +147,19 @@ pub(crate) fn send_blocking(
         .args([
             "--silent",
             "--show-error",
-            "-X", "POST",
+            "-X",
+            "POST",
             API_URL,
-            "-H", &format!("x-api-key: {api_key}"),
-            "-H", &format!("anthropic-version: {API_VERSION}"),
-            "-H", "content-type: application/json",
-            "--data-binary", "@-",
-            "-w", "\n__JTERM4_STATUS__:%{http_code}",
+            "-H",
+            &format!("x-api-key: {api_key}"),
+            "-H",
+            &format!("anthropic-version: {API_VERSION}"),
+            "-H",
+            "content-type: application/json",
+            "--data-binary",
+            "@-",
+            "-w",
+            "\n__JTERM4_STATUS__:%{http_code}",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -158,9 +167,10 @@ pub(crate) fn send_blocking(
         .spawn()
         .map_err(|e| AiError::Transport(format!("spawn curl: {e}")))?;
     {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AiError::Transport("curl stdin unavailable".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| AiError::Transport("curl stdin unavailable".to_string()))?;
         stdin
             .write_all(body_json.as_bytes())
             .map_err(|e| AiError::Transport(format!("write body: {e}")))?;
@@ -184,7 +194,11 @@ pub(crate) fn send_blocking(
         let message = serde_json::from_str::<ApiError>(body)
             .map(|e| format!("{}: {}", e.error.kind, e.error.message))
             .unwrap_or_else(|_| {
-                if body.is_empty() { format!("HTTP {status}") } else { body.to_string() }
+                if body.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    body.to_string()
+                }
             });
         return Err(AiError::Api { status, message });
     }
@@ -285,7 +299,10 @@ mod tests {
 
     #[test]
     fn truncate_elides_middle_large() {
-        let input: String = (0..100).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let input: String = (0..100)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = truncate_for_context(&input, 3);
         assert!(out.starts_with("l0\nl1\nl2"));
         assert!(out.contains("[94 lines elided]"));

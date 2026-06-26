@@ -43,7 +43,12 @@ pub fn read(cwd: &Path) -> Option<RepoMeta> {
     let dirty = read_dirty(cwd);
     let (ahead, behind) = read_ahead_behind(cwd);
 
-    Some(RepoMeta { branch, dirty, ahead, behind })
+    Some(RepoMeta {
+        branch,
+        dirty,
+        ahead,
+        behind,
+    })
 }
 
 fn read_branch(cwd: &Path) -> Option<String> {
@@ -76,10 +81,7 @@ fn read_dirty(cwd: &Path) -> bool {
 fn read_ahead_behind(cwd: &Path) -> (Option<u32>, Option<u32>) {
     // `--count` prints "<behind>\t<ahead>" for `@{u}...HEAD`. Errors when
     // no upstream is configured — that's the None branch.
-    let raw = match run_git(
-        cwd,
-        &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
-    ) {
+    let raw = match run_git(cwd, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]) {
         Some(s) => s,
         None => return (None, None),
     };

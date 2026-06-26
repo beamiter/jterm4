@@ -1,29 +1,26 @@
 //! tabs — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
 use gtk4::{glib, Label, Paned};
 use gtk4::{GestureClick, ToggleButton};
 use libadwaita as adw;
-use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use vte4::{Terminal};
+use vte4::Terminal;
 use vte4::TerminalExt;
 
+use super::*;
+use crate::block_view::TermView;
 use crate::keybindings::Action;
 use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
-use crate::block_view::TermView;
 use crate::terminal::{
-    wrap_with_scrollbar, scrollbar_wrapper_of,
-    terminal_working_directory,
-    setup_terminal_click_handler, show_rename_dialog, show_rename_dialog_with_strip,
-    default_tab_title,
-    find_first_terminal, find_focused_terminal, collect_terminals,
+    collect_terminals, default_tab_title, find_first_terminal, find_focused_terminal,
+    scrollbar_wrapper_of, setup_terminal_click_handler, show_rename_dialog,
+    show_rename_dialog_with_strip, terminal_working_directory, wrap_with_scrollbar,
     VteTerminalView,
 };
-use super::*;
 
 impl UiState {
-
     pub(crate) fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
         // Check for running process before closing
         if let Some(terminal) = find_first_terminal(widget) {
@@ -129,7 +126,9 @@ impl UiState {
                         let ui_state = self.clone();
                         let widget_clone = widget.clone();
                         glib::MainContext::default().spawn_local(async move {
-                            if Self::confirm_close_tab_with_process(&ui_state.window, &process_info).await {
+                            if Self::confirm_close_tab_with_process(&ui_state.window, &process_info)
+                                .await
+                            {
                                 ui_state.remove_tab_by_widget_internal(&widget_clone);
                             }
                         });
@@ -205,7 +204,11 @@ impl UiState {
     }
 
     /// Add an existing terminal widget as a new tab (used by move_pane_to_new_tab).
-    pub(crate) fn add_terminal_as_new_tab(&self, terminal: Terminal, working_directory: Option<String>) {
+    pub(crate) fn add_terminal_as_new_tab(
+        &self,
+        terminal: Terminal,
+        working_directory: Option<String>,
+    ) {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -216,9 +219,10 @@ impl UiState {
         let tab_name = default_tab_title(tab_num, working_directory.as_deref());
 
         // Use existing scrollbar wrapper if present, otherwise create one
-        let page_widget: gtk4::Widget = scrollbar_wrapper_of(&terminal.clone().upcast::<gtk4::Widget>())
-            .map(|bx| bx.upcast::<gtk4::Widget>())
-            .unwrap_or_else(|| wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>());
+        let page_widget: gtk4::Widget =
+            scrollbar_wrapper_of(&terminal.clone().upcast::<gtk4::Widget>())
+                .map(|bx| bx.upcast::<gtk4::Widget>())
+                .unwrap_or_else(|| wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>());
         page_widget.set_widget_name(&format!("tab-{tab_num}"));
 
         // Notebook label
@@ -255,8 +259,21 @@ impl UiState {
         terminal.grab_focus();
     }
 
-    pub(crate) fn add_new_tab(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>) -> Terminal {
-        self.add_tab_with_argv(working_directory, tab_name, session_id, initial_commands, None, None)
+    pub(crate) fn add_new_tab(
+        &self,
+        working_directory: Option<String>,
+        tab_name: Option<String>,
+        session_id: Option<String>,
+        initial_commands: Option<String>,
+    ) -> Terminal {
+        self.add_tab_with_argv(
+            working_directory,
+            tab_name,
+            session_id,
+            initial_commands,
+            None,
+            None,
+        )
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
@@ -266,10 +283,21 @@ impl UiState {
 
     /// Like `connect_remote`, but seeds the new tab's reconnect-backoff counter.
     /// Used by auto-reconnect to carry the attempt count across respawns.
-    fn connect_remote_with_attempt(&self, host: &crate::config::RemoteHost, attempt: u32) -> Terminal {
+    fn connect_remote_with_attempt(
+        &self,
+        host: &crate::config::RemoteHost,
+        attempt: u32,
+    ) -> Terminal {
         let argv = crate::config::build_remote_argv(host);
         log::info!("[remote] connecting to {} via {:?}", host.name, argv);
-        self.add_tab_with_argv(None, Some(host.name.clone()), None, None, Some(argv), Some((host.clone(), attempt)))
+        self.add_tab_with_argv(
+            None,
+            Some(host.name.clone()),
+            None,
+            None,
+            Some(argv),
+            Some((host.clone(), attempt)),
+        )
     }
 
     /// Mark a remote tab as connected (green badge). Called on first output.
@@ -325,7 +353,9 @@ impl UiState {
         if next_attempt > MAX_ATTEMPT {
             log::warn!(
                 "[remote] giving up reconnect for '{}' (tab {}) after {} attempts",
-                conn.host.name, tab_num, conn.attempt
+                conn.host.name,
+                tab_num,
+                conn.attempt
             );
             if let Some(c) = self.tab_connections.borrow_mut().get_mut(&tab_num) {
                 c.status = ConnStatus::Disconnected;
@@ -349,7 +379,11 @@ impl UiState {
         let host = conn.host.clone();
         log::info!(
             "[remote] '{}' (tab {}) disconnected (exit {}); reconnecting in {}s (attempt {})",
-            host.name, tab_num, code, delay, next_attempt
+            host.name,
+            tab_num,
+            code,
+            delay,
+            next_attempt
         );
 
         let ui = self.clone();
@@ -371,7 +405,10 @@ impl UiState {
             let left = remaining.get();
             if left > 1 {
                 remaining.set(left - 1);
-                ui.set_tab_strip_label(tab_num, &format!("{} — reconnect {}s", host.name, left - 1));
+                ui.set_tab_strip_label(
+                    tab_num,
+                    &format!("{} — reconnect {}s", host.name, left - 1),
+                );
                 return glib::ControlFlow::Continue;
             }
             ui.do_reconnect(tab_num, &host, next_attempt);
@@ -413,7 +450,15 @@ impl UiState {
     /// argv (e.g. an ssh command) instead of the configured local shell. When
     /// `remote` is `Some`, the tab is tracked as an ssh connection (status badge +
     /// auto-reconnect) via `tab_connections`.
-    fn add_tab_with_argv(&self, working_directory: Option<String>, tab_name: Option<String>, session_id: Option<String>, initial_commands: Option<String>, argv_override: Option<Vec<String>>, remote: Option<(crate::config::RemoteHost, u32)>) -> Terminal {
+    fn add_tab_with_argv(
+        &self,
+        working_directory: Option<String>,
+        tab_name: Option<String>,
+        session_id: Option<String>,
+        initial_commands: Option<String>,
+        argv_override: Option<Vec<String>>,
+        remote: Option<(crate::config::RemoteHost, u32)>,
+    ) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -423,15 +468,20 @@ impl UiState {
 
         // Record the per-tab connection so we can show status and auto-reconnect.
         if let Some((host, attempt)) = &remote {
-            self.tab_connections.borrow_mut().insert(tab_num, TabConnection {
-                host: host.clone(),
-                status: ConnStatus::Connecting,
-                attempt: *attempt,
-                spawn_at: std::time::Instant::now(),
-            });
+            self.tab_connections.borrow_mut().insert(
+                tab_num,
+                TabConnection {
+                    host: host.clone(),
+                    status: ConnStatus::Connecting,
+                    attempt: *attempt,
+                    spawn_at: std::time::Instant::now(),
+                },
+            );
         }
 
-        let shell_argv: &[String] = argv_override.as_deref().unwrap_or(self.shell_argv.as_slice());
+        let shell_argv: &[String] = argv_override
+            .as_deref()
+            .unwrap_or(self.shell_argv.as_slice());
 
         // Create terminal view based on configured mode
         let (view_type, terminal) = {
@@ -526,7 +576,11 @@ impl UiState {
         let custom_title_for_rename = custom_title.clone();
         rename_click.connect_pressed(move |_, n_press, _, _| {
             if n_press == 2 {
-                show_rename_dialog(&window_for_rename, &label_for_rename, custom_title_for_rename.clone());
+                show_rename_dialog(
+                    &window_for_rename,
+                    &label_for_rename,
+                    custom_title_for_rename.clone(),
+                );
             }
         });
         label.add_controller(rename_click);
@@ -585,11 +639,13 @@ impl UiState {
         let term_wrapper = match &view_type {
             TerminalViewType::Block(term_view) => {
                 let w = term_view.widget();
-                w.downcast::<gtk4::Box>().expect("TermView root must be a Box")
+                w.downcast::<gtk4::Box>()
+                    .expect("TermView root must be a Box")
             }
             TerminalViewType::Vte(vte_view) => {
                 let w = vte_view.widget();
-                w.downcast::<gtk4::Box>().expect("VteTerminalView root must be a Box")
+                w.downcast::<gtk4::Box>()
+                    .expect("VteTerminalView root must be a Box")
             }
         };
 
@@ -642,7 +698,7 @@ impl UiState {
         let pin_icon = gtk4::Image::new();
         pin_icon.set_icon_name(Some("bookmark-symbolic"));
         pin_icon.add_css_class("tab-pin-icon");
-        pin_icon.set_visible(false);  // Hidden by default
+        pin_icon.set_visible(false); // Hidden by default
 
         // Connection-status dot (remote tabs only): yellow→green→red.
         let conn_dot = Label::new(Some("\u{25CF}"));
@@ -713,7 +769,9 @@ impl UiState {
             }
 
             // Add foreground process name
-            if let Some(proc_name) = crate::state::get_foreground_process_name(&terminal_for_tooltip) {
+            if let Some(proc_name) =
+                crate::state::get_foreground_process_name(&terminal_for_tooltip)
+            {
                 tooltip_parts.push(format!("Process: {}", proc_name));
             }
 
@@ -870,7 +928,8 @@ impl UiState {
                 let item = make_item("Duplicate");
                 let popover_c = popover.clone();
                 let ui_duplicate_ctx = ui_for_ctx.clone();
-                let wd_for_dup = terminal_working_directory(&terminal_for_dup).or_else(|| std::env::var("HOME").ok());
+                let wd_for_dup = terminal_working_directory(&terminal_for_dup)
+                    .or_else(|| std::env::var("HOME").ok());
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
                     ui_duplicate_ctx.add_new_tab(wd_for_dup.clone(), None, None, None);
@@ -887,10 +946,14 @@ impl UiState {
                     popover_c.popdown();
                     if strip_btn_mark.has_css_class("tab-marked") {
                         strip_btn_mark.remove_css_class("tab-marked");
-                        unsafe { strip_btn_mark.set_data::<bool>("marked", false); }
+                        unsafe {
+                            strip_btn_mark.set_data::<bool>("marked", false);
+                        }
                     } else {
                         strip_btn_mark.add_css_class("tab-marked");
-                        unsafe { strip_btn_mark.set_data::<bool>("marked", true); }
+                        unsafe {
+                            strip_btn_mark.set_data::<bool>("marked", true);
+                        }
                     }
                 });
                 vbox.append(&item);
@@ -908,13 +971,21 @@ impl UiState {
                     if strip_btn_pin.has_css_class("tab-pinned") {
                         strip_btn_pin.remove_css_class("tab-pinned");
                         pin_icon_pin.set_visible(false);
-                        unsafe { strip_btn_pin.set_data::<bool>("pinned", false); }
-                        unsafe { term_wrapper_pin.set_data::<bool>("pinned", false); }
+                        unsafe {
+                            strip_btn_pin.set_data::<bool>("pinned", false);
+                        }
+                        unsafe {
+                            term_wrapper_pin.set_data::<bool>("pinned", false);
+                        }
                     } else {
                         strip_btn_pin.add_css_class("tab-pinned");
                         pin_icon_pin.set_visible(true);
-                        unsafe { strip_btn_pin.set_data::<bool>("pinned", true); }
-                        unsafe { term_wrapper_pin.set_data::<bool>("pinned", true); }
+                        unsafe {
+                            strip_btn_pin.set_data::<bool>("pinned", true);
+                        }
+                        unsafe {
+                            term_wrapper_pin.set_data::<bool>("pinned", true);
+                        }
                     }
                 });
                 vbox.append(&item);
@@ -1111,7 +1182,9 @@ impl UiState {
         let notebook_for_drop = self.notebook.clone();
         let strip_btn_for_drop = strip_btn.clone();
         drop_target.connect_drop(move |_, value, _, _| {
-            let Ok(drag_name) = value.get::<String>() else { return false };
+            let Ok(drag_name) = value.get::<String>() else {
+                return false;
+            };
             let target_name = strip_btn_for_drop.widget_name().to_string();
             if drag_name == target_name {
                 return false; // dropped on itself
@@ -1149,7 +1222,9 @@ impl UiState {
                 }
                 child = c.next_sibling();
             }
-            let Some(target_w) = target_w else { return false };
+            let Some(target_w) = target_w else {
+                return false;
+            };
 
             if src < dst {
                 src_w.insert_after(&tab_strip_for_drop, Some(&target_w));

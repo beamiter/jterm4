@@ -1,22 +1,24 @@
 //! panes — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::{Orientation, Paned};
 use libadwaita as adw;
-use adw::prelude::*;
-use vte4::{Terminal};
+use vte4::Terminal;
 use vte4::TerminalExt;
 
+use super::*;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{
-    create_terminal, wrap_with_scrollbar, scrollbar_wrapper_of,
-    terminal_working_directory, spawn_shell,
-    setup_terminal_click_handler, collect_terminals,
+    collect_terminals, create_terminal, scrollbar_wrapper_of, setup_terminal_click_handler,
+    spawn_shell, terminal_working_directory, wrap_with_scrollbar,
 };
-use super::*;
 
 impl UiState {
-
-    pub(crate) fn create_split_terminal(&self, working_directory: Option<&str>, tab_widget_name: Option<String>) -> Terminal {
+    pub(crate) fn create_split_terminal(
+        &self,
+        working_directory: Option<&str>,
+        tab_widget_name: Option<String>,
+    ) -> Terminal {
         let terminal = create_terminal(&self.config.borrow());
         setup_terminal_click_handler(&terminal);
         self.setup_context_menu(&terminal);
@@ -45,7 +47,13 @@ impl UiState {
 
         // Split panes get a fresh session ID (new shell instance)
         let sid = generate_session_id();
-        spawn_shell(&terminal, self.shell_argv.as_ref(), working_directory, Some(&sid), None);
+        spawn_shell(
+            &terminal,
+            self.shell_argv.as_ref(),
+            working_directory,
+            Some(&sid),
+            None,
+        );
         terminal
     }
 
@@ -56,7 +64,9 @@ impl UiState {
         let working_directory = terminal_working_directory(&current_term);
 
         // Find the tab widget name for bell/activity signals
-        let tab_widget_name = self.notebook.current_page()
+        let tab_widget_name = self
+            .notebook
+            .current_page()
             .and_then(|p| self.notebook.nth_page(Some(p)))
             .map(|w| w.widget_name().to_string());
 
@@ -96,11 +106,9 @@ impl UiState {
                             self.notebook.remove_page(Some(i));
                             paned.set_start_child(Some(&current_widget));
                             paned.set_end_child(Some(&new_widget));
-                            let new_page_num = self.notebook.insert_page(
-                                &paned,
-                                tab_label.as_ref(),
-                                Some(i),
-                            );
+                            let new_page_num =
+                                self.notebook
+                                    .insert_page(&paned, tab_label.as_ref(), Some(i));
                             self.notebook.set_tab_reorderable(&paned, true);
                             self.notebook.set_current_page(Some(new_page_num));
                             break;
@@ -114,23 +122,35 @@ impl UiState {
     }
 
     pub(crate) fn cycle_pane_focus(&self, direction: i32) {
-        let Some(page_num) = self.notebook.current_page() else { return };
-        let Some(widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
         let mut terms = Vec::new();
         collect_terminals(&widget, &mut terms);
-        if terms.len() <= 1 { return; }
+        if terms.len() <= 1 {
+            return;
+        }
 
         let focused_idx = terms.iter().position(|t| t.has_focus()).unwrap_or(0);
         let next_idx = if direction > 0 {
             (focused_idx + 1) % terms.len()
         } else {
-            if focused_idx == 0 { terms.len() - 1 } else { focused_idx - 1 }
+            if focused_idx == 0 {
+                terms.len() - 1
+            } else {
+                focused_idx - 1
+            }
         };
         terms[next_idx].grab_focus();
     }
 
     pub(crate) fn resize_pane(&self, target_orientation: Orientation, delta: i32) {
-        let Some(term) = self.current_terminal() else { return };
+        let Some(term) = self.current_terminal() else {
+            return;
+        };
         let term_widget = term.upcast::<gtk4::Widget>();
         // Walk up from the terminal to find the nearest Paned with matching orientation
         let mut widget = term_widget.parent();
@@ -147,27 +167,39 @@ impl UiState {
     }
 
     pub(crate) fn focus_pane_directional(&self, direction: Direction) {
-        let Some(page_num) = self.notebook.current_page() else { return };
-        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
         let mut terms = Vec::new();
         collect_terminals(&page_widget, &mut terms);
-        if terms.len() <= 1 { return; }
+        if terms.len() <= 1 {
+            return;
+        }
 
         let focused = terms.iter().find(|t| t.has_focus());
         let Some(focused) = focused else { return };
 
         let focused_widget = focused.clone().upcast::<gtk4::Widget>();
-        let Some(focused_bounds) = focused_widget.compute_bounds(&page_widget) else { return };
+        let Some(focused_bounds) = focused_widget.compute_bounds(&page_widget) else {
+            return;
+        };
         let focused_cx = focused_bounds.x() + focused_bounds.width() / 2.0;
         let focused_cy = focused_bounds.y() + focused_bounds.height() / 2.0;
 
         let mut best: Option<(f32, &Terminal)> = None;
 
         for term in &terms {
-            if term.has_focus() { continue; }
+            if term.has_focus() {
+                continue;
+            }
 
             let tw = term.clone().upcast::<gtk4::Widget>();
-            let Some(bounds) = tw.compute_bounds(&page_widget) else { continue };
+            let Some(bounds) = tw.compute_bounds(&page_widget) else {
+                continue;
+            };
             let cx = bounds.x() + bounds.width() / 2.0;
             let cy = bounds.y() + bounds.height() / 2.0;
 
@@ -181,7 +213,9 @@ impl UiState {
                 Direction::Down => dy > 1.0,
             };
 
-            if !in_direction { continue; }
+            if !in_direction {
+                continue;
+            }
 
             let dist = match direction {
                 Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,

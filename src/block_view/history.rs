@@ -47,7 +47,10 @@ impl TermView {
             // following frame boundaries. Skip any (pathologically large) record
             // that would not fit rather than write a bad prefix.
             if record.len() > u32::MAX as usize {
-                log::warn!("save_history: skipping block of {} bytes (exceeds u32 frame limit)", record.len());
+                log::warn!(
+                    "save_history: skipping block of {} bytes (exceeds u32 frame limit)",
+                    record.len()
+                );
                 continue;
             }
             file.write_all(&(record.len() as u32).to_le_bytes())?;

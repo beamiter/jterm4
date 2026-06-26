@@ -56,7 +56,9 @@ impl CrossSelection {
         let scroll_for_begin = block_scroll.clone();
         let this_for_begin = this.clone();
         drag.connect_drag_begin(move |_, x, y| {
-            this_for_begin.start_idx.set(this_for_begin.vte_index_at(&scroll_for_begin, x, y));
+            this_for_begin
+                .start_idx
+                .set(this_for_begin.vte_index_at(&scroll_for_begin, x, y));
             this_for_begin.claimed.set(false);
         });
 
@@ -111,12 +113,7 @@ impl CrossSelection {
     /// Find which VTE in `ordered_vtes()` the pointer `(x, y)` (in
     /// `block_scroll` coords) lies over. Returns None when the pointer is over
     /// chrome/empty space.
-    fn vte_index_at(
-        &self,
-        block_scroll: &gtk4::ScrolledWindow,
-        x: f64,
-        y: f64,
-    ) -> Option<usize> {
+    fn vte_index_at(&self, block_scroll: &gtk4::ScrolledWindow, x: f64, y: f64) -> Option<usize> {
         let picked = block_scroll.pick(x, y, gtk4::PickFlags::DEFAULT)?;
         let vtes = self.ordered_vtes();
         for (i, vte) in vtes.iter().enumerate() {
@@ -177,7 +174,6 @@ impl CrossSelection {
         }
         false
     }
-
 }
 
 /// True if `needle` is `haystack` or one of its descendants. GTK's `pick()`

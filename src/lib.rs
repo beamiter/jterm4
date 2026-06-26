@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
-pub mod state;
+pub mod ai;
+pub mod block_view;
 pub mod config;
+pub mod git_meta;
 pub mod keybindings;
+pub mod notify;
 pub mod parser;
 pub mod pty;
-pub mod block_view;
-pub mod terminal;
-pub mod ai;
 pub mod redact;
-pub mod notify;
-pub mod git_meta;
+pub mod state;
+pub mod terminal;
 pub mod workflows;

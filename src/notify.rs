@@ -34,10 +34,7 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
 
     let status = if exit_code == 0 { "✓" } else { "✗" };
     let title = format!("{status} {title_cmd}");
-    let body = format!(
-        "Exit {exit_code} after {}",
-        humanize_duration(duration_ms)
-    );
+    let body = format!("Exit {exit_code} after {}", humanize_duration(duration_ms));
 
     let urgency = if exit_code == 0 { "normal" } else { "critical" };
 

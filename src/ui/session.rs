@@ -1,14 +1,13 @@
 //! session — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::Label;
 use gtk4::ToggleButton;
 use libadwaita as adw;
-use adw::prelude::*;
 
-use crate::terminal::wrap_with_scrollbar;
 use super::*;
+use crate::terminal::wrap_with_scrollbar;
 
 impl UiState {
-
     /// Recursively restore a pane layout from saved state
     pub(crate) fn restore_pane_layout(
         &self,
@@ -18,19 +17,21 @@ impl UiState {
         use crate::state::PaneLayout;
 
         match layout {
-            PaneLayout::Leaf { dir, sid, cmds, pinned } => {
+            PaneLayout::Leaf {
+                dir,
+                sid,
+                cmds,
+                pinned,
+            } => {
                 // Create a simple tab with the leaf layout
-                let _terminal = self.add_new_tab(
-                    Some(dir),
-                    tab_name,
-                    Some(sid),
-                    cmds,
-                );
+                let _terminal = self.add_new_tab(Some(dir), tab_name, Some(sid), cmds);
                 // Apply pinned state if set
                 if pinned == Some(true) {
                     let page_num = self.notebook.n_pages().saturating_sub(1);
                     if let Some(page_widget) = self.notebook.nth_page(Some(page_num)) {
-                        unsafe { page_widget.set_data::<bool>("pinned", true); }
+                        unsafe {
+                            page_widget.set_data::<bool>("pinned", true);
+                        }
                     }
                     // Find the corresponding strip button and mark as pinned
                     let tab_name_fmt = format!("tab-{}", page_num);
@@ -85,7 +86,8 @@ impl UiState {
 
                 // Add to notebook
                 let label = tab_name.as_deref().unwrap_or("Split");
-                self.notebook.append_page(&paned, Some(&Label::new(Some(label))));
+                self.notebook
+                    .append_page(&paned, Some(&Label::new(Some(label))));
                 let new_page_num = self.notebook.n_pages().saturating_sub(1);
                 self.notebook.set_tab_reorderable(&paned, true);
 
@@ -105,19 +107,23 @@ impl UiState {
     }
 
     /// Internal helper for recursive pane restoration
-    fn restore_pane_layout_internal(
-        &self,
-        layout: crate::state::PaneLayout,
-    ) -> gtk4::Widget {
+    fn restore_pane_layout_internal(&self, layout: crate::state::PaneLayout) -> gtk4::Widget {
         use crate::state::PaneLayout;
 
         match layout {
-            PaneLayout::Leaf { dir, sid, cmds, pinned } => {
+            PaneLayout::Leaf {
+                dir,
+                sid,
+                cmds,
+                pinned,
+            } => {
                 let terminal = self.add_new_tab(Some(dir), None, Some(sid), cmds);
                 let page_num = self.notebook.n_pages().saturating_sub(1);
                 if let Some(page_widget) = self.notebook.nth_page(Some(page_num)) {
                     if pinned == Some(true) {
-                        unsafe { page_widget.set_data::<bool>("pinned", true); }
+                        unsafe {
+                            page_widget.set_data::<bool>("pinned", true);
+                        }
                     }
                 }
                 // Get the wrapped terminal widget

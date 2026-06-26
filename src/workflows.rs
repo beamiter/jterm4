@@ -77,7 +77,9 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
         if path.extension().and_then(|s| s.to_str()) != Some("toml") {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else { continue };
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
         if let Some(wf) = parse_workflow(&contents, &path) {
             out.push(wf);
         }
@@ -108,7 +110,9 @@ fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
                 Some(t) => t,
                 None => continue,
             };
-            let Some(name) = t.get("name").and_then(|v| v.as_str()) else { continue };
+            let Some(name) = t.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let description = t
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -233,7 +237,10 @@ mod tests {
     fn substitute_replaces_named_placeholders() {
         let out = substitute(
             "deploy {env} {target}",
-            &[("env".into(), "prod".into()), ("target".into(), "api".into())],
+            &[
+                ("env".into(), "prod".into()),
+                ("target".into(), "api".into()),
+            ],
         );
         assert_eq!(out, "deploy prod api");
     }
@@ -250,10 +257,7 @@ mod tests {
 
     #[test]
     fn substitute_double_brace_escape() {
-        let out = substitute(
-            "shell brace expansion: {{a,b,c}}",
-            &[],
-        );
+        let out = substitute("shell brace expansion: {{a,b,c}}", &[]);
         assert_eq!(out, "shell brace expansion: {a,b,c}");
     }
 
@@ -265,10 +269,7 @@ mod tests {
 
     #[test]
     fn substitute_handles_utf8_around_braces() {
-        let out = substitute(
-            "🚀 deploy {env} 完了",
-            &[("env".into(), "prod".into())],
-        );
+        let out = substitute("🚀 deploy {env} 完了", &[("env".into(), "prod".into())]);
         assert_eq!(out, "🚀 deploy prod 完了");
     }
 
@@ -276,9 +277,15 @@ mod tests {
     fn load_all_from_skips_non_toml_and_malformed() {
         let dir = tempdir();
         // good
-        write_file(&dir.path().join("a.toml"), "name = \"A\"\ncommand = \"echo a\"\n");
+        write_file(
+            &dir.path().join("a.toml"),
+            "name = \"A\"\ncommand = \"echo a\"\n",
+        );
         // good
-        write_file(&dir.path().join("b.toml"), "name = \"B\"\ncommand = \"echo b\"\n");
+        write_file(
+            &dir.path().join("b.toml"),
+            "name = \"B\"\ncommand = \"echo b\"\n",
+        );
         // wrong extension
         write_file(&dir.path().join("c.txt"), "not a workflow");
         // malformed toml
@@ -302,14 +309,20 @@ mod tests {
 
     struct TmpDir(PathBuf);
     impl TmpDir {
-        fn path(&self) -> &Path { &self.0 }
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
     impl Drop for TmpDir {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
     fn tempdir() -> TmpDir {
         let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let p = std::env::temp_dir().join(format!("jterm4-wf-test-{nanos}"));
         fs::create_dir_all(&p).unwrap();
         TmpDir(p)

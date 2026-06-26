@@ -390,10 +390,17 @@ pub(crate) fn key_combo_to_string(combo: &KeyCombo) -> String {
         Key::Delete => "Delete".to_string(),
         Key::Home => "Home".to_string(),
         Key::End => "End".to_string(),
-        k => k.name().map(|n| {
-            let s = n.to_string();
-            if s.len() == 1 { s.to_uppercase() } else { s }
-        }).unwrap_or_else(|| "?".to_string()),
+        k => k
+            .name()
+            .map(|n| {
+                let s = n.to_string();
+                if s.len() == 1 {
+                    s.to_uppercase()
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| "?".to_string()),
     };
 
     let mut result = parts.join("+");
@@ -503,8 +510,12 @@ impl KeybindingMap {
 
             // Parse and add new binding
             match parse_key_combo(key_str) {
-                Ok(combo) => { self.bindings.insert(combo, action); }
-                Err(e) => { log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}"); }
+                Ok(combo) => {
+                    self.bindings.insert(combo, action);
+                }
+                Err(e) => {
+                    log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
+                }
             }
         }
     }
@@ -514,7 +525,9 @@ impl KeybindingMap {
     }
 
     pub(crate) fn binding_display(&self, action: &Action) -> String {
-        let combos: Vec<_> = self.bindings.iter()
+        let combos: Vec<_> = self
+            .bindings
+            .iter()
             .filter(|(_, a)| *a == action)
             .map(|(k, _)| key_combo_to_string(k))
             .collect();
@@ -574,8 +587,7 @@ mod tests {
         let map = KeybindingMap::from_defaults();
         let bound_actions: std::collections::HashSet<Action> =
             map.bindings.values().copied().collect();
-        let allowed: std::collections::HashSet<Action> =
-            palette_only.iter().copied().collect();
+        let allowed: std::collections::HashSet<Action> = palette_only.iter().copied().collect();
 
         let missing: Vec<_> = Action::all_actions()
             .into_iter()
@@ -611,9 +623,8 @@ mod tests {
         let map = KeybindingMap::from_defaults();
         for (combo, action) in &map.bindings {
             let s = key_combo_to_string(combo);
-            let parsed = parse_key_combo(&s).unwrap_or_else(|e| {
-                panic!("round-trip failed for {action:?} → {s:?}: {e}")
-            });
+            let parsed = parse_key_combo(&s)
+                .unwrap_or_else(|e| panic!("round-trip failed for {action:?} → {s:?}: {e}"));
             assert_eq!(
                 parsed, *combo,
                 "round-trip mismatch for {action:?}: {combo:?} → {s:?} → {parsed:?}"

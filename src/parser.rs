@@ -73,7 +73,10 @@ pub struct ParserConfig {
 
 impl Default for ParserConfig {
     fn default() -> Self {
-        Self { mouse_reporting: true, focus_reporting: true }
+        Self {
+            mouse_reporting: true,
+            focus_reporting: true,
+        }
     }
 }
 
@@ -84,8 +87,15 @@ fn is_alt_screen_mode(params: &[u8]) -> bool {
 fn is_mouse_reporting_mode(params: &[u8]) -> bool {
     matches!(
         params,
-        b"?9" | b"?1000" | b"?1001" | b"?1002" | b"?1003"
-            | b"?1005" | b"?1006" | b"?1015" | b"?1016"
+        b"?9"
+            | b"?1000"
+            | b"?1001"
+            | b"?1002"
+            | b"?1003"
+            | b"?1005"
+            | b"?1006"
+            | b"?1015"
+            | b"?1016"
     )
 }
 
@@ -223,23 +233,21 @@ impl Parser {
                     }
                 }
 
-                State::Osc { buf } => {
-                    match b {
-                        0x07 => {
-                            let payload = std::mem::take(buf);
-                            self.state = State::Ground;
-                            flush!();
-                            handle_osc(&payload, events);
-                        }
-                        0x1b => {
-                            let payload = std::mem::take(buf);
-                            self.state = State::OscEsc { payload };
-                        }
-                        _ => {
-                            buf.push(b);
-                        }
+                State::Osc { buf } => match b {
+                    0x07 => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::Ground;
+                        flush!();
+                        handle_osc(&payload, events);
                     }
-                }
+                    0x1b => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::OscEsc { payload };
+                    }
+                    _ => {
+                        buf.push(b);
+                    }
+                },
 
                 State::OscEsc { payload } => {
                     let payload = std::mem::take(payload);
@@ -251,23 +259,21 @@ impl Parser {
                     }
                 }
 
-                State::Apc { buf } => {
-                    match b {
-                        0x07 => {
-                            let payload = std::mem::take(buf);
-                            self.state = State::Ground;
-                            flush!();
-                            events.push(ParserEvent::ApcSequence(payload));
-                        }
-                        0x1b => {
-                            let payload = std::mem::take(buf);
-                            self.state = State::ApcEsc { payload };
-                        }
-                        _ => {
-                            buf.push(b);
-                        }
+                State::Apc { buf } => match b {
+                    0x07 => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::Ground;
+                        flush!();
+                        events.push(ParserEvent::ApcSequence(payload));
                     }
-                }
+                    0x1b => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::ApcEsc { payload };
+                    }
+                    _ => {
+                        buf.push(b);
+                    }
+                },
 
                 State::ApcEsc { payload } => {
                     let payload = std::mem::take(payload);
@@ -374,19 +380,25 @@ fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
         let mut t = [0xFFu8; 256];
         let mut i = 0u8;
         loop {
-            if i >= 26 { break; }
+            if i >= 26 {
+                break;
+            }
             t[(b'A' + i) as usize] = i;
             i += 1;
         }
         i = 0;
         loop {
-            if i >= 26 { break; }
+            if i >= 26 {
+                break;
+            }
             t[(b'a' + i) as usize] = 26 + i;
             i += 1;
         }
         i = 0;
         loop {
-            if i >= 10 { break; }
+            if i >= 10 {
+                break;
+            }
             t[(b'0' + i) as usize] = 52 + i;
             i += 1;
         }
@@ -470,8 +482,12 @@ mod tests {
         p.feed(b"\x1b[?1049h\x1b[?1049l", &mut events);
         // Both semantic events fire and the raw mode bytes are NOT passed through.
         // DecsetMode for 1049 may interleave; we only assert both AltScreen events appear.
-        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenEnter)));
-        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenLeave)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ParserEvent::AltScreenEnter)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ParserEvent::AltScreenLeave)));
         assert!(collect_bytes(&events).is_empty());
     }
 
@@ -483,7 +499,9 @@ mod tests {
         let mut events = Vec::new();
         p.feed(b"\x1b[?10", &mut events);
         p.feed(b"49h", &mut events);
-        assert!(events.iter().any(|e| matches!(e, ParserEvent::AltScreenEnter)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ParserEvent::AltScreenEnter)));
         assert!(collect_bytes(&events).is_empty());
     }
 
@@ -531,11 +549,20 @@ mod tests {
     fn mouse_reporting_dropped_when_disabled() {
         // With mouse_reporting=false, the mode-set sequence is swallowed —
         // VTE never sees it, so it never enters mouse-reporting mode.
-        let mut p = Parser::with_config(ParserConfig { mouse_reporting: false, focus_reporting: true });
+        let mut p = Parser::with_config(ParserConfig {
+            mouse_reporting: false,
+            focus_reporting: true,
+        });
         let mut events = Vec::new();
         p.feed(b"\x1b[?1000h", &mut events);
         assert!(collect_bytes(&events).is_empty());
         // The semantic DecsetMode event still fires so downstream can track state.
-        assert!(events.iter().any(|e| matches!(e, ParserEvent::DecsetMode { mode: 1000, set: true })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ParserEvent::DecsetMode {
+                mode: 1000,
+                set: true
+            }
+        )));
     }
 }

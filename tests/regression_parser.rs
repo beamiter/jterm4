@@ -269,9 +269,7 @@ fn pager_neutralized_colored_output_round_trips() {
     let events = feed_all(&mut p, input);
     assert_eq!(collect_bytes(&events), input);
     // No semantic events for plain colored text.
-    assert!(events
-        .iter()
-        .all(|e| matches!(e, ParserEvent::Bytes(_))));
+    assert!(events.iter().all(|e| matches!(e, ParserEvent::Bytes(_))));
 }
 
 /// The actual sequence a real block ends with: OSC 133;C, the command's

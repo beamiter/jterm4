@@ -184,8 +184,8 @@ impl AiPanel {
             let key = EventControllerKey::new();
             let p = panel.clone();
             key.connect_key_pressed(move |_ctrl, keyval, _code, state| {
-                let is_enter = keyval == gtk4::gdk::Key::Return
-                    || keyval == gtk4::gdk::Key::KP_Enter;
+                let is_enter =
+                    keyval == gtk4::gdk::Key::Return || keyval == gtk4::gdk::Key::KP_Enter;
                 let ctrl_held = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
                 if is_enter && ctrl_held {
                     p.send_from_input(None);

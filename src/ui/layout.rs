@@ -70,7 +70,8 @@ impl UiState {
         }
         // set_active does not refire `clicked`, so this won't recurse.
         self.sidebar_tabs_btn.set_active(view == SidebarView::Tabs);
-        self.sidebar_files_btn.set_active(view == SidebarView::Files);
+        self.sidebar_files_btn
+            .set_active(view == SidebarView::Files);
 
         if persist {
             self.sidebar_view.set(view);

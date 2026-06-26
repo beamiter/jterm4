@@ -1,19 +1,18 @@
 //! config_apply — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use libadwaita as adw;
-use adw::prelude::*;
 use std::rc::Rc;
-use vte4::{Terminal};
+use vte4::Terminal;
 use vte4::{TerminalExt, TerminalExtManual};
 
-use crate::config::{Theme, load_config};
-use crate::block_view::TermView;
-use crate::terminal::collect_terminals;
 use super::*;
+use crate::block_view::TermView;
+use crate::config::{load_config, Theme};
+use crate::terminal::collect_terminals;
 
 impl UiState {
-
     pub(crate) fn set_font_scale_all(&self, new_scale: f64) {
         self.font_scale.set(new_scale);
         for i in 0..self.notebook.n_pages() {
@@ -49,7 +48,11 @@ impl UiState {
         let config = self.config.borrow();
         let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
         self.for_each_terminal(|term| {
-            term.set_colors(Some(&config.foreground), Some(&config.background), &palette_refs);
+            term.set_colors(
+                Some(&config.foreground),
+                Some(&config.background),
+                &palette_refs,
+            );
             term.set_color_bold(None);
             term.set_color_cursor(Some(&config.cursor));
             term.set_color_cursor_foreground(Some(&config.cursor_foreground));
@@ -131,7 +134,8 @@ impl UiState {
         let (new_config, themes, new_keybindings) = load_config();
 
         // Apply theme (finds the theme by name from the fresh theme list)
-        let theme = themes.iter()
+        let theme = themes
+            .iter()
             .find(|t| t.name == new_config.theme_name)
             .unwrap_or(&themes[0])
             .clone();

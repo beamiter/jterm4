@@ -108,9 +108,7 @@ impl TermView {
                 let text_match = if q.is_empty() {
                     true
                 } else if let Some(ref re) = re {
-                    re.is_match(&b.prompt)
-                        || re.is_match(&b.cmd)
-                        || re.is_match(&b.output)
+                    re.is_match(&b.prompt) || re.is_match(&b.cmd) || re.is_match(&b.output)
                 } else {
                     contains_case_insensitive(b.prompt.as_bytes(), q_bytes)
                         || contains_case_insensitive(b.cmd.as_bytes(), q_bytes)
@@ -199,14 +197,20 @@ impl TermView {
                     block.command_vte.search_set_regex(Some(&vte_re), 0);
                     block.command_vte.search_set_wrap_around(true);
                     for _ in 0..cmd_count {
-                        matches.push(FindMatch { block_id: block.id, is_output: false });
+                        matches.push(FindMatch {
+                            block_id: block.id,
+                            is_output: false,
+                        });
                     }
                 }
                 if out_count > 0 {
                     block.output_vte.search_set_regex(Some(&vte_re), 0);
                     block.output_vte.search_set_wrap_around(true);
                     for _ in 0..out_count {
-                        matches.push(FindMatch { block_id: block.id, is_output: true });
+                        matches.push(FindMatch {
+                            block_id: block.id,
+                            is_output: true,
+                        });
                     }
                 }
             }
@@ -257,9 +261,17 @@ impl TermView {
     fn focus_current_match_step(&self, delta: isize) {
         let finished = self.finished_blocks.borrow();
         let st = self.find_state.borrow();
-        let Some(fm) = st.matches.get(st.current) else { return; };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else { return; };
-        let vte = if fm.is_output { &block.output_vte } else { &block.command_vte };
+        let Some(fm) = st.matches.get(st.current) else {
+            return;
+        };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+            return;
+        };
+        let vte = if fm.is_output {
+            &block.output_vte
+        } else {
+            &block.command_vte
+        };
         if delta >= 0 {
             vte.search_find_next();
         } else {
@@ -271,9 +283,17 @@ impl TermView {
     fn focus_current_match(&self) {
         let finished = self.finished_blocks.borrow();
         let st = self.find_state.borrow();
-        let Some(fm) = st.matches.get(st.current) else { return; };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else { return; };
-        let vte = if fm.is_output { &block.output_vte } else { &block.command_vte };
+        let Some(fm) = st.matches.get(st.current) else {
+            return;
+        };
+        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+            return;
+        };
+        let vte = if fm.is_output {
+            &block.output_vte
+        } else {
+            &block.command_vte
+        };
         vte.search_find_next();
     }
 
@@ -335,7 +355,12 @@ impl TermView {
             if hits.len() >= max_hits {
                 break;
             }
-            let cmd_preview = block.cmd_text.lines().next().unwrap_or(&block.cmd_text).to_string();
+            let cmd_preview = block
+                .cmd_text
+                .lines()
+                .next()
+                .unwrap_or(&block.cmd_text)
+                .to_string();
 
             // Cmd surface — usually 1 line, but multiline commands exist.
             for (ln_idx, line) in block.cmd_text.lines().enumerate() {
@@ -423,7 +448,11 @@ impl TermView {
         let Some(block) = finished.iter().find(|b| b.id == block_id) else {
             return false;
         };
-        let vte = if is_output { &block.output_vte } else { &block.command_vte };
+        let vte = if is_output {
+            &block.output_vte
+        } else {
+            &block.command_vte
+        };
         vte.search_set_regex(Some(&vte_re), 0);
         vte.search_set_wrap_around(true);
         vte.search_find_next();

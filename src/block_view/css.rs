@@ -1,7 +1,7 @@
 //! css — extracted from block_view (mechanical split, no logic changes)
+use crate::config::Config;
 use gtk4::gdk::RGBA;
 use std::cell::RefCell;
-use crate::config::Config;
 
 /// Vertical chrome the `.block-active` holder adds around the live VTE:
 /// 4px top margin + 4px bottom margin + 1px top border + 1px bottom border +
@@ -33,7 +33,7 @@ pub(crate) fn shorten_path(path: &str) -> String {
     if parts.len() <= 3 {
         display
     } else {
-        format!("…/{}", parts[parts.len()-2..].join("/"))
+        format!("…/{}", parts[parts.len() - 2..].join("/"))
     }
 }
 
@@ -52,7 +52,11 @@ pub(crate) fn git_branch_for(cwd: &str) -> Option<String> {
             std::fs::read_to_string(&dot_git).ok().and_then(|c| {
                 c.strip_prefix("gitdir:").map(|p| {
                     let g = Path::new(p.trim());
-                    if g.is_absolute() { g.join("HEAD") } else { d.join(g).join("HEAD") }
+                    if g.is_absolute() {
+                        g.join("HEAD")
+                    } else {
+                        d.join(g).join("HEAD")
+                    }
                 })
             })
         } else {
@@ -180,7 +184,9 @@ pub(crate) fn install_block_css(config: &Config) {
     let font_family = font_family.replace('\\', "\\\\").replace('"', "\\\"");
 
     // Apply font scale to the base size
-    let scaled_size = (base_size as f64 * config.default_font_scale).round().max(1.0) as i32;
+    let scaled_size = (base_size as f64 * config.default_font_scale)
+        .round()
+        .max(1.0) as i32;
     let font_size = format!("{}pt", scaled_size);
 
     let css = format!(

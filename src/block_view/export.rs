@@ -14,13 +14,19 @@ impl TermView {
     /// Export a block by ID to JSON format
     pub fn export_block_json(&self, block_id: u64) -> Option<String> {
         let blocks = self.block_data.borrow();
-        blocks.iter().find(|b| b.id == block_id).map(|b| b.to_json())
+        blocks
+            .iter()
+            .find(|b| b.id == block_id)
+            .map(|b| b.to_json())
     }
 
     /// Export a block by ID to Markdown format
     pub fn export_block_markdown(&self, block_id: u64) -> Option<String> {
         let blocks = self.block_data.borrow();
-        blocks.iter().find(|b| b.id == block_id).map(|b| b.to_markdown())
+        blocks
+            .iter()
+            .find(|b| b.id == block_id)
+            .map(|b| b.to_markdown())
     }
 
     /// Export all blocks in the session as JSON

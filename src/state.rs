@@ -15,9 +15,7 @@ use crate::block_view::TermView;
 use crate::terminal::{collect_terminals, find_first_terminal, terminal_working_directory};
 
 pub(crate) fn tabs_state_file_path() -> PathBuf {
-    glib::user_config_dir()
-        .join("jterm4")
-        .join("tabs.state")
+    glib::user_config_dir().join("jterm4").join("tabs.state")
 }
 
 /// Generate a unique session ID for rsh session persistence.
@@ -42,7 +40,7 @@ pub enum PaneLayout {
         pinned: Option<bool>,
     },
     Split {
-        orientation: char,  // 'h' or 'v'
+        orientation: char, // 'h' or 'v'
         position: i32,
         start: Box<PaneLayout>,
         end: Box<PaneLayout>,
@@ -50,7 +48,10 @@ pub enum PaneLayout {
 }
 
 /// Serialize a pane layout tree from a GTK widget
-pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap<u32, String>) -> PaneLayout {
+pub(crate) fn serialize_pane_layout(
+    widget: &gtk4::Widget,
+    session_ids: &HashMap<u32, String>,
+) -> PaneLayout {
     if let Some(paned) = widget.downcast_ref::<Paned>() {
         let orientation = match paned.orientation() {
             gtk4::Orientation::Horizontal => 'h',
@@ -71,10 +72,12 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
         // Leaf terminal
         let terminal = find_first_terminal(widget).expect("Leaf must contain terminal");
         let dir = unsafe {
-            widget.data::<std::rc::Rc<TermView>>("term-view")
+            widget
+                .data::<std::rc::Rc<TermView>>("term-view")
                 .map(|tv| tv.as_ref().cwd())
                 .filter(|s| !s.is_empty())
-        }.unwrap_or_else(|| {
+        }
+        .unwrap_or_else(|| {
             terminal_working_directory(&terminal)
                 .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
         });
@@ -83,7 +86,10 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
         let widget_name = widget.widget_name();
         let sid = if let Some(tab_str) = widget_name.to_string().strip_prefix("tab-") {
             if let Ok(tab_num) = tab_str.parse::<u32>() {
-                session_ids.get(&tab_num).cloned().unwrap_or_else(generate_session_id)
+                session_ids
+                    .get(&tab_num)
+                    .cloned()
+                    .unwrap_or_else(generate_session_id)
             } else {
                 generate_session_id()
             }
@@ -94,11 +100,14 @@ pub(crate) fn serialize_pane_layout(widget: &gtk4::Widget, session_ids: &HashMap
         let cmds = get_restorable_commands(&terminal);
 
         // Check if this tab is pinned
-        let pinned = unsafe {
-            widget.data::<bool>("pinned").map(|p| *p.as_ref())
-        };
+        let pinned = unsafe { widget.data::<bool>("pinned").map(|p| *p.as_ref()) };
 
-        PaneLayout::Leaf { dir, sid, cmds, pinned }
+        PaneLayout::Leaf {
+            dir,
+            sid,
+            cmds,
+            pinned,
+        }
     }
 }
 
@@ -143,12 +152,7 @@ pub fn unescape_tab_state(value: &str) -> String {
     out
 }
 
-pub fn parse_tabs_state(
-    contents: &str,
-) -> (
-    Option<u32>,
-    Vec<(Option<String>, PaneLayout)>,
-) {
+pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
 
@@ -200,7 +204,11 @@ pub fn parse_tabs_state(
                     let name = unescape_tab_state(fields[0]);
                     let dir = unescape_tab_state(fields[1]);
                     let sid = unescape_tab_state(fields[2]);
-                    let effective_sid = if sid.is_empty() { generate_session_id() } else { sid };
+                    let effective_sid = if sid.is_empty() {
+                        generate_session_id()
+                    } else {
+                        sid
+                    };
                     let layout = PaneLayout::Leaf {
                         dir,
                         sid: effective_sid,
@@ -215,7 +223,11 @@ pub fn parse_tabs_state(
                     let dir = unescape_tab_state(fields[1]);
                     let sid = unescape_tab_state(fields[2]);
                     let cmds = unescape_tab_state(fields[3]);
-                    let effective_sid = if sid.is_empty() { generate_session_id() } else { sid };
+                    let effective_sid = if sid.is_empty() {
+                        generate_session_id()
+                    } else {
+                        sid
+                    };
                     let effective_cmds = if cmds.is_empty() { None } else { Some(cmds) };
                     let layout = PaneLayout::Leaf {
                         dir,
@@ -242,10 +254,7 @@ pub fn parse_tabs_state(
     (current_page, tabs)
 }
 
-pub(crate) fn load_tabs_state() -> (
-    Option<u32>,
-    Vec<(Option<String>, PaneLayout)>,
-) {
+pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
     let path = tabs_state_file_path();
     log::info!("Loading tabs state from: {}", path.display());
 
@@ -288,7 +297,10 @@ fn process_exists(pid: i32) -> bool {
         return true;
     }
 
-    matches!(std::io::Error::last_os_error().raw_os_error(), Some(nix::libc::EPERM))
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(nix::libc::EPERM)
+    )
 }
 
 fn get_process_group_id(pid: i32) -> Option<i32> {
@@ -393,7 +405,10 @@ pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
 pub(crate) fn kill_terminal_child(terminal: &Terminal) {
     let pid: i32 = unsafe {
         match terminal.data::<i32>("child-pid") {
-            Some(p) => { let v: &i32 = p.as_ref(); *v }
+            Some(p) => {
+                let v: &i32 = p.as_ref();
+                *v
+            }
             None => return,
         }
     };
@@ -569,8 +584,8 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
             continue;
         };
 
-        let label_text = tab_label_text(notebook, &widget)
-            .unwrap_or_else(|| format!("Terminal {}", i + 1));
+        let label_text =
+            tab_label_text(notebook, &widget).unwrap_or_else(|| format!("Terminal {}", i + 1));
 
         // Serialize the pane layout (supports splits)
         let layout = serialize_pane_layout(&widget, session_ids);

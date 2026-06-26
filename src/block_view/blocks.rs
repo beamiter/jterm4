@@ -1,4 +1,7 @@
 //! blocks — finished-block widgets (VTE-backed) and the live ActiveBlock.
+use super::*;
+use crate::config::Config;
+use crate::terminal::open_uri;
 use gtk4::prelude::*;
 use gtk4::Orientation;
 use serde::{Deserialize, Serialize};
@@ -6,11 +9,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
-use crate::config::Config;
-use crate::terminal::open_uri;
-use super::*;
-
-
 
 // ─── FinishedBlock ────────────────────────────────────────────────────────────
 
@@ -344,7 +342,20 @@ impl FinishedBlock {
         cwd: Option<&str>,
         cols: i64,
     ) -> Self {
-        Self::new_with_pool(id, prompt, cmd, cmd_ansi, output, exit_code, config, duration_ms, end_time_ms, cwd, cols, None)
+        Self::new_with_pool(
+            id,
+            prompt,
+            cmd,
+            cmd_ansi,
+            output,
+            exit_code,
+            config,
+            duration_ms,
+            end_time_ms,
+            cwd,
+            cols,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -385,7 +396,11 @@ impl FinishedBlock {
         };
 
         // Status stripe: green left border on success, red on failure.
-        outer.add_css_class(if exit_code == 0 { "block-success" } else { "block-failed" });
+        outer.add_css_class(if exit_code == 0 {
+            "block-success"
+        } else {
+            "block-failed"
+        });
 
         // Add hover highlighting to show block is interactive (and reveal the
         // quick-action buttons). The action box is created below; it's wired into
@@ -409,8 +424,16 @@ impl FinishedBlock {
 
         // Status icon: ✓ for success, ✗ for failure.
         // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
-        let status_icon = gtk4::Label::new(Some(if exit_code == 0 { "\u{f00c}" } else { "\u{f00d}" }));
-        status_icon.add_css_class(if exit_code == 0 { "block-status-ok" } else { "block-status-bad" });
+        let status_icon = gtk4::Label::new(Some(if exit_code == 0 {
+            "\u{f00c}"
+        } else {
+            "\u{f00d}"
+        }));
+        status_icon.add_css_class(if exit_code == 0 {
+            "block-status-ok"
+        } else {
+            "block-status-bad"
+        });
         status_icon.set_halign(gtk4::Align::Start);
         header_row.append(&status_icon);
 
@@ -499,7 +522,13 @@ impl FinishedBlock {
         // the output VTE exist.
         let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
         expand_btn.set_tooltip_text(Some("Expand block"));
-        for btn in [&copy_cmd_btn, &copy_output_btn, &rerun_btn, &filter_btn, &expand_btn] {
+        for btn in [
+            &copy_cmd_btn,
+            &copy_output_btn,
+            &rerun_btn,
+            &filter_btn,
+            &expand_btn,
+        ] {
             btn.add_css_class("block-action-btn");
             btn.add_css_class("flat");
             action_box.append(btn);
@@ -554,7 +583,9 @@ impl FinishedBlock {
             let cmd_rows_for_map = cmd_rows.max(1).min(5);
             let fed = Cell::new(false);
             command_vte.connect_map(move |w| {
-                if fed.get() { return; }
+                if fed.get() {
+                    return;
+                }
                 fed.set(true);
                 w.set_size(cols_for_map, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
@@ -590,7 +621,11 @@ impl FinishedBlock {
                 fed_for_map.set(true);
                 let text = displayed_for_map.borrow();
                 let rows = text.lines().count().max(1) as i64;
-                let cap = if expanded_for_map.get() { max_for_map } else { cap_for_map };
+                let cap = if expanded_for_map.get() {
+                    max_for_map
+                } else {
+                    cap_for_map
+                };
                 let visible_rows = rows.min(cap).max(1);
                 w.set_size(cols_for_map, visible_rows);
                 w.feed(text.as_bytes());
@@ -631,7 +666,11 @@ impl FinishedBlock {
             expand_btn.connect_clicked(move |btn| {
                 let now_expanded = !expand_for_btn.get();
                 expand_for_btn.set(now_expanded);
-                let cap = if now_expanded { max_expanded_cap } else { viewport_cap };
+                let cap = if now_expanded {
+                    max_expanded_cap
+                } else {
+                    viewport_cap
+                };
                 let visible_rows = output_rows.min(cap).max(1);
                 output_vte_for_btn.set_size(cols_for_btn, visible_rows);
                 let ch = output_vte_for_btn.char_height() as i32;
@@ -838,9 +877,8 @@ impl FinishedBlock {
     /// page never resumes. Closes the perceptual gap with a single-scrollback
     /// VTE pane (terminator/xterm).
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
-        let scroll_ctrl = gtk4::EventControllerScroll::new(
-            gtk4::EventControllerScrollFlags::VERTICAL,
-        );
+        let scroll_ctrl =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         // Bubble phase: VTE's own controller runs first and consumes the event
         // when it can scroll. We only see what's left over.
         let vte = self.output_vte.clone();
@@ -850,8 +888,8 @@ impl FinishedBlock {
                 return glib::Propagation::Proceed;
             };
             let at_top = inner_adj.value() <= inner_adj.lower() + f64::EPSILON;
-            let at_bottom = inner_adj.value() + inner_adj.page_size()
-                >= inner_adj.upper() - f64::EPSILON;
+            let at_bottom =
+                inner_adj.value() + inner_adj.page_size() >= inner_adj.upper() - f64::EPSILON;
             let going_up = dy < 0.0;
             let going_down = dy > 0.0;
             if (going_up && !at_top) || (going_down && !at_bottom) {
@@ -1054,4 +1092,3 @@ pub(crate) enum BlockState {
     /// PromptStart ever arrives (late-loading integration).
     RawFallback,
 }
-

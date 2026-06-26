@@ -76,21 +76,19 @@ pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
                                     should_clear = true;
                                 }
                             }
-                            b'K' => {
-                                match param_buf.as_slice() {
-                                    b"" | b"0" => cells.truncate(cursor),
-                                    b"1" => {
-                                        for c in cells.iter_mut().take(cursor) {
-                                            *c = ' ';
-                                        }
+                            b'K' => match param_buf.as_slice() {
+                                b"" | b"0" => cells.truncate(cursor),
+                                b"1" => {
+                                    for c in cells.iter_mut().take(cursor) {
+                                        *c = ' ';
                                     }
-                                    b"2" => {
-                                        cells.clear();
-                                        cursor = 0;
-                                    }
-                                    _ => {}
                                 }
-                            }
+                                b"2" => {
+                                    cells.clear();
+                                    cursor = 0;
+                                }
+                                _ => {}
+                            },
                             b'C' => {
                                 let count = parse_param_first(&param_buf, 1);
                                 cursor = (cursor + count).min(cells.len());
@@ -165,7 +163,11 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
             break;
         }
         let candidate = &haystack[pos..pos + needle.len()];
-        if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
+        if candidate
+            .iter()
+            .zip(needle.iter())
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        {
             return true;
         }
     }
@@ -178,7 +180,11 @@ pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool 
                 break;
             }
             let candidate = &haystack[pos..pos + needle.len()];
-            if candidate.iter().zip(needle.iter()).all(|(&h, &n)| h.to_ascii_lowercase() == n) {
+            if candidate
+                .iter()
+                .zip(needle.iter())
+                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+            {
                 return true;
             }
         }
@@ -199,13 +205,16 @@ pub(crate) fn parse_param_first(buf: &[u8], default: usize) -> usize {
             return default;
         }
     }
-    if val == 0 { default } else { val }
+    if val == 0 {
+        default
+    } else {
+        val
+    }
 }
 
 pub(crate) fn strip_ansi(input: &str) -> String {
     strip_ansi_with_clear_detect(input).0
 }
-
 
 #[cfg(test)]
 mod tests {

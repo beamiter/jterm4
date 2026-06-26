@@ -1,19 +1,16 @@
 //! actions — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::Orientation;
 use libadwaita as adw;
-use adw::prelude::*;
 use std::rc::Rc;
 use vte4::Format;
-use vte4::{Terminal};
+use vte4::Terminal;
 use vte4::TerminalExt;
 
-use crate::keybindings::{Action, Direction};
-use crate::block_view::TermView;
-use crate::terminal::{
-    terminal_working_directory,
-    find_first_terminal, find_focused_terminal,
-};
 use super::*;
+use crate::block_view::TermView;
+use crate::keybindings::{Action, Direction};
+use crate::terminal::{find_first_terminal, find_focused_terminal, terminal_working_directory};
 
 impl UiState {
     pub(crate) fn execute_action(&self, action: Action) {
@@ -226,7 +223,11 @@ impl UiState {
                 if let Some(term_view) = self.current_term_view() {
                     let slow_threshold = 1000; // 1 second
                     let slow_indices = term_view.get_slow_blocks(slow_threshold);
-                    log::info!("Found {} slow blocks (>{}ms)", slow_indices.len(), slow_threshold);
+                    log::info!(
+                        "Found {} slow blocks (>{}ms)",
+                        slow_indices.len(),
+                        slow_threshold
+                    );
                     if !slow_indices.is_empty() {
                         term_view.scroll_to_block(slow_indices[0]);
                     }
@@ -329,7 +330,8 @@ impl UiState {
             self.notebook.nth_page(Some(page_num)).and_then(|widget| {
                 // SAFETY: data() returns a NonNull to data we stored on the widget
                 unsafe {
-                    widget.data::<TerminalViewType>("terminal-view-type")
+                    widget
+                        .data::<TerminalViewType>("terminal-view-type")
                         .map(|ptr| ptr.as_ref().clone())
                 }
             })

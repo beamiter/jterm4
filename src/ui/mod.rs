@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::Terminal;
 
+use crate::block_view::TermView;
 use crate::config::{Config, SidebarView, TabPlacement, Theme};
 use crate::keybindings::KeybindingMap;
-use crate::block_view::TermView;
 use crate::terminal::VteTerminalView;
 
 mod actions;
@@ -26,7 +26,6 @@ mod tabs;
 mod zoom;
 
 pub(crate) use ai_panel::AiPanel;
-
 
 #[derive(Clone)]
 pub(crate) enum TerminalViewType {

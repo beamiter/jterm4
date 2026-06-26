@@ -1,13 +1,12 @@
 //! search — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::glib;
 use libadwaita as adw;
-use adw::prelude::*;
 use vte4::TerminalExt;
 
 use super::*;
 
 impl UiState {
-
     pub(crate) fn toggle_search(&self) {
         let visible = self.search_bar.is_search_mode();
         self.search_bar.set_search_mode(!visible);
@@ -33,11 +32,12 @@ impl UiState {
 
         // Detect regex pattern: /pattern/ syntax
         let text_str = text.as_str();
-        let (query, use_regex) = if text_str.starts_with('/') && text_str.ends_with('/') && text_str.len() > 2 {
-            (text_str[1..text_str.len() - 1].to_string(), true)
-        } else {
-            (text_str.to_string(), false)
-        };
+        let (query, use_regex) =
+            if text_str.starts_with('/') && text_str.ends_with('/') && text_str.len() > 2 {
+                (text_str[1..text_str.len() - 1].to_string(), true)
+            } else {
+                (text_str.to_string(), false)
+            };
 
         // Block mode: highlight every in-text match and focus the first one
         // (Warp's FindWithinBlock). Next/Prev step through them.

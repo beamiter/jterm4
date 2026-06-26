@@ -1,13 +1,12 @@
 //! tab_strip — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::glib;
 use gtk4::ToggleButton;
 use libadwaita as adw;
-use adw::prelude::*;
 
 use super::*;
 
 impl UiState {
-
     /// Update which tab strip button is :checked to match the active notebook page.
     pub(crate) fn sync_tab_strip_active(&self, active_page: Option<u32>) {
         let active = active_page.or(self.notebook.current_page()).unwrap_or(0);
@@ -60,9 +59,17 @@ impl UiState {
                 return;
             }
             let next = if direction > 0 {
-                if page < n - 1 { page + 1 } else { 0 }
+                if page < n - 1 {
+                    page + 1
+                } else {
+                    0
+                }
             } else {
-                if page > 0 { page - 1 } else { n.saturating_sub(1) }
+                if page > 0 {
+                    page - 1
+                } else {
+                    n.saturating_sub(1)
+                }
             };
             self.notebook.set_current_page(Some(next));
         }
@@ -180,7 +187,10 @@ impl UiState {
         if let Some(current_page) = self.notebook.current_page() {
             if current_page > 0 {
                 let new_page = current_page - 1;
-                self.notebook.reorder_child(&self.notebook.nth_page(Some(current_page)).unwrap(), Some(new_page));
+                self.notebook.reorder_child(
+                    &self.notebook.nth_page(Some(current_page)).unwrap(),
+                    Some(new_page),
+                );
                 self.reorder_tab_strip_buttons();
                 self.notebook.set_current_page(Some(new_page));
                 self.sync_tab_strip_active(Some(new_page));
@@ -193,7 +203,10 @@ impl UiState {
             let n_pages = self.notebook.n_pages();
             if current_page < n_pages - 1 {
                 let new_page = current_page + 1;
-                self.notebook.reorder_child(&self.notebook.nth_page(Some(current_page)).unwrap(), Some(new_page));
+                self.notebook.reorder_child(
+                    &self.notebook.nth_page(Some(current_page)).unwrap(),
+                    Some(new_page),
+                );
                 self.reorder_tab_strip_buttons();
                 self.notebook.set_current_page(Some(new_page));
                 self.sync_tab_strip_active(Some(new_page));
@@ -226,7 +239,8 @@ impl UiState {
                         prev_child = pc.next_sibling();
                     }
                 } else {
-                    self.tab_strip.reorder_child_after(&c, None::<&gtk4::Widget>);
+                    self.tab_strip
+                        .reorder_child_after(&c, None::<&gtk4::Widget>);
                 }
                 button_idx += 1;
             }
@@ -243,10 +257,14 @@ impl UiState {
                     if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
                         if btn.has_css_class("tab-marked") {
                             btn.remove_css_class("tab-marked");
-                            unsafe { btn.set_data::<bool>("marked", false); }
+                            unsafe {
+                                btn.set_data::<bool>("marked", false);
+                            }
                         } else {
                             btn.add_css_class("tab-marked");
-                            unsafe { btn.set_data::<bool>("marked", true); }
+                            unsafe {
+                                btn.set_data::<bool>("marked", true);
+                            }
                         }
                     }
                     break;
@@ -279,8 +297,12 @@ impl UiState {
                         } else {
                             btn.remove_css_class("tab-pinned");
                         }
-                        unsafe { btn.set_data::<bool>("pinned", pinned); }
-                        unsafe { wrapper.set_data::<bool>("pinned", pinned); }
+                        unsafe {
+                            btn.set_data::<bool>("pinned", pinned);
+                        }
+                        unsafe {
+                            wrapper.set_data::<bool>("pinned", pinned);
+                        }
                         if let Some(icon) = find_pin_icon(&btn) {
                             icon.set_visible(pinned);
                         }

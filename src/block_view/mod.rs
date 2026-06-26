@@ -1,3 +1,4 @@
+use gtk4::gdk::RGBA;
 use gtk4::pango::FontDescription;
 use gtk4::prelude::*;
 use gtk4::{glib, Orientation, ScrolledWindow};
@@ -8,14 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use vte4::Terminal;
 use vte4::{TerminalExt, TerminalExtManual};
-use gtk4::gdk::RGBA;
 
 use crate::config::Config;
 use crate::parser::{Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 
-mod ansi;
 mod alt_screen;
+mod ansi;
 mod blocks;
 mod cross_selection;
 mod css;
@@ -24,15 +24,14 @@ mod find;
 mod history;
 mod palette;
 mod scroll;
-pub(crate) use ansi::*;
 pub(crate) use alt_screen::*;
+pub(crate) use ansi::*;
 pub(crate) use blocks::*;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use find::*;
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
-
 
 // ── perf profiling (env JTERM_PROF=1) ───────────────────────────────────────
 pub(crate) fn prof_enabled() -> bool {
@@ -51,7 +50,11 @@ fn next_block_id() -> u64 {
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
     if unread > 0 {
-        let n = if unread > 99 { "99+".to_string() } else { unread.to_string() };
+        let n = if unread > 99 {
+            "99+".to_string()
+        } else {
+            unread.to_string()
+        };
         fab.set_label(&format!("\u{f078}  {}", n));
     } else {
         fab.set_label("\u{f078}");
@@ -926,11 +929,7 @@ impl ReaderCtx {
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
 /// Without the synchronous push the per-frame resize tick would catch up only
 /// on the next frame, racing with the child.
-fn sync_active_to_pty(
-    resize_active: &Rc<dyn Fn()>,
-    vte: &Terminal,
-    pty: &OwnedPty,
-) {
+fn sync_active_to_pty(resize_active: &Rc<dyn Fn()>, vte: &Terminal, pty: &OwnedPty) {
     resize_active();
     let cols = vte.column_count().max(1) as u16;
     let rows = vte.row_count().max(1) as u16;
@@ -939,10 +938,7 @@ fn sync_active_to_pty(
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
 /// VTE fills the scroll area like a normal full-screen terminal.
-fn enter_fullscreen(
-    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
-    fullscreen: &Rc<Cell<bool>>,
-) {
+fn enter_fullscreen(finished: &Rc<RefCell<Vec<FinishedBlock>>>, fullscreen: &Rc<Cell<bool>>) {
     if fullscreen.replace(true) {
         return;
     }
@@ -1044,10 +1040,9 @@ impl KeyCtx {
                         let widget = block.widget().clone();
                         let scroll = block_scroll_for_key.clone();
                         glib::idle_add_local_once(move || {
-                            if let Some(point) = widget.compute_point(
-                                &scroll,
-                                &gtk4::graphene::Point::new(0.0, 0.0),
-                            ) {
+                            if let Some(point) =
+                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                            {
                                 let adj = scroll.vadjustment();
                                 let target = (point.y() as f64) - adj.page_size() / 3.0;
                                 adj.set_value(target.max(0.0));
@@ -1151,10 +1146,9 @@ impl KeyCtx {
                         let widget = block.widget().clone();
                         let scroll = block_scroll_for_key.clone();
                         glib::idle_add_local_once(move || {
-                            if let Some(point) = widget.compute_point(
-                                &scroll,
-                                &gtk4::graphene::Point::new(0.0, 0.0),
-                            ) {
+                            if let Some(point) =
+                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                            {
                                 let adj = scroll.vadjustment();
                                 let target = (point.y() as f64) - adj.page_size() / 3.0;
                                 adj.set_value(target.max(0.0));
@@ -1329,7 +1323,8 @@ impl TermView {
 
         // ── PTY ───────────────────────────────────────────────────────────
         // Detect rsh shell for session_id passing
-        let is_rsh = shell_argv.first()
+        let is_rsh = shell_argv
+            .first()
             .and_then(|s| std::path::Path::new(s).file_name())
             .and_then(|f| f.to_str())
             .map(|name| name == "rsh")
@@ -1528,7 +1523,8 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
-        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> = Rc::new(Cell::new(MouseReportingMode::None));
+        let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
+            Rc::new(Cell::new(MouseReportingMode::None));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1552,9 +1548,7 @@ impl TermView {
         // Set once any OSC-133 (FTCS) event is seen, so the view knows shell
         // integration is live.
         let ftcs_seen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(
-            cwd.unwrap_or("").to_string()
-        ));
+        let current_cwd: Rc<RefCell<String>> = Rc::new(RefCell::new(cwd.unwrap_or("").to_string()));
 
         // CWD updates come from VTE's native OSC 7 signal (the parser passes
         // OSC 7 through unchanged, see parser.rs). Title updates likewise come
@@ -1639,21 +1633,25 @@ impl TermView {
             let ftcs_seen_rc = ftcs_seen.clone();
 
             // Command queue for replaying initial_commands on PromptEnd events
-            let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> = Rc::new(RefCell::new(
-                initial_commands
-                    .map(|s| s.split(", ")
-                        .map(|c| c.trim().to_string())
-                        .filter(|c| !c.is_empty())
-                        .collect())
-                    .unwrap_or_default()
-            ));
+            let init_cmds_queue: Rc<RefCell<std::collections::VecDeque<String>>> =
+                Rc::new(RefCell::new(
+                    initial_commands
+                        .map(|s| {
+                            s.split(", ")
+                                .map(|c| c.trim().to_string())
+                                .filter(|c| !c.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ));
             let init_cmds_queue_for_cb = Rc::clone(&init_cmds_queue);
             let pty_for_init = Rc::clone(&pty);
             let block_start_time_for_cb = block_start_time.clone();
             let pending_exit_code_rc = pending_exit_code.clone();
             let current_cwd_for_cb = current_cwd.clone();
 
-            let event_buf: Rc<RefCell<Vec<ParserEvent>>> = Rc::new(RefCell::new(Vec::with_capacity(32)));
+            let event_buf: Rc<RefCell<Vec<ParserEvent>>> =
+                Rc::new(RefCell::new(Vec::with_capacity(32)));
             ReaderCtx {
                 active_rc,
                 active_vte: active_vte_rc,
@@ -1720,34 +1718,36 @@ impl TermView {
             let scroll = block_scroll.clone();
             let holder = active.borrow().widget().clone();
             let check_pending = Rc::new(Cell::new(false));
-            block_scroll.vadjustment().connect_value_changed(move |_adj| {
-                if check_pending.get() {
-                    return;
-                }
-                check_pending.set(true);
-                let user_scrolled = user_scrolled.clone();
-                let fab = fab.clone();
-                let unread = unread.clone();
-                let scroll = scroll.clone();
-                let holder = holder.clone();
-                let check_pending = check_pending.clone();
-                glib::idle_add_local_once(move || {
-                    check_pending.set(false);
-                    let vp_h = scroll.height() as f64;
-                    let at_bottom = holder
-                        .compute_bounds(&scroll)
-                        .map(|b| (b.y() as f64) < vp_h - 4.0)
-                        .unwrap_or(true);
-                    user_scrolled.set(!at_bottom);
-                    if at_bottom {
-                        unread.set(0);
-                        fab.set_visible(false);
-                    } else {
-                        set_jump_fab_label(&fab, unread.get());
-                        fab.set_visible(true);
+            block_scroll
+                .vadjustment()
+                .connect_value_changed(move |_adj| {
+                    if check_pending.get() {
+                        return;
                     }
+                    check_pending.set(true);
+                    let user_scrolled = user_scrolled.clone();
+                    let fab = fab.clone();
+                    let unread = unread.clone();
+                    let scroll = scroll.clone();
+                    let holder = holder.clone();
+                    let check_pending = check_pending.clone();
+                    glib::idle_add_local_once(move || {
+                        check_pending.set(false);
+                        let vp_h = scroll.height() as f64;
+                        let at_bottom = holder
+                            .compute_bounds(&scroll)
+                            .map(|b| (b.y() as f64) < vp_h - 4.0)
+                            .unwrap_or(true);
+                        user_scrolled.set(!at_bottom);
+                        if at_bottom {
+                            unread.set(0);
+                            fab.set_visible(false);
+                        } else {
+                            set_jump_fab_label(&fab, unread.get());
+                            fab.set_visible(true);
+                        }
+                    });
                 });
-            });
         }
 
         // ── Re-clamp input height on viewport resize ──────────────────────
@@ -1984,9 +1984,7 @@ impl TermView {
                     return glib::Propagation::Stop;
                 }
                 let (col, row) = pointer_for_scroll.get();
-                if let Some(bytes) =
-                    encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row)
-                {
+                if let Some(bytes) = encode_mouse_wheel(mouse_mode_for_scroll.get(), dy, col, row) {
                     pty_for_scroll.write_bytes(&bytes);
                 }
                 glib::Propagation::Stop
@@ -2049,7 +2047,11 @@ impl TermView {
             let config = term_view.config.borrow();
             let fallback_cols = term_view.active.borrow().grid_cols() as i64;
             for block in block_data_ref.iter() {
-                let cols = if block.cols > 0 { block.cols as i64 } else { fallback_cols };
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
                 let finished = FinishedBlock::new(
                     block.id,
                     &block.prompt,
@@ -2063,8 +2065,16 @@ impl TermView {
                     block.cwd.as_deref(),
                     cols,
                 );
-                finished.widget().insert_before(&term_view.block_list, Some(term_view.active.borrow().widget()));
-                finished.connect_actions(&term_view.active_vte, &term_view.pty, &pty_synced, &term_view.active);
+                finished.widget().insert_before(
+                    &term_view.block_list,
+                    Some(term_view.active.borrow().widget()),
+                );
+                finished.connect_actions(
+                    &term_view.active_vte,
+                    &term_view.pty,
+                    &pty_synced,
+                    &term_view.active,
+                );
                 finished.connect_scroll_forwarding(&term_view.block_scroll);
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
@@ -2337,7 +2347,8 @@ impl TermView {
             &palette_refs,
         );
         self.active_vte.set_color_cursor(Some(&config.cursor));
-        self.active_vte.set_color_cursor_foreground(Some(&config.cursor_foreground));
+        self.active_vte
+            .set_color_cursor_foreground(Some(&config.cursor_foreground));
         install_block_css(&config);
     }
 
@@ -2441,7 +2452,10 @@ impl TermView {
             (
                 "State",
                 vec![
-                    ("Block state".to_string(), format!("{:?}", self.bstate.get())),
+                    (
+                        "Block state".to_string(),
+                        format!("{:?}", self.bstate.get()),
+                    ),
                     (
                         "Mouse reporting".to_string(),
                         format!("{:?}", self.mouse_reporting_mode.get()),
@@ -2457,7 +2471,10 @@ impl TermView {
                 vec![
                     ("PID".to_string(), self.pty.pid_i32().to_string()),
                     ("CWD".to_string(), self.current_cwd.borrow().clone()),
-                    ("Output grid".to_string(), format!("{out_cols} × {out_rows}")),
+                    (
+                        "Output grid".to_string(),
+                        format!("{out_cols} × {out_rows}"),
+                    ),
                 ],
             ),
             (
@@ -2467,16 +2484,28 @@ impl TermView {
                     ("Block data entries".to_string(), block_data_len.to_string()),
                     ("Failed blocks".to_string(), failed.to_string()),
                     ("Slow blocks (>1s)".to_string(), slow.to_string()),
-                    ("Total output bytes".to_string(), total_output_bytes.to_string()),
+                    (
+                        "Total output bytes".to_string(),
+                        total_output_bytes.to_string(),
+                    ),
                     ("Selected block id".to_string(), selected),
                 ],
             ),
             (
                 "Viewport",
                 vec![
-                    ("First visible".to_string(), viewport.first_visible.to_string()),
-                    ("Last visible".to_string(), viewport.last_visible.to_string()),
-                    ("Total height".to_string(), format!("{}px", viewport.total_height)),
+                    (
+                        "First visible".to_string(),
+                        viewport.first_visible.to_string(),
+                    ),
+                    (
+                        "Last visible".to_string(),
+                        viewport.last_visible.to_string(),
+                    ),
+                    (
+                        "Total height".to_string(),
+                        format!("{}px", viewport.total_height),
+                    ),
                     ("Realized widgets".to_string(), visible.to_string()),
                     ("Profiling".to_string(), prof_enabled().to_string()),
                 ],
@@ -2546,9 +2575,8 @@ impl TermView {
         let data = self.block_data.borrow();
         let bd = data.iter().find(|b| b.id == id);
 
-        let output = block.with_stripped_output(|s| {
-            crate::ai::truncate_for_context(s, lines_per_side)
-        });
+        let output =
+            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
         Some(crate::ai::BlockContext {
             cmd: block.cmd_text.clone(),
             output,
@@ -2556,7 +2584,6 @@ impl TermView {
             exit_code: bd.map(|b| b.exit_code).unwrap_or(0),
         })
     }
-
 }
 
 #[cfg(test)]
@@ -2901,7 +2928,7 @@ mod tests {
         // After commit, preedit should be empty and cursor advances
         let cmd = "ls ";
         let _preedit = "zhong"; // composing
-        // Simulate commit of "中"
+                                // Simulate commit of "中"
         let (buf, pos) = simulate_ime_commit(cmd, cmd.chars().count(), "中");
         assert_eq!(buf, "ls 中");
         assert_eq!(pos, 4);
@@ -2917,11 +2944,7 @@ mod tests {
         let cmd = "你好世界";
         let pos = 4; // cursor at end
         let mut buf = cmd.to_string();
-        let byte_pos = buf
-            .char_indices()
-            .nth(pos - 1)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let byte_pos = buf.char_indices().nth(pos - 1).map(|(i, _)| i).unwrap_or(0);
         let next_byte = buf
             .char_indices()
             .nth(pos)
@@ -2938,7 +2961,7 @@ mod tests {
         let cmd = "你好world";
         let chars: Vec<char> = cmd.chars().collect();
         assert_eq!(chars.len(), 7); // 你好 = 2 chars, world = 5 chars
-        // At pos 2, cursor is between '好' and 'w'
+                                    // At pos 2, cursor is between '好' and 'w'
         let pos = 2;
         assert_eq!(chars[pos - 1], '好');
         assert_eq!(chars[pos], 'w');

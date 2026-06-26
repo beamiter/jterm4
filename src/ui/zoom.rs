@@ -1,17 +1,15 @@
 //! zoom — UiState methods extracted from ui (mechanical split, no logic changes)
+use adw::prelude::*;
 use gtk4::Paned;
 use libadwaita as adw;
-use adw::prelude::*;
 
-use crate::terminal::{
-    scrollbar_wrapper_of,
-    terminal_working_directory,
-    find_first_terminal, find_focused_terminal, reattach_terminal_to_tree,
-};
 use super::*;
+use crate::terminal::{
+    find_first_terminal, find_focused_terminal, reattach_terminal_to_tree, scrollbar_wrapper_of,
+    terminal_working_directory,
+};
 
 impl UiState {
-
     pub(crate) fn toggle_pane_zoom(&self) {
         let has_zoom = self.zoom_state.borrow().is_some();
         if has_zoom {
@@ -23,19 +21,31 @@ impl UiState {
     }
 
     pub(crate) fn zoom_pane(&self) {
-        let Some(page_num) = self.notebook.current_page() else { return };
-        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
 
         // Only zoom if there are splits (page is a Paned)
-        if page_widget.clone().downcast::<Paned>().is_err() { return; }
+        if page_widget.clone().downcast::<Paned>().is_err() {
+            return;
+        }
 
-        let Some(term) = find_focused_terminal(&page_widget) else { return };
+        let Some(term) = find_focused_terminal(&page_widget) else {
+            return;
+        };
         // The effective widget (wrapper box or bare terminal) is what sits in the Paned.
         let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
             .map(|bx| bx.upcast::<gtk4::Widget>())
             .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
-        let Some(parent) = eff_widget.parent() else { return };
-        let Ok(parent_paned) = parent.downcast::<Paned>() else { return };
+        let Some(parent) = eff_widget.parent() else {
+            return;
+        };
+        let Ok(parent_paned) = parent.downcast::<Paned>() else {
+            return;
+        };
 
         let tab_label = self.notebook.tab_label(&page_widget);
 
@@ -51,11 +61,9 @@ impl UiState {
 
         // Add terminal (with scrollbar wrapper) as a standalone page
         eff_widget.set_widget_name(&widget_name);
-        let new_page = self.notebook.insert_page(
-            &eff_widget,
-            tab_label.as_ref(),
-            Some(page_num),
-        );
+        let new_page = self
+            .notebook
+            .insert_page(&eff_widget, tab_label.as_ref(), Some(page_num));
         self.notebook.set_tab_reorderable(&eff_widget, true);
         self.notebook.set_current_page(Some(new_page));
         self.sync_tab_strip_active(Some(new_page));
@@ -70,15 +78,18 @@ impl UiState {
     }
 
     pub(crate) fn unzoom_pane(&self, state: ZoomState) {
-        let Some(page_num) = self.notebook.current_page() else { return };
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
 
         // Remove the zoomed terminal's standalone page
         self.notebook.remove_page(Some(page_num));
 
         // Re-attach the effective widget (wrapper box or terminal) to the Paned tree
-        let eff_widget = scrollbar_wrapper_of(&state.zoomed_terminal.clone().upcast::<gtk4::Widget>())
-            .map(|bx| bx.upcast::<gtk4::Widget>())
-            .unwrap_or_else(|| state.zoomed_terminal.clone().upcast::<gtk4::Widget>());
+        let eff_widget =
+            scrollbar_wrapper_of(&state.zoomed_terminal.clone().upcast::<gtk4::Widget>())
+                .map(|bx| bx.upcast::<gtk4::Widget>())
+                .unwrap_or_else(|| state.zoomed_terminal.clone().upcast::<gtk4::Widget>());
         reattach_terminal_to_tree(&state.original_page, &eff_widget);
 
         // Re-add the original Paned tree as the page
@@ -89,25 +100,38 @@ impl UiState {
             state.tab_label.as_ref(),
             Some(state.page_index),
         );
-        self.notebook.set_tab_reorderable(&state.original_page, true);
+        self.notebook
+            .set_tab_reorderable(&state.original_page, true);
         self.notebook.set_current_page(Some(new_page));
         self.sync_tab_strip_active(Some(new_page));
         state.zoomed_terminal.grab_focus();
     }
 
     pub(crate) fn move_pane_to_new_tab(&self) {
-        let Some(page_num) = self.notebook.current_page() else { return };
-        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else { return };
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
 
         // Only works if there are splits
-        if page_widget.clone().downcast::<Paned>().is_err() { return; }
+        if page_widget.clone().downcast::<Paned>().is_err() {
+            return;
+        }
 
-        let Some(term) = find_focused_terminal(&page_widget) else { return };
+        let Some(term) = find_focused_terminal(&page_widget) else {
+            return;
+        };
         let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
             .map(|bx| bx.upcast::<gtk4::Widget>())
             .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
-        let Some(parent) = eff_widget.parent() else { return };
-        let Ok(paned) = parent.clone().downcast::<Paned>() else { return };
+        let Some(parent) = eff_widget.parent() else {
+            return;
+        };
+        let Ok(paned) = parent.clone().downcast::<Paned>() else {
+            return;
+        };
 
         let start = paned.start_child();
         let end = paned.end_child();

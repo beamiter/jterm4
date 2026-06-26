@@ -26,12 +26,20 @@ pub(crate) fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
     let mut last: i64 = -1;
     for (ti, ch) in text.to_lowercase().chars().enumerate() {
         if qi < q.len() && ch == q[qi] {
-            score += if last < 0 { ti as i64 } else { ti as i64 - last - 1 };
+            score += if last < 0 {
+                ti as i64
+            } else {
+                ti as i64 - last - 1
+            };
             last = ti as i64;
             qi += 1;
         }
     }
-    if qi == q.len() { Some(score) } else { None }
+    if qi == q.len() {
+        Some(score)
+    } else {
+        None
+    }
 }
 
 /// A command-history entry for the palette, carrying the outcome metadata the
@@ -227,7 +235,11 @@ pub(crate) fn show_command_palette(
                 }
                 Key::Down => {
                     if n_rows > 0 {
-                        let next = if cur < 0 || cur >= n_rows - 1 { 0 } else { cur + 1 };
+                        let next = if cur < 0 || cur >= n_rows - 1 {
+                            0
+                        } else {
+                            cur + 1
+                        };
                         if let Some(r) = list.row_at_index(next) {
                             list.select_row(Some(&r));
                         }
