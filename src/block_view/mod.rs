@@ -977,6 +977,7 @@ struct KeyCtx {
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    bstate_for_key: Rc<Cell<BlockState>>,
 }
 
 impl KeyCtx {
@@ -991,6 +992,7 @@ impl KeyCtx {
             selected_block_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
+            bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
             use gtk4::gdk::Key;
@@ -1082,7 +1084,12 @@ impl KeyCtx {
 
             // Ctrl+B: toggle a bookmark on the selected block (Warp's
             // ToggleBookmarkBlock). Shows the gutter star + accent stripe.
-            if ctrl && !shift && !alt && matches!(keyval, Key::b | Key::B) {
+            // Only consume the key when bookmark logic actually fires — in
+            // alt-screen (vim/less) or with no selection, let VTE deliver
+            // Ctrl+B to the running app (e.g. vim's page-up).
+            if ctrl && !shift && !alt && matches!(keyval, Key::b | Key::B)
+                && bstate_for_key.get() != BlockState::AltScreen
+            {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
                     let finished = finished_blocks_for_key.borrow();
                     if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
@@ -1099,9 +1106,9 @@ impl KeyCtx {
                         } else {
                             block.widget().remove_css_class("block-bookmarked");
                         }
+                        return glib::Propagation::Stop;
                     }
                 }
-                return glib::Propagation::Stop;
             }
 
             // Ctrl+,/Ctrl+. : jump to the previous/next bookmarked block (Warp's
@@ -1928,6 +1935,7 @@ impl TermView {
                 selected_block_id_for_key,
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
+                bstate_for_key: bstate.clone(),
             }
             .connect(&key_ctrl);
 
