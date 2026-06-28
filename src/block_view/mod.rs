@@ -694,7 +694,15 @@ impl ReaderCtx {
                                     let left_click = gtk4::GestureClick::new();
                                     left_click.set_button(1);
                                     left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                                    left_click.connect_pressed(move |gesture, _, _, y| {
+                                    left_click.connect_pressed(move |gesture, n_press, _, y| {
+                                        // Only act on the first press of a sequence. Refiring
+                                        // grab_focus() on the 2nd/3rd press would interrupt
+                                        // VTE's native double/triple-click word/line selection
+                                        // in the output VTE child.
+                                        if n_press != 1 {
+                                            gesture.set_state(gtk4::EventSequenceState::Denied);
+                                            return;
+                                        }
                                         active_for_click.borrow().grab_focus();
                                         // Header strip occupies the top of the block; a
                                         // press there toggles this block's selection.
