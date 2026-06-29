@@ -1095,7 +1095,10 @@ impl KeyCtx {
             // Only consume the key when bookmark logic actually fires — in
             // alt-screen (vim/less) or with no selection, let VTE deliver
             // Ctrl+B to the running app (e.g. vim's page-up).
-            if ctrl && !shift && !alt && matches!(keyval, Key::b | Key::B)
+            if ctrl
+                && !shift
+                && !alt
+                && matches!(keyval, Key::b | Key::B)
                 && bstate_for_key.get() != BlockState::AltScreen
             {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
