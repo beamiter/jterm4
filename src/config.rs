@@ -221,6 +221,10 @@ pub struct Config {
     /// off only if the noise of mass `[REDACTED:...]` markers in a session
     /// full of legitimately-looking-secret-shaped data outweighs the risk.
     pub(crate) ai_redact_secrets: bool,
+    /// Allow OSC 52 SET (`\e]52;c;<base64>\e\\`) from remote/local apps to
+    /// overwrite the system clipboard. Off by default — a malicious or buggy
+    /// remote process can otherwise silently replace the user's clipboard.
+    pub(crate) allow_remote_clipboard_write: bool,
     /// When a block runs longer than `notify_long_block_threshold_ms`, post a
     /// desktop notification on completion via `notify-send`. The terminal
     /// emulator equivalent of the "your build is done" toast.
@@ -429,6 +433,7 @@ struct FileConfig {
     ai_model: Option<String>,
     ai_max_tokens: Option<u32>,
     ai_redact_secrets: Option<bool>,
+    allow_remote_clipboard_write: Option<bool>,
     notify_long_blocks: Option<bool>,
     notify_long_block_threshold_ms: Option<u64>,
     show_repo_strip: Option<bool>,
@@ -578,6 +583,9 @@ fn load_file_config() -> FileConfig {
             .and_then(|v| v.as_integer())
             .map(|v| v as u32),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
+        allow_remote_clipboard_write: table
+            .get("allow_remote_clipboard_write")
+            .and_then(|v| v.as_bool()),
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table
             .get("notify_long_block_threshold_ms")
@@ -838,6 +846,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or(1024)
             .clamp(64, 8192),
         ai_redact_secrets: fc.ai_redact_secrets.unwrap_or(true),
+        allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),
@@ -934,6 +943,10 @@ pub(crate) fn save_config(config: &Config) {
     table.insert(
         "ai_redact_secrets".into(),
         toml::Value::Boolean(config.ai_redact_secrets),
+    );
+    table.insert(
+        "allow_remote_clipboard_write".into(),
+        toml::Value::Boolean(config.allow_remote_clipboard_write),
     );
     table.insert(
         "notify_long_blocks".into(),

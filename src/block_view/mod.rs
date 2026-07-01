@@ -11,7 +11,7 @@ use vte4::Terminal;
 use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
-use crate::parser::{Parser, ParserConfig, ParserEvent};
+use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 
 mod alt_screen;
@@ -77,6 +77,78 @@ fn refresh_repo_strip(label: &gtk4::Label, cwd: &str) {
         }
         None => {
             label.set_visible(false);
+        }
+    }
+}
+
+fn sample_output_for_event(output: &str) -> String {
+    const MAX_CHARS: usize = 32 * 1024;
+    if output.len() <= MAX_CHARS {
+        return output.to_string();
+    }
+    let half = MAX_CHARS / 2;
+    let head_end = output
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= half)
+        .last()
+        .unwrap_or(0);
+    let tail_start = output
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i >= output.len().saturating_sub(half))
+        .unwrap_or(output.len());
+    format!(
+        "{}\n... [{} bytes elided] ...\n{}",
+        &output[..head_end],
+        tail_start.saturating_sub(head_end),
+        &output[tail_start..]
+    )
+}
+
+fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
+    match idx {
+        0..=15 => {
+            let c = palette[idx as usize];
+            (
+                (c.red() * 255.0) as u8,
+                (c.green() * 255.0) as u8,
+                (c.blue() * 255.0) as u8,
+            )
+        }
+        16..=231 => {
+            let idx = idx - 16;
+            let r = (idx / 36) * 51;
+            let g = ((idx % 36) / 6) * 51;
+            let b = (idx % 6) * 51;
+            (r, g, b)
+        }
+        232..=255 => {
+            let gray = 8 + (idx - 232) * 10;
+            (gray, gray, gray)
+        }
+    }
+}
+
+fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
+    let rgba = match kind {
+        ColorKind::Foreground => config.foreground,
+        ColorKind::Background => config.background,
+        ColorKind::Cursor => config.cursor,
+        ColorKind::Palette(idx) => {
+            let (r, g, b) = ansi256_to_rgb(idx, &config.palette);
+            RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+        }
+    };
+    let r = (rgba.red() * 65535.0) as u16;
+    let g = (rgba.green() * 65535.0) as u16;
+    let b = (rgba.blue() * 65535.0) as u16;
+    match kind {
+        ColorKind::Foreground => format!("\x1b]10;rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\"),
+        ColorKind::Background => format!("\x1b]11;rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\"),
+        ColorKind::Cursor => format!("\x1b]12;rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\"),
+        ColorKind::Palette(idx) => {
+            format!("\x1b]4;{idx};rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\")
         }
     }
 }
@@ -162,6 +234,8 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
 
+type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
+
 pub struct TermView {
     root: gtk4::Box,
     block_scroll: ScrolledWindow,
@@ -186,6 +260,7 @@ pub struct TermView {
     programmatic_scroll: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
     cwd_callbacks: StrCallbacks,
+    remote_session_callbacks: StrCallbacks,
     exited_callbacks: IntCallbacks,
     bell_callbacks: VoidCallbacks,
     title_callbacks: StrCallbacks,
@@ -198,6 +273,7 @@ pub struct TermView {
     widget_pool: Rc<RefCell<WidgetPool>>,
     visible_indices: Rc<RefCell<std::collections::HashSet<usize>>>,
     selected_block_id: Rc<Cell<Option<u64>>>,
+    bookmarks: Rc<RefCell<std::collections::HashSet<u64>>>,
     /// Find-within-blocks state: every match across the finished blocks plus a
     /// cursor into it, so Ctrl+F highlights all hits and Next/Prev step through
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
@@ -210,6 +286,7 @@ pub struct TermView {
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
+    block_finished_callbacks: BlockFinishedCallbacks,
 }
 
 impl Drop for TermView {
@@ -245,6 +322,7 @@ struct ReaderCtx {
     prompt_display_rc: Rc<RefCell<String>>,
     block_list_rc: gtk4::Box,
     block_scroll_rc: ScrolledWindow,
+    remote_session_cbs: StrCallbacks,
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
@@ -278,6 +356,7 @@ struct ReaderCtx {
     /// finishes (the user may have just run `git commit`, `git pull`,
     /// or anything else that changes branch/dirty/ahead-behind).
     repo_strip: gtk4::Label,
+    block_finished_cbs: BlockFinishedCallbacks,
 }
 
 /// Fold every run of consecutive `ParserEvent::Bytes(_)` entries in `events`
@@ -342,6 +421,7 @@ impl ReaderCtx {
             prompt_display_rc,
             block_list_rc,
             block_scroll_rc,
+            remote_session_cbs,
             exited_cbs,
             activity_cbs,
             mouse_reporting_rc,
@@ -368,6 +448,7 @@ impl ReaderCtx {
             running_cmd_rc,
             resize_active,
             repo_strip,
+            block_finished_cbs,
         } = self;
         pty.start_reader(
             move |data: Vec<u8>| {
@@ -583,6 +664,11 @@ impl ReaderCtx {
                                 finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
+
+                                let output_sample = sample_output_for_event(&output_plain);
+                                for cb in block_finished_cbs.borrow().iter() {
+                                    cb(cmd.clone(), exit_code, output_sample.clone());
+                                }
 
                                 {
                                     let cfg = config_for_cb.borrow();
@@ -932,9 +1018,28 @@ impl ReaderCtx {
                         }
 
                         ParserEvent::ClipboardSet(text) => {
-                            if let Some(display) = gtk4::gdk::Display::default() {
-                                let clipboard = display.clipboard();
-                                clipboard.set_text(text);
+                            if config_for_cb.borrow().allow_remote_clipboard_write {
+                                if let Some(display) = gtk4::gdk::Display::default() {
+                                    let clipboard = display.clipboard();
+                                    clipboard.set_text(text);
+                                }
+                            }
+                        }
+
+                        ParserEvent::ClipboardQuery => {
+                            pty_for_init.write_bytes(b"\x1b]52;c;\x1b\\");
+                        }
+
+                        ParserEvent::ColorQuery(kind) => {
+                            let reply = build_color_query_reply(&config_for_cb.borrow(), *kind);
+                            pty_for_init.write_bytes(reply.as_bytes());
+                        }
+
+                        ParserEvent::KeyboardProtocolQuery(_query) => {}
+
+                        ParserEvent::RemoteSessionId(id) => {
+                            for cb in remote_session_cbs.borrow().iter() {
+                                cb(id);
                             }
                         }
 
@@ -1601,6 +1706,7 @@ impl TermView {
         // True while an alt-screen app owns the viewport (finished blocks hidden).
         let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let cwd_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
+        let remote_session_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let exited_callbacks: IntCallbacks = Rc::new(RefCell::new(vec![]));
         let bell_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
         // Bell signal is delivered natively by VTE — no need to scan the byte
@@ -1616,6 +1722,7 @@ impl TermView {
         }
         let title_callbacks: StrCallbacks = Rc::new(RefCell::new(vec![]));
         let activity_callbacks: VoidCallbacks = Rc::new(RefCell::new(vec![]));
+        let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
             Rc::new(Cell::new(MouseReportingMode::None));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
@@ -1758,6 +1865,7 @@ impl TermView {
                 prompt_display_rc,
                 block_list_rc,
                 block_scroll_rc,
+                remote_session_cbs: remote_session_callbacks.clone(),
                 exited_cbs,
                 activity_cbs,
                 mouse_reporting_rc,
@@ -1784,6 +1892,7 @@ impl TermView {
                 running_cmd_rc: running_cmd.clone(),
                 resize_active: update_input_height.clone(),
                 repo_strip: repo_strip.clone(),
+                block_finished_cbs: block_finished_callbacks.clone(),
             }
             .install(&pty);
         }
@@ -2155,6 +2264,7 @@ impl TermView {
             programmatic_scroll: programmatic_scroll.clone(),
             pty,
             cwd_callbacks,
+            remote_session_callbacks,
             exited_callbacks,
             bell_callbacks,
             title_callbacks,
@@ -2171,10 +2281,12 @@ impl TermView {
             widget_pool,
             visible_indices,
             selected_block_id,
+            bookmarks: block_bookmarks,
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
             cross_selection,
+            block_finished_callbacks,
         };
 
         // Load history if configured
@@ -2478,6 +2590,10 @@ impl TermView {
         self.cwd_callbacks.borrow_mut().push(Box::new(f));
     }
 
+    pub fn connect_remote_session_id<F: Fn(&str) + 'static>(&self, f: F) {
+        self.remote_session_callbacks.borrow_mut().push(Box::new(f));
+    }
+
     pub fn connect_exited<F: Fn(i32) + 'static>(&self, f: F) {
         self.exited_callbacks.borrow_mut().push(Box::new(f));
     }
@@ -2492,6 +2608,96 @@ impl TermView {
 
     pub fn connect_activity<F: Fn() + 'static>(&self, f: F) {
         self.activity_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn connect_block_finished<F>(&self, f: F)
+    where
+        F: Fn(String, i32, String) + 'static,
+    {
+        self.block_finished_callbacks.borrow_mut().push(Box::new(f));
+    }
+
+    pub fn scroll_lines(&self, lines: i32) {
+        let adj = self.block_scroll.vadjustment();
+        let cell_h = self.active_vte.char_height() as f64;
+        let step = if cell_h > 0.0 {
+            cell_h
+        } else {
+            adj.step_increment()
+        };
+        let max_val = (adj.upper() - adj.page_size()).max(adj.lower());
+        let value = (adj.value() + step * lines as f64).clamp(adj.lower(), max_val);
+        adj.set_value(value);
+    }
+
+    pub fn apply_failed_filter(&self) {
+        if let Some(idx) = self.get_failed_blocks().first().copied() {
+            self.scroll_to_block(idx);
+        }
+    }
+
+    pub fn apply_slow_filter(&self) {
+        if let Some(idx) = self.get_slow_blocks(1000).first().copied() {
+            self.scroll_to_block(idx);
+        }
+    }
+
+    pub fn apply_pinned_filter(&self) {
+        let finished = self.finished_blocks.borrow();
+        let bookmarks = self.bookmarks.borrow();
+        if let Some((idx, _)) = finished
+            .iter()
+            .enumerate()
+            .find(|(_, block)| bookmarks.contains(&block.id))
+        {
+            drop(bookmarks);
+            drop(finished);
+            self.scroll_to_block(idx);
+        }
+    }
+
+    pub fn clear_block_filter(&self) {
+        self.scroll_to_block(0);
+    }
+
+    pub fn jump_to_pinned(&self, direction: i32) {
+        let finished = self.finished_blocks.borrow();
+        let bookmarks = self.bookmarks.borrow();
+        if bookmarks.is_empty() {
+            return;
+        }
+        let marked: Vec<usize> = finished
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| bookmarks.contains(&block.id))
+            .map(|(idx, _)| idx)
+            .collect();
+        if marked.is_empty() {
+            return;
+        }
+        let cur = self
+            .selected_block_id
+            .get()
+            .and_then(|id| finished.iter().position(|block| block.id == id));
+        let target = if direction < 0 {
+            marked
+                .iter()
+                .rev()
+                .find(|&&idx| cur.map(|c| idx < c).unwrap_or(true))
+                .copied()
+                .or_else(|| marked.last().copied())
+        } else {
+            marked
+                .iter()
+                .find(|&&idx| cur.map(|c| idx > c).unwrap_or(true))
+                .copied()
+                .or_else(|| marked.first().copied())
+        };
+        drop(bookmarks);
+        drop(finished);
+        if let Some(idx) = target {
+            self.scroll_to_block(idx);
+        }
     }
 
     /// Apply updated theme colors to the block widgets and the live VTE.

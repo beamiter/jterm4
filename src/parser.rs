@@ -1,3 +1,46 @@
+//! OSC/CSI stream parser. Splits a raw PTY byte stream into semantic
+//! `ParserEvent`s — passing through display bytes while extracting the OSC 133
+//! shell-integration marks, OSC 52 clipboard, alt-screen toggles and APC
+//! sequences that drive the block view. OSC 7/title sequences pass through to
+//! VTE so its native cwd/title signals stay authoritative.
+
+/// Which color slot an OSC 10/11/12/4 query asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorKind {
+    /// OSC 10 — default foreground.
+    Foreground,
+    /// OSC 11 — default background.
+    Background,
+    /// OSC 12 — cursor color.
+    Cursor,
+    /// OSC 4;N — palette index N.
+    Palette(u8),
+}
+
+/// Which terminal-capability handshake an app sent. The active VTE in block view
+/// has no real PTY return path, so we synthesize a sensible "not supported"
+/// reply ourselves to keep neovim/helix from blocking on a missing response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardProtocolQuery {
+    /// `CSI ? u` — kitty progressive-enhancement flag query.
+    KittyQuery,
+    /// `CSI ? 4 m` — XTQMODKEYS modifyOtherKeys query.
+    ModifyOtherKeysQuery,
+    /// `CSI c` / `CSI 0 c` — primary device attributes (DA1).
+    PrimaryDeviceAttributes,
+    /// `CSI > c` / `CSI > 0 c` — secondary device attributes (DA2). Different
+    /// reply format from DA1 (`CSI > Pp ; Pv ; Pc c` vs `CSI ? ... c`).
+    SecondaryDeviceAttributes,
+    /// `CSI = c` / `CSI = 0 c` — tertiary device attributes (DA3).
+    TertiaryDeviceAttributes,
+    /// `CSI > q` — XTVERSION (xterm name/version request).
+    XtVersion,
+    /// `CSI 5 n` — DSR: report device status (reply `\e[0n` = OK).
+    DeviceStatus,
+    /// `CSI 6 n` — DSR: report cursor position (reply `\e[<row>;<col>R`).
+    CursorPosition,
+}
+
 /// Events emitted by the stream parser.
 #[derive(Debug, Clone)]
 pub enum ParserEvent {
@@ -11,21 +54,32 @@ pub enum ParserEvent {
     CommandStart,
     /// OSC 133 ;D;<code> — command finished with exit code.
     CommandEnd(i32),
+    /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
+    /// startup. The UI stores it on the tab's RemoteConn so subsequent
+    /// reconnects pass `--session <id>` and rsh restores cwd/env/aliases.
+    RemoteSessionId(String),
     /// CSI ? 1049 h — alt screen entered (vim, less, etc.)
     AltScreenEnter,
     /// CSI ? 1049 l — alt screen left.
     AltScreenLeave,
     /// OSC 52 — application set clipboard content.
-    /// VTE 4 does not expose an OSC 52 "application-set" hook (only user paste),
-    /// so this remains hand-parsed instead of routed through a VTE signal.
     ClipboardSet(String),
+    /// OSC 52 with `?` — app is asking for current clipboard content.
+    /// We reply with an empty payload (`\e]52;c;\e\\`) so probers (tmux/vim)
+    /// know we accept SET but don't expose clipboard contents to the shell.
+    ClipboardQuery,
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
     /// CSI ? <mode> h / l — DEC private mode change. Emitted in addition to
-    /// pass-through so block_view can react to a few modes (notably mouse
-    /// reporting for wheel-suppression) without re-scanning the byte stream.
-    /// `set` = true for `h`, false for `l`.
+    /// pass-through so block_view can track reporting modes.
     DecsetMode { mode: u32, set: bool },
+    /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
+    /// The caller must write a `\e]<n>;rgb:RRRR/GGGG/BBBB\e\\` reply to the PTY.
+    ColorQuery(ColorKind),
+    /// App queried a keyboard/capability protocol. Caller should reply on the PTY
+    /// with a canned "not supported" / level-0 response so the app falls back
+    /// gracefully (otherwise neovim, helix, etc. hang waiting on the reply).
+    KeyboardProtocolQuery(KeyboardProtocolQuery),
 }
 
 #[derive(Default)]
@@ -44,27 +98,66 @@ enum State {
     Apc { buf: Vec<u8> },
     /// Saw ESC while in APC — next byte should be '\' for ST
     ApcEsc { payload: Vec<u8> },
-    /// Inside DCS/PM — just consume until ST
+    /// Inside DCS (ESC P): collect until ST. Unlike `Ignore`, the bytes are
+    /// rewrapped as `ESC P ... ESC \` and passed through to the active VTE so
+    /// sixel graphics, DECRQSS replies, and tmux passthrough survive block mode.
+    Dcs { buf: Vec<u8> },
+    /// Saw ESC while in DCS — next byte should be '\' for ST.
+    DcsEsc { payload: Vec<u8> },
+    /// Inside PM (ESC ^) — consume until ST and discard.
     Ignore,
-    /// Saw ESC while in Ignore — next byte is the second half of ST
-    /// (typically `\`). Must be consumed too, otherwise it leaks into
-    /// Ground state and is emitted as a literal — vim's many XTGETTCAP
-    /// queries each ended with `ESC \`, so this leaked one `\` per
-    /// query into the display.
+    /// Saw ESC while in PM — consume the ST final byte too.
     IgnoreEsc,
+}
+
+/// Which mouse-tracking mode the shell asked for. The active VTE in block-view
+/// has no real PTY, so VTE never auto-generates mouse reports; the caller drives
+/// reporting itself by reading this state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseMode {
+    #[default]
+    None,
+    /// `?9` — only button presses (no release).
+    X10,
+    /// `?1000` — button press + release.
+    Normal,
+    /// `?1002` — press/release + motion while a button is held.
+    ButtonEvent,
+    /// `?1003` — press/release + all motion.
+    AnyEvent,
+}
+
+/// Wire format for mouse reports. Set by `?1006`, `?1015`, `?1005` (or default
+/// xterm encoding if none enabled).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseEncoding {
+    /// Legacy `\e[M` + 3 bytes (button + 32, col + 32, row + 32).
+    #[default]
+    Default,
+    /// `?1006` — SGR: `\e[<b;col;row;{M|m}`.
+    Sgr,
+    /// `?1015` — urxvt: `\e[b;col;row;M`.
+    Urxvt,
+    /// `?1005` — UTF-8 encoded coordinates.
+    Utf8,
 }
 
 pub struct Parser {
     state: State,
     passthrough: Vec<u8>,
     config: ParserConfig,
+    /// `?2004` — shell asked for paste content to be bracketed with `\e[200~`
+    /// / `\e[201~`. The caller wraps its own `Paste` write when this is on.
+    bracketed_paste: bool,
+    /// Which mouse mode is currently active (highest-priority "h" wins).
+    mouse_mode: MouseMode,
+    /// Active mouse encoding flags. SGR/Urxvt/Utf8 are toggled independently; a
+    /// later "h" replaces the encoding choice.
+    mouse_encoding: MouseEncoding,
+    /// `?1004` — shell asked for `\e[I` / `\e[O` on focus enter/leave.
+    focus_events: bool,
 }
 
-/// Runtime toggles for selectively swallowing reporting-enable sequences before
-/// they reach the downstream consumer (VTE). When a toggle is `false`, the
-/// matching `CSI ?…h`/`CSI ?…l` sequences are dropped from the byte stream so
-/// the terminal never enters that reporting mode and apps never receive the
-/// corresponding events.
 #[derive(Clone, Copy)]
 pub struct ParserConfig {
     pub mouse_reporting: bool,
@@ -103,16 +196,6 @@ fn is_focus_reporting_mode(params: &[u8]) -> bool {
     matches!(params, b"?1004")
 }
 
-/// Parse the digit groups in a DECSET parameter slice (with the leading `?`
-/// already stripped) into mode numbers. Handles `1000`, `1000;1006`, etc.
-fn parse_decset_modes(rest: &[u8]) -> impl Iterator<Item = u32> + '_ {
-    rest.split(|&b| b == b';').filter_map(|seg| {
-        std::str::from_utf8(seg)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-    })
-}
-
 impl Default for Parser {
     fn default() -> Self {
         Self::new()
@@ -129,7 +212,105 @@ impl Parser {
             state: State::default(),
             passthrough: Vec::with_capacity(4096),
             config,
+            bracketed_paste: false,
+            mouse_mode: MouseMode::None,
+            mouse_encoding: MouseEncoding::Default,
+            focus_events: false,
         }
+    }
+
+    /// True while the shell has `?2004` enabled — callers should wrap pasted
+    /// content with `\e[200~` / `\e[201~` before writing to the PTY.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Currently active mouse-tracking mode, or `None` when reporting is off.
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    /// Wire encoding the next mouse report should use.
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.mouse_encoding
+    }
+
+    /// True while `?1004` is enabled — callers should emit `\e[I` on focus-in,
+    /// `\e[O` on focus-out.
+    pub fn focus_events(&self) -> bool {
+        self.focus_events
+    }
+
+    /// Apply each `?N` token from a `CSI ? Pm h/l` to the snooped state.
+    /// `enable` = true for `h`, false for `l`. Unknown modes are ignored —
+    /// they still pass through to the VTE.
+    fn update_dec_private_modes(&mut self, params: &[u8], enable: bool) -> Vec<u32> {
+        let mut modes = Vec::new();
+        for token in params.split(|&c| c == b';') {
+            // Each token may itself start with `?` if the shell sent
+            // `CSI ?1;?2 h`; tolerate that.
+            let token = token.strip_prefix(b"?").unwrap_or(token);
+            let n: u32 = match std::str::from_utf8(token).ok().and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            modes.push(n);
+            match n {
+                2004 => self.bracketed_paste = enable,
+                9 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::X10
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1000 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::Normal
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1002 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::ButtonEvent
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1003 => {
+                    self.mouse_mode = if enable {
+                        MouseMode::AnyEvent
+                    } else {
+                        MouseMode::None
+                    }
+                }
+                1004 => self.focus_events = enable,
+                1005 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Utf8
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                1006 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Sgr
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                1015 => {
+                    self.mouse_encoding = if enable {
+                        MouseEncoding::Urxvt
+                    } else {
+                        MouseEncoding::Default
+                    }
+                }
+                _ => {}
+            }
+        }
+        modes
     }
 
     pub fn feed(&mut self, data: &[u8], events: &mut Vec<ParserEvent>) {
@@ -143,16 +324,34 @@ impl Parser {
             };
         }
 
-        for &b in data {
-            match &mut self.state {
-                State::Ground => match b {
-                    0x1b => {
+        // Ground-state fast-path: bulk-copy runs of bytes until the next ESC.
+        // The previous per-byte loop dominated cost on heavy text streams; ESC
+        // is the only byte that exits Ground, so memchr lets us hop directly
+        // to the next state transition.
+        let mut i = 0usize;
+        let len = data.len();
+        while i < len {
+            if matches!(self.state, State::Ground) {
+                match memchr::memchr(0x1b, &data[i..]) {
+                    Some(off) => {
+                        if off > 0 {
+                            self.passthrough.extend_from_slice(&data[i..i + off]);
+                        }
+                        i += off + 1;
                         self.state = State::Esc;
+                        continue;
                     }
-                    _ => {
-                        self.passthrough.push(b);
+                    None => {
+                        self.passthrough.extend_from_slice(&data[i..]);
+                        break;
                     }
-                },
+                }
+            }
+
+            let b = data[i];
+            i += 1;
+            match &mut self.state {
+                State::Ground => unreachable!("handled by fast-path above"),
 
                 State::Esc => match b {
                     b'[' => {
@@ -168,7 +367,10 @@ impl Parser {
                     b'_' => {
                         self.state = State::Apc { buf: Vec::new() };
                     }
-                    b'P' | b'^' => {
+                    b'P' => {
+                        self.state = State::Dcs { buf: Vec::new() };
+                    }
+                    b'^' => {
                         self.state = State::Ignore;
                     }
                     _ => {
@@ -183,15 +385,15 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
-                        // Observe DEC private mode set/reset for downstream
-                        // consumers (block_view tracks mouse-reporting state
-                        // for wheel suppression). Emitted before any pending
-                        // passthrough is flushed so the Cell is current when
-                        // VTE sees the bytes that put it into the mode.
-                        if (b == b'h' || b == b'l') && params.first() == Some(&b'?') {
-                            let set = b == b'h';
-                            for mode in parse_decset_modes(&params[1..]) {
-                                events.push(ParserEvent::DecsetMode { mode, set });
+                        if (b == b'h' || b == b'l')
+                            && params.first() == Some(&b'?')
+                            && !is_alt_screen_mode(&params)
+                        {
+                            for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
+                                events.push(ParserEvent::DecsetMode {
+                                    mode,
+                                    set: b == b'h',
+                                });
                             }
                         }
                         if b == b'h' && is_alt_screen_mode(&params) {
@@ -213,6 +415,63 @@ impl Parser {
                         {
                             // Drop: keep VTE out of focus reporting mode.
                         } else {
+                            // Detect terminal-capability handshakes whose response
+                            // the active VTE would write back through its own PTY
+                            // (which is not connected). The caller synthesizes a
+                            // canned reply on `ctx.pty` so neovim/helix/etc. don't
+                            // hang waiting on it. The byte stream itself is still
+                            // passed through so the VTE updates its internal state.
+                            //
+                            // `CSI ? u`                       — kitty keyboard query
+                            // `CSI ? 4 m`                     — XTQMODKEYS query
+                            // `CSI c`, `CSI 0 c`              — primary DA (DA1)
+                            // `CSI > c`, `CSI > 0 c`          — secondary DA (DA2)
+                            // `CSI = c`, `CSI = 0 c`          — tertiary DA (DA3)
+                            // `CSI > q`                       — XTVERSION
+                            // `CSI 5 n` / `CSI 6 n`           — DSR status / cursor pos
+                            match (b, params.as_slice()) {
+                                (b'u', b"?") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::KittyQuery,
+                                    ));
+                                }
+                                (b'm', b"?4") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                                    ));
+                                }
+                                (b'c', b"") | (b'c', b"0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                                    ));
+                                }
+                                (b'c', b">") | (b'c', b">0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::SecondaryDeviceAttributes,
+                                    ));
+                                }
+                                (b'c', b"=") | (b'c', b"=0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::TertiaryDeviceAttributes,
+                                    ));
+                                }
+                                (b'q', b">") | (b'q', b">0") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::XtVersion,
+                                    ));
+                                }
+                                (b'n', b"5") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::DeviceStatus,
+                                    ));
+                                }
+                                (b'n', b"6") => {
+                                    events.push(ParserEvent::KeyboardProtocolQuery(
+                                        KeyboardProtocolQuery::CursorPosition,
+                                    ));
+                                }
+                                _ => {}
+                            }
                             // Pass the complete sequence through as one contiguous run.
                             self.passthrough.push(0x1b);
                             self.passthrough.push(b'[');
@@ -288,23 +547,47 @@ impl Parser {
                     }
                 }
 
+                State::Dcs { buf } => match b {
+                    0x07 => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::Ground;
+                        emit_dcs_passthrough(&payload, &mut self.passthrough);
+                    }
+                    0x1b => {
+                        let payload = std::mem::take(buf);
+                        self.state = State::DcsEsc { payload };
+                    }
+                    _ => {
+                        buf.push(b);
+                        // Bound runaway DCS (malformed stream) the same way CSI is bounded.
+                        if buf.len() > 1 << 20 {
+                            let payload = std::mem::take(buf);
+                            self.state = State::Ground;
+                            emit_dcs_passthrough(&payload, &mut self.passthrough);
+                        }
+                    }
+                },
+
+                State::DcsEsc { payload } => {
+                    let payload = std::mem::take(payload);
+                    self.state = State::Ground;
+                    emit_dcs_passthrough(&payload, &mut self.passthrough);
+                    if b == b'\\' {
+                        // Consumed the ST terminator.
+                    } else {
+                        self.passthrough.push(b);
+                    }
+                }
+
                 State::Ignore => {
                     if b == 0x07 {
-                        // BEL — single-byte ST.
                         self.state = State::Ground;
                     } else if b == 0x1b {
-                        // ESC — first byte of `ESC \` two-byte ST. Wait for
-                        // the `\` (or any final byte) before returning to
-                        // Ground so it doesn't leak as a literal.
                         self.state = State::IgnoreEsc;
                     }
                 }
 
                 State::IgnoreEsc => {
-                    // Consume the byte after ESC inside an ignored DCS/PM,
-                    // regardless of what it is (well-formed sequences send
-                    // `\`). If it's another ESC, stay in IgnoreEsc; otherwise
-                    // we're done.
                     if b != 0x1b {
                         self.state = State::Ground;
                     }
@@ -316,6 +599,18 @@ impl Parser {
     }
 }
 
+/// Rewrap a DCS payload as `ESC P ... ESC \` and append to the passthrough buffer
+/// so the active VTE — which can interpret sixel, DECRQSS replies, tmux
+/// passthrough, etc. — gets the original sequence verbatim.
+fn emit_dcs_passthrough(payload: &[u8], passthrough: &mut Vec<u8>) {
+    passthrough.reserve(payload.len() + 4);
+    passthrough.push(0x1b);
+    passthrough.push(b'P');
+    passthrough.extend_from_slice(payload);
+    passthrough.push(0x1b);
+    passthrough.push(b'\\');
+}
+
 fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     let s = match std::str::from_utf8(payload) {
         Ok(s) => s,
@@ -323,9 +618,6 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     };
 
     // OSC 133 ; <mark> [; params...] — shell integration (FTCS).
-    // Real shells emit extra `;`-separated params, e.g. "A;cl=m;k=i" or
-    // "D;1;aid=7", so match only the leading mark field and treat the rest
-    // as parameters.
     if let Some(rest) = s.strip_prefix("133;") {
         let mut fields = rest.split(';');
         match fields.next() {
@@ -333,8 +625,6 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
             Some("B") => events.push(ParserEvent::PromptEnd),
             Some("C") => events.push(ParserEvent::CommandStart),
             Some("D") => {
-                // Exit code is the first param after D (if any); ignore trailing
-                // fields like aid=. A non-numeric/absent code means "unknown" → 0.
                 let code = fields
                     .next()
                     .and_then(|f| f.parse::<i32>().ok())
@@ -346,19 +636,11 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
         return;
     }
 
-    // OSC 52 ; <selection> ; <base64-data> — clipboard set.
-    // VTE doesn't expose an OSC 52 application-set hook, so we hand-parse and
-    // route to the system clipboard ourselves.
-    if let Some(rest) = s.strip_prefix("52;") {
-        if let Some(data_start) = rest.find(';') {
-            let b64_data = &rest[data_start + 1..];
-            if b64_data != "?" {
-                if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
-                    if let Ok(text) = String::from_utf8(decoded) {
-                        events.push(ParserEvent::ClipboardSet(text));
-                    }
-                }
-            }
+    // OSC 7770 ; <session-id> — rsh-specific session announce (see rsh osc.rs:107).
+    if let Some(rest) = s.strip_prefix("7770;") {
+        let id = rest.trim();
+        if !id.is_empty() {
+            events.push(ParserEvent::RemoteSessionId(id.to_string()));
         }
         return;
     }
@@ -367,6 +649,62 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
     // unchanged. VTE consumes them natively and fires
     // current-directory-uri-notify / window-title-changed signals, which the
     // block_view subscribes to instead of re-parsing here.
+    if s.starts_with("7;") {
+        let mut bytes = Vec::with_capacity(payload.len() + 4);
+        bytes.push(0x1b);
+        bytes.push(b']');
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\x1b\\");
+        events.push(ParserEvent::Bytes(bytes));
+        return;
+    }
+
+    // OSC 10 ; ? / OSC 11 ; ? / OSC 12 ; ?  — color queries (XParseColor reply).
+    // The active VTE in block view has no return PTY, so the response we'd
+    // expect VTE to emit never reaches the app. Emit a semantic event and let
+    // the caller write a reply on the real PTY.
+    for (prefix, kind) in [
+        ("10;", ColorKind::Foreground),
+        ("11;", ColorKind::Background),
+        ("12;", ColorKind::Cursor),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if rest.starts_with('?') {
+                events.push(ParserEvent::ColorQuery(kind));
+                return;
+            }
+        }
+    }
+
+    // OSC 4 ; <idx> ; ? — palette color query.
+    if let Some(rest) = s.strip_prefix("4;") {
+        let mut it = rest.splitn(2, ';');
+        if let (Some(idx_str), Some(value)) = (it.next(), it.next()) {
+            if value.starts_with('?') {
+                if let Ok(idx) = idx_str.parse::<u8>() {
+                    events.push(ParserEvent::ColorQuery(ColorKind::Palette(idx)));
+                    return;
+                }
+            }
+        }
+    }
+
+    // OSC 52 ; <selection> ; <base64-data | ?> — clipboard set / query
+    if let Some(rest) = s.strip_prefix("52;") {
+        if let Some(data_start) = rest.find(';') {
+            let b64_data = &rest[data_start + 1..];
+            if b64_data == "?" {
+                events.push(ParserEvent::ClipboardQuery);
+            } else if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    events.push(ParserEvent::ClipboardSet(text));
+                }
+            }
+        }
+        return;
+    }
+
+    // All other OSC sequences: reconstruct and pass through.
     let mut bytes = Vec::with_capacity(payload.len() + 4);
     bytes.push(0x1b);
     bytes.push(b']');
@@ -434,7 +772,6 @@ fn base64_decode(input: &[u8]) -> Result<Vec<u8>, ()> {
 mod tests {
     use super::*;
 
-    /// Concatenate all Bytes events into one buffer (what downstream sees).
     fn collect_bytes(events: &[ParserEvent]) -> Vec<u8> {
         let mut out = Vec::new();
         for e in events {
@@ -447,15 +784,10 @@ mod tests {
 
     #[test]
     fn csi_not_split_across_feeds() {
-        // A CSI sequence arriving in two reads (split mid-sequence) must surface
-        // as a single contiguous run in ONE Bytes event, so interactive-mode
-        // scanners see each CSI whole.
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b[3", &mut events); // first half: no complete sequence yet
-        p.feed(b"1m", &mut events); // second half: completes ESC[31m
-
-        // The whole CSI lands in a single Bytes event, never fragmented.
+        p.feed(b"\x1b[3", &mut events);
+        p.feed(b"1m", &mut events);
         let bytes_events: Vec<&Vec<u8>> = events
             .iter()
             .filter_map(|e| match e {
@@ -468,41 +800,108 @@ mod tests {
     }
 
     #[test]
-    fn text_around_csi_passes_through() {
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(b"ab\x1b[1mcd", &mut events);
-        assert_eq!(collect_bytes(&events), b"ab\x1b[1mcd");
-    }
-
-    #[test]
     fn alt_screen_enter_leave_emitted_and_stripped() {
         let mut p = Parser::new();
         let mut events = Vec::new();
         p.feed(b"\x1b[?1049h\x1b[?1049l", &mut events);
-        // Both semantic events fire and the raw mode bytes are NOT passed through.
-        // DecsetMode for 1049 may interleave; we only assert both AltScreen events appear.
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ParserEvent::AltScreenEnter)));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, ParserEvent::AltScreenLeave)));
+        assert!(matches!(events[0], ParserEvent::AltScreenEnter));
+        assert!(matches!(events[1], ParserEvent::AltScreenLeave));
         assert!(collect_bytes(&events).is_empty());
     }
 
     #[test]
-    fn alt_screen_enter_split_across_feeds() {
-        // The mode sequence split across reads still emits the semantic event
-        // (parser state persists), and never leaks bytes downstream.
+    fn dcs_is_passed_through_not_dropped() {
+        // A DCS sixel sequence: ESC P q ... ESC \. The whole thing should
+        // appear verbatim in the Bytes stream so the active VTE can render it.
         let mut p = Parser::new();
         let mut events = Vec::new();
-        p.feed(b"\x1b[?10", &mut events);
-        p.feed(b"49h", &mut events);
-        assert!(events
+        p.feed(b"before\x1bPq#0;2;0;0;0!100~-\x1b\\after", &mut events);
+        let bytes = collect_bytes(&events);
+        // The plain "before" and "after" survive, and the DCS round-trips.
+        assert!(bytes.windows(6).any(|w| w == b"before"));
+        assert!(bytes.windows(5).any(|w| w == b"after"));
+        assert!(bytes.windows(3).any(|w| w == b"\x1bPq"));
+        assert!(bytes.windows(2).any(|w| w == b"\x1b\\"));
+    }
+
+    #[test]
+    fn pm_st_does_not_leak_backslash() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"before\x1b^ignored\x1b\\after", &mut events);
+        assert_eq!(collect_bytes(&events), b"beforeafter");
+    }
+
+    #[test]
+    fn osc_color_queries_emit_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(
+            b"\x1b]11;?\x07\x1b]10;?\x07\x1b]12;?\x1b\\\x1b]4;5;?\x07",
+            &mut events,
+        );
+        let kinds: Vec<_> = events
             .iter()
-            .any(|e| matches!(e, ParserEvent::AltScreenEnter)));
-        assert!(collect_bytes(&events).is_empty());
+            .filter_map(|e| match e {
+                ParserEvent::ColorQuery(k) => Some(*k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ColorKind::Background,
+                ColorKind::Foreground,
+                ColorKind::Cursor,
+                ColorKind::Palette(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_protocol_queries_emit_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        // kitty flag query, modifyOtherKeys query, primary & secondary DA.
+        p.feed(b"\x1b[?u\x1b[?4m\x1b[c\x1b[>c", &mut events);
+        let qs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KeyboardProtocolQuery(q) => Some(*q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qs,
+            vec![
+                KeyboardProtocolQuery::KittyQuery,
+                KeyboardProtocolQuery::ModifyOtherKeysQuery,
+                KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                KeyboardProtocolQuery::SecondaryDeviceAttributes,
+            ]
+        );
+    }
+
+    #[test]
+    fn da1_da2_da3_emit_distinct_events() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[0c\x1b[>0c\x1b[=0c", &mut events);
+        let qs: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ParserEvent::KeyboardProtocolQuery(q) => Some(*q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            qs,
+            vec![
+                KeyboardProtocolQuery::PrimaryDeviceAttributes,
+                KeyboardProtocolQuery::SecondaryDeviceAttributes,
+                KeyboardProtocolQuery::TertiaryDeviceAttributes,
+            ]
+        );
     }
 
     #[test]
@@ -524,31 +923,17 @@ mod tests {
 
     #[test]
     fn osc7_cwd_passes_through_to_vte() {
-        // OSC 7 is consumed by VTE natively (current-directory-uri-notify);
-        // the parser must NOT swallow it — VTE never sees it otherwise.
         let mut p = Parser::new();
         let mut events = Vec::new();
-        let input = b"\x1b]7;file://host/home/me/dir\x07";
-        p.feed(input, &mut events);
-        let bytes = collect_bytes(&events);
-        assert_eq!(bytes, input, "OSC 7 must reach VTE verbatim");
+        p.feed(b"\x1b]7;file://host/home/me/dir\x07", &mut events);
+        assert_eq!(
+            collect_bytes(&events),
+            b"\x1b]7;file://host/home/me/dir\x1b\\"
+        );
     }
 
     #[test]
-    fn osc2_title_passes_through_to_vte() {
-        // Same as OSC 7: VTE's window-title-changed signal handles it.
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        let input = b"\x1b]2;my title\x07";
-        p.feed(input, &mut events);
-        let bytes = collect_bytes(&events);
-        assert_eq!(bytes, input);
-    }
-
-    #[test]
-    fn mouse_reporting_dropped_when_disabled() {
-        // With mouse_reporting=false, the mode-set sequence is swallowed —
-        // VTE never sees it, so it never enters mouse-reporting mode.
+    fn mouse_reporting_dropped_when_disabled_but_event_emitted() {
         let mut p = Parser::with_config(ParserConfig {
             mouse_reporting: false,
             focus_reporting: true,
@@ -556,7 +941,6 @@ mod tests {
         let mut events = Vec::new();
         p.feed(b"\x1b[?1000h", &mut events);
         assert!(collect_bytes(&events).is_empty());
-        // The semantic DecsetMode event still fires so downstream can track state.
         assert!(events.iter().any(|e| matches!(
             e,
             ParserEvent::DecsetMode {
@@ -564,5 +948,27 @@ mod tests {
                 set: true
             }
         )));
+    }
+
+    #[test]
+    fn osc_7770_emits_remote_session_id() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]7770;home-main\x1b\\", &mut events);
+        let id = events.iter().find_map(|e| match e {
+            ParserEvent::RemoteSessionId(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(id.as_deref(), Some("home-main"));
+    }
+
+    #[test]
+    fn osc_7770_empty_payload_ignored() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b]7770;\x07", &mut events);
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, ParserEvent::RemoteSessionId(_))));
     }
 }

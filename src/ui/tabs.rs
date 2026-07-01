@@ -528,6 +528,13 @@ impl UiState {
                     let _ = term_view_for_exit.save_history();
                     ui_for_exit.handle_tab_exit(tab_num_for_exit, code);
                 });
+
+                let conns_for_session = self.tab_connections.clone();
+                term_view.connect_remote_session_id(move |id| {
+                    if let Some(conn) = conns_for_session.borrow_mut().get_mut(&tab_num) {
+                        conn.host.session = Some(id.to_string());
+                    }
+                });
             }
             TerminalViewType::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);
