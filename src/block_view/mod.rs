@@ -106,6 +106,48 @@ fn select_finished_block(
     selected_block_id.set(new_id);
 }
 
+/// Install the shared click-to-select behavior for a finished block. New blocks
+/// and restored history blocks must use the same handler; otherwise keyboard
+/// block actions only work on commands produced after app startup.
+fn install_finished_block_selection(
+    block: &FinishedBlock,
+    active: &Rc<RefCell<ActiveBlock>>,
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+) {
+    let active_for_click = active.clone();
+    let header_for_click = block.header_row.clone();
+    let finished_blocks_for_select = finished_blocks.clone();
+    let selected_for_click = selected_block_id.clone();
+    let this_id = block.id;
+    let left_click = gtk4::GestureClick::new();
+    left_click.set_button(1);
+    left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    left_click.connect_pressed(move |gesture, n_press, _, y| {
+        // Only act on the first press of a sequence. Refiring grab_focus() on
+        // the 2nd/3rd press would interrupt VTE's native double/triple-click
+        // word/line selection in the output VTE child.
+        if n_press != 1 {
+            gesture.set_state(gtk4::EventSequenceState::Denied);
+            return;
+        }
+        active_for_click.borrow().grab_focus();
+        // Header strip occupies the top of the block; a press there toggles
+        // this block's selection. Output clicks stay native VTE selection.
+        if y <= header_for_click.height() as f64 {
+            let finished = finished_blocks_for_select.borrow();
+            let target = if selected_for_click.get() == Some(this_id) {
+                None
+            } else {
+                Some(this_id)
+            };
+            select_finished_block(&finished, &selected_for_click, target);
+        }
+        gesture.set_state(gtk4::EventSequenceState::Denied);
+    });
+    block.widget().add_controller(left_click);
+}
+
 /// Cap on the retained raw output buffer for a single running command. The raw
 /// byte buffer used to re-render the finished block grew without bound — a runaway
 /// command (`cat /dev/urandom`) could exhaust memory before CommandEnd. When the
@@ -598,6 +640,7 @@ impl ReaderCtx {
                                 let finished_blocks_for_menu = finished_blocks_for_cb.clone();
                                 let block_list_for_menu = block_list_rc.clone();
                                 let vte_for_copy = active_vte.clone();
+                                let selected_for_menu = selected_block_id_rc.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk4::GestureClick::new();
@@ -607,6 +650,14 @@ impl ReaderCtx {
                                 let block_data_for_export = block_data_for_cb.clone();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
+                                    {
+                                        let finished = finished_blocks_for_menu.borrow();
+                                        select_finished_block(
+                                            &finished,
+                                            &selected_for_menu,
+                                            Some(block_id),
+                                        );
+                                    }
 
                                     let popover = gtk4::Popover::new();
                                     let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
@@ -686,6 +737,7 @@ impl ReaderCtx {
                                         let finished_blocks_for_delete = finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
+                                        let selected_for_delete = selected_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
@@ -693,6 +745,9 @@ impl ReaderCtx {
                                             if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
                                                 let block = blocks.remove(pos);
                                                 block_list_for_delete.remove(block.widget());
+                                            }
+                                            if selected_for_delete.get() == Some(block_id_del) {
+                                                selected_for_delete.set(None);
                                             }
                                             // Keep block_data in lockstep with the widget list.
                                             block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
@@ -708,56 +763,18 @@ impl ReaderCtx {
                                 });
                                 finished_widget.add_controller(right_click);
 
-                                // Single capture-phase click handler for the whole
-                                // block: it both moves focus to the live VTE and (when
-                                // the press lands on the header strip) toggles selection.
-                                //
-                                // This is deliberately ONE gesture rather than a separate
-                                // GestureClick on header_row. A capture-phase gesture here
-                                // grabs focus on press, which interrupts delivery of the
-                                // bubble-phase event to any controller mounted on a child
-                                // widget — so a header_row gesture would silently never
-                                // fire. Instead we gate selection on the press y-coordinate
-                                // falling within the header strip's height. Selection
-                                // enables Enter-to-rerun and keeps the quick actions
-                                // visible after the pointer leaves.
-                                {
-                                    let active_for_click = active_rc.clone();
-                                    let header_for_click = finished_clone.header_row.clone();
-                                    let finished_blocks_for_select = finished_blocks_for_cb.clone();
-                                    let selected_for_click = selected_block_id_rc.clone();
-                                    let this_id = finished_clone.id;
-                                    let left_click = gtk4::GestureClick::new();
-                                    left_click.set_button(1);
-                                    left_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                                    left_click.connect_pressed(move |gesture, n_press, _, y| {
-                                        // Only act on the first press of a sequence. Refiring
-                                        // grab_focus() on the 2nd/3rd press would interrupt
-                                        // VTE's native double/triple-click word/line selection
-                                        // in the output VTE child.
-                                        if n_press != 1 {
-                                            gesture.set_state(gtk4::EventSequenceState::Denied);
-                                            return;
-                                        }
-                                        active_for_click.borrow().grab_focus();
-                                        // Header strip occupies the top of the block; a
-                                        // press there toggles this block's selection.
-                                        if y <= header_for_click.height() as f64 {
-                                            let finished = finished_blocks_for_select.borrow();
-                                            let target = if selected_for_click.get() == Some(this_id) {
-                                                None
-                                            } else {
-                                                Some(this_id)
-                                            };
-                                            select_finished_block(&finished, &selected_for_click, target);
-                                        }
-                                        gesture.set_state(gtk4::EventSequenceState::Denied);
-                                    });
-                                    finished_widget.add_controller(left_click);
-                                }
+                                install_finished_block_selection(
+                                    &finished_clone,
+                                    &active_rc,
+                                    &finished_blocks_for_cb,
+                                    &selected_block_id_rc,
+                                );
 
                                 if finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
+                                    if selected_block_id_rc.get() == Some(oldest.id) {
+                                        selected_block_id_rc.set(None);
+                                    }
                                     let widget_to_release = oldest.widget().clone();
                                     block_list_rc.remove(&widget_to_release);
                                     widget_pool_for_cb.borrow_mut().release(widget_to_release);
@@ -2273,6 +2290,12 @@ impl TermView {
                     &term_view.active,
                 );
                 finished.connect_scroll_forwarding(&term_view.block_scroll);
+                install_finished_block_selection(
+                    &finished,
+                    &term_view.active,
+                    &term_view.finished_blocks,
+                    &term_view.selected_block_id,
+                );
                 term_view.finished_blocks.borrow_mut().push(finished);
             }
         }
@@ -2724,6 +2747,7 @@ impl TermView {
             return;
         }
         if let Some(block) = finished.get(block_index) {
+            select_finished_block(&finished, &self.selected_block_id, Some(block.id));
             block.widget().grab_focus();
             let adj = self.block_scroll.vadjustment();
             if let Some(value) = block

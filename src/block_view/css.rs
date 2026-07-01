@@ -305,6 +305,11 @@ pub(crate) fn install_block_css(config: &Config) {
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
+        .block-action-active {{
+            color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.34);
+        }}
         .block-filter-row {{
             padding: 2px 0;
         }}
@@ -320,6 +325,15 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-filter-toggle:checked {{
             color: {fg_hex};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.35);
+        }}
+        .block-filter-status {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.78em;
+            padding: 0 6px;
+        }}
+        .block-filter-empty {{
+            color: {err_hex};
         }}
         .block-header {{
             border-radius: 6px 6px 0 0;

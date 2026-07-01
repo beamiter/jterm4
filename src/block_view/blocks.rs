@@ -294,6 +294,34 @@ fn filter_output_lines(
         .join("\n")
 }
 
+fn output_row_count(text: &str) -> i64 {
+    if text.is_empty() {
+        1
+    } else {
+        text.lines().count().max(1) as i64
+    }
+}
+
+fn line_count_text(rows: i64) -> String {
+    if rows == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{rows} lines")
+    }
+}
+
+fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
+    let old_label = btn.label().map(|s| s.to_string()).unwrap_or_default();
+    let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
+    btn.set_label(label);
+    btn.set_tooltip_text(Some(tooltip));
+    let btn_for_restore = btn.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+        btn_for_restore.set_label(&old_label);
+        btn_for_restore.set_tooltip_text(old_tooltip.as_deref());
+    });
+}
+
 /// Render `bytes` into a read-only finished VTE: reset the grid, resize to the
 /// new visible-row count (so the chrome shrinks/grows on filter), then feed
 /// the bytes in one shot. Used for filter changes — the initial feed happens
@@ -607,7 +635,7 @@ impl FinishedBlock {
         // path keeps in sync with whatever the user wants to see.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
-        let output_rows = output.lines().count().max(1) as i64;
+        let output_rows = output_row_count(output);
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
@@ -626,7 +654,7 @@ impl FinishedBlock {
                 }
                 fed_for_map.set(true);
                 let text = displayed_for_map.borrow();
-                let rows = text.lines().count().max(1) as i64;
+                let rows = output_row_count(&text);
                 let cap = if expanded_for_map.get() {
                     max_for_map
                 } else {
@@ -668,6 +696,7 @@ impl FinishedBlock {
         if output_rows > viewport_cap {
             let expand_for_btn = expanded.clone();
             let output_vte_for_btn = output_vte.clone();
+            let displayed_for_btn = displayed_output.clone();
             let cols_for_btn = cols.max(1);
             expand_btn.connect_clicked(move |btn| {
                 let now_expanded = !expand_for_btn.get();
@@ -677,7 +706,8 @@ impl FinishedBlock {
                 } else {
                     viewport_cap
                 };
-                let visible_rows = output_rows.min(cap).max(1);
+                let rows = output_row_count(&displayed_for_btn.borrow());
+                let visible_rows = rows.min(cap).max(1);
                 output_vte_for_btn.set_size(cols_for_btn, visible_rows);
                 let ch = output_vte_for_btn.char_height() as i32;
                 if ch > 0 {
@@ -736,6 +766,13 @@ impl FinishedBlock {
         let has_output = !output.trim().is_empty();
         if !has_output {
             output_vte.set_visible(false);
+            collapse_btn.set_sensitive(false);
+            collapse_btn.set_tooltip_text(Some("No output"));
+        } else {
+            collapse_btn.set_tooltip_text(Some(&format!(
+                "Toggle output ({})",
+                line_count_text(output_rows)
+            )));
         }
         // Wire collapse button to toggle output visibility.
         let output_vte_for_collapse = output_vte.clone();
@@ -772,6 +809,9 @@ impl FinishedBlock {
             let ctx_spin = gtk4::SpinButton::with_range(0.0, 9.0, 1.0);
             ctx_spin.set_tooltip_text(Some("Lines of context around each match"));
             ctx_spin.set_value(0.0);
+            let filter_status = gtk4::Label::new(None);
+            filter_status.add_css_class("block-filter-status");
+            filter_status.set_halign(gtk4::Align::Start);
             for w in [&regex_tg, &case_tg, &invert_tg] {
                 w.add_css_class("flat");
                 w.add_css_class("block-filter-toggle");
@@ -781,6 +821,7 @@ impl FinishedBlock {
             filter_row.append(&case_tg);
             filter_row.append(&invert_tg);
             filter_row.append(&ctx_spin);
+            filter_row.append(&filter_status);
 
             outer.append(&filter_row);
             outer.reorder_child_after(&filter_row, Some(&cmd_row));
@@ -794,9 +835,14 @@ impl FinishedBlock {
                 let case_tg = case_tg.clone();
                 let invert_tg = invert_tg.clone();
                 let ctx_spin = ctx_spin.clone();
+                let filter_status = filter_status.clone();
+                let expand_btn = expand_btn.clone();
+                let expanded = expanded.clone();
+                let filter_btn = filter_btn.clone();
                 move || {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
+                    let full_rows = output_row_count(&full);
                     let shown = if q.is_empty() {
                         full.to_string()
                     } else {
@@ -809,14 +855,47 @@ impl FinishedBlock {
                             ctx_spin.value() as usize,
                         )
                     };
-                    let shown_rows = shown.lines().count().max(1) as i64;
+                    let shown_rows = output_row_count(&shown);
+                    let active_cap = if expanded.get() {
+                        max_expanded_cap
+                    } else {
+                        viewport_cap
+                    };
                     render_bytes_into_finished_vte(
                         &output_vte,
                         shown.as_bytes(),
                         cols,
                         shown_rows,
-                        viewport_cap,
+                        active_cap,
                     );
+                    let ch = output_vte.char_height() as i32;
+                    if ch > 0 {
+                        output_vte.set_height_request(
+                            (shown_rows.min(active_cap).max(1) as i32) * ch,
+                        );
+                    }
+                    let has_query = !q.trim().is_empty();
+                    if has_query {
+                        filter_btn.add_css_class("block-action-active");
+                        filter_status.set_visible(true);
+                        let hidden = full_rows.saturating_sub(shown_rows);
+                        if shown.trim().is_empty() {
+                            filter_status.set_text("No matches");
+                            filter_status.add_css_class("block-filter-empty");
+                        } else {
+                            filter_status.remove_css_class("block-filter-empty");
+                            filter_status.set_text(&format!(
+                                "{} shown, {} hidden",
+                                line_count_text(shown_rows),
+                                hidden
+                            ));
+                        }
+                    } else {
+                        filter_btn.remove_css_class("block-action-active");
+                        filter_status.remove_css_class("block-filter-empty");
+                        filter_status.set_visible(false);
+                    }
+                    expand_btn.set_visible(shown_rows > viewport_cap);
                     // Keep `displayed_output` in sync so a later unmap → remap
                     // (block scrolls out of view, then back) re-feeds the
                     // filtered text, not the full output.
@@ -840,12 +919,15 @@ impl FinishedBlock {
             let filter_row_for_btn = filter_row.clone();
             let entry_for_btn = filter_entry.clone();
             let apply_for_btn = apply.clone();
+            let filter_btn_for_toggle = filter_btn.clone();
             filter_btn.connect_clicked(move |_| {
                 let show = !filter_row_for_btn.is_visible();
                 filter_row_for_btn.set_visible(show);
                 if show {
+                    filter_btn_for_toggle.add_css_class("block-action-active");
                     entry_for_btn.grab_focus();
                 } else {
+                    filter_btn_for_toggle.remove_css_class("block-action-active");
                     entry_for_btn.set_text("");
                     apply_for_btn();
                 }
@@ -973,24 +1055,26 @@ impl FinishedBlock {
     ) {
         let vte_for_cmd = vte.clone();
         let cmd_for_copy = self.cmd_text.clone();
-        self.copy_cmd_btn.connect_clicked(move |_| {
+        self.copy_cmd_btn.connect_clicked(move |btn| {
             vte_for_cmd.clipboard().set_text(&cmd_for_copy);
+            flash_button_label(btn, "\u{f00c}", "Command copied");
         });
 
         let vte_for_out = vte.clone();
         // Copy the FULL output (ANSI stripped), not just the collapsed first-N
         // lines shown in output_buffer before "Show more" is clicked.
         let full_output_for_copy = self.full_output.clone();
-        self.copy_output_btn.connect_clicked(move |_| {
+        self.copy_output_btn.connect_clicked(move |btn| {
             let text = strip_ansi(&full_output_for_copy.borrow());
             vte_for_out.clipboard().set_text(&text);
+            flash_button_label(btn, "\u{f00c}", "Output copied");
         });
 
         let pty_for_rerun = Rc::clone(pty);
         let pty_synced_for_rerun = pty_synced.clone();
         let active_for_rerun = active.clone();
         let cmd_for_rerun = self.cmd_text.clone();
-        self.rerun_btn.connect_clicked(move |_| {
+        self.rerun_btn.connect_clicked(move |btn| {
             // Clear any partial line at the live prompt (Ctrl+U) then type the
             // command bytes into the shell, leaving the user to press Enter
             // (jterm1 rerun model).
@@ -1000,6 +1084,7 @@ impl FinishedBlock {
             pty_for_rerun.write_bytes(cmd_for_rerun.as_bytes());
             pty_synced_for_rerun.set(true);
             active_for_rerun.borrow().grab_focus();
+            flash_button_label(btn, "\u{f00c}", "Command inserted");
         });
     }
 }
