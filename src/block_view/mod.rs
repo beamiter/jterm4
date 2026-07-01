@@ -515,17 +515,10 @@ impl ReaderCtx {
                                 };
 
                                 let line_count = output_trimmed.lines().count();
-                                let estimated_height = {
-                                    let cfg = config_for_cb.borrow();
-                                    let parts: Vec<&str> = cfg.font_desc.split_whitespace().collect();
-                                    let base_size = parts
-                                        .last()
-                                        .and_then(|s| s.parse::<i32>().ok())
-                                        .unwrap_or(14);
-                                    let scaled_pt = (base_size as f64 * cfg.default_font_scale).max(1.0);
-                                    let per_line = (scaled_pt * (96.0 / 72.0) * 1.2).ceil() as i32;
-                                    (line_count as i32 * per_line.max(1)).max(60)
-                                };
+                                let estimated_height = estimated_finished_block_height(
+                                    &config_for_cb.borrow(),
+                                    line_count,
+                                );
 
                                 let start_time = block_start_time_for_cb.get();
                                 let now = SystemTime::now();

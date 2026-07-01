@@ -310,6 +310,24 @@ fn line_count_text(rows: i64) -> String {
     }
 }
 
+pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
+    let parts: Vec<&str> = config.font_desc.split_whitespace().collect();
+    let base_size = parts
+        .last()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(14.0);
+    (base_size * config.default_font_scale * (96.0 / 72.0) * 1.2)
+        .ceil()
+        .max(1.0) as i32
+}
+
+pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: usize) -> i32 {
+    let cell = estimated_cell_height_px(config);
+    // Header + command row + output rows + margins/borders/filter slack.
+    let rows = output_rows.max(1) as i32;
+    (rows + 2) * cell + 34
+}
+
 fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
     let old_label = btn.label().map(|s| s.to_string()).unwrap_or_default();
     let old_tooltip = btn.tooltip_text().map(|s| s.to_string());
@@ -637,22 +655,19 @@ impl FinishedBlock {
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_rows = output_row_count(output);
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
+        let initial_visible_rows = output_rows.min(viewport_cap).max(1);
+        output_vte
+            .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
         // Tracks whether the user has toggled this block to its expanded
         // height. Survives unmap/remap so re-feeding picks the right cap.
         let expanded: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
-            let fed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let cols_for_map = cols.max(1);
             let cap_for_map = viewport_cap;
             let max_for_map = max_expanded_cap;
             let displayed_for_map = displayed_output.clone();
-            let fed_for_map = fed.clone();
             let expanded_for_map = expanded.clone();
             output_vte.connect_map(move |w| {
-                if fed_for_map.get() {
-                    return;
-                }
-                fed_for_map.set(true);
                 let text = displayed_for_map.borrow();
                 let rows = output_row_count(&text);
                 let cap = if expanded_for_map.get() {
@@ -661,31 +676,18 @@ impl FinishedBlock {
                     cap_for_map
                 };
                 let visible_rows = rows.min(cap).max(1);
-                w.set_size(cols_for_map, visible_rows);
-                w.feed(text.as_bytes());
+                render_bytes_into_finished_vte(w, text.as_bytes(), cols_for_map, rows, cap);
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
-                // when the live (`active`) block claims full-viewport height
-                // during CollectingOutput state, the finished VTEs above are
-                // squeezed to ~1 row of allocation — VTE then auto-resizes its
-                // grid down to match, scrolling all rendered output into its
-                // own (invisible-by-default) scrollback. Pinning the request
-                // forces the ScrolledWindow to actually scroll instead.
+                // finished VTEs can be allocated at ~1 row and VTE scrolls their
+                // content into internal scrollback. Do not clear on unmap: GTK
+                // virtual scrolling and ordinary layout churn can unmap visible
+                // blocks transiently, and clearing there loses output if a later
+                // remap is skipped or coalesced.
                 let ch = w.char_height() as i32;
                 if ch > 0 {
                     w.set_height_request((visible_rows as i32) * ch);
                 }
-            });
-            let fed_for_unmap = fed.clone();
-            output_vte.connect_unmap(move |w| {
-                if !fed_for_unmap.get() {
-                    return;
-                }
-                fed_for_unmap.set(false);
-                // Clear the grid + scrollback so the off-screen block's per-widget
-                // buffer memory is reclaimed. Tabstops and theming persist (they
-                // are configured via separate setters in alt_screen::apply_theme).
-                w.reset(false, true);
             });
         }
 
@@ -870,9 +872,8 @@ impl FinishedBlock {
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
-                        output_vte.set_height_request(
-                            (shown_rows.min(active_cap).max(1) as i32) * ch,
-                        );
+                        output_vte
+                            .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
                     }
                     let has_query = !q.trim().is_empty();
                     if has_query {
