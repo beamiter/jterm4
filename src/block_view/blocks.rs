@@ -2,7 +2,6 @@
 use super::*;
 use crate::config::Config;
 use crate::terminal::open_uri;
-use gtk4::prelude::*;
 use gtk4::Orientation;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -104,6 +103,10 @@ pub(crate) struct FinishedBlock {
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
     pub(crate) full_output: Rc<RefCell<String>>,
+    /// The currently displayed output. Usually identical to `full_output`, but
+    /// filters can narrow it. Running blocks append to both so remap re-feeds
+    /// the bytes already shown instead of waiting for a final snapshot.
+    pub(crate) displayed_output: Rc<RefCell<String>>,
     /// Lazy-populated ANSI-stripped view of `full_output`, used as the haystack
     /// for find-within-blocks. Avoids re-stripping on every keystroke. Cleared
     /// when `full_output` is rewritten by a filter action; otherwise kept for
@@ -116,6 +119,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) header_row: gtk4::Box,
     pub(crate) action_box: gtk4::Box,
     pub(crate) bookmark_star: gtk4::Label,
+    pub(crate) status_icon: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
     /// Visible-row cap (config.finished_block_viewport_rows).
@@ -132,6 +136,7 @@ impl Clone for FinishedBlock {
             output_vte: self.output_vte.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
+            displayed_output: self.displayed_output.clone(),
             stripped_output: self.stripped_output.clone(),
             copy_cmd_btn: self.copy_cmd_btn.clone(),
             copy_output_btn: self.copy_output_btn.clone(),
@@ -139,6 +144,7 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             bookmark_star: self.bookmark_star.clone(),
+            status_icon: self.status_icon.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
         }
@@ -853,6 +859,7 @@ impl FinishedBlock {
             command_vte,
             output_vte,
             full_output,
+            displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
             cmd_text: cmd.to_string(),
             copy_cmd_btn,
@@ -861,6 +868,7 @@ impl FinishedBlock {
             header_row,
             action_box,
             bookmark_star,
+            status_icon,
             cols,
             viewport_cap,
         }
@@ -868,6 +876,52 @@ impl FinishedBlock {
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Append bytes to a running block's output VTE. This is the Warp-style path:
+    /// output grows in the command block while the process is running, so command
+    /// completion does not need to visibly replay the live terminal into a new
+    /// finished widget.
+    pub(crate) fn append_output_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        let text = String::from_utf8_lossy(bytes);
+        self.full_output.borrow_mut().push_str(&text);
+        self.displayed_output.borrow_mut().push_str(&text);
+        *self.stripped_output.borrow_mut() = None;
+
+        let was_mapped = self.output_vte.is_mapped();
+        self.output_vte.set_visible(true);
+        if was_mapped {
+            self.output_vte.feed(bytes);
+        }
+
+        let rows = self.displayed_output.borrow().lines().count().max(1) as i64;
+        let visible_rows = rows.min(self.viewport_cap).max(1);
+        self.output_vte.set_size(self.cols.max(1), visible_rows);
+        let ch = self.output_vte.char_height() as i32;
+        if ch > 0 {
+            self.output_vte
+                .set_height_request((visible_rows as i32) * ch);
+        }
+    }
+
+    pub(crate) fn set_exit_status(&self, exit_code: i32) {
+        self.widget.remove_css_class("block-success");
+        self.widget.remove_css_class("block-failed");
+        self.status_icon.remove_css_class("block-status-ok");
+        self.status_icon.remove_css_class("block-status-bad");
+        if exit_code == 0 {
+            self.widget.add_css_class("block-success");
+            self.status_icon.add_css_class("block-status-ok");
+            self.status_icon.set_text("\u{f00c}");
+        } else {
+            self.widget.add_css_class("block-failed");
+            self.status_icon.add_css_class("block-status-bad");
+            self.status_icon.set_text("\u{f00d}");
+        }
     }
 
     /// Forward wheel events on the output VTE to the outer ScrolledWindow once

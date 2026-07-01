@@ -257,9 +257,9 @@ fn parser_does_not_coalesce_across_feed_boundaries() {
     assert_eq!(n_bytes, 2, "events: {events:?}");
 }
 
-/// PAGER neutralization smoke: long colored output from git log (PAGER=cat
-/// in block mode) is just bytes + SGR + LF — must round-trip with no event
-/// other than Bytes (and no swallowed escapes).
+/// Long colored output from git log (when it is emitted on the main screen) is
+/// just bytes + SGR + LF — must round-trip with no event other than Bytes (and
+/// no swallowed escapes).
 #[test]
 fn pager_neutralized_colored_output_round_trips() {
     let mut p = Parser::new();

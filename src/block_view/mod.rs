@@ -119,6 +119,7 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// there is always usable room to type. It grows with multiline input up to the
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
+const RUNNING_INPUT_ROWS: i32 = 1;
 
 pub struct TermView {
     root: gtk4::Box,
@@ -210,6 +211,9 @@ struct ReaderCtx {
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
+    /// Command block currently being rendered live. Created at CommandStart and
+    /// reused at PromptStart, avoiding the old end-of-command visible snapshot.
+    running_block_for_cb: Rc<RefCell<Option<FinishedBlock>>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
@@ -307,6 +311,7 @@ impl ReaderCtx {
             parser,
             block_data_for_cb,
             finished_blocks_for_cb,
+            running_block_for_cb,
             scroll_debouncer,
             widget_pool_for_cb,
             pty_synced_rc,
@@ -366,41 +371,49 @@ impl ReaderCtx {
                                 bstate_rc.set(BlockState::RawFallback);
                             }
 
-                            match bstate_rc.get() {
+                            let feed_active_vte = match bstate_rc.get() {
                                 BlockState::CollectingPrompt => {
                                     let text = String::from_utf8_lossy(bytes);
                                     prompt_buf_rc.borrow_mut().push_str(&text);
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                    true
                                 }
                                 BlockState::AwaitingCommand => {
                                     // The command text is read off the live VTE
                                     // at CommandStart (`text_range_format`), so
                                     // no shadow accumulation is needed here.
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                    true
                                 }
                                 BlockState::CollectingOutput | BlockState::PostCommand => {
                                     active_rc.borrow().accumulate_output(bytes);
+                                    let rendered_in_block =
+                                        if let Some(block) = running_block_for_cb.borrow().as_ref() {
+                                        block.append_output_bytes(bytes);
+                                            true
+                                        } else {
+                                            false
+                                        };
                                     for cb in activity_cbs.borrow().iter() {
                                         cb();
                                     }
-                                    // No synchronous pin here. The live cell is
-                                    // capped at viewport rows during collection,
-                                    // so `upper` stops growing once the cell
-                                    // fills the page — further output rolls in
-                                    // VTE's own scrollback and the deferred
-                                    // idle pin in `connect_contents_changed`
-                                    // handles the (no-op) follow-bottom without
-                                    // racing layout per chunk.
+                                    // Warp-style block mode renders normal
+                                    // command output in the running block above.
+                                    // Only fall back to the active VTE if a
+                                    // running block is unexpectedly absent.
+                                    !rendered_in_block
                                 }
                                 BlockState::AltScreen => {
                                     // Alt-screen bytes go to the live VTE only — they
                                     // are not captured into block output (ephemeral).
+                                    true
                                 }
-                                _ => {}
-                            }
+                                _ => true,
+                            };
 
-                            // Everything renders in the one live VTE.
-                            active_vte.feed(bytes);
+                            if feed_active_vte {
+                                active_vte.feed(bytes);
+                            }
                         }
 
                         ParserEvent::PromptStart => {
@@ -490,7 +503,11 @@ impl ReaderCtx {
                                 // Single id shared by the serializable BlockData and
                                 // the GTK FinishedBlock so id-keyed lookups (export,
                                 // delete) resolve in both lists.
-                                let block_id = next_block_id();
+                                let block_id = running_block_for_cb
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|b| b.id)
+                                    .unwrap_or_else(next_block_id);
                                 // Capture cols now (live VTE is allocated by the time
                                 // a command finishes) and store it on BlockData so
                                 // session restore can recreate the finished VTE at
@@ -515,13 +532,32 @@ impl ReaderCtx {
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
-                                let recycled = widget_pool_for_cb.borrow_mut().acquire();
-                                let finished = FinishedBlock::new_with_pool(
-                                    block_id, &prompt, &cmd, None, &output_with_ansi, exit_code, &config_for_cb.borrow(),
-                                    duration_ms, end_time_ms, block_cwd.as_deref(), cols, recycled,
-                                );
-
-                                finished.widget().insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                let finished = if let Some(existing) =
+                                    running_block_for_cb.borrow_mut().take()
+                                {
+                                    existing.set_exit_status(exit_code);
+                                    existing
+                                } else {
+                                    let recycled = widget_pool_for_cb.borrow_mut().acquire();
+                                    let finished = FinishedBlock::new_with_pool(
+                                        block_id,
+                                        &prompt,
+                                        &cmd,
+                                        None,
+                                        &output_with_ansi,
+                                        exit_code,
+                                        &config_for_cb.borrow(),
+                                        duration_ms,
+                                        end_time_ms,
+                                        block_cwd.as_deref(),
+                                        cols,
+                                        recycled,
+                                    );
+                                    finished
+                                        .widget()
+                                        .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                    finished
+                                };
 
                                 // If the user is reading history (scrolled up), this
                                 // freshly-finished block is "unread": bump the FAB badge
@@ -774,6 +810,11 @@ impl ReaderCtx {
                             prompt_end_pos_rc.set((col, row));
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
+                            resize_active();
+                            let active_for_focus = active_rc.clone();
+                            glib::idle_add_local_once(move || {
+                                active_for_focus.borrow().grab_focus();
+                            });
 
                             // Feed next initial command if any.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
@@ -825,9 +866,43 @@ impl ReaderCtx {
                             *running_cmd_rc.borrow_mut() = cmd_from_vte;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
-                            // Snap the live VTE to viewport rows immediately so
-                            // the child sees a real-terminal-shaped grid on its
-                            // very first read (see sync_active_to_pty doc).
+                            typed_cmd_rc.borrow_mut().clear();
+                            {
+                                let prompt = prompt_display_rc.borrow().clone();
+                                let cmd = vte_typed_cmd_rc.borrow().clone();
+                                let block_cwd = {
+                                    let cwd_str = current_cwd_for_cb.borrow().clone();
+                                    if cwd_str.is_empty() {
+                                        None
+                                    } else {
+                                        Some(cwd_str)
+                                    }
+                                };
+                                let cols = active_rc.borrow().grid_cols() as i64;
+                                let block_id = next_block_id();
+                                let running = FinishedBlock::new(
+                                    block_id,
+                                    &prompt,
+                                    &cmd,
+                                    None,
+                                    "",
+                                    0,
+                                    &config_for_cb.borrow(),
+                                    None,
+                                    None,
+                                    block_cwd.as_deref(),
+                                    cols,
+                                );
+                                running
+                                    .widget()
+                                    .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                *running_block_for_cb.borrow_mut() = Some(running);
+                            }
+                            active_vte.reset(true, true);
+                            active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
+                            // Re-sync after the running block is in place. The
+                            // active VTE stays compact for normal commands; the
+                            // visible output now grows in the block above.
                             sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
@@ -846,7 +921,14 @@ impl ReaderCtx {
                             // to the block list so the next prompt is usable.
                             if state == BlockState::AltScreen {
                                 active_vte.feed(b"\x1b[?1049l");
-                                exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
+                                exit_fullscreen(
+                                    &finished_blocks_for_cb,
+                                    &visible_indices_rc,
+                                    &fullscreen_rc,
+                                );
+                                if let Some(block) = running_block_for_cb.borrow().as_ref() {
+                                    block.widget().set_visible(true);
+                                }
                                 resize_active();
                             }
                             pending_exit_code_rc.set(*code);
@@ -867,6 +949,9 @@ impl ReaderCtx {
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
+                            if let Some(block) = running_block_for_cb.borrow().as_ref() {
+                                block.widget().set_visible(false);
+                            }
                             // Grow the live VTE to the full viewport before the
                             // app draws (see sync_active_to_pty doc).
                             sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
@@ -881,7 +966,14 @@ impl ReaderCtx {
                             // NOT merged into the block. The active block keeps
                             // just the command name + exit code.
                             active_vte.feed(b"\x1b[?1049l");
-                            exit_fullscreen(&finished_blocks_for_cb, &visible_indices_rc, &fullscreen_rc);
+                            exit_fullscreen(
+                                &finished_blocks_for_cb,
+                                &visible_indices_rc,
+                                &fullscreen_rc,
+                            );
+                            if let Some(block) = running_block_for_cb.borrow().as_ref() {
+                                block.widget().set_visible(true);
+                            }
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
                             // Collapse the live VTE back to the compact input cell
@@ -1248,6 +1340,7 @@ impl TermView {
         let root = gtk4::Box::new(Orientation::Vertical, 0);
         root.set_hexpand(true);
         root.set_vexpand(true);
+        root.set_focusable(true);
         root.add_css_class("term-view-root");
 
         // Block list inside a scrolled window
@@ -1358,12 +1451,17 @@ impl TermView {
         }
         let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-        // Warp parity: do NOT override GIT_PAGER / PAGER. Pagers (less, etc.)
-        // enter the alternate screen via ?1049h, which the alt-screen path
-        // hands the full viewport to. Forcing `cat` was a workaround for an
-        // earlier compact-input-cell sizing bug; we now resize the PTY to the
-        // full viewport on alt-screen enter so pagers get a real terminal.
-        let mut env_extra: Vec<(&str, &str)> = vec![];
+        // Git defaults LESS to "FRX" when the user has not set it. "F" quits
+        // the pager when output fits on one screen, and "X" disables less'
+        // alternate-screen setup. Default to raw-control-char rendering only:
+        // keep colored git output, keep the interactive pager even for a short
+        // `git log`, and let less use alt-screen so transient pager content
+        // stays ephemeral. Respect an explicit user-provided LESS.
+        let mut env_extra: Vec<(&str, &str)> = if std::env::var_os("LESS").is_none() {
+            vec![("LESS", "R")]
+        } else {
+            Vec::new()
+        };
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
@@ -1433,29 +1531,43 @@ impl TermView {
                 let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
                 let viewport_rows = ((usable / cell_h).max(1)) as i64;
                 let cols = vte.column_count().max(1);
-                let target_rows = match bstate.get() {
+                let state = bstate.get();
+                if matches!(
+                    state,
+                    BlockState::CollectingOutput | BlockState::PostCommand
+                ) {
+                    if vte.row_count() != RUNNING_INPUT_ROWS as i64 {
+                        vte.set_size(cols, RUNNING_INPUT_ROWS as i64);
+                    }
+                    holder.set_height_request(0);
+                    holder.set_visible(false);
+                    return;
+                }
+                holder.set_visible(true);
+                let compact_rows = || {
+                    let input_lines =
+                        1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
+                    let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
+                    let cap = viewport_rows.max(floor);
+                    input_lines.clamp(floor, cap)
+                };
+                let target_rows = match state {
                     // A real terminal's grid is the viewport, always. While a
-                    // command is running, while an alt-screen app owns the
-                    // screen, or while we fall back to raw VTE (no OSC-133),
-                    // we keep the live VTE pinned to the full viewport — the
-                    // child sees a stable winsize, old rows scroll into VTE's
-                    // own scrollback, and there is no per-chunk grid resize.
-                    BlockState::CollectingOutput
-                    | BlockState::PostCommand
-                    | BlockState::AltScreen
-                    | BlockState::RawFallback => viewport_rows,
+                    // alt-screen app owns the screen, or while we fall back to
+                    // raw VTE (no OSC-133), keep the live VTE pinned to the full
+                    // viewport. Normal command output is rendered into the
+                    // running block above, so the live input cell can stay
+                    // compact instead of stealing the page.
+                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
                     // Between prompts the live cell collapses to fit the
                     // typed command (warp-style compact input). Must NOT use
                     // cursor_position().1 here: it's the absolute scrollback
                     // row and climbs without bound across the session.
                     BlockState::Idle
                     | BlockState::CollectingPrompt
-                    | BlockState::AwaitingCommand => {
-                        let input_lines =
-                            1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
-                        let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
-                        let cap = viewport_rows.max(floor);
-                        input_lines.clamp(floor, cap)
+                    | BlockState::AwaitingCommand => compact_rows(),
+                    BlockState::CollectingOutput | BlockState::PostCommand => {
+                        RUNNING_INPUT_ROWS as i64
                     }
                 };
                 // Drive the VTE grid directly. `set_height_request` only sets a
@@ -1640,6 +1752,8 @@ impl TermView {
             })));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
+            let running_block_for_cb: Rc<RefCell<Option<FinishedBlock>>> =
+                Rc::new(RefCell::new(None));
             let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
                 user_scrolled_up.clone(),
                 programmatic_scroll.clone(),
@@ -1690,6 +1804,7 @@ impl TermView {
                 parser,
                 block_data_for_cb,
                 finished_blocks_for_cb,
+                running_block_for_cb,
                 scroll_debouncer,
                 widget_pool_for_cb,
                 pty_synced_rc,
@@ -1921,6 +2036,55 @@ impl TermView {
                     }
                 }
             });
+        }
+
+        // When a normal command is running, the visible command/output lives in
+        // the running block and the active VTE is hidden to avoid an empty input
+        // card at the bottom. Keep basic terminal input working by forwarding
+        // common keys from the focusable root directly to the PTY.
+        {
+            let pty_for_root_key = pty.clone();
+            let bstate_for_root_key = bstate.clone();
+            let root_key = gtk4::EventControllerKey::new();
+            root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+                use gtk4::gdk::Key;
+                if !matches!(
+                    bstate_for_root_key.get(),
+                    BlockState::CollectingOutput | BlockState::PostCommand
+                ) {
+                    return glib::Propagation::Proceed;
+                }
+
+                let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+                let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+                if ctrl && !alt && matches!(keyval, Key::c | Key::C) {
+                    pty_for_root_key.write_bytes(b"\x03");
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && !alt && matches!(keyval, Key::d | Key::D) {
+                    pty_for_root_key.write_bytes(b"\x04");
+                    return glib::Propagation::Stop;
+                }
+                if !ctrl && !alt && matches!(keyval, Key::Return | Key::KP_Enter) {
+                    pty_for_root_key.write_bytes(b"\r");
+                    return glib::Propagation::Stop;
+                }
+                if !ctrl && !alt && matches!(keyval, Key::BackSpace) {
+                    pty_for_root_key.write_bytes(b"\x7f");
+                    return glib::Propagation::Stop;
+                }
+                if !ctrl && !alt {
+                    if let Some(ch) = keyval.to_unicode() {
+                        let mut buf = [0u8; 4];
+                        pty_for_root_key.write_bytes(ch.encode_utf8(&mut buf).as_bytes());
+                        return glib::Propagation::Stop;
+                    }
+                }
+
+                glib::Propagation::Proceed
+            });
+            root.add_controller(root_key);
         }
 
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
