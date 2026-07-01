@@ -948,7 +948,11 @@ impl ReaderCtx {
                             bstate_rc.set(BlockState::AltScreen);
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
-                            enter_fullscreen(&finished_blocks_for_cb, &fullscreen_rc);
+                            enter_fullscreen(
+                                &finished_blocks_for_cb,
+                                &visible_indices_rc,
+                                &fullscreen_rc,
+                            );
                             if let Some(block) = running_block_for_cb.borrow().as_ref() {
                                 block.widget().set_visible(false);
                             }
@@ -1038,11 +1042,21 @@ fn sync_active_to_pty(resize_active: &Rc<dyn Fn()>, vte: &Terminal, pty: &OwnedP
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
 /// VTE fills the scroll area like a normal full-screen terminal.
-fn enter_fullscreen(finished: &Rc<RefCell<Vec<FinishedBlock>>>, fullscreen: &Rc<Cell<bool>>) {
+fn enter_fullscreen(
+    finished: &Rc<RefCell<Vec<FinishedBlock>>>,
+    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+    fullscreen: &Rc<Cell<bool>>,
+) {
     if fullscreen.replace(true) {
         return;
     }
-    for block in finished.borrow().iter() {
+    let finished = finished.borrow();
+    let mut visible = visible_indices.borrow_mut();
+    visible.clear();
+    for (i, block) in finished.iter().enumerate() {
+        if block.widget().is_visible() {
+            visible.insert(i);
+        }
         block.widget().set_visible(false);
     }
 }
@@ -2275,9 +2289,13 @@ impl TermView {
             let config = term_view.config.clone();
             let finished_blocks = term_view.finished_blocks.clone();
             let visible_indices = term_view.visible_indices.clone();
+            let fullscreen = term_view.fullscreen.clone();
 
             let vadjust = block_scroll.vadjustment();
             vadjust.connect_changed(move |_| {
+                if fullscreen.get() {
+                    return;
+                }
                 // Update viewport on scroll change
                 let adj = block_scroll.vadjustment();
                 let scroll_top = adj.value() as i32;
@@ -2312,7 +2330,11 @@ impl TermView {
                 let vp = viewport.clone();
                 let finished = finished_blocks.clone();
                 let visible = visible_indices.clone();
+                let fullscreen = fullscreen.clone();
                 glib::idle_add_local_once(move || {
+                    if fullscreen.get() {
+                        return;
+                    }
                     let vp_ref = vp.borrow();
                     let mut new_visible = std::collections::HashSet::new();
 
