@@ -161,7 +161,6 @@ const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// there is always usable room to type. It grows with multiline input up to the
 /// viewport, and is forced to the full viewport only for alt-screen apps.
 const MIN_INPUT_ROWS: i32 = 6;
-const RUNNING_INPUT_ROWS: i32 = 1;
 
 pub struct TermView {
     root: gtk4::Box,
@@ -253,9 +252,6 @@ struct ReaderCtx {
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks_for_cb: Rc<RefCell<Vec<FinishedBlock>>>,
-    /// Command block currently being rendered live. Created at CommandStart and
-    /// reused at PromptStart, avoiding the old end-of-command visible snapshot.
-    running_block_for_cb: Rc<RefCell<Option<FinishedBlock>>>,
     scroll_debouncer: ScrollDebouncer,
     widget_pool_for_cb: Rc<RefCell<WidgetPool>>,
     pty_synced_rc: Rc<Cell<bool>>,
@@ -353,7 +349,6 @@ impl ReaderCtx {
             parser,
             block_data_for_cb,
             finished_blocks_for_cb,
-            running_block_for_cb,
             scroll_debouncer,
             widget_pool_for_cb,
             pty_synced_rc,
@@ -429,21 +424,10 @@ impl ReaderCtx {
                                 }
                                 BlockState::CollectingOutput | BlockState::PostCommand => {
                                     active_rc.borrow().accumulate_output(bytes);
-                                    let rendered_in_block =
-                                        if let Some(block) = running_block_for_cb.borrow().as_ref() {
-                                        block.append_output_bytes(bytes);
-                                            true
-                                        } else {
-                                            false
-                                        };
                                     for cb in activity_cbs.borrow().iter() {
                                         cb();
                                     }
-                                    // Warp-style block mode renders normal
-                                    // command output in the running block above.
-                                    // Only fall back to the active VTE if a
-                                    // running block is unexpectedly absent.
-                                    !rendered_in_block
+                                    true
                                 }
                                 BlockState::AltScreen => {
                                     // Alt-screen bytes go to the live VTE only — they
@@ -538,11 +522,7 @@ impl ReaderCtx {
                                 // Single id shared by the serializable BlockData and
                                 // the GTK FinishedBlock so id-keyed lookups (export,
                                 // delete) resolve in both lists.
-                                let block_id = running_block_for_cb
-                                    .borrow()
-                                    .as_ref()
-                                    .map(|b| b.id)
-                                    .unwrap_or_else(next_block_id);
+                                let block_id = next_block_id();
                                 // Capture cols now (live VTE is allocated by the time
                                 // a command finishes) and store it on BlockData so
                                 // session restore can recreate the finished VTE at
@@ -567,32 +547,24 @@ impl ReaderCtx {
 
                                 block_data_for_cb.borrow_mut().push_back(block_data);
 
-                                let finished = if let Some(existing) =
-                                    running_block_for_cb.borrow_mut().take()
-                                {
-                                    existing.set_exit_status(exit_code);
-                                    existing
-                                } else {
-                                    let recycled = widget_pool_for_cb.borrow_mut().acquire();
-                                    let finished = FinishedBlock::new_with_pool(
-                                        block_id,
-                                        &prompt,
-                                        &cmd,
-                                        None,
-                                        &output_with_ansi,
-                                        exit_code,
-                                        &config_for_cb.borrow(),
-                                        duration_ms,
-                                        end_time_ms,
-                                        block_cwd.as_deref(),
-                                        cols,
-                                        recycled,
-                                    );
-                                    finished
-                                        .widget()
-                                        .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
-                                    finished
-                                };
+                                let recycled = widget_pool_for_cb.borrow_mut().acquire();
+                                let finished = FinishedBlock::new_with_pool(
+                                    block_id,
+                                    &prompt,
+                                    &cmd,
+                                    None,
+                                    &output_with_ansi,
+                                    exit_code,
+                                    &config_for_cb.borrow(),
+                                    duration_ms,
+                                    end_time_ms,
+                                    block_cwd.as_deref(),
+                                    cols,
+                                    recycled,
+                                );
+                                finished
+                                    .widget()
+                                    .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
 
                                 // If the user is reading history (scrolled up), this
                                 // freshly-finished block is "unread": bump the FAB badge
@@ -877,42 +849,11 @@ impl ReaderCtx {
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             typed_cmd_rc.borrow_mut().clear();
-                            {
-                                let prompt = prompt_display_rc.borrow().clone();
-                                let cmd = vte_typed_cmd_rc.borrow().clone();
-                                let block_cwd = {
-                                    let cwd_str = current_cwd_for_cb.borrow().clone();
-                                    if cwd_str.is_empty() {
-                                        None
-                                    } else {
-                                        Some(cwd_str)
-                                    }
-                                };
-                                let cols = active_rc.borrow().grid_cols() as i64;
-                                let block_id = next_block_id();
-                                let running = FinishedBlock::new(
-                                    block_id,
-                                    &prompt,
-                                    &cmd,
-                                    None,
-                                    "",
-                                    0,
-                                    &config_for_cb.borrow(),
-                                    None,
-                                    None,
-                                    block_cwd.as_deref(),
-                                    cols,
-                                );
-                                running
-                                    .widget()
-                                    .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
-                                *running_block_for_cb.borrow_mut() = Some(running);
-                            }
-                            active_vte.reset(true, true);
-                            active_vte.feed(b"\x1b[H\x1b[2J\x1b[3J");
-                            // Re-sync after the running block is in place. The
-                            // active VTE stays compact for normal commands; the
-                            // visible output now grows in the block above.
+                            // Match jterm1's block-mode runtime model: keep the
+                            // active VTE as the live surface while the command
+                            // runs, then snapshot it into a finished block on the
+                            // next prompt. Interactive CLIs such as Codex rely on
+                            // VTE applying cursor positioning/redraws directly.
                             sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
@@ -936,9 +877,6 @@ impl ReaderCtx {
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
-                                if let Some(block) = running_block_for_cb.borrow().as_ref() {
-                                    block.widget().set_visible(true);
-                                }
                                 resize_active();
                             }
                             pending_exit_code_rc.set(*code);
@@ -963,9 +901,6 @@ impl ReaderCtx {
                                 &visible_indices_rc,
                                 &fullscreen_rc,
                             );
-                            if let Some(block) = running_block_for_cb.borrow().as_ref() {
-                                block.widget().set_visible(false);
-                            }
                             // Grow the live VTE to the full viewport before the
                             // app draws (see sync_active_to_pty doc).
                             sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
@@ -985,9 +920,6 @@ impl ReaderCtx {
                                 &visible_indices_rc,
                                 &fullscreen_rc,
                             );
-                            if let Some(block) = running_block_for_cb.borrow().as_ref() {
-                                block.widget().set_visible(true);
-                            }
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
                             // Collapse the live VTE back to the compact input cell
@@ -1048,6 +980,19 @@ fn sync_active_to_pty(resize_active: &Rc<dyn Fn()>, vte: &Terminal, pty: &OwnedP
     let cols = vte.column_count().max(1) as u16;
     let rows = vte.row_count().max(1) as u16;
     pty.resize(cols, rows);
+}
+
+fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
+    let cell_h = (vte.char_height() as i32).max(1);
+    let page = scroll.vadjustment().page_size() as i32;
+    if page <= 1 {
+        return None;
+    }
+    // .block-active wraps the VTE with margin+border+padding; subtract it from
+    // page_size so the holder total fits. Running commands use this same row
+    // count for their live active VTE, matching jterm1's block-mode behavior.
+    let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+    Some(((usable / cell_h).max(1)) as i64)
 }
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
@@ -1540,31 +1485,25 @@ impl TermView {
             let scroll = block_scroll.clone();
             let bstate = bstate.clone();
             let typed_cmd = typed_cmd.clone();
+            let last_size_target: Rc<Cell<(i64, i64)>> = Rc::new(Cell::new((0, 0)));
             Rc::new(move || {
                 let cell_h = (vte.char_height() as i32).max(1);
-                let page = scroll.vadjustment().page_size() as i32;
-                if page <= 1 {
+                let Some(viewport_rows) = viewport_rows_for(&vte, &scroll) else {
                     return;
-                }
-                // .block-active wraps the VTE with margin+border+padding; subtract
-                // it from page_size so the holder TOTAL fits — otherwise the live
-                // VTE sized to page_size/cell_h is BLOCK_ACTIVE_VCHROME_PX taller
-                // than page_size and the ScrolledWindow's pin-to-bottom clips the
-                // top row (e.g. the topmost "commit <hash>" line of `git log` paged
-                // by less). See css::BLOCK_ACTIVE_VCHROME_PX for the source rule.
-                let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
-                let viewport_rows = ((usable / cell_h).max(1)) as i64;
+                };
                 let cols = vte.column_count().max(1);
                 let state = bstate.get();
                 if matches!(
                     state,
                     BlockState::CollectingOutput | BlockState::PostCommand
                 ) {
-                    if vte.row_count() != RUNNING_INPUT_ROWS as i64 {
-                        vte.set_size(cols, RUNNING_INPUT_ROWS as i64);
+                    let target = (cols, viewport_rows);
+                    if last_size_target.get() != target {
+                        vte.set_size(cols, viewport_rows);
+                        last_size_target.set(target);
                     }
-                    holder.set_height_request(0);
-                    holder.set_visible(false);
+                    holder.set_visible(true);
+                    holder.set_height_request((viewport_rows as i32) * cell_h);
                     return;
                 }
                 holder.set_visible(true);
@@ -1590,9 +1529,7 @@ impl TermView {
                     BlockState::Idle
                     | BlockState::CollectingPrompt
                     | BlockState::AwaitingCommand => compact_rows(),
-                    BlockState::CollectingOutput | BlockState::PostCommand => {
-                        RUNNING_INPUT_ROWS as i64
-                    }
+                    BlockState::CollectingOutput | BlockState::PostCommand => viewport_rows,
                 };
                 // Drive the VTE grid directly. `set_height_request` only sets a
                 // *minimum*, so it cannot shrink a VTE whose natural height
@@ -1600,8 +1537,10 @@ impl TermView {
                 // full-height. `set_size` sets the preferred grid, shrinking the
                 // VTE's natural height so the (non-expanding) holder collapses to
                 // it. The PTY-resize tick then follows row_count up/down.
-                if vte.row_count() != target_rows {
+                let target = (cols, target_rows);
+                if last_size_target.get() != target {
                     vte.set_size(cols, target_rows);
+                    last_size_target.set(target);
                 }
                 holder.set_height_request((target_rows as i32) * cell_h);
             })
@@ -1776,8 +1715,6 @@ impl TermView {
             })));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
-            let running_block_for_cb: Rc<RefCell<Option<FinishedBlock>>> =
-                Rc::new(RefCell::new(None));
             let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
                 user_scrolled_up.clone(),
                 programmatic_scroll.clone(),
@@ -1828,7 +1765,6 @@ impl TermView {
                 parser,
                 block_data_for_cb,
                 finished_blocks_for_cb,
-                running_block_for_cb,
                 scroll_debouncer,
                 widget_pool_for_cb,
                 pty_synced_rc,

@@ -961,52 +961,6 @@ impl FinishedBlock {
         &self.widget
     }
 
-    /// Append bytes to a running block's output VTE. This is the Warp-style path:
-    /// output grows in the command block while the process is running, so command
-    /// completion does not need to visibly replay the live terminal into a new
-    /// finished widget.
-    pub(crate) fn append_output_bytes(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-
-        let text = String::from_utf8_lossy(bytes);
-        self.full_output.borrow_mut().push_str(&text);
-        self.displayed_output.borrow_mut().push_str(&text);
-        *self.stripped_output.borrow_mut() = None;
-
-        let was_mapped = self.output_vte.is_mapped();
-        self.output_vte.set_visible(true);
-        if was_mapped {
-            self.output_vte.feed(bytes);
-        }
-
-        let rows = self.displayed_output.borrow().lines().count().max(1) as i64;
-        let visible_rows = rows.min(self.viewport_cap).max(1);
-        self.output_vte.set_size(self.cols.max(1), visible_rows);
-        let ch = self.output_vte.char_height() as i32;
-        if ch > 0 {
-            self.output_vte
-                .set_height_request((visible_rows as i32) * ch);
-        }
-    }
-
-    pub(crate) fn set_exit_status(&self, exit_code: i32) {
-        self.widget.remove_css_class("block-success");
-        self.widget.remove_css_class("block-failed");
-        self.status_icon.remove_css_class("block-status-ok");
-        self.status_icon.remove_css_class("block-status-bad");
-        if exit_code == 0 {
-            self.widget.add_css_class("block-success");
-            self.status_icon.add_css_class("block-status-ok");
-            self.status_icon.set_text("\u{f00c}");
-        } else {
-            self.widget.add_css_class("block-failed");
-            self.status_icon.add_css_class("block-status-bad");
-            self.status_icon.set_text("\u{f00d}");
-        }
-    }
-
     /// Forward wheel events on the output VTE to the outer ScrolledWindow once
     /// the VTE's internal scrollback can't move further in the wheel direction.
     /// Without this the user's scroll "sticks" at a long block's edge: VTE
