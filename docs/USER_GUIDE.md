@@ -18,6 +18,7 @@ jterm4 will:
 Edit `~/.config/jterm4/config.toml`:
 
 ```toml
+terminal_mode = "vte"  # or "block"
 terminal_mode = "block"  # or "vte"
 opacity = 0.95
 font = "SauceCodePro Nerd Font Regular 14"

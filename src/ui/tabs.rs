@@ -266,6 +266,7 @@ impl UiState {
         session_id: Option<String>,
         initial_commands: Option<String>,
     ) -> Terminal {
+        let terminal_mode = self.config.borrow().terminal_mode.clone();
         self.add_tab_with_argv(
             working_directory,
             tab_name,
@@ -273,6 +274,7 @@ impl UiState {
             initial_commands,
             None,
             None,
+            terminal_mode,
         )
     }
 
@@ -289,6 +291,7 @@ impl UiState {
         attempt: u32,
     ) -> Terminal {
         let argv = crate::config::build_remote_argv(host);
+        let terminal_mode = self.config.borrow().terminal_mode.clone();
         log::info!("[remote] connecting to {} via {:?}", host.name, argv);
         self.add_tab_with_argv(
             None,
@@ -297,6 +300,7 @@ impl UiState {
             None,
             Some(argv),
             Some((host.clone(), attempt)),
+            terminal_mode,
         )
     }
 
@@ -458,6 +462,7 @@ impl UiState {
         initial_commands: Option<String>,
         argv_override: Option<Vec<String>>,
         remote: Option<(crate::config::RemoteHost, u32)>,
+        terminal_mode: crate::config::TerminalMode,
     ) -> Terminal {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
@@ -485,10 +490,8 @@ impl UiState {
 
         // Create terminal view based on configured mode
         let (view_type, terminal) = {
-            let config = self.config.borrow();
-            match &config.terminal_mode {
+            match &terminal_mode {
                 crate::config::TerminalMode::Block => {
-                    drop(config);
                     let term_view = Rc::new(TermView::new(
                         &self.config.borrow(),
                         shell_argv,
@@ -500,7 +503,6 @@ impl UiState {
                     (TerminalViewType::Block(term_view), terminal)
                 }
                 crate::config::TerminalMode::Vte => {
-                    drop(config);
                     let vte_view = Rc::new(VteTerminalView::new(
                         self.config.clone(),
                         shell_argv,

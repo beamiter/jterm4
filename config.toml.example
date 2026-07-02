@@ -8,7 +8,7 @@
 # 终端模式: "block" 或 "vte"
 # - block: 块模式，命令历史以块形式显示（推荐）
 # - vte: 传统终端模式
-terminal_mode = "block"
+terminal_mode = "vte"
 
 # 窗口透明度 (0.0 - 1.0)
 # 0.0 = 完全透明，1.0 = 完全不透明

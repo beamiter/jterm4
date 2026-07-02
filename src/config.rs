@@ -72,8 +72,9 @@ impl SidebarView {
 // ---------------------------------------------------------------------------
 
 /// A saved SSH target. A new tab can be opened that runs the remote shell over
-/// `ssh -t`, reusing all local PTY/terminal infrastructure (OSC 133 markers
-/// emitted by the remote shell flow through ssh, so block mode works remotely).
+/// `ssh -t`, reusing all local PTY/terminal infrastructure. OSC 133 markers
+/// emitted by the remote shell flow through ssh are preserved so session-aware
+/// terminal behavior keeps working for remote tabs.
 #[derive(Clone, Debug)]
 pub struct RemoteHost {
     pub name: String,
@@ -793,10 +794,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
     let shell = std::env::var("JTERM4_SHELL").ok().or(fc.shell);
 
-    // Parse terminal mode (default: block)
+    // Parse terminal mode (default: vte)
     let terminal_mode_str = env_string("JTERM4_MODE")
         .or(fc.terminal_mode)
-        .unwrap_or_else(|| "block".to_string());
+        .unwrap_or_else(|| "vte".to_string());
     let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
         "vte" => TerminalMode::Vte,
         _ => TerminalMode::Block,
