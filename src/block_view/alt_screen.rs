@@ -166,7 +166,11 @@ pub(crate) fn create_finished_terminal(
     viewport_cap: i64,
 ) -> Terminal {
     let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = output_rows.max(visible_rows) as u32;
+    let scrollback = if output_rows > visible_rows {
+        output_rows.saturating_sub(visible_rows).saturating_add(64) as u32
+    } else {
+        0
+    };
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
@@ -181,13 +185,9 @@ pub(crate) fn create_finished_terminal(
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
-        // Finished blocks are fed once; the view should anchor at the TOP of
-        // the captured output so the user reads it head-down (e.g. `git log`'s
-        // first `commit <hash>` line stays visible). With the VTE default
-        // (`scroll-on-output = true`) the post-feed cursor at end snaps the
-        // view to the bottom, hiding the first rows in scrollback whenever
-        // output_rows > viewport_cap — which is exactly the wide-terminal
-        // case where there's room to show them.
+        // Finished blocks are snapshots. Short output is rendered statically;
+        // long output anchors at the top so `git log`-style output starts from
+        // the first line instead of snapping to the tail.
         .scroll_on_output(false)
         .scroll_on_keystroke(false)
         .build();

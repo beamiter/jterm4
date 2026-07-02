@@ -99,6 +99,11 @@ pub(crate) struct FinishedBlock {
     /// rows beyond viewport_cap live in this VTE's own scrollback so the user
     /// can scroll inside long blocks (e.g. `git log`).
     pub(crate) output_vte: vte4::Terminal,
+    /// Static renderer for short output that fits entirely in the block. Using
+    /// a VTE here gives it an internal scroll offset, which can hide the first
+    /// row after outer block scrolling. Short output is a snapshot, not a
+    /// scrollable terminal.
+    pub(crate) output_label: Option<gtk4::Label>,
     /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
@@ -124,6 +129,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) cols: i64,
     /// Visible-row cap (config.finished_block_viewport_rows).
     pub(crate) viewport_cap: i64,
+    /// True only when this block has more output rows than can be shown at once.
+    pub(crate) output_scrollable: bool,
 }
 
 impl Clone for FinishedBlock {
@@ -134,6 +141,7 @@ impl Clone for FinishedBlock {
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
+            output_label: self.output_label.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
@@ -147,6 +155,7 @@ impl Clone for FinishedBlock {
             status_icon: self.status_icon.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
+            output_scrollable: self.output_scrollable,
         }
     }
 }
@@ -295,10 +304,40 @@ fn filter_output_lines(
 }
 
 fn output_row_count(text: &str) -> i64 {
+    let text = output_display_text(text);
     if text.is_empty() {
         1
     } else {
-        text.lines().count().max(1) as i64
+        let trailing_blank_row =
+            text.ends_with('\n') || (text.ends_with('\r') && !text.ends_with("\r\n"));
+        let rows = text.lines().count().max(1) as i64;
+        if trailing_blank_row {
+            rows + 1
+        } else {
+            rows
+        }
+    }
+}
+
+fn output_display_text(text: &str) -> &str {
+    let text = if let Some(stripped) = text.strip_prefix("\r\n") {
+        stripped
+    } else if let Some(stripped) = text.strip_prefix('\n') {
+        stripped
+    } else if let Some(stripped) = text.strip_prefix('\r') {
+        stripped
+    } else {
+        text
+    };
+
+    if let Some(stripped) = text.strip_suffix("\r\n") {
+        stripped
+    } else if let Some(stripped) = text.strip_suffix('\n') {
+        stripped
+    } else if let Some(stripped) = text.strip_suffix('\r') {
+        stripped
+    } else {
+        text
     }
 }
 
@@ -308,6 +347,14 @@ fn line_count_text(rows: i64) -> String {
     } else {
         format!("{rows} lines")
     }
+}
+
+fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
+    let outer_adj = outer.vadjustment();
+    let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
+    let max_value = (outer_adj.upper() - outer_adj.page_size()).max(outer_adj.lower());
+    let target = (outer_adj.value() + dy * step).clamp(outer_adj.lower(), max_value);
+    outer_adj.set_value(target);
 }
 
 pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
@@ -346,24 +393,30 @@ fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static
 /// once at construction.
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
-    bytes: &[u8],
+    text: &str,
     cols: i64,
     output_rows: i64,
     viewport_cap: i64,
 ) {
+    let display_text = output_display_text(text);
     let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = (output_rows.max(visible_rows) as u32).saturating_add(64);
+    let scrollback = if output_rows > visible_rows {
+        output_rows.saturating_sub(visible_rows).saturating_add(64)
+    } else {
+        0
+    };
+    vte.set_scroll_on_output(false);
     // Set size BEFORE reset/feed so VTE's internal grid is sized correctly when
     // bytes are processed. If we feed first and resize later, VTE wraps lines
     // at the pre-resize default width (root cause of the ls-output misalignment
     // bug: `ls` formats for N cols but VTE wrapped at a narrower width,
     // producing mid-word splits like "ta\nuri-sandbox").
     vte.set_size(cols.max(1), visible_rows);
-    vte.set_scrollback_lines(scrollback as i64);
+    vte.set_scrollback_lines(scrollback);
     vte.reset(true, true);
     // reset() can clamp dimensions on some VTE builds — re-assert.
     vte.set_size(cols.max(1), visible_rows);
-    vte.feed(bytes);
+    vte.feed(display_text.as_bytes());
 }
 
 impl FinishedBlock {
@@ -654,7 +707,20 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_rows = output_row_count(output);
+        let output_scrollable = output_rows > viewport_cap;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
+        let output_label = if output_scrollable {
+            None
+        } else {
+            let label = gtk4::Label::new(Some(&strip_ansi(output_display_text(output))));
+            label.add_css_class("block-output");
+            label.add_css_class("block-output-static");
+            label.set_xalign(0.0);
+            label.set_halign(gtk4::Align::Fill);
+            label.set_wrap(false);
+            label.set_selectable(true);
+            Some(label)
+        };
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
         output_vte
             .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
@@ -676,7 +742,7 @@ impl FinishedBlock {
                     cap_for_map
                 };
                 let visible_rows = rows.min(cap).max(1);
-                render_bytes_into_finished_vte(w, text.as_bytes(), cols_for_map, rows, cap);
+                render_bytes_into_finished_vte(w, &text, cols_for_map, rows, cap);
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
                 // finished VTEs can be allocated at ~1 row and VTE scrolls their
@@ -735,7 +801,15 @@ impl FinishedBlock {
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
-        outer.append(&output_vte);
+        let output_widget: gtk4::Widget = if let Some(label) = output_label.as_ref() {
+            let widget = label.clone().upcast::<gtk4::Widget>();
+            outer.append(label);
+            widget
+        } else {
+            let widget = output_vte.clone().upcast::<gtk4::Widget>();
+            outer.append(&output_vte);
+            widget
+        };
 
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
@@ -767,7 +841,7 @@ impl FinishedBlock {
 
         let has_output = !output.trim().is_empty();
         if !has_output {
-            output_vte.set_visible(false);
+            output_widget.set_visible(false);
             collapse_btn.set_sensitive(false);
             collapse_btn.set_tooltip_text(Some("No output"));
         } else {
@@ -777,10 +851,10 @@ impl FinishedBlock {
             )));
         }
         // Wire collapse button to toggle output visibility.
-        let output_vte_for_collapse = output_vte.clone();
+        let output_widget_for_collapse = output_widget.clone();
         collapse_btn.connect_clicked(move |btn| {
-            let visible = output_vte_for_collapse.is_visible();
-            output_vte_for_collapse.set_visible(!visible);
+            let visible = output_widget_for_collapse.is_visible();
+            output_widget_for_collapse.set_visible(!visible);
             btn.set_label(if visible { "\u{f054}" } else { "\u{f078}" }); // chevron right / down
         });
         if !has_output {
@@ -830,6 +904,7 @@ impl FinishedBlock {
 
             let apply = {
                 let output_vte = output_vte.clone();
+                let output_label = output_label.clone();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
                 let filter_entry = filter_entry.clone();
@@ -865,7 +940,7 @@ impl FinishedBlock {
                     };
                     render_bytes_into_finished_vte(
                         &output_vte,
-                        shown.as_bytes(),
+                        &shown,
                         cols,
                         shown_rows,
                         active_cap,
@@ -874,6 +949,9 @@ impl FinishedBlock {
                     if ch > 0 {
                         output_vte
                             .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
+                    }
+                    if let Some(label) = output_label.as_ref() {
+                        label.set_text(&strip_ansi(output_display_text(&shown)));
                     }
                     let has_query = !q.trim().is_empty();
                     if has_query {
@@ -941,6 +1019,7 @@ impl FinishedBlock {
             prompt_text: prompt.to_string(),
             command_vte,
             output_vte,
+            output_label,
             full_output,
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
@@ -954,6 +1033,7 @@ impl FinishedBlock {
             status_icon,
             cols,
             viewport_cap,
+            output_scrollable,
         }
     }
 
@@ -970,11 +1050,15 @@ impl FinishedBlock {
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-        // Bubble phase: VTE's own controller runs first and consumes the event
-        // when it can scroll. We only see what's left over.
         let vte = self.output_vte.clone();
-        let outer = outer.clone();
+        let outer_for_vte = outer.clone();
+        let output_scrollable = self.output_scrollable;
         scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+            if !output_scrollable {
+                forward_outer_scroll(&outer_for_vte, dy);
+                return glib::Propagation::Stop;
+            }
+
             let Some(inner_adj) = vte.vadjustment() else {
                 return glib::Propagation::Proceed;
             };
@@ -988,14 +1072,22 @@ impl FinishedBlock {
                 return glib::Propagation::Proceed;
             }
             // Drive the outer ScrolledWindow by one step in the wheel direction.
-            let outer_adj = outer.vadjustment();
-            let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
-            let target = (outer_adj.value() + dy * step)
-                .clamp(outer_adj.lower(), outer_adj.upper() - outer_adj.page_size());
-            outer_adj.set_value(target);
+            forward_outer_scroll(&outer_for_vte, dy);
             glib::Propagation::Stop
         });
         self.output_vte.add_controller(scroll_ctrl);
+
+        if let Some(label) = self.output_label.as_ref() {
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let outer = outer.clone();
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                forward_outer_scroll(&outer, dy);
+                glib::Propagation::Stop
+            });
+            label.add_controller(scroll_ctrl);
+        }
     }
 
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).

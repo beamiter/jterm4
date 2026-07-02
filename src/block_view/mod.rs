@@ -410,6 +410,13 @@ fn coalesce_bytes_events(events: &mut Vec<ParserEvent>) {
     events.truncate(write);
 }
 
+fn is_post_command_metadata(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b]7;")
+        || bytes.starts_with(b"\x1b]0;")
+        || bytes.starts_with(b"\x1b]1;")
+        || bytes.starts_with(b"\x1b]2;")
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -508,7 +515,11 @@ impl ReaderCtx {
                                     true
                                 }
                                 BlockState::CollectingOutput | BlockState::PostCommand => {
-                                    active_rc.borrow().accumulate_output(bytes);
+                                    if bstate_rc.get() != BlockState::PostCommand
+                                        || !is_post_command_metadata(bytes)
+                                    {
+                                        active_rc.borrow().accumulate_output(bytes);
+                                    }
                                     for cb in activity_cbs.borrow().iter() {
                                         cb();
                                     }
@@ -651,10 +662,12 @@ impl ReaderCtx {
                                     .widget()
                                     .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
 
+                                let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
+
                                 // If the user is reading history (scrolled up), this
                                 // freshly-finished block is "unread": bump the FAB badge
                                 // so they can see work completed below and jump to it.
-                                if scroll_debouncer.user_scrolled_up.get() {
+                                if was_user_scrolled {
                                     unread_count_rc.set(unread_count_rc.get().saturating_add(1));
                                     set_jump_fab_label(&jump_fab, unread_count_rc.get());
                                     jump_fab.set_visible(true);
@@ -841,7 +854,10 @@ impl ReaderCtx {
 
                                 let preserve = config_for_cb.borrow().preserve_live_scrollback;
                                 active_rc.borrow().reset_active(preserve);
-                                scroll_debouncer.reset_scroll_lock();
+                                if !was_user_scrolled {
+                                    scroll_debouncer.reset_scroll_lock();
+                                    scroll_debouncer.pin_to_bottom_deferred(&block_scroll_rc);
+                                }
                             }
                             bstate_rc.set(BlockState::CollectingPrompt);
                             prompt_buf_rc.borrow_mut().clear();

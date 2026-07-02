@@ -1,4 +1,5 @@
 //! scroll — extracted from block_view (mechanical split, no logic changes)
+use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::ScrolledWindow;
 use std::cell::{Cell, RefCell};
@@ -43,6 +44,46 @@ impl ScrollDebouncer {
         self.programmatic_scroll.set(true);
         adj.set_value(target);
         self.programmatic_scroll.set(false);
+    }
+
+    /// Follow the live prompt across a few settled layout passes.
+    ///
+    /// With virtual scrolling, hidden blocks have 0 GTK height until the scroll
+    /// position brings them near the viewport. A single `upper - page` jump can
+    /// therefore land short: the jump reveals more blocks, those blocks expand,
+    /// and `upper` grows on the next frame. Re-applying the bottom pin briefly
+    /// keeps the latest finished block and prompt visible.
+    pub(crate) fn pin_to_bottom_deferred(&self, scroll: &ScrolledWindow) {
+        if self.user_scrolled_up.get() {
+            return;
+        }
+
+        let scroll = scroll.clone();
+        let user_scrolled = self.user_scrolled_up.clone();
+        let programmatic = self.programmatic_scroll.clone();
+        let tries = Rc::new(Cell::new(0u8));
+        let stable = Rc::new(Cell::new(0u8));
+
+        glib::idle_add_local(move || {
+            if user_scrolled.get() || tries.get() >= 12 || stable.get() >= 2 {
+                return glib::ControlFlow::Break;
+            }
+            tries.set(tries.get() + 1);
+
+            let adj = scroll.vadjustment();
+            let before = adj.value();
+            let target = (adj.upper() - adj.page_size()).max(adj.lower());
+            programmatic.set(true);
+            adj.set_value(target);
+            programmatic.set(false);
+
+            if (adj.value() - before).abs() < 1.0 {
+                stable.set(stable.get() + 1);
+            } else {
+                stable.set(0);
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     pub(crate) fn reset_scroll_lock(&self) {
