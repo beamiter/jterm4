@@ -525,7 +525,7 @@ pub(crate) fn install_block_css(config: &Config) {
     }
 
     let provider = gtk4::CssProvider::new();
-    provider.load_from_data(&css);
+    provider.load_from_string(&css);
     let Some(display) = gtk4::gdk::Display::default() else {
         // No display (headless / CI). Nothing to style.
         return;

@@ -85,7 +85,7 @@ impl UiState {
              .tab-strip-search {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-search text {{ color: rgb({fr},{fg_g},{fb}); caret-color: rgb({fr},{fg_g},{fb}); }}"
         );
-        self.scrollbar_css.load_from_data(&css);
+        self.scrollbar_css.load_from_string(&css);
     }
 
     pub(crate) fn apply_font_all(&self) {

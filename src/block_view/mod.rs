@@ -245,18 +245,22 @@ pub struct TermView {
     active_vte: Terminal,
     active: Rc<RefCell<ActiveBlock>>,
     bstate: Rc<Cell<BlockState>>,
+    #[allow(dead_code)]
     prompt_buf: Rc<RefCell<String>>,
     /// Keystroke shadow used only to size the idle input cell (line count). The
     /// authoritative finished-command text is read off the live VTE at
     /// CommandStart, so this never has to round-trip to display.
+    #[allow(dead_code)]
     typed_cmd: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Rc<Cell<bool>>,
     /// True once the user has scrolled up off the live prompt; while false the
     /// view follows the bottom. Read by the per-frame tick to re-pin the prompt.
+    #[allow(dead_code)]
     user_scrolled_up: Rc<Cell<bool>>,
     /// Guards programmatic scrolls so the scroll-lock detector doesn't mistake
     /// them for a user drag.
+    #[allow(dead_code)]
     programmatic_scroll: Rc<Cell<bool>>,
     pty: Rc<OwnedPty>,
     cwd_callbacks: StrCallbacks,

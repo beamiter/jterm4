@@ -141,18 +141,17 @@ fn osc52_clipboard_query_does_not_set() {
     assert!(!any_set, "OSC 52 query `?` must not fire ClipboardSet");
 }
 
-/// DCS / PM sequences ignored cleanly. vim emits dozens of XTGETTCAP
-/// queries `\eP+q<hex>\e\\` per startup; the closing `\` of the ST was
-/// previously leaking into the Bytes stream (one stray `\` per query,
-/// hundreds across a vim session).
+/// DCS sequences pass through cleanly. VTE consumes XTGETTCAP/sixel/etc.
+/// natively, so the parser must preserve the full `ESC P ... ESC \` sequence
+/// rather than leaking only part of the ST terminator.
 #[test]
-fn dcs_consumed_including_trailing_st_byte() {
+fn dcs_passthrough_including_trailing_st_byte() {
     let mut p = Parser::new();
     let events = feed_all(&mut p, b"hi\x1bP+q544e\x1b\\bye");
     assert_eq!(
         collect_bytes(&events),
-        b"hibye",
-        "DCS body AND its `ESC \\` ST must both be consumed: {events:?}"
+        b"hi\x1bP+q544e\x1b\\bye",
+        "DCS body and its `ESC \\` ST must round-trip together: {events:?}"
     );
 }
 

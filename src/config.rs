@@ -187,6 +187,7 @@ pub struct Config {
     /// per-block toggle. `finished_block_viewport_rows` is the default cap;
     /// expanding lifts the cap up to this value (clamped 10..=5000).
     pub(crate) finished_block_max_expanded_rows: u32,
+    #[allow(dead_code)]
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,

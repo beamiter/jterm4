@@ -1,4 +1,8 @@
 //! file_tree — sidebar file browser for UiState.
+#![allow(deprecated)]
+// This module owns the current TreeView/TreeStore implementation. GTK 4.10
+// deprecates it in favor of ColumnView/TreeListModel, which is a larger rewrite.
+
 use gtk4::prelude::*;
 use gtk4::{TreeIter, TreePath, TreeView};
 use std::path::{Path, PathBuf};

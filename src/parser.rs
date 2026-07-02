@@ -221,22 +221,26 @@ impl Parser {
 
     /// True while the shell has `?2004` enabled — callers should wrap pasted
     /// content with `\e[200~` / `\e[201~` before writing to the PTY.
+    #[allow(dead_code)]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
     }
 
     /// Currently active mouse-tracking mode, or `None` when reporting is off.
+    #[allow(dead_code)]
     pub fn mouse_mode(&self) -> MouseMode {
         self.mouse_mode
     }
 
     /// Wire encoding the next mouse report should use.
+    #[allow(dead_code)]
     pub fn mouse_encoding(&self) -> MouseEncoding {
         self.mouse_encoding
     }
 
     /// True while `?1004` is enabled — callers should emit `\e[I` on focus-in,
     /// `\e[O` on focus-out.
+    #[allow(dead_code)]
     pub fn focus_events(&self) -> bool {
         self.focus_events
     }

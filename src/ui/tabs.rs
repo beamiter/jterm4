@@ -1071,7 +1071,10 @@ impl UiState {
             // Check if the click landed on the close icon area
             let btn_widget = strip_btn_for_close.upcast_ref::<gtk4::Widget>();
             let icon_widget = close_icon_for_hit.upcast_ref::<gtk4::Widget>();
-            if let Some((ix, iy)) = btn_widget.translate_coordinates(icon_widget, x, y) {
+            let point = gtk4::graphene::Point::new(x as f32, y as f32);
+            if let Some(mapped) = btn_widget.compute_point(icon_widget, &point) {
+                let ix = mapped.x() as f64;
+                let iy = mapped.y() as f64;
                 let w = icon_widget.width() as f64;
                 let h = icon_widget.height() as f64;
                 if ix >= 0.0 && iy >= 0.0 && ix <= w && iy <= h {

@@ -75,23 +75,74 @@ fn init_logging() {
     log::set_max_level(level);
 }
 
-fn main() -> glib::ExitCode {
-    // Ensure fcitx5 GTK4 IM module is discoverable at runtime.
-    // FCITX5_GTK_PATH is baked in at compile time (set by nix develop shellHook).
-    // SAFETY: Must run before GTK init (single-threaded at this point).
-    if let Some(fcitx5_path) = option_env!("FCITX5_GTK_PATH") {
-        let gtk_path = match std::env::var("GTK_PATH") {
-            Ok(existing) if !existing.contains(fcitx5_path) => {
-                format!("{}:{}", fcitx5_path, existing)
-            }
-            Ok(existing) => existing,
-            Err(_) => fcitx5_path.to_string(),
-        };
-        unsafe {
-            std::env::set_var("GTK_PATH", &gtk_path);
+/// Make the fcitx5 GTK4 input-method module discoverable before GTK initializes,
+/// so CJK preedit/commit works even when the binary is launched outside the nix
+/// dev shell.
+fn init_input_method_env() {
+    let is_unset = |k: &str| std::env::var_os(k).map_or(true, |v| v.is_empty());
+
+    if let Some(fcitx_gtk_path) = option_env!("FCITX5_GTK_PATH") {
+        if !fcitx_gtk_path.is_empty() {
+            let combined = match std::env::var_os("GTK_PATH") {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{fcitx_gtk_path}:{}", existing.to_string_lossy())
+                }
+                _ => fcitx_gtk_path.to_string(),
+            };
+            unsafe { std::env::set_var("GTK_PATH", combined) };
         }
     }
+    if is_unset("GTK_IM_MODULE") {
+        unsafe { std::env::set_var("GTK_IM_MODULE", "fcitx") };
+    }
+    if is_unset("XMODIFIERS") {
+        unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
+    }
+}
 
+#[allow(deprecated)]
+// TreeView/TreeStore are deprecated in GTK 4.10. The current sidebar file tree
+// still uses them; migrating to ColumnView/TreeListModel should be a focused UI
+// rewrite, not mixed into warning cleanup.
+fn build_file_tree_widgets() -> (gtk4::TreeStore, gtk4::TreeView) {
+    let file_tree_store = gtk4::TreeStore::new(&[
+        glib::types::Type::STRING, // 0: display name
+        glib::types::Type::STRING, // 1: absolute path
+        glib::types::Type::BOOL,   // 2: is directory
+        glib::types::Type::STRING, // 3: icon name
+    ]);
+    let file_tree = gtk4::TreeView::with_model(&file_tree_store);
+    file_tree.set_headers_visible(false);
+    file_tree.set_can_focus(true);
+    file_tree.add_css_class("file-tree");
+
+    let column = gtk4::TreeViewColumn::new();
+    let icon_renderer = gtk4::CellRendererPixbuf::new();
+    gtk4::prelude::CellLayoutExt::pack_start(&column, &icon_renderer, false);
+    gtk4::prelude::CellLayoutExt::add_attribute(&column, &icon_renderer, "icon-name", 3);
+    let text_renderer = gtk4::CellRendererText::new();
+    gtk4::prelude::CellLayoutExt::pack_start(&column, &text_renderer, true);
+    gtk4::prelude::CellLayoutExt::add_attribute(&column, &text_renderer, "text", 0);
+    file_tree.append_column(&column);
+
+    (file_tree_store, file_tree)
+}
+
+#[allow(deprecated)]
+fn connect_file_tree_handlers(file_tree: &gtk4::TreeView, ui: &UiState) {
+    let ui_for_ft_expand = ui.clone();
+    file_tree.connect_test_expand_row(move |_tv, iter, _path| {
+        ui_for_ft_expand.file_tree_on_expand(iter);
+        glib::Propagation::Proceed
+    });
+    let ui_for_ft_act = ui.clone();
+    file_tree.connect_row_activated(move |tv, path, _col| {
+        ui_for_ft_act.file_tree_on_activate(tv, path);
+    });
+}
+
+fn main() -> glib::ExitCode {
+    init_input_method_env();
     init_logging();
 
     // NON_UNIQUE: each launch is its own process with its own window, instead of
@@ -160,7 +211,7 @@ fn main() -> glib::ExitCode {
 
         // Custom tab bar CSS
         let css_provider = CssProvider::new();
-        css_provider.load_from_data(
+        css_provider.load_from_string(
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
              .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid #8be9fd; outline-offset: -2px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
@@ -294,26 +345,7 @@ fn main() -> glib::ExitCode {
         sidebar_tabs_page.append(&tab_strip_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
-        let file_tree_store = gtk4::TreeStore::new(&[
-            glib::types::Type::STRING, // 0: display name
-            glib::types::Type::STRING, // 1: absolute path
-            glib::types::Type::BOOL,   // 2: is directory
-            glib::types::Type::STRING, // 3: icon name
-        ]);
-        let file_tree = gtk4::TreeView::with_model(&file_tree_store);
-        file_tree.set_headers_visible(false);
-        file_tree.set_can_focus(true);
-        file_tree.add_css_class("file-tree");
-        {
-            let column = gtk4::TreeViewColumn::new();
-            let icon_renderer = gtk4::CellRendererPixbuf::new();
-            gtk4::prelude::CellLayoutExt::pack_start(&column, &icon_renderer, false);
-            gtk4::prelude::CellLayoutExt::add_attribute(&column, &icon_renderer, "icon-name", 3);
-            let text_renderer = gtk4::CellRendererText::new();
-            gtk4::prelude::CellLayoutExt::pack_start(&column, &text_renderer, true);
-            gtk4::prelude::CellLayoutExt::add_attribute(&column, &text_renderer, "text", 0);
-            file_tree.append_column(&column);
-        }
+        let (file_tree_store, file_tree) = build_file_tree_widgets();
 
         let file_tree_scroll = ScrolledWindow::new();
         file_tree_scroll.set_hexpand(false);
@@ -494,16 +526,8 @@ fn main() -> glib::ExitCode {
             ui_for_ft_up.file_tree_go_up();
         });
 
-        // Wire file-tree lazy expansion and row activation
-        let ui_for_ft_expand = ui.clone();
-        file_tree.connect_test_expand_row(move |_tv, iter, _path| {
-            ui_for_ft_expand.file_tree_on_expand(iter);
-            glib::Propagation::Proceed
-        });
-        let ui_for_ft_act = ui.clone();
-        file_tree.connect_row_activated(move |tv, path, _col| {
-            ui_for_ft_act.file_tree_on_activate(tv, path);
-        });
+        // Wire file-tree lazy expansion and row activation.
+        connect_file_tree_handlers(&file_tree, &ui);
 
         // Wire sidebar Tabs/Files segmented switcher
         let ui_for_tabs_view = ui.clone();
@@ -789,7 +813,7 @@ fn main() -> glib::ExitCode {
         });
 
         window.set_content(Some(&main_box));
-        window.show();
+        window.present();
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();

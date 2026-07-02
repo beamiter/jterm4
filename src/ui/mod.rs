@@ -1,3 +1,8 @@
+#![allow(deprecated)]
+// The sidebar file tree still uses GTK's deprecated TreeStore type. Keep the
+// allowance local to the UI module until the file browser is migrated to
+// ColumnView/TreeListModel.
+
 use gtk4::Notebook;
 use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton, TreeStore};
 use libadwaita as adw;
