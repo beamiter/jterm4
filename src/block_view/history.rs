@@ -5,6 +5,7 @@
 //! bounded, since the deque was already seeded from this file on startup.
 
 use super::{BlockData, TermView};
+use std::borrow::Cow;
 
 #[allow(dead_code)]
 impl TermView {
@@ -36,11 +37,13 @@ impl TermView {
             let serialized = rkyv::to_bytes::<_, 256>(block)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            let record: &[u8] = if compress {
-                &zstd::encode_all(serialized.as_slice(), 3)
+            let record: Cow<[u8]> = if compress {
+                Cow::Owned(
+                    zstd::encode_all(serialized.as_slice(), 3)
                     .map_err(|e| std::io::Error::other(e.to_string()))?
+                )
             } else {
-                &serialized
+                Cow::Borrowed(serialized.as_slice())
             };
 
             // The length prefix is a u32; silently truncating it would corrupt all
@@ -54,7 +57,7 @@ impl TermView {
                 continue;
             }
             file.write_all(&(record.len() as u32).to_le_bytes())?;
-            file.write_all(record)?;
+            file.write_all(record.as_ref())?;
         }
 
         Ok(())
