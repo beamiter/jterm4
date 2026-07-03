@@ -49,6 +49,10 @@ pub(crate) fn skip_escape_sequence(bytes: &[u8], i: usize) -> usize {
 
 pub(crate) fn strip_ansi_with_clear_detect(input: &str) -> (String, bool) {
     let bytes = input.as_bytes();
+    if memchr::memchr3(0x1b, b'\r', b'\x08', bytes).is_none() {
+        return (input.to_string(), false);
+    }
+
     let mut lines: Vec<Vec<char>> = vec![Vec::new()];
     let mut cursor = 0usize;
     let mut i = 0;
@@ -218,7 +222,7 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_case_insensitive as cci;
+    use super::{contains_case_insensitive as cci, strip_ansi_with_clear_detect};
 
     #[test]
     fn matches_regardless_of_case() {
@@ -244,5 +248,13 @@ mod tests {
         // false there, skipping the uppercase-variant scan that matches "Fo"
         // at position 0.
         assert!(cci(b"Foxf", b"fo"));
+    }
+
+    #[test]
+    fn strip_plain_multiline_output_uses_passthrough_result() {
+        assert_eq!(
+            strip_ansi_with_clear_detect("plain\ntext\n"),
+            ("plain\ntext\n".to_string(), false)
+        );
     }
 }

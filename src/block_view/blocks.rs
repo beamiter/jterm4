@@ -269,7 +269,14 @@ fn filter_output_lines(
     } else {
         None
     };
-    let lc_query = if case_sensitive {
+    let ascii_query = (!case_sensitive && query.is_ascii()).then(|| {
+        query
+            .as_bytes()
+            .iter()
+            .map(|b| b.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    let lc_query = if case_sensitive || ascii_query.is_some() {
         String::new()
     } else {
         query.to_lowercase()
@@ -280,6 +287,8 @@ fn filter_output_lines(
             re.is_match(line)
         } else if case_sensitive {
             line.contains(query)
+        } else if let Some(ref q) = ascii_query {
+            contains_case_insensitive(line.as_bytes(), q)
         } else {
             line.to_lowercase().contains(&lc_query)
         };
@@ -295,12 +304,17 @@ fn filter_output_lines(
             }
         }
     }
-    lines
-        .iter()
-        .zip(keep.iter())
-        .filter_map(|(l, k)| if *k { Some(*l) } else { None })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::new();
+    for (line, keep) in lines.iter().zip(keep.iter()) {
+        if !*keep {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 fn output_row_count(text: &str) -> i64 {
@@ -420,17 +434,25 @@ pub(crate) fn render_bytes_into_finished_vte(
 }
 
 impl FinishedBlock {
+    fn with_cached_stripped_output<R>(
+        full_output: &Rc<RefCell<String>>,
+        stripped_output: &Rc<RefCell<Option<String>>>,
+        f: impl FnOnce(&str) -> R,
+    ) -> R {
+        if stripped_output.borrow().is_none() {
+            let s = strip_ansi(&full_output.borrow());
+            *stripped_output.borrow_mut() = Some(s);
+        }
+        let guard = stripped_output.borrow();
+        f(guard.as_deref().unwrap_or(""))
+    }
+
     /// Returns the ANSI-stripped view of `full_output`, populating the cache on
     /// first call. Caller passes a closure to handle the cached string by ref to
     /// avoid an extra clone — `stripped_output` lives in a `RefCell` so we can't
     /// hand out a `Ref` that outlives the borrow.
     pub(crate) fn with_stripped_output<R>(&self, f: impl FnOnce(&str) -> R) -> R {
-        if self.stripped_output.borrow().is_none() {
-            let s = strip_ansi(&self.full_output.borrow());
-            *self.stripped_output.borrow_mut() = Some(s);
-        }
-        let guard = self.stripped_output.borrow();
-        f(guard.as_deref().unwrap_or(""))
+        Self::with_cached_stripped_output(&self.full_output, &self.stripped_output, f)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1111,8 +1133,13 @@ impl FinishedBlock {
         // Copy the FULL output (ANSI stripped), not just the collapsed first-N
         // lines shown in output_buffer before "Show more" is clicked.
         let full_output_for_copy = self.full_output.clone();
+        let stripped_output_for_copy = self.stripped_output.clone();
         self.copy_output_btn.connect_clicked(move |btn| {
-            let text = strip_ansi(&full_output_for_copy.borrow());
+            let text = Self::with_cached_stripped_output(
+                &full_output_for_copy,
+                &stripped_output_for_copy,
+                |s| s.to_string(),
+            );
             vte_for_out.clipboard().set_text(&text);
             flash_button_label(btn, "\u{f00c}", "Output copied");
         });
@@ -1277,4 +1304,33 @@ pub(crate) enum BlockState {
     /// has been seen within the startup grace window. Recovered to block mode if a
     /// PromptStart ever arrives (late-loading integration).
     RawFallback,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_output_lines;
+
+    #[test]
+    fn filter_output_lines_matches_ascii_case_insensitive() {
+        assert_eq!(
+            filter_output_lines("alpha\nERROR: nope\nomega", "error", false, false, false, 0),
+            "ERROR: nope"
+        );
+    }
+
+    #[test]
+    fn filter_output_lines_preserves_unicode_case_insensitive_search() {
+        assert_eq!(
+            filter_output_lines("alpha\n你好世界\nomega", "你好", false, false, false, 0),
+            "你好世界"
+        );
+    }
+
+    #[test]
+    fn filter_output_lines_includes_context_without_extra_alloc_join() {
+        assert_eq!(
+            filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1),
+            "two\nthree\nfour"
+        );
+    }
 }

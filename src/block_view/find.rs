@@ -19,6 +19,7 @@ use super::{contains_case_insensitive, select_finished_block, BlockFilters, Term
 #[derive(Clone)]
 pub(crate) struct FindMatch {
     pub(crate) block_id: u64,
+    pub(crate) block_index: usize,
     /// false = command VTE, true = output VTE.
     pub(crate) is_output: bool,
 }
@@ -57,6 +58,16 @@ fn snippet(line: &str) -> String {
         s.push('…');
         s
     }
+}
+
+fn find_match_block<'a>(
+    finished: &'a [super::FinishedBlock],
+    fm: &FindMatch,
+) -> Option<&'a super::FinishedBlock> {
+    finished
+        .get(fm.block_index)
+        .filter(|block| block.id == fm.block_id)
+        .or_else(|| finished.iter().find(|block| block.id == fm.block_id))
 }
 
 #[cfg(test)]
@@ -190,7 +201,7 @@ impl TermView {
         let mut matches: Vec<FindMatch> = Vec::new();
         {
             let finished = self.finished_blocks.borrow();
-            for block in finished.iter() {
+            for (block_index, block) in finished.iter().enumerate() {
                 let cmd_count = re.find_iter(&block.cmd_text).count();
                 let out_count = block.with_stripped_output(|s| re.find_iter(s).count());
                 if cmd_count > 0 {
@@ -199,6 +210,7 @@ impl TermView {
                     for _ in 0..cmd_count {
                         matches.push(FindMatch {
                             block_id: block.id,
+                            block_index,
                             is_output: false,
                         });
                     }
@@ -209,6 +221,7 @@ impl TermView {
                     for _ in 0..out_count {
                         matches.push(FindMatch {
                             block_id: block.id,
+                            block_index,
                             is_output: true,
                         });
                     }
@@ -264,7 +277,7 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+        let Some(block) = find_match_block(&finished, fm) else {
             return;
         };
         let vte = if fm.is_output {
@@ -286,7 +299,7 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+        let Some(block) = find_match_block(&finished, fm) else {
             return;
         };
         let vte = if fm.is_output {
@@ -303,7 +316,7 @@ impl TermView {
         let Some(fm) = st.matches.get(st.current) else {
             return;
         };
-        let Some(block) = finished.iter().find(|b| b.id == fm.block_id) else {
+        let Some(block) = find_match_block(&finished, fm) else {
             return;
         };
         let widget = block.widget().clone();

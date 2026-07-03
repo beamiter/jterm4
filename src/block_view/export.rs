@@ -7,7 +7,7 @@
 
 use gtk4::prelude::*;
 
-use super::{strip_ansi, BlockData, TermView};
+use super::TermView;
 
 #[allow(dead_code)]
 impl TermView {
@@ -32,8 +32,7 @@ impl TermView {
     /// Export all blocks in the session as JSON
     pub fn export_session_json(&self) -> String {
         let blocks = self.block_data.borrow();
-        let blocks_vec: Vec<&BlockData> = blocks.iter().collect();
-        serde_json::to_string_pretty(&blocks_vec).unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string_pretty(&*blocks).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// Export all blocks in the session as Markdown
@@ -60,9 +59,9 @@ impl TermView {
         if let Some(block) = finished.iter().find(|b| b.id == block_id) {
             let prompt_text = block.prompt_text.clone();
             let cmd_text = block.cmd_text.clone();
-            let output_text = strip_ansi(&block.full_output.borrow());
 
-            let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+            let full_text =
+                block.with_stripped_output(|output| format!("{prompt_text}\n{cmd_text}\n{output}"));
             let clipboard = self.active_vte.clipboard();
             clipboard.set_text(&full_text);
         }

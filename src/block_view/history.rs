@@ -6,6 +6,17 @@
 
 use super::{BlockData, TermView};
 use std::borrow::Cow;
+use std::collections::VecDeque;
+
+fn push_bounded_back<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if items.len() == limit {
+        items.pop_front();
+    }
+    items.push_back(item);
+}
 
 #[allow(dead_code)]
 impl TermView {
@@ -13,7 +24,13 @@ impl TermView {
     pub fn save_history(&self) -> std::io::Result<()> {
         use std::io::Write;
 
-        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
+        let (path_opt, compress) = {
+            let config = self.config.borrow();
+            (
+                config.block_history_path.as_ref().cloned(),
+                config.block_history_compress,
+            )
+        };
         if path_opt.is_none() {
             return Ok(());
         }
@@ -31,8 +48,6 @@ impl TermView {
             .truncate(true)
             .open(path)?;
 
-        let compress = self.config.borrow().block_history_compress;
-
         for block in blocks.iter() {
             let serialized = rkyv::to_bytes::<_, 256>(block)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -40,7 +55,7 @@ impl TermView {
             let record: Cow<[u8]> = if compress {
                 Cow::Owned(
                     zstd::encode_all(serialized.as_slice(), 3)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                        .map_err(|e| std::io::Error::other(e.to_string()))?,
                 )
             } else {
                 Cow::Borrowed(serialized.as_slice())
@@ -65,7 +80,14 @@ impl TermView {
 
     /// Load block history from file (if configured).
     pub fn load_history(&self) -> std::io::Result<()> {
-        let path_opt = self.config.borrow().block_history_path.as_ref().cloned();
+        let (path_opt, compress, lazy_load_threshold) = {
+            let config = self.config.borrow();
+            (
+                config.block_history_path.as_ref().cloned(),
+                config.block_history_compress,
+                config.lazy_load_threshold as usize,
+            )
+        };
         if path_opt.is_none() {
             return Ok(());
         }
@@ -77,10 +99,9 @@ impl TermView {
 
         use std::io::Read;
         let mut file = std::fs::File::open(path)?;
-        let lazy_load_threshold = self.config.borrow().lazy_load_threshold as usize;
-        let mut temp_blocks = Vec::new();
+        let mut recent_blocks = VecDeque::new();
+        let mut total_loaded = 0usize;
 
-        // First pass: load all blocks into temporary storage
         loop {
             let mut len_bytes = [0u8; 4];
             if file.read_exact(&mut len_bytes).is_err() {
@@ -97,7 +118,7 @@ impl TermView {
             let mut data = vec![0u8; len];
             file.read_exact(&mut data)?;
 
-            let decoded = if self.config.borrow().block_history_compress {
+            let decoded = if compress {
                 zstd::decode_all(data.as_slice())
                     .map_err(|e| std::io::Error::other(e.to_string()))?
             } else {
@@ -105,29 +126,57 @@ impl TermView {
             };
 
             if let Ok(block) = rkyv::from_bytes::<BlockData>(&decoded) {
-                temp_blocks.push(block);
+                total_loaded += 1;
+                push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
             }
         }
 
-        // Second pass: only load the most recent N blocks (lazy loading optimization)
-        let total_loaded = temp_blocks.len();
-        let start_idx = if total_loaded > lazy_load_threshold {
+        if total_loaded > lazy_load_threshold {
             log::info!("Lazy loading history: keeping {} recent blocks out of {} total (skipping {} old blocks)",
                 lazy_load_threshold, total_loaded, total_loaded - lazy_load_threshold);
-            total_loaded - lazy_load_threshold
-        } else {
-            0
-        };
+        }
 
         let mut blocks = self.block_data.borrow_mut();
-        for (idx, block) in temp_blocks.into_iter().enumerate() {
-            if idx >= start_idx {
-                log::debug!("Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
-                    idx, &block.prompt, &block.cmd, block.output.len(), block.exit_code);
-                blocks.push_back(block);
-            }
+        let start_idx = total_loaded.saturating_sub(recent_blocks.len());
+        for (offset, block) in recent_blocks.into_iter().enumerate() {
+            let idx = start_idx + offset;
+            log::debug!(
+                "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
+                idx,
+                &block.prompt,
+                &block.cmd,
+                block.output.len(),
+                block.exit_code
+            );
+            blocks.push_back(block);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_bounded_back;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn push_bounded_back_keeps_only_recent_items() {
+        let mut items = VecDeque::new();
+
+        for item in 0..5 {
+            push_bounded_back(&mut items, item, 3);
+        }
+
+        assert_eq!(items.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn push_bounded_back_honors_zero_limit() {
+        let mut items = VecDeque::new();
+
+        push_bounded_back(&mut items, 1, 0);
+
+        assert!(items.is_empty());
     }
 }

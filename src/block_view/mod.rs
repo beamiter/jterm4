@@ -106,6 +106,26 @@ fn sample_output_for_event(output: &str) -> String {
     )
 }
 
+fn truncate_plain_output_for_height(output_plain: &str, line_limit: usize) -> (String, usize) {
+    let trimmed = output_plain.trim();
+    let total_lines = trimmed.lines().count();
+    if total_lines <= line_limit {
+        return (trimmed.to_string(), total_lines);
+    }
+
+    let kept = trimmed
+        .lines()
+        .take(line_limit)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let truncated = format!(
+        "{}\n\n[... truncated: {} lines total, showing first {}]",
+        kept, total_lines, line_limit
+    );
+    let displayed_lines = truncated.lines().count();
+    (truncated, displayed_lines)
+}
+
 fn ansi256_to_rgb(idx: u8, palette: &[RGBA; 16]) -> (u8, u8, u8) {
     match idx {
         0..=15 => {
@@ -486,7 +506,9 @@ impl ReaderCtx {
                                 (1002, true) => Some(MouseReportingMode::Button),
                                 (1003, true) => Some(MouseReportingMode::Motion),
                                 (1006, true) => Some(MouseReportingMode::Sgr),
-                                (1000 | 1002 | 1003 | 1006, false) => Some(MouseReportingMode::None),
+                                (1000 | 1002 | 1003 | 1006, false) => {
+                                    Some(MouseReportingMode::None)
+                                }
                                 _ => None,
                             };
                             if let Some(m) = new_mode {
@@ -541,7 +563,9 @@ impl ReaderCtx {
                         ParserEvent::PromptStart => {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                            if state == BlockState::CollectingOutput
+                                || state == BlockState::AltScreen
+                            {
                                 continue;
                             }
                             // Finalize the previous command (deferred from CommandEnd).
@@ -580,21 +604,15 @@ impl ReaderCtx {
                                 // reconstruction pass.
                                 let output_with_ansi = active_rc.borrow().output_text();
 
-                                let output_plain = strip_ansi(&output_with_ansi).to_string();
+                                let output_plain = strip_ansi(&output_with_ansi);
 
-                                let truncation_limit = config_for_cb.borrow().truncation_threshold_lines as usize;
-                                let output_trimmed = {
-                                    let trimmed = output_plain.trim();
-                                    let lines: Vec<&str> = trimmed.lines().collect();
-                                    if lines.len() > truncation_limit {
-                                        let kept: String = lines[..truncation_limit].join("\n");
-                                        format!("{}\n\n[... truncated: {} lines total, showing first {}]", kept, lines.len(), truncation_limit)
-                                    } else {
-                                        trimmed.to_string()
-                                    }
-                                };
-
-                                let line_count = output_trimmed.lines().count();
+                                let truncation_limit =
+                                    config_for_cb.borrow().truncation_threshold_lines as usize;
+                                let (_output_trimmed, line_count) =
+                                    truncate_plain_output_for_height(
+                                        &output_plain,
+                                        truncation_limit,
+                                    );
                                 let estimated_height = estimated_finished_block_height(
                                     &config_for_cb.borrow(),
                                     line_count,
@@ -602,15 +620,26 @@ impl ReaderCtx {
 
                                 let start_time = block_start_time_for_cb.get();
                                 let now = SystemTime::now();
-                                let end_time_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64);
-                                let start_time_ms = start_time.and_then(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64));
+                                let end_time_ms = now
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as u64);
+                                let start_time_ms = start_time.and_then(|st| {
+                                    st.duration_since(SystemTime::UNIX_EPOCH)
+                                        .ok()
+                                        .map(|d| d.as_millis() as u64)
+                                });
                                 let duration_ms = start_time.and_then(|st| {
                                     now.duration_since(st).ok().map(|d| d.as_millis() as u64)
                                 });
 
                                 let block_cwd = {
                                     let cwd_str = current_cwd_for_cb.borrow().clone();
-                                    if cwd_str.is_empty() { None } else { Some(cwd_str) }
+                                    if cwd_str.is_empty() {
+                                        None
+                                    } else {
+                                        Some(cwd_str)
+                                    }
                                 };
 
                                 let exit_code = pending_exit_code_rc.get();
@@ -658,9 +687,10 @@ impl ReaderCtx {
                                     cols,
                                     recycled,
                                 );
-                                finished
-                                    .widget()
-                                    .insert_before(&block_list_rc, Some(active_rc.borrow().widget()));
+                                finished.widget().insert_before(
+                                    &block_list_rc,
+                                    Some(active_rc.borrow().widget()),
+                                );
 
                                 let was_user_scrolled = scroll_debouncer.user_scrolled_up.get();
 
@@ -677,7 +707,12 @@ impl ReaderCtx {
                                 let finished_clone = finished.clone();
                                 let finished_widget = finished_clone.widget().clone();
 
-                                finished_clone.connect_actions(&active_vte, &pty_for_init, &pty_synced_rc, &active_rc);
+                                finished_clone.connect_actions(
+                                    &active_vte,
+                                    &pty_for_init,
+                                    &pty_synced_rc,
+                                    &active_rc,
+                                );
                                 finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
@@ -692,7 +727,9 @@ impl ReaderCtx {
                                     if cfg.notify_long_blocks {
                                         if let Some(ms) = duration_ms {
                                             if ms >= cfg.notify_long_block_threshold_ms {
-                                                crate::notify::long_block_finished(&cmd, exit_code, ms);
+                                                crate::notify::long_block_finished(
+                                                    &cmd, exit_code, ms,
+                                                );
                                             }
                                         }
                                     }
@@ -728,7 +765,10 @@ impl ReaderCtx {
                                     }
 
                                     let popover = gtk4::Popover::new();
-                                    let widget: &gtk4::Widget = &finished_menu_clone.widget().clone().upcast::<gtk4::Widget>();
+                                    let widget: &gtk4::Widget = &finished_menu_clone
+                                        .widget()
+                                        .clone()
+                                        .upcast::<gtk4::Widget>();
                                     popover.set_parent(widget);
                                     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
                                         x as i32, y as i32, 1, 1,
@@ -758,8 +798,10 @@ impl ReaderCtx {
                                             popover_c.popdown();
                                             let prompt_text = finished_for_copy.prompt_text.clone();
                                             let cmd_text = finished_for_copy.cmd_text.clone();
-                                            let output_text = strip_ansi(&finished_for_copy.full_output.borrow());
-                                            let full_text = format!("{}\n{}\n{}", prompt_text, cmd_text, output_text);
+                                            let full_text =
+                                                finished_for_copy.with_stripped_output(|output| {
+                                                    format!("{prompt_text}\n{cmd_text}\n{output}")
+                                                });
                                             vte_for_action.clipboard().set_text(&full_text);
                                         });
                                         vbox.append(&item);
@@ -774,7 +816,9 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let blocks = block_data_for_json.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_json) {
+                                            if let Some(block) =
+                                                blocks.iter().find(|b| b.id == block_id_json)
+                                            {
                                                 let json = block.to_json();
                                                 vte_for_json.clipboard().set_text(&json);
                                             }
@@ -791,7 +835,9 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             let blocks = block_data_for_md.borrow();
-                                            if let Some(block) = blocks.iter().find(|b| b.id == block_id_md) {
+                                            if let Some(block) =
+                                                blocks.iter().find(|b| b.id == block_id_md)
+                                            {
                                                 let markdown = block.to_markdown();
                                                 vte_for_md.clipboard().set_text(&markdown);
                                             }
@@ -802,15 +848,19 @@ impl ReaderCtx {
                                     {
                                         let item = make_item("Delete Block");
                                         let popover_c = popover.clone();
-                                        let finished_blocks_for_delete = finished_blocks_for_menu.clone();
+                                        let finished_blocks_for_delete =
+                                            finished_blocks_for_menu.clone();
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
                                         let selected_for_delete = selected_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let mut blocks = finished_blocks_for_delete.borrow_mut();
-                                            if let Some(pos) = blocks.iter().position(|b| b.id == block_id_del) {
+                                            let mut blocks =
+                                                finished_blocks_for_delete.borrow_mut();
+                                            if let Some(pos) =
+                                                blocks.iter().position(|b| b.id == block_id_del)
+                                            {
                                                 let block = blocks.remove(pos);
                                                 block_list_for_delete.remove(block.widget());
                                             }
@@ -818,7 +868,9 @@ impl ReaderCtx {
                                                 selected_for_delete.set(None);
                                             }
                                             // Keep block_data in lockstep with the widget list.
-                                            block_data_for_delete.borrow_mut().retain(|b| b.id != block_id_del);
+                                            block_data_for_delete
+                                                .borrow_mut()
+                                                .retain(|b| b.id != block_id_del);
                                         });
                                         vbox.append(&item);
                                     }
@@ -917,7 +969,9 @@ impl ReaderCtx {
                         ParserEvent::CommandStart => {
                             ftcs_seen_rc.set(true);
                             let state = bstate_rc.get();
-                            if state == BlockState::CollectingOutput || state == BlockState::AltScreen {
+                            if state == BlockState::CollectingOutput
+                                || state == BlockState::AltScreen
+                            {
                                 osc133_depth_rc.set(osc133_depth_rc.get() + 1);
                                 continue;
                             }
@@ -966,7 +1020,9 @@ impl ReaderCtx {
 
                         ParserEvent::CommandEnd(code) => {
                             let state = bstate_rc.get();
-                            if state != BlockState::CollectingOutput && state != BlockState::AltScreen {
+                            if state != BlockState::CollectingOutput
+                                && state != BlockState::AltScreen
+                            {
                                 continue;
                             }
                             if osc133_depth_rc.get() > 0 {
@@ -1118,6 +1174,68 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     // count for their live active VTE, matching jterm1's block-mode behavior.
     let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
+}
+
+fn compute_viewport_state(
+    block_data: &VecDeque<BlockData>,
+    visible_top: i32,
+    visible_bottom: i32,
+) -> ViewportState {
+    let mut y = 0;
+    let mut first = None;
+    let mut last = 0;
+    let mut iter = block_data.iter().enumerate();
+
+    while let Some((i, block)) = iter.next() {
+        let block_top = y;
+        let block_bottom = y + block.estimated_height;
+        if first.is_none() && block_bottom > visible_top {
+            first = Some(i);
+        }
+        if block_top < visible_bottom {
+            last = i;
+        }
+        y = block_bottom;
+
+        if first.is_some() && y >= visible_bottom {
+            for (_, block) in iter {
+                y += block.estimated_height;
+            }
+            break;
+        }
+    }
+
+    ViewportState {
+        first_visible: first.unwrap_or(0),
+        last_visible: last,
+        total_height: y,
+    }
+}
+
+fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet<usize> {
+    let mut new_visible = std::collections::HashSet::new();
+    for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
+        new_visible.insert(i);
+    }
+    new_visible
+}
+
+fn apply_visible_indices(
+    finished: &[FinishedBlock],
+    visible: &mut std::collections::HashSet<usize>,
+    new_visible: std::collections::HashSet<usize>,
+) {
+    for &i in visible.difference(&new_visible) {
+        if let Some(block) = finished.get(i) {
+            block.widget().set_visible(false);
+        }
+    }
+    for &i in new_visible.difference(visible) {
+        if let Some(block) = finished.get(i) {
+            block.widget().set_visible(true);
+        }
+    }
+    *visible = new_visible;
 }
 
 /// Hand the viewport to an alt-screen app: hide every finished block so the live
@@ -2374,6 +2492,7 @@ impl TermView {
             let finished_blocks = term_view.finished_blocks.clone();
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
+            let visibility_update_pending = Rc::new(Cell::new(false));
 
             let vadjust = block_scroll.vadjustment();
             vadjust.connect_changed(move |_| {
@@ -2390,56 +2509,35 @@ impl TermView {
                 let visible_bottom = scroll_top + viewport_height + margin;
 
                 let block_data_ref = block_data.borrow();
-                let mut y = 0;
-                let mut first = None;
-                let mut last = 0;
-
-                for (i, block) in block_data_ref.iter().enumerate() {
-                    if first.is_none() && y + block.estimated_height > visible_top {
-                        first = Some(i);
-                    }
-                    if y < visible_bottom {
-                        last = i;
-                    }
-                    y += block.estimated_height;
-                }
+                let next_viewport =
+                    compute_viewport_state(&block_data_ref, visible_top, visible_bottom);
 
                 let mut vp = viewport.borrow_mut();
-                vp.first_visible = first.unwrap_or(0);
-                vp.last_visible = last;
-                vp.total_height = y;
+                *vp = next_viewport;
                 drop(vp);
+
+                if visibility_update_pending.get() {
+                    return;
+                }
+                visibility_update_pending.set(true);
 
                 // Schedule visibility update on next idle
                 let vp = viewport.clone();
                 let finished = finished_blocks.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
+                let pending = visibility_update_pending.clone();
                 glib::idle_add_local_once(move || {
+                    pending.set(false);
                     if fullscreen.get() {
                         return;
                     }
                     let vp_ref = vp.borrow();
-                    let mut new_visible = std::collections::HashSet::new();
-
-                    for i in
-                        vp_ref.first_visible..=vp_ref.last_visible.min(vp_ref.first_visible + 1000)
-                    {
-                        new_visible.insert(i);
-                    }
+                    let new_visible = visible_indices_for_viewport(&vp_ref);
 
                     let finished_ref = finished.borrow();
                     let mut visible_ref = visible.borrow_mut();
-
-                    for (i, block) in finished_ref.iter().enumerate() {
-                        if new_visible.contains(&i) && !visible_ref.contains(&i) {
-                            block.widget().set_visible(true);
-                        } else if !new_visible.contains(&i) && visible_ref.contains(&i) {
-                            block.widget().set_visible(false);
-                        }
-                    }
-
-                    *visible_ref = new_visible;
+                    apply_visible_indices(&finished_ref, &mut visible_ref, new_visible);
                 });
             });
         }
@@ -2762,49 +2860,20 @@ impl TermView {
         let visible_bottom = scroll_top + viewport_height + margin;
 
         let block_data = self.block_data.borrow();
-        let mut y = 0;
-        let mut first = None;
-        let mut last = 0;
-
-        for (i, block) in block_data.iter().enumerate() {
-            if first.is_none() && y + block.estimated_height > visible_top {
-                first = Some(i);
-            }
-            if y < visible_bottom {
-                last = i;
-            }
-            y += block.estimated_height;
-        }
+        let next_viewport = compute_viewport_state(&block_data, visible_top, visible_bottom);
 
         let mut vp = self.viewport.borrow_mut();
-        vp.first_visible = first.unwrap_or(0);
-        vp.last_visible = last;
-        vp.total_height = y;
+        *vp = next_viewport;
     }
 
     /// Update block visibility based on viewport: show visible blocks, hide off-screen ones.
     pub fn update_block_visibility(&self) {
         let vp = self.viewport.borrow().clone();
-        let mut new_visible = std::collections::HashSet::new();
-
-        // Only show blocks in the visible range
-        for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
-            new_visible.insert(i);
-        }
+        let new_visible = visible_indices_for_viewport(&vp);
 
         let finished = self.finished_blocks.borrow();
         let mut visible = self.visible_indices.borrow_mut();
-
-        // Update visibility: hide blocks not in new_visible, show blocks in new_visible
-        for (i, block) in finished.iter().enumerate() {
-            if new_visible.contains(&i) && !visible.contains(&i) {
-                block.widget().set_visible(true);
-            } else if !new_visible.contains(&i) && visible.contains(&i) {
-                block.widget().set_visible(false);
-            }
-        }
-
-        *visible = new_visible;
+        apply_visible_indices(&finished, &mut visible, new_visible);
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -2972,8 +3041,12 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce_bytes_events, strip_ansi, strip_ansi_with_clear_detect};
+    use super::{
+        coalesce_bytes_events, compute_viewport_state, strip_ansi, strip_ansi_with_clear_detect,
+        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, ViewportState,
+    };
     use crate::parser::ParserEvent;
+    use std::collections::VecDeque;
 
     fn ev_summary(events: &[ParserEvent]) -> Vec<String> {
         events
@@ -2989,6 +3062,73 @@ mod tests {
                 _ => "?".to_string(),
             })
             .collect()
+    }
+
+    fn block_with_height(estimated_height: i32) -> BlockData {
+        BlockData {
+            id: 0,
+            prompt: String::new(),
+            cmd: String::new(),
+            cmd_markup: None,
+            output: String::new(),
+            exit_code: 0,
+            estimated_height,
+            line_count: 0,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 0,
+        }
+    }
+
+    #[test]
+    fn viewport_state_keeps_total_height_after_visible_range() {
+        let blocks: VecDeque<BlockData> = [10, 20, 30, 40]
+            .into_iter()
+            .map(block_with_height)
+            .collect();
+
+        let vp = compute_viewport_state(&blocks, 15, 55);
+
+        assert_eq!(vp.first_visible, 1);
+        assert_eq!(vp.last_visible, 2);
+        assert_eq!(vp.total_height, 100);
+    }
+
+    #[test]
+    fn visible_indices_are_capped_to_reasonable_window() {
+        let vp = ViewportState {
+            first_visible: 10,
+            last_visible: 2_000,
+            total_height: 0,
+        };
+
+        let visible = visible_indices_for_viewport(&vp);
+
+        assert!(visible.contains(&10));
+        assert!(visible.contains(&1010));
+        assert!(!visible.contains(&1011));
+        assert_eq!(visible.len(), 1001);
+    }
+
+    #[test]
+    fn truncate_plain_output_passthrough_counts_trimmed_lines() {
+        let (text, lines) = truncate_plain_output_for_height("\nalpha\nbeta\n", 10);
+
+        assert_eq!(text, "alpha\nbeta");
+        assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn truncate_plain_output_collects_only_visible_prefix() {
+        let (text, lines) = truncate_plain_output_for_height("a\nb\nc\nd", 2);
+
+        assert_eq!(
+            text,
+            "a\nb\n\n[... truncated: 4 lines total, showing first 2]"
+        );
+        assert_eq!(lines, 4);
     }
 
     #[test]
