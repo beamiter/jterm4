@@ -25,6 +25,7 @@ use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use config::{choose_shell_argv, config_file_path, load_config};
@@ -75,28 +76,132 @@ fn init_logging() {
     log::set_max_level(level);
 }
 
-/// Make the fcitx5 GTK4 input-method module discoverable before GTK initializes,
-/// so CJK preedit/commit works even when the binary is launched outside the nix
+fn env_is_unset(k: &str) -> bool {
+    std::env::var_os(k).map_or(true, |v| v.is_empty())
+}
+
+fn gtk_path_has_fcitx_module(path: &Path) -> bool {
+    path.join("4.0.0/immodules/im-fcitx5.so").exists()
+        || path.join("4.0.0/immodules/im-fcitx.so").exists()
+        || path.join("4.0.0/immodules/libim-fcitx5.so").exists()
+        || path.join("4.0.0/immodules/libim-fcitx.so").exists()
+}
+
+fn gtk_path_has_ibus_module(path: &Path) -> bool {
+    path.join("4.0.0/immodules/im-ibus.so").exists()
+        || path.join("4.0.0/immodules/libim-ibus.so").exists()
+}
+
+fn gtk_path_has_xim_module(path: &Path) -> bool {
+    path.join("4.0.0/immodules/im-xim.so").exists()
+        || path.join("4.0.0/immodules/libim-xim.so").exists()
+}
+
+fn candidate_fcitx_gtk_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(path) = option_env!("FCITX5_GTK_PATH").filter(|p| !p.is_empty()) {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("FCITX5_GTK_PATH").filter(|p| !p.is_empty()) {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|p| !p.is_empty()) {
+        paths.push(PathBuf::from(home).join(".nix-profile/lib/gtk-4.0"));
+    }
+
+    paths.extend(
+        [
+            "/run/current-system/sw/lib/gtk-4.0",
+            "/usr/lib/gtk-4.0",
+            "/usr/lib64/gtk-4.0",
+            "/usr/lib/x86_64-linux-gnu/gtk-4.0",
+            "/usr/local/lib/gtk-4.0",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+
+    paths
+}
+
+fn prepend_gtk_path_if_missing(path: &Path) {
+    let existing = std::env::var_os("GTK_PATH").unwrap_or_default();
+    let already_present = std::env::split_paths(&existing).any(|p| p == path);
+    if already_present {
+        return;
+    }
+
+    let mut paths = vec![path.to_path_buf()];
+    paths.extend(std::env::split_paths(&existing));
+    match std::env::join_paths(paths) {
+        Ok(combined) => unsafe { std::env::set_var("GTK_PATH", combined) },
+        Err(err) => log::warn!("Failed to build GTK_PATH for input method: {err}"),
+    }
+}
+
+fn should_use_xim_for_fcitx4(fcitx_gtk_path_found: bool, xim_gtk_path_found: bool) -> bool {
+    !fcitx_gtk_path_found
+        && xim_gtk_path_found
+        && std::env::var("XMODIFIERS")
+            .map(|s| s.contains("fcitx"))
+            .unwrap_or(false)
+        && !std::env::var_os("DISPLAY").map_or(true, |v| v.is_empty())
+}
+
+/// Make the GTK4 input-method module discoverable before GTK initializes, so
+/// CJK preedit/commit works even when the binary is launched outside the nix
 /// dev shell.
 fn init_input_method_env() {
-    let is_unset = |k: &str| std::env::var_os(k).map_or(true, |v| v.is_empty());
+    let candidates = candidate_fcitx_gtk_paths();
+    let fcitx_gtk_path = candidates.iter().find(|p| gtk_path_has_fcitx_module(p));
+    let ibus_gtk_path = candidates.iter().find(|p| gtk_path_has_ibus_module(p));
+    let xim_gtk_path = candidates.iter().find(|p| gtk_path_has_xim_module(p));
 
-    if let Some(fcitx_gtk_path) = option_env!("FCITX5_GTK_PATH") {
-        if !fcitx_gtk_path.is_empty() {
-            let combined = match std::env::var_os("GTK_PATH") {
-                Some(existing) if !existing.is_empty() => {
-                    format!("{fcitx_gtk_path}:{}", existing.to_string_lossy())
-                }
-                _ => fcitx_gtk_path.to_string(),
-            };
-            unsafe { std::env::set_var("GTK_PATH", combined) };
+    if let Some(path) = fcitx_gtk_path.as_deref() {
+        prepend_gtk_path_if_missing(path);
+        log::debug!("Using fcitx GTK4 input module path {}", path.display());
+    } else if let Some(path) = ibus_gtk_path.as_deref() {
+        prepend_gtk_path_if_missing(path);
+        log::debug!("Using ibus GTK4 input module path {}", path.display());
+    } else if let Some(path) = xim_gtk_path.as_deref() {
+        prepend_gtk_path_if_missing(path);
+        log::debug!("Using xim GTK4 input module path {}", path.display());
+    }
+
+    let use_xim_for_fcitx4 =
+        should_use_xim_for_fcitx4(fcitx_gtk_path.is_some(), xim_gtk_path.is_some());
+    let gtk_im_module = std::env::var("GTK_IM_MODULE").unwrap_or_default();
+    if gtk_im_module == "fcitx" && use_xim_for_fcitx4 {
+        unsafe { std::env::set_var("GTK_IM_MODULE", "xim") };
+        log::warn!(
+            "GTK_IM_MODULE=fcitx but no GTK4 fcitx module was found; using xim via XMODIFIERS for fcitx4"
+        );
+    } else if gtk_im_module == "fcitx" && fcitx_gtk_path.is_none() {
+        log::warn!(
+            "GTK_IM_MODULE=fcitx but no GTK4 fcitx module was found. fcitx4 needs a GTK4 fcitx/xim module; install fcitx5-gtk or use ibus for GTK4 apps."
+        );
+    } else if env_is_unset("GTK_IM_MODULE") {
+        let xmods = std::env::var("XMODIFIERS").unwrap_or_default();
+        let module = if use_xim_for_fcitx4 {
+            "xim"
+        } else if xmods.contains("ibus")
+            || (!std::env::var_os("IBUS_ADDRESS").map_or(true, |v| v.is_empty())
+                && fcitx_gtk_path.is_none())
+            || (fcitx_gtk_path.is_none() && ibus_gtk_path.is_some())
+        {
+            "ibus"
+        } else {
+            "fcitx"
+        };
+        unsafe { std::env::set_var("GTK_IM_MODULE", module) };
+    }
+
+    if env_is_unset("XMODIFIERS") {
+        let module = std::env::var("GTK_IM_MODULE").unwrap_or_else(|_| "fcitx".to_string());
+        if matches!(module.as_str(), "fcitx" | "ibus") {
+            unsafe { std::env::set_var("XMODIFIERS", format!("@im={module}")) };
         }
-    }
-    if is_unset("GTK_IM_MODULE") {
-        unsafe { std::env::set_var("GTK_IM_MODULE", "fcitx") };
-    }
-    if is_unset("XMODIFIERS") {
-        unsafe { std::env::set_var("XMODIFIERS", "@im=fcitx") };
     }
 }
 
@@ -142,8 +247,8 @@ fn connect_file_tree_handlers(file_tree: &gtk4::TreeView, ui: &UiState) {
 }
 
 fn main() -> glib::ExitCode {
-    init_input_method_env();
     init_logging();
+    init_input_method_env();
 
     // NON_UNIQUE: each launch is its own process with its own window, instead of
     // the second invocation activating the first instance and then exiting.

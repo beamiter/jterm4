@@ -1157,6 +1157,27 @@ fn exit_fullscreen(
     }
 }
 
+fn running_root_control_bytes(
+    keyval: gtk4::gdk::Key,
+    modifiers: gtk4::gdk::ModifierType,
+) -> Option<&'static [u8]> {
+    use gtk4::gdk::Key;
+
+    let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
+    let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
+    if !ctrl || alt {
+        return None;
+    }
+
+    if matches!(keyval, Key::c | Key::C) {
+        Some(b"\x03")
+    } else if matches!(keyval, Key::d | Key::D) {
+        Some(b"\x04")
+    } else {
+        None
+    }
+}
+
 /// Captures the handles the live-VTE key handler needs. With the VTE owning line
 /// editing + IME natively (jterm1 model), this is reduced to a Capture-phase
 /// navigation / copy-paste / block-selection handler; printable keys and editing
@@ -2127,17 +2148,17 @@ impl TermView {
             });
         }
 
-        // When a normal command is running, the visible command/output lives in
-        // the running block and the active VTE is hidden to avoid an empty input
-        // card at the bottom. Keep basic terminal input working by forwarding
-        // common keys from the focusable root directly to the PTY.
+        // While a normal command is running, the active VTE is still the live
+        // terminal surface. Let it own printable keys, Enter, Backspace, control
+        // sequences, and IME preedit/commit. This root capture handler is only a
+        // focus fallback for interrupt/EOF; forwarding text here would bypass
+        // GTK's input method context and break CJK composition.
         {
             let pty_for_root_key = pty.clone();
             let bstate_for_root_key = bstate.clone();
             let root_key = gtk4::EventControllerKey::new();
             root_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
             root_key.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
-                use gtk4::gdk::Key;
                 if !matches!(
                     bstate_for_root_key.get(),
                     BlockState::CollectingOutput | BlockState::PostCommand
@@ -2145,30 +2166,9 @@ impl TermView {
                     return glib::Propagation::Proceed;
                 }
 
-                let ctrl = modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
-                let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
-                if ctrl && !alt && matches!(keyval, Key::c | Key::C) {
-                    pty_for_root_key.write_bytes(b"\x03");
+                if let Some(bytes) = running_root_control_bytes(keyval, modifiers) {
+                    pty_for_root_key.write_bytes(bytes);
                     return glib::Propagation::Stop;
-                }
-                if ctrl && !alt && matches!(keyval, Key::d | Key::D) {
-                    pty_for_root_key.write_bytes(b"\x04");
-                    return glib::Propagation::Stop;
-                }
-                if !ctrl && !alt && matches!(keyval, Key::Return | Key::KP_Enter) {
-                    pty_for_root_key.write_bytes(b"\r");
-                    return glib::Propagation::Stop;
-                }
-                if !ctrl && !alt && matches!(keyval, Key::BackSpace) {
-                    pty_for_root_key.write_bytes(b"\x7f");
-                    return glib::Propagation::Stop;
-                }
-                if !ctrl && !alt {
-                    if let Some(ch) = keyval.to_unicode() {
-                        let mut buf = [0u8; 4];
-                        pty_for_root_key.write_bytes(ch.encode_utf8(&mut buf).as_bytes());
-                        return glib::Propagation::Stop;
-                    }
                 }
 
                 glib::Propagation::Proceed
@@ -3229,6 +3229,39 @@ mod tests {
         assert_eq!(
             strip_ansi_with_clear_detect("\u{1b}[0J"),
             ("".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn running_root_handler_only_falls_back_for_interrupt_and_eof() {
+        use gtk4::gdk::{Key, ModifierType};
+
+        assert_eq!(
+            super::running_root_control_bytes(Key::c, ModifierType::CONTROL_MASK),
+            Some(b"\x03".as_slice())
+        );
+        assert_eq!(
+            super::running_root_control_bytes(Key::D, ModifierType::CONTROL_MASK),
+            Some(b"\x04".as_slice())
+        );
+        assert_eq!(
+            super::running_root_control_bytes(Key::a, ModifierType::empty()),
+            None
+        );
+        assert_eq!(
+            super::running_root_control_bytes(Key::Return, ModifierType::empty()),
+            None
+        );
+        assert_eq!(
+            super::running_root_control_bytes(Key::BackSpace, ModifierType::empty()),
+            None
+        );
+        assert_eq!(
+            super::running_root_control_bytes(
+                Key::c,
+                ModifierType::CONTROL_MASK | ModifierType::ALT_MASK
+            ),
+            None
         );
     }
 
