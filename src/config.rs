@@ -112,6 +112,33 @@ fn control_socket_dir() -> Option<PathBuf> {
     Some(base)
 }
 
+fn shell_single_quote(s: &str) -> String {
+    let mut quoted = String::with_capacity(s.len() + 2);
+    quoted.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn wrap_exec_in_login_bash(command: &str) -> String {
+    format!("bash -lc 'exec {}'", command.replace('\'', "'\\''"))
+}
+
+fn wrap_rsh_argv_in_interactive_bash(rsh_path: &str) -> Option<Vec<String>> {
+    let bash_path = find_executable_in_path("bash")?;
+    Some(vec![
+        bash_path.to_string_lossy().to_string(),
+        "-ic".to_string(),
+        format!("exec {}", shell_single_quote(rsh_path)),
+    ])
+}
+
 /// Build the local argv that connects to a remote host via ssh.
 /// Produces e.g. `["ssh", "-t", "-p", "2222", "mm@100.x.x.x", "rsh --session home-main"]`.
 pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
@@ -125,10 +152,7 @@ pub(crate) fn build_remote_argv(host: &RemoteHost) -> Vec<String> {
         remote_cmd.push_str(sid);
     }
     if host.login_shell {
-        // Wrap in a login shell so the remote profile populates PATH before exec.
-        // Single-quote the payload and escape any embedded quotes.
-        let escaped = remote_cmd.replace('\'', "'\\''");
-        remote_cmd = format!("bash -lc 'exec {escaped}'");
+        remote_cmd = wrap_exec_in_login_bash(&remote_cmd);
     }
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     if host.multiplex {
@@ -1035,20 +1059,6 @@ fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn shell_single_quote(s: &str) -> String {
-    let mut quoted = String::with_capacity(s.len() + 2);
-    quoted.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(path) = configured_shell {
@@ -1058,12 +1068,8 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
             if shell_name == "rsh" {
-                if let Some(bash_path) = find_executable_in_path("bash") {
-                    return vec![
-                        bash_path.to_string_lossy().to_string(),
-                        "-ic".to_string(),
-                        format!("exec {}", shell_single_quote(path)),
-                    ];
+                if let Some(argv) = wrap_rsh_argv_in_interactive_bash(path) {
+                    return argv;
                 }
             }
             return vec![path.to_string()];
@@ -1076,12 +1082,8 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 
     // Prefer rsh when it's on PATH.
     if let Some(rsh_path) = find_executable_in_path("rsh") {
-        if let Some(bash_path) = find_executable_in_path("bash") {
-            return vec![
-                bash_path.to_string_lossy().to_string(),
-                "-ic".to_string(),
-                format!("exec {}", shell_single_quote(&rsh_path.to_string_lossy())),
-            ];
+        if let Some(argv) = wrap_rsh_argv_in_interactive_bash(&rsh_path.to_string_lossy()) {
+            return argv;
         }
         return vec![rsh_path.to_string_lossy().to_string()];
     }
