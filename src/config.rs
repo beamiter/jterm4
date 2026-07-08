@@ -1035,10 +1035,37 @@ fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+fn shell_single_quote(s: &str) -> String {
+    let mut quoted = String::with_capacity(s.len() + 2);
+    quoted.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(path) = configured_shell {
         if is_executable(Path::new(path)) {
+            let shell_name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if shell_name == "rsh" {
+                if let Some(bash_path) = find_executable_in_path("bash") {
+                    return vec![
+                        bash_path.to_string_lossy().to_string(),
+                        "-ic".to_string(),
+                        format!("exec {}", shell_single_quote(path)),
+                    ];
+                }
+            }
             return vec![path.to_string()];
         }
         log::warn!(
@@ -1049,6 +1076,13 @@ pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
 
     // Prefer rsh when it's on PATH.
     if let Some(rsh_path) = find_executable_in_path("rsh") {
+        if let Some(bash_path) = find_executable_in_path("bash") {
+            return vec![
+                bash_path.to_string_lossy().to_string(),
+                "-ic".to_string(),
+                format!("exec {}", shell_single_quote(&rsh_path.to_string_lossy())),
+            ];
+        }
         return vec![rsh_path.to_string_lossy().to_string()];
     }
 
@@ -1114,6 +1148,13 @@ mod tests {
             argv.last().unwrap(),
             r#"bash -lc 'exec /home/yj/.cargo/bin/rsh --session it'\''s'"#
         );
+    }
+
+    #[test]
+    fn local_rsh_is_wrapped_in_interactive_bash() {
+        let argv = choose_shell_argv(Some("/home/yj/.cargo/bin/rsh"));
+        assert_eq!(argv[1], "-ic");
+        assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/rsh'");
     }
 
     #[test]
