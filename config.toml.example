@@ -70,6 +70,10 @@ virtual_scroll_margin = 5
 # 是否压缩块历史
 block_history_compress = true
 
+# Also retain completed output in the live VTE. This duplicates finished blocks,
+# so the default is false; enable only when native VTE PageUp history is preferred.
+preserve_live_scrollback = false
+
 # ============================================================================
 # 快捷键配置
 # ============================================================================

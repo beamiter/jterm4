@@ -8,11 +8,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use vte4::Terminal;
-use vte4::{TerminalExt, TerminalExtManual};
+use vte4::TerminalExt;
 
 use crate::config::Config;
 use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
+use crate::terminal::apply_terminal_theme;
 
 mod alt_screen;
 mod ansi;
@@ -104,6 +105,23 @@ fn sample_output_for_event(output: &str) -> String {
         tail_start.saturating_sub(head_end),
         &output[tail_start..]
     )
+}
+
+/// Shell integration normally places PromptEnd after the prompt, so the VTE
+/// range starts at the first command cell. Some prompt integrations emit the
+/// marker early; in that case the captured range includes the rendered prompt.
+/// Finished blocks already represent the prompt with their own chevron/header,
+/// so remove only an exact leading prompt to avoid duplicated, drifting command
+/// rows such as `❯ yj ~ ❯ pwd`.
+fn normalize_captured_command(captured: &str, prompt: &str) -> String {
+    let captured = captured.trim();
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        if let Some(command) = captured.strip_prefix(prompt) {
+            return command.trim_start().to_string();
+        }
+    }
+    captured.to_string()
 }
 
 fn truncate_plain_output_for_height(output_plain: &str, line_limit: usize) -> (String, usize) {
@@ -248,10 +266,9 @@ fn install_finished_block_selection(
 /// command's output.
 const MAX_RAW_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-/// Minimum rows the live input cell is guaranteed when idle (warp-style compact
-/// input): it shrinks to fit the prompt + typed command but never below this, so
-/// there is always usable room to type. It grows with multiline input up to the
-/// viewport, and is forced to the full viewport only for alt-screen apps.
+/// Visual floor for the live prompt/editor while no command owns the screen.
+/// This does not become the PTY's row count: the child always receives the full
+/// viewport winsize via `pty_grid_size`.
 const MIN_INPUT_ROWS: i32 = 6;
 
 type BlockFinishedCallbacks = Rc<RefCell<Vec<Box<dyn Fn(String, i32, String)>>>>;
@@ -267,9 +284,8 @@ pub struct TermView {
     bstate: Rc<Cell<BlockState>>,
     #[allow(dead_code)]
     prompt_buf: Rc<RefCell<String>>,
-    /// Keystroke shadow used only to size the idle input cell (line count). The
-    /// authoritative finished-command text is read off the live VTE at
-    /// CommandStart, so this never has to round-trip to display.
+    /// Keystroke shadow used only as a fallback command capture. The authoritative
+    /// finished-command text is read off the live VTE at CommandStart.
     #[allow(dead_code)]
     typed_cmd: Rc<RefCell<String>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
@@ -371,11 +387,9 @@ struct ReaderCtx {
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
-    /// Re-runs the input-cell sizing (`update_input_height`). Called at every
-    /// FTCS state transition so the live VTE switches between compact (idle)
-    /// and viewport (running / alt-screen) deterministically — without waiting
-    /// for the next `contents_changed` to race with the child's first draw.
-    resize_active: Rc<dyn Fn()>,
+    /// Switches the live surface between compact prompt and full-screen layouts.
+    /// PTY geometry is deliberately synchronized separately.
+    layout_active_surface: Rc<dyn Fn()>,
     /// Bottom-of-pane repo metadata label. Re-probed every time a block
     /// finishes (the user may have just run `git commit`, `git pull`,
     /// or anything else that changes branch/dirty/ahead-behind).
@@ -477,7 +491,7 @@ impl ReaderCtx {
             selected_block_id_rc,
             cmd_running_rc,
             running_cmd_rc,
-            resize_active,
+            layout_active_surface,
             repo_strip,
             block_finished_cbs,
         } = self;
@@ -913,11 +927,14 @@ impl ReaderCtx {
                             }
                             bstate_rc.set(BlockState::CollectingPrompt);
                             prompt_buf_rc.borrow_mut().clear();
-                            // Live VTE collapses back to the compact input cell
-                            // now that no command is running. Sync the PTY size
-                            // so the shell sees the new winsize before it reads
-                            // anything past the prompt.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            // Reassert the stable viewport grid before the shell
+                            // renders the next prompt.
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -950,7 +967,7 @@ impl ReaderCtx {
                             prompt_end_pos_rc.set((col, row));
                             pty_synced_rc.set(false);
                             bstate_rc.set(BlockState::AwaitingCommand);
-                            resize_active();
+                            layout_active_surface();
                             let active_for_focus = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_focus.borrow().grab_focus();
@@ -991,7 +1008,7 @@ impl ReaderCtx {
                             // shell echoes a newline and starts the command).
                             let (cmd_end_col, cmd_end_row) = active_vte.cursor_position();
                             let (start_col, start_row) = prompt_end_pos_rc.get();
-                            let cmd_from_vte = active_vte
+                            let captured = active_vte
                                 .text_range_format(
                                     vte4::Format::Text,
                                     start_row,
@@ -1001,9 +1018,9 @@ impl ReaderCtx {
                                 )
                                 .0
                                 .map(|gs| gs.to_string())
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
+                                .unwrap_or_default();
+                            let cmd_from_vte =
+                                normalize_captured_command(&captured, &prompt_display_rc.borrow());
                             *vte_typed_cmd_rc.borrow_mut() = cmd_from_vte.clone();
                             *running_cmd_rc.borrow_mut() = cmd_from_vte;
                             cmd_running_rc.set(true);
@@ -1014,7 +1031,12 @@ impl ReaderCtx {
                             // runs, then snapshot it into a finished block on the
                             // next prompt. Interactive CLIs such as Codex rely on
                             // VTE applying cursor positioning/redraws directly.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
@@ -1039,7 +1061,7 @@ impl ReaderCtx {
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
-                                resize_active();
+                                layout_active_surface();
                             }
                             pending_exit_code_rc.set(*code);
                             cmd_running_rc.set(false);
@@ -1065,7 +1087,12 @@ impl ReaderCtx {
                             );
                             // Grow the live VTE to the full viewport before the
                             // app draws (see sync_active_to_pty doc).
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             active_vte.feed(b"\x1b[?1049h");
                         }
 
@@ -1084,9 +1111,14 @@ impl ReaderCtx {
                             );
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
-                            // Collapse the live VTE back to the compact input cell
-                            // now that the alt app has released the viewport.
-                            sync_active_to_pty(&resize_active, &active_vte, &pty_for_init);
+                            // The primary and alternate screens share the same
+                            // viewport-sized grid, just like regular VTE mode.
+                            sync_active_to_pty(
+                                &layout_active_surface,
+                                &active_vte,
+                                &block_scroll_rc,
+                                &pty_for_init,
+                            );
                             let active_for_idle = active_rc.clone();
                             glib::idle_add_local_once(move || {
                                 active_for_idle.borrow().grab_focus();
@@ -1150,17 +1182,30 @@ impl ReaderCtx {
     }
 }
 
-/// Run `resize_active` (recompute target rows from layout + state) and then push
-/// the resulting (cols, rows) to the PTY synchronously. Used at state
+/// Lay out the live surface and push the full viewport grid to the PTY
+/// synchronously. The visual surface may be compact while the user is typing,
+/// but terminal geometry remains identical to regular VTE mode. Used at state
 /// transitions where the child needs to see a correct winsize on its very first
 /// read — `top` queries TIOCGWINSZ before painting, less/vim do the same.
 /// Without the synchronous push the per-frame resize tick would catch up only
 /// on the next frame, racing with the child.
-fn sync_active_to_pty(resize_active: &Rc<dyn Fn()>, vte: &Terminal, pty: &OwnedPty) {
-    resize_active();
-    let cols = vte.column_count().max(1) as u16;
-    let rows = vte.row_count().max(1) as u16;
+fn sync_active_to_pty(
+    layout_active_surface: &Rc<dyn Fn()>,
+    vte: &Terminal,
+    scroll: &ScrolledWindow,
+    pty: &OwnedPty,
+) {
+    layout_active_surface();
+    let (cols, rows) = pty_grid_size(vte, scroll);
     pty.resize(cols, rows);
+}
+
+fn pty_grid_size(vte: &Terminal, scroll: &ScrolledWindow) -> (u16, u16) {
+    let cols = vte.column_count().max(1) as u16;
+    let rows = viewport_rows_for(vte, scroll)
+        .unwrap_or_else(|| vte.row_count().max(1))
+        .clamp(1, u16::MAX as i64) as u16;
+    (cols, rows)
 }
 
 fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
@@ -1170,8 +1215,7 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
         return None;
     }
     // .block-active wraps the VTE with margin+border+padding; subtract it from
-    // page_size so the holder total fits. Running commands use this same row
-    // count for their live active VTE, matching jterm1's block-mode behavior.
+    // page_size so a full running surface fits exactly inside the pane.
     let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
@@ -1578,8 +1622,7 @@ impl TermView {
 
         // Block list inside a scrolled window
         let block_list = gtk4::Box::new(Orientation::Vertical, 0);
-        block_list.set_vexpand(true); // jterm1: expand so the active card fills
-                                      // the space left below finished blocks.
+        block_list.set_vexpand(true);
         block_list.add_css_class("block-list");
 
         let block_scroll = ScrolledWindow::new();
@@ -1603,10 +1646,9 @@ impl TermView {
 
         block_list.append(active.borrow().widget());
 
-        // The live VTE holder is NOT pinned to the full viewport. Its height is
-        // driven by `update_input_height` (installed after `bstate` exists below):
-        // compact (content-sized, min MIN_INPUT_ROWS) while idle so history shows
-        // above it (warp model), and full-viewport only for alt-screen apps.
+        // The live VTE is visually compact at a prompt and expands to the full
+        // viewport for running commands and terminal apps. PTY geometry remains
+        // viewport-sized in both cases.
 
         // ── Jump-to-bottom floating action button ─────────────────────────
         // Shown when the user scrolls up into history; an optional unread badge
@@ -1715,10 +1757,9 @@ impl TermView {
         // ── Shared state ──────────────────────────────────────────────────
         let bstate = Rc::new(Cell::new(BlockState::Idle));
 
-        // Keystroke-shadow command line; kept only to drive the idle input-cell
-        // height (newline count). The authoritative command text is read off the
-        // VTE at CommandStart, so this shadow is no longer load-bearing — it
-        // does not need to match the rendered line in edge cases.
+        // Keystroke-shadow command line. The authoritative command text is read
+        // off the VTE at CommandStart; this remains a best-effort fallback when
+        // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         // Command text snapshot taken at CommandStart from the VTE itself,
         // between `prompt_end_pos` and the current cursor. This is what
@@ -1736,14 +1777,12 @@ impl TermView {
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-        // ── Warp-style input-cell sizing ──────────────────────────────────
-        // The live VTE holder hugs its content (prompt + typed command) with a
-        // guaranteed minimum height while idle, so finished blocks remain visible
-        // above it. It is forced to the full viewport only for alt-screen apps
-        // (vim/less/TUIs) which need real terminal rows. During a running command
-        // the height is frozen at the idle value (no per-chunk resize / SIGWINCH
-        // thrash); the full output is snapshotted into a finished block when done.
-        let update_input_height: Rc<dyn Fn()> = {
+        // ── Hybrid live-surface layout ─────────────────────────────────────
+        // Idle prompts use a compact visual cell so completed output exists only
+        // once, in blocks above. Running commands and terminal apps receive the
+        // full live VTE. PTY rows are NOT taken from this visual height; see
+        // `pty_grid_size`, which always reports the full viewport to the child.
+        let layout_active_surface: Rc<dyn Fn()> = {
             let holder = active.borrow().widget().clone();
             let vte = active_vte.clone();
             let scroll = block_scroll.clone();
@@ -1756,51 +1795,22 @@ impl TermView {
                     return;
                 };
                 let cols = vte.column_count().max(1);
-                let state = bstate.get();
-                if matches!(
-                    state,
-                    BlockState::CollectingOutput | BlockState::PostCommand
-                ) {
-                    let target = (cols, viewport_rows);
-                    if last_size_target.get() != target {
-                        vte.set_size(cols, viewport_rows);
-                        last_size_target.set(target);
-                    }
-                    holder.set_visible(true);
-                    holder.set_height_request((viewport_rows as i32) * cell_h);
-                    return;
-                }
                 holder.set_visible(true);
-                let compact_rows = || {
+                let compact_rows = {
                     let input_lines =
                         1 + typed_cmd.borrow().bytes().filter(|&b| b == b'\n').count() as i64;
                     let floor = (MIN_INPUT_ROWS as i64).min(viewport_rows);
-                    let cap = viewport_rows.max(floor);
-                    input_lines.clamp(floor, cap)
+                    input_lines.clamp(floor, viewport_rows.max(floor))
                 };
-                let target_rows = match state {
-                    // A real terminal's grid is the viewport, always. While a
-                    // alt-screen app owns the screen, or while we fall back to
-                    // raw VTE (no OSC-133), keep the live VTE pinned to the full
-                    // viewport. Normal command output is rendered into the
-                    // running block above, so the live input cell can stay
-                    // compact instead of stealing the page.
-                    BlockState::AltScreen | BlockState::RawFallback => viewport_rows,
-                    // Between prompts the live cell collapses to fit the
-                    // typed command (warp-style compact input). Must NOT use
-                    // cursor_position().1 here: it's the absolute scrollback
-                    // row and climbs without bound across the session.
+                let target_rows = match bstate.get() {
                     BlockState::Idle
                     | BlockState::CollectingPrompt
-                    | BlockState::AwaitingCommand => compact_rows(),
-                    BlockState::CollectingOutput | BlockState::PostCommand => viewport_rows,
+                    | BlockState::AwaitingCommand => compact_rows,
+                    BlockState::CollectingOutput
+                    | BlockState::PostCommand
+                    | BlockState::AltScreen
+                    | BlockState::RawFallback => viewport_rows,
                 };
-                // Drive the VTE grid directly. `set_height_request` only sets a
-                // *minimum*, so it cannot shrink a VTE whose natural height
-                // (row_count * char_height) is larger — the cell would stay
-                // full-height. `set_size` sets the preferred grid, shrinking the
-                // VTE's natural height so the (non-expanding) holder collapses to
-                // it. The PTY-resize tick then follows row_count up/down.
                 let target = (cols, target_rows);
                 if last_size_target.get() != target {
                     vte.set_size(cols, target_rows);
@@ -1813,8 +1823,7 @@ impl TermView {
         // schedules at most one deferred scroll.
         let pin_pending: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
-            // Drive sizing from the data path (contents changed: prompt printed,
-            // user typing, output streaming, alt-screen toggle), and follow the
+            // Reassert the viewport grid from the data path and follow the
             // bottom from here too — NOT from the vadjustment `changed` signal.
             //
             // Why a deferred idle and not `changed`: pinning inside `changed`
@@ -1824,7 +1833,7 @@ impl TermView {
             // → … an infinite two-state oscillation. A low-priority idle runs once
             // per content burst, AFTER layout settles (so `upper` is final), and is
             // never re-triggered by the visibility side-effects of its own scroll.
-            let f = update_input_height.clone();
+            let f = layout_active_surface.clone();
             let scroll = block_scroll.clone();
             let user_scrolled = user_scrolled_up.clone();
             let programmatic = programmatic_scroll.clone();
@@ -2049,7 +2058,7 @@ impl TermView {
                 selected_block_id_rc: selected_block_id.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
-                resize_active: update_input_height.clone(),
+                layout_active_surface: layout_active_surface.clone(),
                 repo_strip: repo_strip.clone(),
                 block_finished_cbs: block_finished_callbacks.clone(),
             }
@@ -2062,16 +2071,10 @@ impl TermView {
         // value-vs-max "at bottom" math can never be trusted. Instead detect the
         // live bottom geometrically off the never-virtualized live VTE holder.
         //
-        // Key subtlety (see scroll.rs): in the normal follow state the holder is
-        // one full page tall and parked at its *top*, so its top edge sits a little
-        // below y=0 (≈ the just-finished block's height) and its bottom edge falls
-        // *below* the viewport. So neither "top≈0" nor "bottom inside viewport"
-        // alone is right. What actually distinguishes "following" from "scrolled
-        // up into history" is whether the live prompt is still on screen: while
-        // following, the holder's top is somewhere inside the viewport; scroll up
-        // far enough and the holder (prompt) slides off the bottom. So: at-bottom
-        // ⟺ holder top is above the viewport's bottom edge. Sampled on idle so it
-        // reflects the settled post-scroll layout.
+        // Compact and full-screen live layouts have different heights, so detect
+        // the invariant that matters: whether the live holder still intersects
+        // the viewport. Once its top moves below the viewport, the user is reading
+        // history and follow mode must stop. Sample on idle after layout settles.
         {
             let user_scrolled = user_scrolled_up.clone();
             let fab = jump_fab.clone();
@@ -2111,7 +2114,7 @@ impl TermView {
                 });
         }
 
-        // ── Re-clamp input height on viewport resize ──────────────────────
+        // ── Recompute the live grid on viewport resize ────────────────────
         // `changed` fires during the viewport's size-allocate, after layout. We
         // re-clamp the input height here ONLY when the viewport itself resized
         // (page_size moved) — content-driven sizing comes from the data path
@@ -2120,7 +2123,7 @@ impl TermView {
         // (hidden off-screen blocks collapse to 0 height) and oscillates forever.
         // The follow-bottom pin is the deferred idle scheduled on contents_changed.
         {
-            let f = update_input_height.clone();
+            let f = layout_active_surface.clone();
             let last_page = Rc::new(Cell::new(0.0f64));
             block_scroll.vadjustment().connect_changed(move |adj| {
                 let page = adj.page_size();
@@ -2244,10 +2247,8 @@ impl TermView {
                 pty_for_commit.write_bytes(text.as_bytes());
                 // The finished-block command text comes from a live-VTE
                 // text_range read at CommandStart (see PromptEnd / CommandStart
-                // handlers), so this shadow buffer is only used to size the
-                // input cell while idle (line count). We do not need to track
-                // escape sequences or replay deletes — newline count is what
-                // drives `update_input_height`.
+                // handlers), so this shadow buffer is only a fallback. It need
+                // not reproduce every line-editor escape sequence.
                 if bstate_for_commit.get() == BlockState::AwaitingCommand {
                     let mut cmd = typed_cmd_for_commit.borrow_mut();
                     for ch in text.chars() {
@@ -2551,19 +2552,15 @@ impl TermView {
         term_view
     }
 
-    /// Keep the PTY grid in sync with the live VTE (jterm1 model). The VTE
-    /// re-derives its own column/row count from its allocation on every
-    /// size_allocate, so we just mirror that onto the PTY whenever it changes —
-    /// no pixel math, no chrome calibration. State-driven sizing (compact
-    /// when idle, viewport when running) is handled in `update_input_height`,
-    /// and FTCS transitions push TIOCSWINSZ synchronously from the reader so
-    /// the child never sees a stale winsize on its first read.
+    /// Keep PTY geometry synchronized with the real pane viewport, independent
+    /// of the compact/full visual state of the live VTE. FTCS transitions also
+    /// push TIOCSWINSZ synchronously so apps never see a stale first layout.
     fn install_resize_tick(&self) {
         let pty_for_resize = self.pty.clone();
+        let scroll_for_resize = self.block_scroll.clone();
         let last: Rc<Cell<(u16, u16)>> = Rc::new(Cell::new((0, 0)));
         let tick_id = self.active_vte.add_tick_callback(move |vte, _clock| {
-            let cols = vte.column_count() as u16;
-            let rows = vte.row_count() as u16;
+            let (cols, rows) = pty_grid_size(vte, &scroll_for_resize);
             if cols > 0 && rows > 0 && (cols, rows) != last.get() {
                 last.set((cols, rows));
                 pty_for_resize.resize(cols, rows);
@@ -2610,7 +2607,7 @@ impl TermView {
     }
 
     /// Copy selected text to clipboard.
-    /// Priority: (1) live VTE selection (alt-screen apps + idle input cell),
+    /// Priority: (1) live VTE selection,
     /// (2) any finished-block TextBuffer with an active selection, (3) PRIMARY
     /// clipboard as a last-resort fallback. Step 2 is what makes Ctrl+Shift+C
     /// work for mouse-selected text inside finished command/output views —
@@ -2821,21 +2818,21 @@ impl TermView {
     /// Apply updated theme colors to the block widgets and the live VTE.
     pub fn apply_theme(&self) {
         let config = self.config.borrow();
-        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-        self.active_vte.set_colors(
-            Some(&config.foreground),
-            Some(&config.background),
-            &palette_refs,
-        );
-        self.active_vte.set_color_cursor(Some(&config.cursor));
-        self.active_vte
-            .set_color_cursor_foreground(Some(&config.cursor_foreground));
+        apply_terminal_theme(&self.active_vte, &config);
+        for block in self.finished_blocks.borrow().iter() {
+            apply_snapshot_theme_to_vte(&block.command_vte, &config);
+            apply_snapshot_theme_to_vte(&block.output_vte, &config);
+        }
         install_block_css(&config);
     }
 
     /// Update font for VTE terminal and block view CSS.
     pub fn set_font(&self, font_desc: &FontDescription) {
         self.active_vte.set_font(Some(font_desc));
+        for block in self.finished_blocks.borrow().iter() {
+            block.command_vte.set_font(Some(font_desc));
+            block.output_vte.set_font(Some(font_desc));
+        }
         // Update config and regenerate CSS with new font
         self.config.borrow_mut().font_desc = font_desc.to_string();
         install_block_css(&self.config.borrow());
@@ -2844,6 +2841,10 @@ impl TermView {
     /// Update font scale for VTE terminal and block view CSS.
     pub fn set_font_scale(&self, scale: f64) {
         self.active_vte.set_font_scale(scale);
+        for block in self.finished_blocks.borrow().iter() {
+            block.command_vte.set_font_scale(scale);
+            block.output_vte.set_font_scale(scale);
+        }
         self.config.borrow_mut().default_font_scale = scale;
         // Regenerate CSS with updated font scale
         install_block_css(&self.config.borrow());
@@ -3042,8 +3043,9 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_bytes_events, compute_viewport_state, strip_ansi, strip_ansi_with_clear_detect,
-        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, ViewportState,
+        coalesce_bytes_events, compute_viewport_state, normalize_captured_command, strip_ansi,
+        strip_ansi_with_clear_detect, truncate_plain_output_for_height,
+        visible_indices_for_viewport, BlockData, ViewportState,
     };
     use crate::parser::ParserEvent;
     use std::collections::VecDeque;
@@ -3062,6 +3064,19 @@ mod tests {
                 _ => "?".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn captured_command_drops_early_prompt_marker_prefix() {
+        assert_eq!(normalize_captured_command("yj ~ ❯ pwd", "yj ~ ❯"), "pwd");
+    }
+
+    #[test]
+    fn captured_command_preserves_legitimate_text() {
+        assert_eq!(
+            normalize_captured_command("printf pwd", "yj ~ ❯"),
+            "printf pwd"
+        );
     }
 
     fn block_with_height(estimated_height: i32) -> BlockData {

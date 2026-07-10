@@ -1166,7 +1166,7 @@ impl FinishedBlock {
 // ─── ActiveBlock ──────────────────────────────────────────────────────────────
 
 /// The live area: a single persistent input-enabled VTE pinned to the viewport
-/// height (jterm1 model). The shell's prompt, the user's typing, and command
+/// height. The shell's prompt, the user's typing, and command
 /// output all render natively in this one VTE. When a command finishes, its
 /// accumulated output (`raw_output`) is snapshotted into a styled FinishedBlock
 /// stacked above this card.
@@ -1187,10 +1187,9 @@ impl ActiveBlock {
         // (including active_vte) from ever receiving focus.
         widget.set_focusable(false);
         widget.set_hexpand(true);
-        // NOT vexpand: the input cell hugs its content (warp model). Its exact
-        // height is driven by `update_input_height` in block_view/mod.rs via
-        // height_request. With vexpand the cell would fill the whole viewport
-        // regardless of the requested height.
+        // The outer block document owns vertical expansion. The live surface is
+        // explicitly sized compact/full by block_view; keeping it non-expanding
+        // prevents GTK from adding document slack to its grid.
         widget.set_vexpand(false);
 
         let active_vte = create_active_terminal(config);
@@ -1260,10 +1259,9 @@ impl ActiveBlock {
     ///
     /// `preserve_scrollback`: when true, keep the VTE's buffer + scrollback intact
     /// (only the accumulated raw_output snapshot for the *next* block is cleared,
-    /// and SGR state is soft-reset). This mirrors a traditional VTE where PageUp
-    /// at a prompt reveals the previous command's output tail. The default (false)
-    /// wipes the live VTE on every PromptStart, since the finished blocks above
-    /// already hold the authoritative scrollback.
+    /// and SGR state is soft-reset). When false (the default), finished blocks
+    /// remain the sole historical surface and the compact live cell shows only
+    /// the current prompt.
     pub(crate) fn reset_active(&self, preserve_scrollback: bool) {
         if preserve_scrollback {
             self.active_vte.feed(b"\x1b[0m");

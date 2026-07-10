@@ -225,12 +225,9 @@ pub struct Config {
     pub(crate) scroll_reporting_enabled: bool,
     /// Forward window focus in/out (CSI ?1004) events to apps.
     pub(crate) focus_reporting_enabled: bool,
-    /// Block mode only: keep the live VTE's buffer + scrollback across commands
-    /// (default `false` resets it on each PromptStart). When `true`, the user
-    /// can PageUp inside the live cell to see the previous command's output
-    /// tail — mirroring a traditional VTE. Trade-off: prompts may visually
-    /// abut the previous command's last line, and finished blocks already
-    /// preserve the same content above so there's redundant display.
+    /// Block mode only: also keep completed output in the live VTE scrollback.
+    /// Disabled by default because finished blocks already own that history;
+    /// enabling it deliberately presents both the VTE and structured views.
     pub(crate) preserve_live_scrollback: bool,
     /// Show the right-side AI chat panel (Anthropic Messages API). Toggled
     /// via Ctrl+Shift+A; persisted across sessions.

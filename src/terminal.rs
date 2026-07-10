@@ -16,6 +16,24 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
 
+/// Apply the visual profile shared by regular VTE mode, block mode's live
+/// surface, and block snapshots. Keeping this in one place prevents a runtime
+/// theme change from making the two terminal modes drift apart.
+pub(crate) fn apply_terminal_theme(terminal: &Terminal, config: &Config) {
+    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
+    terminal.set_colors(
+        Some(&config.foreground),
+        Some(&config.background),
+        &palette_refs,
+    );
+    terminal.set_color_bold(None);
+    terminal.set_color_cursor(Some(&config.cursor));
+    terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
+    let font_desc = FontDescription::from_string(&config.font_desc);
+    terminal.set_font(Some(&font_desc));
+    terminal.set_font_scale(config.default_font_scale);
+}
+
 pub(crate) fn create_terminal(config: &Config) -> Terminal {
     let font_scale = config.default_font_scale;
     let terminal = Terminal::builder()
@@ -37,20 +55,7 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
 
     terminal.set_mouse_autohide(true);
 
-    // Set colors
-    let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-    terminal.set_colors(
-        Some(&config.foreground),
-        Some(&config.background),
-        &palette_refs,
-    );
-    terminal.set_color_bold(None);
-    terminal.set_color_cursor(Some(&config.cursor));
-    terminal.set_color_cursor_foreground(Some(&config.cursor_foreground));
-
-    // Set font
-    let font_desc = FontDescription::from_string(&config.font_desc);
-    terminal.set_font(Some(&font_desc));
+    apply_terminal_theme(&terminal, config);
 
     // Set regex for hyperlinks
     let regex_pattern = vte4::Regex::for_match(
@@ -247,16 +252,7 @@ impl VteTerminalView {
 
     pub fn apply_theme(&self) {
         let config = self.config.borrow();
-        let palette_refs: Vec<&RGBA> = config.palette.iter().collect();
-        self.terminal.set_colors(
-            Some(&config.foreground),
-            Some(&config.background),
-            &palette_refs,
-        );
-        self.terminal.set_color_bold(None);
-        self.terminal.set_color_cursor(Some(&config.cursor));
-        self.terminal
-            .set_color_cursor_foreground(Some(&config.cursor_foreground));
+        apply_terminal_theme(&self.terminal, &config);
     }
 
     pub fn write_input(&self, data: &[u8]) {
