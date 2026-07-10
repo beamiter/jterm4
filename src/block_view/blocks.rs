@@ -99,11 +99,6 @@ pub(crate) struct FinishedBlock {
     /// rows beyond viewport_cap live in this VTE's own scrollback so the user
     /// can scroll inside long blocks (e.g. `git log`).
     pub(crate) output_vte: vte4::Terminal,
-    /// Static renderer for short output that fits entirely in the block. Using
-    /// a VTE here gives it an internal scroll offset, which can hide the first
-    /// row after outer block scrolling. Short output is a snapshot, not a
-    /// scrollable terminal.
-    pub(crate) output_label: Option<gtk4::Label>,
     /// Raw ANSI-bearing output bytes — the source for filter re-feed and the
     /// copy-output action. Mutable so filter can swap the displayed slice
     /// without losing the original.
@@ -141,7 +136,6 @@ impl Clone for FinishedBlock {
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
             output_vte: self.output_vte.clone(),
-            output_label: self.output_label.clone(),
             cmd_text: self.cmd_text.clone(),
             full_output: self.full_output.clone(),
             displayed_output: self.displayed_output.clone(),
@@ -731,18 +725,6 @@ impl FinishedBlock {
         let output_rows = output_row_count(output);
         let output_scrollable = output_rows > viewport_cap;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
-        let output_label = if output_scrollable {
-            None
-        } else {
-            let label = gtk4::Label::new(Some(&strip_ansi(output_display_text(output))));
-            label.add_css_class("block-output");
-            label.add_css_class("block-output-static");
-            label.set_xalign(0.0);
-            label.set_halign(gtk4::Align::Fill);
-            label.set_wrap(false);
-            label.set_selectable(true);
-            Some(label)
-        };
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
         output_vte
             .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
@@ -823,15 +805,11 @@ impl FinishedBlock {
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
-        let output_widget: gtk4::Widget = if let Some(label) = output_label.as_ref() {
-            let widget = label.clone().upcast::<gtk4::Widget>();
-            outer.append(label);
-            widget
-        } else {
-            let widget = output_vte.clone().upcast::<gtk4::Widget>();
-            outer.append(&output_vte);
-            widget
-        };
+        // Always use a read-only VTE, including short output. The previous Label
+        // fast path stripped ANSI SGR bytes, so `ls` and `git status` lost the
+        // colors users see in regular VTE mode.
+        let output_widget: gtk4::Widget = output_vte.clone().upcast::<gtk4::Widget>();
+        outer.append(&output_vte);
 
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
@@ -926,7 +904,6 @@ impl FinishedBlock {
 
             let apply = {
                 let output_vte = output_vte.clone();
-                let output_label = output_label.clone();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
                 let filter_entry = filter_entry.clone();
@@ -971,9 +948,6 @@ impl FinishedBlock {
                     if ch > 0 {
                         output_vte
                             .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
-                    }
-                    if let Some(label) = output_label.as_ref() {
-                        label.set_text(&strip_ansi(output_display_text(&shown)));
                     }
                     let has_query = !q.trim().is_empty();
                     if has_query {
@@ -1041,7 +1015,6 @@ impl FinishedBlock {
             prompt_text: prompt.to_string(),
             command_vte,
             output_vte,
-            output_label,
             full_output,
             displayed_output,
             stripped_output: Rc::new(RefCell::new(None)),
@@ -1098,18 +1071,6 @@ impl FinishedBlock {
             glib::Propagation::Stop
         });
         self.output_vte.add_controller(scroll_ctrl);
-
-        if let Some(label) = self.output_label.as_ref() {
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            let outer = outer.clone();
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                forward_outer_scroll(&outer, dy);
-                glib::Propagation::Stop
-            });
-            label.add_controller(scroll_ctrl);
-        }
     }
 
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).

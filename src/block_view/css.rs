@@ -440,10 +440,6 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 0;
             margin: 0;
         }}
-        .block-output-static {{
-            padding-left: 0;
-            padding-right: 0;
-        }}
         .block-show-more {{
             color: {accent};
             background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
