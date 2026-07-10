@@ -357,6 +357,13 @@ fn line_count_text(rows: i64) -> String {
     }
 }
 
+/// Copy for the compact placeholder shown when a block's output is folded.
+/// Keeping this as a small pure helper makes the collapsed state useful even
+/// after a per-block filter changes the number of displayed rows.
+fn collapsed_output_summary(rows: i64) -> String {
+    format!("▸ {} hidden — click to show", line_count_text(rows))
+}
+
 fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
@@ -811,6 +818,22 @@ impl FinishedBlock {
         let output_widget: gtk4::Widget = output_vte.clone().upcast::<gtk4::Widget>();
         outer.append(&output_vte);
 
+        // Folding used to leave only a tiny chevron in the header. That made a
+        // collapsed block look like it had no output at all, especially once it
+        // had scrolled away from the pointer. Keep a compact, keyboard-focusable
+        // summary in the document instead; it both preserves the output's scale
+        // and is a large, obvious target to restore it.
+        let collapsed_summary = gtk4::Button::with_label(&collapsed_output_summary(output_rows));
+        collapsed_summary.add_css_class("block-output-summary");
+        collapsed_summary.add_css_class("flat");
+        collapsed_summary.set_halign(gtk4::Align::Start);
+        collapsed_summary.set_margin_start(18);
+        collapsed_summary.set_margin_end(8);
+        collapsed_summary.set_margin_bottom(4);
+        collapsed_summary.set_tooltip_text(Some("Show block output"));
+        collapsed_summary.set_visible(false);
+        outer.append(&collapsed_summary);
+
         // Ctrl+click on a URL inside the output VTE → open in browser.
         // VTE's `match_add_regex` (registered in create_finished_terminal) makes
         // `check_match_at` return the matching URL at the pointer position;
@@ -850,15 +873,35 @@ impl FinishedBlock {
                 line_count_text(output_rows)
             )));
         }
-        // Wire collapse button to toggle output visibility.
-        let output_widget_for_collapse = output_widget.clone();
-        collapse_btn.connect_clicked(move |btn| {
-            let visible = output_widget_for_collapse.is_visible();
-            output_widget_for_collapse.set_visible(!visible);
-            btn.set_label(if visible { "\u{f054}" } else { "\u{f078}" }); // chevron right / down
-        });
+        // Header chevron and the inline summary share one folded-state update,
+        // so either target consistently restores the same output surface.
+        let set_collapsed: Rc<dyn Fn(bool)> = {
+            let output_widget = output_widget.clone();
+            let collapsed_summary = collapsed_summary.clone();
+            let collapse_btn = collapse_btn.clone();
+            Rc::new(move |collapsed| {
+                output_widget.set_visible(!collapsed);
+                collapsed_summary.set_visible(collapsed);
+                collapse_btn.set_label(if collapsed { "\u{f054}" } else { "\u{f078}" });
+                collapse_btn.set_tooltip_text(Some(if collapsed {
+                    "Show output"
+                } else {
+                    "Hide output"
+                }));
+            })
+        };
+        {
+            let set_collapsed = set_collapsed.clone();
+            let output_widget = output_widget.clone();
+            collapse_btn.connect_clicked(move |_| set_collapsed(output_widget.is_visible()));
+        }
+        {
+            let set_collapsed = set_collapsed.clone();
+            collapsed_summary.connect_clicked(move |_| set_collapsed(false));
+        }
         if !has_output {
             collapse_btn.set_label("\u{f054}"); // nf-fa-chevron_right
+            collapsed_summary.set_visible(false);
         }
 
         // Per-block output filter (Warp's BlockFilterQuery): the funnel button in
@@ -915,6 +958,7 @@ impl FinishedBlock {
                 let expand_btn = expand_btn.clone();
                 let expanded = expanded.clone();
                 let filter_btn = filter_btn.clone();
+                let collapsed_summary = collapsed_summary.clone();
                 move || {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
@@ -970,6 +1014,7 @@ impl FinishedBlock {
                         filter_status.remove_css_class("block-filter-empty");
                         filter_status.set_visible(false);
                     }
+                    collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
                     expand_btn.set_visible(shown_rows > viewport_cap);
                     // Keep `displayed_output` in sync so a later unmap → remap
                     // (block scrolls out of view, then back) re-feeds the
@@ -1267,7 +1312,7 @@ pub(crate) enum BlockState {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_output_lines;
+    use super::{collapsed_output_summary, filter_output_lines};
 
     #[test]
     fn filter_output_lines_matches_ascii_case_insensitive() {
@@ -1282,6 +1327,18 @@ mod tests {
         assert_eq!(
             filter_output_lines("alpha\n你好世界\nomega", "你好", false, false, false, 0),
             "你好世界"
+        );
+    }
+
+    #[test]
+    fn collapsed_summary_uses_singular_and_plural_line_counts() {
+        assert_eq!(
+            collapsed_output_summary(1),
+            "▸ 1 line hidden — click to show"
+        );
+        assert_eq!(
+            collapsed_output_summary(42),
+            "▸ 42 lines hidden — click to show"
         );
     }
 

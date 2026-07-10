@@ -356,6 +356,17 @@ pub(crate) fn install_block_css(config: &Config) {
             color: {fg_hex};
             background-color: rgba({fg_r},{fg_g},{fg_b},0.12);
         }}
+        .block-output-summary {{
+            color: {dim_fg};
+            font-family: "{font_family}";
+            font-size: 0.82em;
+            padding: 2px 4px;
+            border-radius: 5px;
+        }}
+        .block-output-summary:hover {{
+            color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.12);
+        }}
         .block-prompt {{
             color: {dim_fg};
             font-family: "{font_family}";
