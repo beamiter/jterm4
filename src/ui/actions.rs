@@ -10,7 +10,9 @@ use vte4::TerminalExt;
 use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::{Action, Direction};
-use crate::terminal::{find_first_terminal, find_focused_terminal, terminal_working_directory};
+use crate::terminal::{
+    find_first_terminal, find_focused_terminal, focus_terminal_deferred, terminal_working_directory,
+};
 
 impl UiState {
     pub(crate) fn execute_action(&self, action: Action) {
@@ -295,16 +297,31 @@ impl UiState {
     pub(crate) fn focus_current_terminal(&self) {
         if let Some(page) = self.notebook.current_page() {
             if let Some(widget) = self.notebook.nth_page(Some(page)) {
-                if let Some(term) = find_first_terminal(&widget) {
-                    term.grab_focus();
-                }
+                self.focus_terminal_in_page(&widget);
             }
+        }
+    }
+
+    /// Focus the live terminal for a notebook page. A block-mode page contains
+    /// several read-only VTEs for completed blocks before its active input VTE,
+    /// so a generic depth-first terminal lookup targets the wrong widget once
+    /// history exists. The page stores its `TermView`; prefer it when present.
+    pub(crate) fn focus_terminal_in_page(&self, widget: &gtk4::Widget) {
+        if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
+            let term_view = unsafe { term_view.as_ref() };
+            term_view.grab_focus();
+        } else if let Some(term) = find_first_terminal(widget) {
+            focus_terminal_deferred(&term);
         }
     }
 
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
         self.notebook.current_page().and_then(|page_num| {
             self.notebook.nth_page(Some(page_num)).and_then(|widget| {
+                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
+                    let term_view = unsafe { term_view.as_ref() };
+                    return Some(term_view.vte().clone());
+                }
                 // Try focused terminal first (for split panes), then fall back to first terminal
                 find_focused_terminal(&widget).or_else(|| find_first_terminal(&widget))
             })

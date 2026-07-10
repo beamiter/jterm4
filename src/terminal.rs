@@ -16,6 +16,18 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
 
+/// Focus a terminal now and once after GTK finishes the current page/focus
+/// transition. Notebook switches can emit `switch-page` before the newly
+/// selected child is mapped, so the immediate grab is occasionally discarded
+/// by the container's own focus reconciliation.
+pub(crate) fn focus_terminal_deferred(terminal: &Terminal) {
+    terminal.grab_focus();
+    let deferred = terminal.clone();
+    glib::idle_add_local_once(move || {
+        deferred.grab_focus();
+    });
+}
+
 /// Apply the visual profile shared by regular VTE mode, block mode's live
 /// surface, and block snapshots. Keeping this in one place prevents a runtime
 /// theme change from making the two terminal modes drift apart.
@@ -208,7 +220,7 @@ impl VteTerminalView {
     }
 
     pub fn grab_focus(&self) {
-        self.terminal.grab_focus();
+        focus_terminal_deferred(&self.terminal);
     }
 
     pub fn copy_to_clipboard(&self) {

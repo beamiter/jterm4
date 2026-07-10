@@ -13,7 +13,7 @@ use vte4::TerminalExt;
 use crate::config::Config;
 use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
-use crate::terminal::apply_terminal_theme;
+use crate::terminal::{apply_terminal_theme, focus_terminal_deferred};
 
 mod alt_screen;
 mod ansi;
@@ -2603,7 +2603,7 @@ impl TermView {
     }
 
     pub fn grab_focus(&self) {
-        self.active_vte.grab_focus();
+        focus_terminal_deferred(&self.active_vte);
     }
 
     /// Copy selected text to clipboard.

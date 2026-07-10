@@ -31,7 +31,7 @@ use std::rc::Rc;
 use config::{choose_shell_argv, config_file_path, load_config};
 use keybindings::{normalize_key, Action, KeyCombo};
 use state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
-use terminal::{find_first_terminal, terminal_working_directory};
+use terminal::terminal_working_directory;
 use ui::UiState;
 
 struct SimpleStderrLogger {
@@ -847,10 +847,22 @@ fn main() -> glib::ExitCode {
 
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
+        let notebook_for_switch = notebook.clone();
         notebook.connect_switch_page(move |_, widget, page_num| {
-            if let Some(term) = find_first_terminal(widget) {
-                term.grab_focus();
-            }
+            ui_for_switch.focus_terminal_in_page(widget);
+            // `switch-page` runs before GTK has completed map/allocation and a
+            // held Ctrl+PageUp can queue several switches in one event burst.
+            // Reclaim focus on the next frame, but only if this is still the
+            // selected page; otherwise an older tab's deferred callback can
+            // steal focus from the final tab in the cycle.
+            let notebook_for_focus = notebook_for_switch.clone();
+            let target_widget = widget.clone();
+            let ui_for_focus = ui_for_switch.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
+                if notebook_for_focus.current_page() == Some(page_num) {
+                    ui_for_focus.focus_terminal_in_page(&target_widget);
+                }
+            });
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
