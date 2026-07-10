@@ -759,6 +759,9 @@ impl ReaderCtx {
                                 let finished_blocks_for_menu = finished_blocks_for_cb.clone();
                                 let block_list_for_menu = block_list_rc.clone();
                                 let vte_for_copy = active_vte.clone();
+                                let pty_for_rerun_menu = pty_for_init.clone();
+                                let pty_synced_for_rerun_menu = pty_synced_rc.clone();
+                                let active_for_rerun_menu = active_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let block_id = finished_clone.id;
 
@@ -804,6 +807,34 @@ impl ReaderCtx {
                                     };
 
                                     {
+                                        let item = make_item("Copy Command");
+                                        let popover_c = popover.clone();
+                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            vte_for_action
+                                                .clipboard()
+                                                .set_text(&finished_for_copy.cmd_text);
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
+                                        let item = make_item("Copy Output");
+                                        let popover_c = popover.clone();
+                                        let finished_for_copy = finished_menu_clone.clone();
+                                        let vte_for_action = vte_for_copy.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let output = finished_for_copy
+                                                .with_stripped_output(|output| output.to_string());
+                                            vte_for_action.clipboard().set_text(&output);
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    {
                                         let item = make_item("Copy Block");
                                         let popover_c = popover.clone();
                                         let finished_for_copy = finished_menu_clone.clone();
@@ -820,6 +851,34 @@ impl ReaderCtx {
                                         });
                                         vbox.append(&item);
                                     }
+
+                                    {
+                                        let item = make_item("Insert Command at Prompt");
+                                        let popover_c = popover.clone();
+                                        let finished_for_rerun = finished_menu_clone.clone();
+                                        let pty_for_action = pty_for_rerun_menu.clone();
+                                        let pty_synced_for_action =
+                                            pty_synced_for_rerun_menu.clone();
+                                        let active_for_action = active_for_rerun_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            // Match the visible re-run affordance: replace any
+                                            // partial prompt text, but leave Enter to the user.
+                                            if pty_synced_for_action.get() {
+                                                pty_for_action.write_bytes(b"\x15");
+                                            }
+                                            pty_for_action.write_bytes(
+                                                finished_for_rerun.cmd_text.as_bytes(),
+                                            );
+                                            pty_synced_for_action.set(true);
+                                            active_for_action.borrow().grab_focus();
+                                        });
+                                        vbox.append(&item);
+                                    }
+
+                                    let separator =
+                                        gtk4::Separator::new(gtk4::Orientation::Horizontal);
+                                    vbox.append(&separator);
 
                                     {
                                         let item = make_item("Export as JSON");
