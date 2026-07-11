@@ -634,6 +634,32 @@ impl UiState {
             }
         }
 
+        // Keep the existing tab widgets alive for OSC 0/2 title changes.
+        // Some applications animate their title with a spinner; replacing the
+        // strip button for every frame loses in-flight click and drag gestures.
+        let update_title = |connect: &dyn Fn(Box<dyn Fn(&str)>)| {
+            let label_for_title = label.clone();
+            let strip_btn_label_for_title = strip_btn_label.clone();
+            let custom_title_for_title = custom_title.clone();
+            connect(Box::new(move |title| {
+                if custom_title_for_title.get() || label_for_title.text().as_str() == title {
+                    return;
+                }
+                label_for_title.set_text(title);
+                if let Some(ref btn_label) = *strip_btn_label_for_title.borrow() {
+                    btn_label.set_text(title);
+                }
+            }));
+        };
+        match &view_type {
+            TerminalViewType::Block(term_view) => {
+                update_title(&|callback| term_view.connect_title_changed(callback));
+            }
+            TerminalViewType::Vte(vte_view) => {
+                update_title(&|callback| vte_view.connect_title_changed(callback));
+            }
+        }
+
         let close_button = gtk4::Button::from_icon_name("window-close-symbolic");
         close_button.set_focus_on_click(false);
         close_button.set_can_focus(false);
