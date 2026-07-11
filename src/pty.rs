@@ -32,7 +32,10 @@ extern "C" {
 }
 
 const G_IO_IN: u32 = 1;
-const G_PRIORITY_DEFAULT: i32 = 0;
+// A block command may continuously repaint a spinner or progress bar.  Keep
+// PTY delivery at idle priority so GTK can dispatch pointer/button events
+// first; otherwise a perpetually readable eventfd can monopolize the loop.
+const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
 /// Bound the amount of shell output processed in one GLib source dispatch.
 /// A continuously chatty command otherwise keeps the PTY source ready forever
 /// and starves pointer and keyboard events, making tab switching appear broken.
@@ -66,7 +69,7 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
     let ptr = Box::into_raw(data) as *mut std::ffi::c_void;
     unsafe {
         g_unix_fd_add_full(
-            G_PRIORITY_DEFAULT,
+            G_PRIORITY_DEFAULT_IDLE,
             fd,
             G_IO_IN,
             fd_watch_callback::<F>,
