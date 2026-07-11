@@ -33,6 +33,10 @@ extern "C" {
 
 const G_IO_IN: u32 = 1;
 const G_PRIORITY_DEFAULT: i32 = 0;
+/// Bound the amount of shell output processed in one GLib source dispatch.
+/// A continuously chatty command otherwise keeps the PTY source ready forever
+/// and starves pointer and keyboard events, making tab switching appear broken.
+const MAX_MESSAGES_PER_DISPATCH: usize = 8;
 
 struct FdWatchData<F: FnMut() -> bool> {
     callback: F,
@@ -257,10 +261,19 @@ impl OwnedPty {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
             }
 
+            let mut processed = 0usize;
             loop {
                 match rx.try_recv() {
                     Ok(PtyMsg::Data(data)) => {
                         callback(data);
+                        processed += 1;
+                        if processed >= MAX_MESSAGES_PER_DISPATCH {
+                            // The eventfd read above consumed its aggregate
+                            // wakeup count. Re-signal queued data so GLib can
+                            // dispatch input before this source runs again.
+                            signal_eventfd(efd);
+                            return true;
+                        }
                     }
                     Ok(PtyMsg::Exit(code)) => {
                         if let Some(f) = on_exit.take() {
@@ -349,22 +362,29 @@ impl OwnedPty {
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
 
-        glib::timeout_add_local(std::time::Duration::from_millis(1), move || loop {
-            match rx.borrow().try_recv() {
-                Ok(PtyMsg::Data(data)) => {
-                    callback(data);
-                }
-                Ok(PtyMsg::Exit(code)) => {
-                    if let Some(f) = on_exit.take() {
-                        f(code);
+        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
+            let mut processed = 0usize;
+            loop {
+                match rx.borrow().try_recv() {
+                    Ok(PtyMsg::Data(data)) => {
+                        callback(data);
+                        processed += 1;
+                        if processed >= MAX_MESSAGES_PER_DISPATCH {
+                            return glib::ControlFlow::Continue;
+                        }
                     }
-                    return glib::ControlFlow::Break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    return glib::ControlFlow::Continue;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return glib::ControlFlow::Break;
+                    Ok(PtyMsg::Exit(code)) => {
+                        if let Some(f) = on_exit.take() {
+                            f(code);
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return glib::ControlFlow::Break;
+                    }
                 }
             }
         });
