@@ -306,6 +306,9 @@ pub struct TermView {
     title_callbacks: StrCallbacks,
     activity_callbacks: VoidCallbacks,
     mouse_reporting_mode: Rc<Cell<MouseReportingMode>>,
+    /// Whether the shell has enabled DECSET 2004. Clipboard input is written
+    /// directly to our PTY, so block mode must apply this wrapper itself.
+    bracketed_paste: Rc<Cell<bool>>,
     config: Rc<RefCell<Config>>,
     block_data: Rc<RefCell<VecDeque<BlockData>>>,
     finished_blocks: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -366,6 +369,7 @@ struct ReaderCtx {
     exited_cbs: IntCallbacks,
     activity_cbs: VoidCallbacks,
     mouse_reporting_rc: Rc<Cell<MouseReportingMode>>,
+    bracketed_paste_rc: Rc<Cell<bool>>,
     config_for_cb: Rc<RefCell<Config>>,
     parser: Rc<RefCell<Parser>>,
     block_data_for_cb: Rc<RefCell<VecDeque<BlockData>>>,
@@ -470,6 +474,7 @@ impl ReaderCtx {
             exited_cbs,
             activity_cbs,
             mouse_reporting_rc,
+            bracketed_paste_rc,
             config_for_cb,
             parser,
             block_data_for_cb,
@@ -512,6 +517,9 @@ impl ReaderCtx {
                     let state = bstate_rc.get();
                     match event {
                         ParserEvent::DecsetMode { mode, set } => {
+                            if *mode == 2004 {
+                                bracketed_paste_rc.set(*set);
+                            }
                             // VTE handles paste/cursor/etc. natively from its
                             // own bytes; block_view only needs mouse-reporting
                             // state for wheel suppression in alt-screen apps.
@@ -1952,6 +1960,10 @@ impl TermView {
         let block_finished_callbacks: BlockFinishedCallbacks = Rc::new(RefCell::new(vec![]));
         let mouse_reporting_mode: Rc<Cell<MouseReportingMode>> =
             Rc::new(Cell::new(MouseReportingMode::None));
+        // Unlike a regular VTE terminal, block mode owns the shell PTY. Keep
+        // DECSET 2004 state here so clipboard pastes can be forwarded as one
+        // ordered byte stream instead of relying on VTE's unrelated PTY.
+        let bracketed_paste: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let block_data_rc: Rc<RefCell<VecDeque<BlockData>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let finished_blocks_rc: Rc<RefCell<Vec<FinishedBlock>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2042,6 +2054,7 @@ impl TermView {
             let exited_cbs = exited_callbacks.clone();
             let activity_cbs = activity_callbacks.clone();
             let mouse_reporting_rc = mouse_reporting_mode.clone();
+            let bracketed_paste_rc = bracketed_paste.clone();
             let config_for_cb = Rc::new(RefCell::new(config.clone()));
             let parser = Rc::new(RefCell::new(Parser::with_config(ParserConfig {
                 mouse_reporting: config.mouse_reporting_enabled,
@@ -2096,6 +2109,7 @@ impl TermView {
                 exited_cbs,
                 activity_cbs,
                 mouse_reporting_rc,
+                bracketed_paste_rc,
                 config_for_cb,
                 parser,
                 block_data_for_cb,
@@ -2468,6 +2482,7 @@ impl TermView {
             title_callbacks,
             activity_callbacks,
             mouse_reporting_mode,
+            bracketed_paste,
             config: Rc::new(RefCell::new(config.clone())),
             block_data: block_data_rc,
             finished_blocks: finished_blocks_rc,
@@ -2752,12 +2767,27 @@ impl TermView {
         log::debug!(">>> TermView copy: no selection found, nothing to copy");
     }
 
-    /// Paste from clipboard to PTY via VTE's native `paste_clipboard()`.
-    /// VTE tracks its own bracketed-paste state from the same byte stream the
-    /// shell sent it, so this honors mode 2004 automatically — no need to
-    /// duplicate the state machine in block_view.
+    /// Paste clipboard text as one ordered write to block mode's shell PTY.
+    ///
+    /// The active VTE is display-only in this mode and has no child PTY, so
+    /// `Terminal::paste_clipboard()` can lose or reorder multiline input. Read
+    /// the clipboard ourselves and preserve the shell's bracketed-paste mode.
     pub fn paste_from_clipboard(&self) {
-        self.active_vte.paste_clipboard();
+        let clipboard = self.active_vte.clipboard();
+        let pty = self.pty.clone();
+        let bracketed_paste = self.bracketed_paste.clone();
+        clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
+            let Ok(Some(text)) = result else {
+                return;
+            };
+            if bracketed_paste.get() {
+                pty.write_bytes(b"\x1b[200~");
+                pty.write_bytes(text.as_bytes());
+                pty.write_bytes(b"\x1b[201~");
+            } else {
+                pty.write_bytes(text.as_bytes());
+            }
+        });
     }
 
     pub fn connect_cwd_changed<F: Fn(&str) + 'static>(&self, f: F) {
