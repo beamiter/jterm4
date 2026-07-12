@@ -118,6 +118,8 @@ pub(crate) struct FinishedBlock {
     pub(crate) rerun_btn: gtk4::Button,
     pub(crate) header_row: gtk4::Box,
     pub(crate) action_box: gtk4::Box,
+    /// Keyboard affordances shown only while this block is selected.
+    pub(crate) selection_hint: gtk4::Label,
     pub(crate) bookmark_star: gtk4::Label,
     pub(crate) status_icon: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
@@ -145,6 +147,7 @@ impl Clone for FinishedBlock {
             rerun_btn: self.rerun_btn.clone(),
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
+            selection_hint: self.selection_hint.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             cols: self.cols,
@@ -510,6 +513,7 @@ impl FinishedBlock {
             }
             reused.remove_css_class("block-hovered");
             reused.remove_css_class("block-selected");
+            reused.remove_css_class("block-bookmarked");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
             reused
@@ -628,6 +632,16 @@ impl FinishedBlock {
             header_row.append(&badge);
         }
 
+        // Selected blocks behave like a lightweight navigation mode. Keep the
+        // available keyboard actions visible instead of making users memorize them.
+        let selection_hint =
+            gtk4::Label::new(Some("Enter recall   Ctrl+Enter run   Delete remove"));
+        selection_hint.add_css_class("block-selection-hint");
+        selection_hint.set_visible(false);
+        selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        selection_hint.set_max_width_chars(38);
+        header_row.append(&selection_hint);
+
         // Quick-action buttons (hidden until the block is hovered). Handlers are
         // wired by the caller, which has access to the clipboard + active block.
         let action_box = gtk4::Box::new(Orientation::Horizontal, 2);
@@ -641,7 +655,7 @@ impl FinishedBlock {
         let copy_output_btn = gtk4::Button::with_label("\u{f0ea}"); // nf-fa-clipboard  copy output
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
-        rerun_btn.set_tooltip_text(Some("Re-run command"));
+        rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
         let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
         // Expand button: appears only when output_rows > viewport_cap; toggles
@@ -1069,6 +1083,7 @@ impl FinishedBlock {
             rerun_btn,
             header_row,
             action_box,
+            selection_hint,
             bookmark_star,
             status_icon,
             cols,
@@ -1127,6 +1142,7 @@ impl FinishedBlock {
         pty: &Rc<crate::pty::OwnedPty>,
         pty_synced: &Rc<Cell<bool>>,
         active: &Rc<RefCell<ActiveBlock>>,
+        bstate: &Rc<Cell<BlockState>>,
     ) {
         let vte_for_cmd = vte.clone();
         let cmd_for_copy = self.cmd_text.clone();
@@ -1153,8 +1169,17 @@ impl FinishedBlock {
         let pty_for_rerun = Rc::clone(pty);
         let pty_synced_for_rerun = pty_synced.clone();
         let active_for_rerun = active.clone();
+        let bstate_for_rerun = bstate.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
+            // Never inject a recalled command into stdin of a running command or
+            // an alt-screen application. Wait until OSC-133 says the prompt is ready.
+            if !command_recall_available(bstate_for_rerun.get()) {
+                active_for_rerun.borrow().grab_focus();
+                flash_button_label(btn, "\u{f071}", "Wait for the prompt");
+                return;
+            }
+
             // Clear any partial line at the live prompt (Ctrl+U) then type the
             // command bytes into the shell, leaving the user to press Enter
             // (jterm1 rerun model).
@@ -1310,9 +1335,33 @@ pub(crate) enum BlockState {
     RawFallback,
 }
 
+/// Recalling a finished command is safe only while the shell is sitting at a
+/// prompt. In every other state, writing command bytes would feed the currently
+/// running process (or vim/less) instead of the shell line editor.
+pub(crate) fn command_recall_available(state: BlockState) -> bool {
+    state == BlockState::AwaitingCommand
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collapsed_output_summary, filter_output_lines};
+    use super::{
+        collapsed_output_summary, command_recall_available, filter_output_lines, BlockState,
+    };
+
+    #[test]
+    fn command_recall_is_only_available_at_the_prompt() {
+        assert!(command_recall_available(BlockState::AwaitingCommand));
+        for state in [
+            BlockState::Idle,
+            BlockState::CollectingPrompt,
+            BlockState::CollectingOutput,
+            BlockState::AltScreen,
+            BlockState::PostCommand,
+            BlockState::RawFallback,
+        ] {
+            assert!(!command_recall_available(state), "{state:?}");
+        }
+    }
 
     #[test]
     fn filter_output_lines_matches_ascii_case_insensitive() {

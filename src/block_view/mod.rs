@@ -204,16 +204,69 @@ fn select_finished_block(
     if let Some(pid) = prev {
         if let Some(b) = finished.iter().find(|b| b.id == pid) {
             b.widget().remove_css_class("block-selected");
-            b.action_box.set_visible(false);
+            b.selection_hint.set_visible(false);
+            // If the pointer is still over the block, keep hover actions visible.
+            if !b.widget().has_css_class("block-hovered") {
+                b.action_box.set_visible(false);
+            }
         }
     }
     if let Some(nid) = new_id {
         if let Some(b) = finished.iter().find(|b| b.id == nid) {
             b.widget().add_css_class("block-selected");
+            b.selection_hint.set_visible(true);
             b.action_box.set_visible(true);
         }
     }
     selected_block_id.set(new_id);
+}
+
+/// Remove one block and all of its parallel state. Keeping the GTK widgets,
+/// serializable history, selection, and bookmarks in lockstep prevents deleted
+/// blocks from reappearing in history/search or leaving stale keyboard targets.
+fn remove_finished_block(
+    block_id: u64,
+    finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
+    block_data: &Rc<RefCell<VecDeque<BlockData>>>,
+    block_list: &gtk4::Box,
+    selected_block_id: &Rc<Cell<Option<u64>>>,
+    bookmarks: &Rc<RefCell<std::collections::HashSet<u64>>>,
+    visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
+) -> bool {
+    let removed = {
+        let mut finished = finished_blocks.borrow_mut();
+        finished
+            .iter()
+            .position(|b| b.id == block_id)
+            .map(|pos| (pos, finished.remove(pos)))
+    };
+    let Some((removed_pos, block)) = removed else {
+        return false;
+    };
+
+    block_list.remove(block.widget());
+    block_data.borrow_mut().retain(|b| b.id != block_id);
+    bookmarks.borrow_mut().remove(&block_id);
+    // Virtual-scroll visibility is index-based, so shift every surviving index
+    // above the removed position down by one.
+    let mut visible = visible_indices.borrow_mut();
+    let shifted = visible
+        .iter()
+        .filter_map(|&i| {
+            if i == removed_pos {
+                None
+            } else if i > removed_pos {
+                Some(i - 1)
+            } else {
+                Some(i)
+            }
+        })
+        .collect();
+    *visible = shifted;
+    if selected_block_id.get() == Some(block_id) {
+        selected_block_id.set(None);
+    }
+    true
 }
 
 /// Install the shared click-to-select behavior for a finished block. New blocks
@@ -389,6 +442,7 @@ struct ReaderCtx {
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk4::Button,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
+    bookmarks_for_cb: Rc<RefCell<std::collections::HashSet<u64>>>,
     cmd_running_rc: Rc<Cell<bool>>,
     running_cmd_rc: Rc<RefCell<String>>,
     /// Switches the live surface between compact prompt and full-screen layouts.
@@ -494,6 +548,7 @@ impl ReaderCtx {
             unread_count_rc,
             jump_fab,
             selected_block_id_rc,
+            bookmarks_for_cb,
             cmd_running_rc,
             running_cmd_rc,
             layout_active_surface,
@@ -734,6 +789,7 @@ impl ReaderCtx {
                                     &pty_for_init,
                                     &pty_synced_rc,
                                     &active_rc,
+                                    &bstate_rc,
                                 );
                                 finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
@@ -770,7 +826,10 @@ impl ReaderCtx {
                                 let pty_for_rerun_menu = pty_for_init.clone();
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
+                                let bstate_for_rerun_menu = bstate_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
+                                let bookmarks_for_menu = bookmarks_for_cb.clone();
+                                let visible_for_menu = visible_indices_rc.clone();
                                 let block_id = finished_clone.id;
 
                                 let right_click = gtk4::GestureClick::new();
@@ -868,8 +927,19 @@ impl ReaderCtx {
                                         let pty_synced_for_action =
                                             pty_synced_for_rerun_menu.clone();
                                         let active_for_action = active_for_rerun_menu.clone();
+                                        let bstate_for_action = bstate_for_rerun_menu.clone();
+                                        item.set_sensitive(command_recall_available(
+                                            bstate_for_rerun_menu.get(),
+                                        ));
+                                        item.set_tooltip_text(Some(
+                                            "Available when the shell prompt is ready",
+                                        ));
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
+                                            if !command_recall_available(bstate_for_action.get()) {
+                                                active_for_action.borrow().grab_focus();
+                                                return;
+                                            }
                                             // Match the visible re-run affordance: replace any
                                             // partial prompt text, but leave Enter to the user.
                                             if pty_synced_for_action.get() {
@@ -934,24 +1004,20 @@ impl ReaderCtx {
                                         let block_list_for_delete = block_list_for_menu.clone();
                                         let block_data_for_delete = block_data_for_export.clone();
                                         let selected_for_delete = selected_for_menu.clone();
+                                        let bookmarks_for_delete = bookmarks_for_menu.clone();
+                                        let visible_for_delete = visible_for_menu.clone();
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            let mut blocks =
-                                                finished_blocks_for_delete.borrow_mut();
-                                            if let Some(pos) =
-                                                blocks.iter().position(|b| b.id == block_id_del)
-                                            {
-                                                let block = blocks.remove(pos);
-                                                block_list_for_delete.remove(block.widget());
-                                            }
-                                            if selected_for_delete.get() == Some(block_id_del) {
-                                                selected_for_delete.set(None);
-                                            }
-                                            // Keep block_data in lockstep with the widget list.
-                                            block_data_for_delete
-                                                .borrow_mut()
-                                                .retain(|b| b.id != block_id_del);
+                                            remove_finished_block(
+                                                block_id_del,
+                                                &finished_blocks_for_delete,
+                                                &block_data_for_delete,
+                                                &block_list_for_delete,
+                                                &selected_for_delete,
+                                                &bookmarks_for_delete,
+                                                &visible_for_delete,
+                                            );
                                         });
                                         vbox.append(&item);
                                     }
@@ -975,6 +1041,15 @@ impl ReaderCtx {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
                                     if selected_block_id_rc.get() == Some(oldest.id) {
                                         selected_block_id_rc.set(None);
+                                    }
+                                    bookmarks_for_cb.borrow_mut().remove(&oldest.id);
+                                    {
+                                        let mut visible = visible_indices_rc.borrow_mut();
+                                        let shifted = visible
+                                            .iter()
+                                            .filter_map(|&i| i.checked_sub(1))
+                                            .collect();
+                                        *visible = shifted;
                                     }
                                     let widget_to_release = oldest.widget().clone();
                                     block_list_rc.remove(&widget_to_release);
@@ -1413,6 +1488,7 @@ fn running_root_control_bytes(
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
+    pty_synced_for_key: Rc<Cell<bool>>,
     active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -1421,6 +1497,7 @@ struct KeyCtx {
     selected_block_id_for_key: Rc<Cell<Option<u64>>>,
     block_scroll_for_key: ScrolledWindow,
     bookmarks_for_key: Rc<RefCell<std::collections::HashSet<u64>>>,
+    visible_indices_for_key: Rc<RefCell<std::collections::HashSet<usize>>>,
     bstate_for_key: Rc<Cell<BlockState>>,
 }
 
@@ -1428,6 +1505,7 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
+            pty_synced_for_key,
             active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
@@ -1436,6 +1514,7 @@ impl KeyCtx {
             selected_block_id_for_key,
             block_scroll_for_key,
             bookmarks_for_key,
+            visible_indices_for_key,
             bstate_for_key,
         } = self;
         key_ctrl.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
@@ -1499,21 +1578,50 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Enter while a block is selected: recall its command into the live
-            // input line (clear the shell line with Ctrl+U, then type it).
+            // Enter while a block is selected recalls its command into the live
+            // input line. Ctrl+Enter also submits it immediately. Never inject the
+            // command while another process or an alt-screen application owns stdin.
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
+                    if !command_recall_available(bstate_for_key.get()) {
+                        let finished = finished_blocks_for_key.borrow();
+                        select_finished_block(&finished, &selected_block_id_for_key, None);
+                        return glib::Propagation::Proceed;
+                    }
+
                     let finished = finished_blocks_for_key.borrow();
                     if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
                         let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
                         pty_for_key.write_bytes(b"\x15");
                         pty_for_key.write_bytes(cmd.as_bytes());
+                        pty_synced_for_key.set(true);
+                        if ctrl && !alt {
+                            pty_for_key.write_bytes(b"\r");
+                        }
                         typed_cmd_for_key.borrow_mut().clear();
                     }
                     select_finished_block(&finished, &selected_block_id_for_key, None);
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
+            }
+
+            // Delete removes the selected block from both the document and saved
+            // history. This is intentionally unmodified: selection is a visible,
+            // explicit mode, while Backspace remains available to the shell.
+            if !ctrl && !shift && !alt && keyval == Key::Delete {
+                if let Some(sel_id) = selected_block_id_for_key.get() {
+                    remove_finished_block(
+                        sel_id,
+                        &finished_blocks_for_key,
+                        &block_data_for_key,
+                        &block_list_for_key,
+                        &selected_block_id_for_key,
+                        &bookmarks_for_key,
+                        &visible_indices_for_key,
+                    );
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Escape clears the block selection (when one is active).
@@ -1621,6 +1729,10 @@ impl KeyCtx {
                 for block in blocks.drain(..) {
                     block_list_for_key.remove(block.widget());
                 }
+                block_data_for_key.borrow_mut().clear();
+                bookmarks_for_key.borrow_mut().clear();
+                visible_indices_for_key.borrow_mut().clear();
+                selected_block_id_for_key.set(None);
                 pty_for_key.write_bytes(b"\x0c");
                 return glib::Propagation::Stop;
             }
@@ -2129,6 +2241,7 @@ impl TermView {
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
                 selected_block_id_rc: selected_block_id.clone(),
+                bookmarks_for_cb: block_bookmarks.clone(),
                 cmd_running_rc: cmd_running.clone(),
                 running_cmd_rc: running_cmd.clone(),
                 layout_active_surface: layout_active_surface.clone(),
@@ -2316,7 +2429,26 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
+            let pty_synced_for_commit = pty_synced.clone();
+            let finished_blocks_for_commit = finished_blocks_rc.clone();
+            let selected_block_id_for_commit = selected_block_id.clone();
             active_vte.connect_commit(move |_, text, _size| {
+                // Any real terminal input exits block-selection mode. Otherwise a
+                // later Enter could unexpectedly recall the old selection instead
+                // of submitting the line the user has just started editing.
+                if selected_block_id_for_commit.get().is_some() {
+                    let finished = finished_blocks_for_commit.borrow();
+                    select_finished_block(&finished, &selected_block_id_for_commit, None);
+                }
+
+                if bstate_for_commit.get() == BlockState::AwaitingCommand
+                    && text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n')
+                {
+                    // A later recall must replace this edited readline buffer,
+                    // not append to it. PromptEnd resets the flag for a new line.
+                    pty_synced_for_commit.set(true);
+                }
+
                 pty_for_commit.write_bytes(text.as_bytes());
                 // The finished-block command text comes from a live-VTE
                 // text_range read at CommandStart (see PromptEnd / CommandStart
@@ -2383,6 +2515,7 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
+                pty_synced_for_key: pty_synced.clone(),
                 active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
@@ -2391,11 +2524,30 @@ impl TermView {
                 selected_block_id_for_key,
                 block_scroll_for_key,
                 bookmarks_for_key: block_bookmarks.clone(),
+                visible_indices_for_key: visible_indices.clone(),
                 bstate_for_key: bstate.clone(),
             }
             .connect(&key_ctrl);
 
             active_vte.add_controller(key_ctrl);
+        }
+
+        // Clicking back into the live prompt is an explicit exit from historical
+        // block selection. Programmatic focus from a header click does not trigger
+        // this gesture, so keyboard block navigation remains intact.
+        {
+            let finished_for_click = finished_blocks_rc.clone();
+            let selected_for_click = selected_block_id.clone();
+            let active_click = gtk4::GestureClick::new();
+            active_click.set_button(1);
+            active_click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            active_click.connect_pressed(move |_, _, _, _| {
+                if selected_for_click.get().is_some() {
+                    let finished = finished_for_click.borrow();
+                    select_finished_block(&finished, &selected_for_click, None);
+                }
+            });
+            active_vte.add_controller(active_click);
         }
 
         // Wheel handling inside an alt-screen + mouse-reporting app (less / vim /
@@ -2542,6 +2694,7 @@ impl TermView {
                     &term_view.pty,
                     &pty_synced,
                     &term_view.active,
+                    &term_view.bstate,
                 );
                 finished.connect_scroll_forwarding(&term_view.block_scroll);
                 install_finished_block_selection(

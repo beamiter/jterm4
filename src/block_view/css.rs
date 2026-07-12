@@ -342,6 +342,12 @@ pub(crate) fn install_block_css(config: &Config) {
             color: {dim_fg};
             font-size: 0.85em;
         }}
+        .block-selection-hint {{
+            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            font-family: "{font_family}";
+            font-size: 0.76em;
+            padding: 0 4px;
+        }}
         .block-collapse-btn {{
             color: {dim_fg};
             font-family: "{font_family}";
