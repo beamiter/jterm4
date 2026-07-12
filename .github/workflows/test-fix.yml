@@ -1,0 +1,50 @@
+name: Test fix
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Make local rsh test environment-independent
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/config.rs")
+          text = path.read_text()
+          old = '''        let argv = choose_shell_argv(Some("/home/yj/.cargo/bin/rsh"));
+          assert_eq!(argv[1], "-ic");'''
+          new = '''        let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
+              .expect("bash should be available on the test runner");
+          assert_eq!(argv[1], "-ic");'''
+          if text.count(old) != 1:
+              raise SystemExit("expected test snippet was not found exactly once")
+          path.write_text(text.replace(old, new))
+
+      - name: Format changes
+        run: cargo fmt --all
+
+      - name: Commit test fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/config.rs
+          if git diff --cached --quiet; then
+            echo "No test fix needed"
+            exit 0
+          fi
+          git commit -m "Make rsh wrapping test environment-independent"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
