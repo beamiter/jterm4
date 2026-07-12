@@ -1151,7 +1151,8 @@ mod tests {
 
     #[test]
     fn local_rsh_is_wrapped_in_interactive_bash() {
-        let argv = choose_shell_argv(Some("/home/yj/.cargo/bin/rsh"));
+        let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
+            .expect("bash should be available on the test runner");
         assert_eq!(argv[1], "-ic");
         assert_eq!(argv[2], "exec '/home/yj/.cargo/bin/rsh'");
     }
