@@ -328,6 +328,33 @@ fn output_row_count(text: &str) -> i64 {
     }
 }
 
+/// Rows occupied after VTE wraps the snapshot at `cols`. Finished cards need
+/// this rather than the logical line count, otherwise long stack-trace lines
+/// are still pushed into the VTE's private scrollback.
+fn output_visual_row_count(text: &str, cols: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
+
+    let cols = cols.max(1) as usize;
+    let text = output_display_text(text);
+    if text.is_empty() {
+        return 1;
+    }
+
+    text.split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                width += match ch {
+                    '\t' => 8 - (width % 8),
+                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                };
+            }
+            width.max(1).div_ceil(cols) as i64
+        })
+        .sum::<i64>()
+        .max(1)
+}
+
 fn output_display_text(text: &str) -> &str {
     let text = if let Some(stripped) = text.strip_prefix("\r\n") {
         stripped
@@ -502,8 +529,11 @@ impl FinishedBlock {
         cols: i64,
         recycled: Option<gtk4::Box>,
     ) -> Self {
-        let viewport_cap = config.finished_block_viewport_rows.max(3) as i64;
-        let max_expanded_cap = (config.finished_block_max_expanded_rows as i64).max(viewport_cap);
+        // Finished blocks are full-height cards on one vertically scrolling
+        // canvas. The global truncation limit still bounds pathological output.
+        let output_rows = output_visual_row_count(output, cols);
+        let viewport_cap = output_rows.max(1);
+        let max_expanded_cap = viewport_cap;
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -733,16 +763,10 @@ impl FinishedBlock {
             });
         }
 
-        // Output VTE: full output fed once on first map; rows beyond the
-        // viewport cap live in this widget's scrollback so the user can
-        // scroll inside the block. When the block scrolls out of view it's
-        // unmapped — at that point we reset the VTE's grid + scrollback so
-        // its per-widget buffer memory is reclaimed. A subsequent map (block
-        // scrolls back in) re-feeds from `displayed_output`, which the filter
-        // path keeps in sync with whatever the user wants to see.
+        // Output VTE: full output is allocated at its complete wrapped height.
+        // The outer ScrolledWindow is the sole vertical canvas.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
-        let output_rows = output_row_count(output);
         let output_scrollable = output_rows > viewport_cap;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
@@ -759,7 +783,7 @@ impl FinishedBlock {
             let expanded_for_map = expanded.clone();
             output_vte.connect_map(move |w| {
                 let text = displayed_for_map.borrow();
-                let rows = output_row_count(&text);
+                let rows = output_visual_row_count(&text, cols_for_map);
                 let cap = if expanded_for_map.get() {
                     max_for_map
                 } else {
@@ -798,7 +822,7 @@ impl FinishedBlock {
                 } else {
                     viewport_cap
                 };
-                let rows = output_row_count(&displayed_for_btn.borrow());
+                let rows = output_visual_row_count(&displayed_for_btn.borrow(), cols_for_btn);
                 let visible_rows = rows.min(cap).max(1);
                 output_vte_for_btn.set_size(cols_for_btn, visible_rows);
                 let ch = output_vte_for_btn.char_height() as i32;
@@ -992,7 +1016,8 @@ impl FinishedBlock {
                         Err(_) => (full.to_string(), true),
                     };
                     let shown_rows = output_row_count(&shown);
-                    let can_expand = shown_rows > viewport_cap;
+                    let shown_visual_rows = output_visual_row_count(&shown, cols);
+                    let can_expand = shown_visual_rows > viewport_cap;
                     // A narrow filter result must not leave the block logically
                     // expanded; clearing the query should return to default height.
                     if !can_expand && expanded.replace(false) {
@@ -1008,13 +1033,14 @@ impl FinishedBlock {
                         &output_vte,
                         &shown,
                         cols,
-                        shown_rows,
+                        shown_visual_rows,
                         active_cap,
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
-                        output_vte
-                            .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
+                        output_vte.set_height_request(
+                            (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
+                        );
                     }
                     let has_query = !q.trim().is_empty();
                     if invalid_regex {
@@ -1477,6 +1503,12 @@ mod tests {
             collapsed_output_summary(42),
             "▸ 42 lines hidden — click to show"
         );
+    }
+
+    #[test]
+    fn visual_row_count_includes_terminal_wrapping() {
+        assert_eq!(super::output_visual_row_count("123456789\nabc", 4), 4);
+        assert_eq!(super::output_visual_row_count("界界界", 4), 2);
     }
 
     #[test]
