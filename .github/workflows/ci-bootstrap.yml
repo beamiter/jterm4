@@ -1,0 +1,42 @@
+name: CI bootstrap
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply formatting and generate lockfile
+        run: |
+          cargo fmt --all
+          cargo generate-lockfile
+          sed -i '/^Cargo\.lock$/d' .gitignore
+
+      - name: Commit bootstrap changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No bootstrap changes needed"
+            exit 0
+          fi
+          git commit -m "Apply Rust formatting and lock dependencies"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
