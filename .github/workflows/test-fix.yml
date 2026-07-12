@@ -25,13 +25,11 @@ jobs:
 
           path = Path("src/config.rs")
           text = path.read_text()
-          old = '''        let argv = choose_shell_argv(Some("/home/yj/.cargo/bin/rsh"));
-          assert_eq!(argv[1], "-ic");'''
-          new = '''        let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
-              .expect("bash should be available on the test runner");
-          assert_eq!(argv[1], "-ic");'''
+          old = 'let argv = choose_shell_argv(Some("/home/yj/.cargo/bin/rsh"));'
+          new = '''let argv = wrap_rsh_argv_in_interactive_bash("/home/yj/.cargo/bin/rsh")
+              .expect("bash should be available on the test runner");'''
           if text.count(old) != 1:
-              raise SystemExit("expected test snippet was not found exactly once")
+              raise SystemExit("expected test line was not found exactly once")
           path.write_text(text.replace(old, new))
 
       - name: Format changes
