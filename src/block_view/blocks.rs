@@ -876,10 +876,13 @@ impl FinishedBlock {
         }
 
         let has_output = !output.trim().is_empty();
+        // Output-only controls are noise for commands such as `cd`,
+        // `mkdir`, and successful redirects.
+        copy_output_btn.set_visible(has_output);
+        filter_btn.set_visible(has_output);
+        collapse_btn.set_visible(has_output);
         if !has_output {
             output_widget.set_visible(false);
-            collapse_btn.set_sensitive(false);
-            collapse_btn.set_tooltip_text(Some("No output"));
         } else {
             collapse_btn.set_tooltip_text(Some(&format!(
                 "Toggle output ({})",
@@ -911,10 +914,6 @@ impl FinishedBlock {
         {
             let set_collapsed = set_collapsed.clone();
             collapsed_summary.connect_clicked(move |_| set_collapsed(false));
-        }
-        if !has_output {
-            collapse_btn.set_label("\u{f054}"); // nf-fa-chevron_right
-            collapsed_summary.set_visible(false);
         }
 
         // Per-block output filter (Warp's BlockFilterQuery): the funnel button in
@@ -993,6 +992,13 @@ impl FinishedBlock {
                         Err(_) => (full.to_string(), true),
                     };
                     let shown_rows = output_row_count(&shown);
+                    let can_expand = shown_rows > viewport_cap;
+                    // A narrow filter result must not leave the block logically
+                    // expanded; clearing the query should return to default height.
+                    if !can_expand && expanded.replace(false) {
+                        expand_btn.set_label("\u{f065}");
+                        expand_btn.set_tooltip_text(Some("Expand block"));
+                    }
                     let active_cap = if expanded.get() {
                         max_expanded_cap
                     } else {
@@ -1037,7 +1043,7 @@ impl FinishedBlock {
                         filter_status.set_visible(false);
                     }
                     collapsed_summary.set_label(&collapsed_output_summary(shown_rows));
-                    expand_btn.set_visible(shown_rows > viewport_cap);
+                    expand_btn.set_visible(can_expand);
                     // Keep `displayed_output` in sync so a later unmap → remap
                     // (block scrolls out of view, then back) re-feeds the
                     // filtered text, not the full output.
@@ -1062,10 +1068,12 @@ impl FinishedBlock {
             let entry_for_btn = filter_entry.clone();
             let apply_for_btn = apply.clone();
             let filter_btn_for_toggle = filter_btn.clone();
+            let set_collapsed_for_filter = set_collapsed.clone();
             filter_btn.connect_clicked(move |_| {
                 let show = !filter_row_for_btn.is_visible();
                 filter_row_for_btn.set_visible(show);
                 if show {
+                    set_collapsed_for_filter(false);
                     filter_btn_for_toggle.add_css_class("block-action-active");
                     entry_for_btn.grab_focus();
                 } else {
@@ -1151,6 +1159,7 @@ impl FinishedBlock {
         pty_synced: &Rc<Cell<bool>>,
         active: &Rc<RefCell<ActiveBlock>>,
         bstate: &Rc<Cell<BlockState>>,
+        bracketed_paste: &Rc<Cell<bool>>,
     ) {
         let vte_for_cmd = vte.clone();
         let cmd_for_copy = self.cmd_text.clone();
@@ -1178,6 +1187,7 @@ impl FinishedBlock {
         let pty_synced_for_rerun = pty_synced.clone();
         let active_for_rerun = active.clone();
         let bstate_for_rerun = bstate.clone();
+        let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
             // Never inject a recalled command into stdin of a running command or
@@ -1188,16 +1198,19 @@ impl FinishedBlock {
                 return;
             }
 
-            // Clear any partial line at the live prompt (Ctrl+U) then type the
-            // command bytes into the shell, leaving the user to press Enter
-            // (jterm1 rerun model).
-            if pty_synced_for_rerun.get() {
-                pty_for_rerun.write_bytes(b"\x15");
-            }
-            pty_for_rerun.write_bytes(cmd_for_rerun.as_bytes());
+            let first_line_only = write_recalled_command(
+                &pty_for_rerun,
+                &cmd_for_rerun,
+                bracketed_for_rerun.get(),
+                false,
+            );
             pty_synced_for_rerun.set(true);
             active_for_rerun.borrow().grab_focus();
-            flash_button_label(btn, "\u{f00c}", "Command inserted");
+            if first_line_only {
+                flash_button_label(btn, "\u{f071}", "First line inserted");
+            } else {
+                flash_button_label(btn, "\u{f00c}", "Command inserted");
+            }
         });
     }
 }
@@ -1350,6 +1363,51 @@ pub(crate) fn command_recall_available(state: BlockState) -> bool {
     state == BlockState::AwaitingCommand
 }
 
+/// Select text that can be inserted without accidentally submitting multiple
+/// commands. With bracketed paste enabled, the whole multiline edit buffer is
+/// safe; otherwise fall back to the first line.
+fn recalled_command_text(cmd: &str, bracketed_paste: bool) -> (&str, bool) {
+    let cmd = cmd.trim_end_matches(|c: char| matches!(c, '\r' | '\n'));
+    if bracketed_paste {
+        return (cmd, false);
+    }
+    let first_break = cmd
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '\r' | '\n').then_some(idx));
+    match first_break {
+        Some(idx) => (&cmd[..idx], true),
+        None => (cmd, false),
+    }
+}
+
+/// Replace the current shell edit buffer with a recalled command. Multiline
+/// commands use bracketed-paste markers when the shell advertised DECSET 2004,
+/// so embedded newlines remain editable instead of executing early.
+pub(crate) fn write_recalled_command(
+    pty: &crate::pty::OwnedPty,
+    cmd: &str,
+    bracketed_paste: bool,
+    execute: bool,
+) -> bool {
+    let (text, first_line_only) = recalled_command_text(cmd, bracketed_paste);
+    let multiline = text.contains('\n') || text.contains('\r');
+
+    // Always clear the line. User-typed text is not represented by pty_synced,
+    // so conditioning Ctrl+U on that flag appends history to partial input.
+    pty.write_bytes(b"\x15");
+    if bracketed_paste && multiline {
+        pty.write_bytes(b"\x1b[200~");
+        pty.write_bytes(text.as_bytes());
+        pty.write_bytes(b"\x1b[201~");
+    } else {
+        pty.write_bytes(text.as_bytes());
+    }
+    if execute {
+        pty.write_bytes(b"\r");
+    }
+    first_line_only
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1369,6 +1427,22 @@ mod tests {
         ] {
             assert!(!command_recall_available(state), "{state:?}");
         }
+    }
+
+    #[test]
+    fn multiline_recall_uses_full_text_with_bracketed_paste() {
+        assert_eq!(
+            super::recalled_command_text("printf one\nprintf two\n", true),
+            ("printf one\nprintf two", false)
+        );
+    }
+
+    #[test]
+    fn multiline_recall_falls_back_without_bracketed_paste() {
+        assert_eq!(
+            super::recalled_command_text("printf one\nprintf two", false),
+            ("printf one", true)
+        );
     }
 
     #[test]

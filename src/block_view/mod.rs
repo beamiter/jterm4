@@ -848,6 +848,7 @@ impl ReaderCtx {
                                     &pty_synced_rc,
                                     &active_rc,
                                     &bstate_rc,
+                                    &bracketed_paste_rc,
                                 );
                                 finished_clone.connect_scroll_forwarding(&block_scroll_rc);
 
@@ -885,6 +886,7 @@ impl ReaderCtx {
                                 let pty_synced_for_rerun_menu = pty_synced_rc.clone();
                                 let active_for_rerun_menu = active_rc.clone();
                                 let bstate_for_rerun_menu = bstate_rc.clone();
+                                let bracketed_paste_for_menu = bracketed_paste_rc.clone();
                                 let selected_for_menu = selected_block_id_rc.clone();
                                 let bookmarks_for_menu = bookmarks_for_cb.clone();
                                 let visible_for_menu = visible_indices_rc.clone();
@@ -987,6 +989,7 @@ impl ReaderCtx {
                                             pty_synced_for_rerun_menu.clone();
                                         let active_for_action = active_for_rerun_menu.clone();
                                         let bstate_for_action = bstate_for_rerun_menu.clone();
+                                        let bracketed_for_action = bracketed_paste_for_menu.clone();
                                         item.set_sensitive(command_recall_available(
                                             bstate_for_rerun_menu.get(),
                                         ));
@@ -999,13 +1002,11 @@ impl ReaderCtx {
                                                 active_for_action.borrow().grab_focus();
                                                 return;
                                             }
-                                            // Match the visible re-run affordance: replace any
-                                            // partial prompt text, but leave Enter to the user.
-                                            if pty_synced_for_action.get() {
-                                                pty_for_action.write_bytes(b"\x15");
-                                            }
-                                            pty_for_action.write_bytes(
-                                                finished_for_rerun.cmd_text.as_bytes(),
+                                            write_recalled_command(
+                                                &pty_for_action,
+                                                &finished_for_rerun.cmd_text,
+                                                bracketed_for_action.get(),
+                                                false,
                                             );
                                             pty_synced_for_action.set(true);
                                             active_for_action.borrow().grab_focus();
@@ -1559,6 +1560,7 @@ fn running_root_control_bytes(
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     pty_synced_for_key: Rc<Cell<bool>>,
+    bracketed_paste_for_key: Rc<Cell<bool>>,
     active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
@@ -1576,6 +1578,7 @@ impl KeyCtx {
         let KeyCtx {
             pty_for_key,
             pty_synced_for_key,
+            bracketed_paste_for_key,
             active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
@@ -1656,13 +1659,13 @@ impl KeyCtx {
 
                     let finished = finished_blocks_for_key.borrow();
                     if let Some(block) = finished.iter().find(|b| b.id == sel_id) {
-                        let cmd: String = block.cmd_text.lines().next().unwrap_or("").to_string();
-                        pty_for_key.write_bytes(b"\x15");
-                        pty_for_key.write_bytes(cmd.as_bytes());
+                        write_recalled_command(
+                            &pty_for_key,
+                            &block.cmd_text,
+                            bracketed_paste_for_key.get(),
+                            ctrl && !alt,
+                        );
                         pty_synced_for_key.set(true);
-                        if ctrl && !alt {
-                            pty_for_key.write_bytes(b"\r");
-                        }
                         typed_cmd_for_key.borrow_mut().clear();
                     }
                     select_finished_block(&finished, &selected_block_id_for_key, None);
@@ -1824,7 +1827,7 @@ impl KeyCtx {
                 {
                     let block_data = block_data_for_key.borrow();
                     for b in block_data.iter().rev() {
-                        let c = b.cmd.lines().next().unwrap_or("").trim().to_string();
+                        let c = b.cmd.trim().to_string();
                         if c.is_empty() {
                             continue;
                         }
@@ -1837,12 +1840,16 @@ impl KeyCtx {
                         }
                     }
                 }
+                if entries.is_empty() {
+                    return glib::Propagation::Proceed;
+                }
                 show_command_palette(
                     &block_scroll_for_key,
                     entries,
                     pty_for_key.clone(),
                     typed_cmd_for_key.clone(),
                     pty_synced_for_key.clone(),
+                    bracketed_paste_for_key.clone(),
                     active_vte_for_key.clone(),
                 );
                 return glib::Propagation::Stop;
@@ -2588,6 +2595,7 @@ impl TermView {
             KeyCtx {
                 pty_for_key,
                 pty_synced_for_key: pty_synced.clone(),
+                bracketed_paste_for_key: bracketed_paste.clone(),
                 active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
@@ -2767,6 +2775,7 @@ impl TermView {
                     &pty_synced,
                     &term_view.active,
                     &term_view.bstate,
+                    &term_view.bracketed_paste,
                 );
                 finished.connect_scroll_forwarding(&term_view.block_scroll);
                 install_finished_block_selection(
@@ -3282,35 +3291,23 @@ impl TermView {
 
     pub fn scroll_to_block(&self, block_index: usize) {
         let finished = self.finished_blocks.borrow();
-        if block_index >= finished.len() {
-            return;
-        }
         if let Some(block) = finished.get(block_index) {
             select_finished_block(&finished, &self.selected_block_id, Some(block.id));
-            block.widget().grab_focus();
-            let adj = self.block_scroll.vadjustment();
-            if let Some(value) = block
-                .widget()
-                .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
-            {
-                adj.set_value(value.y() as f64);
-            }
+            scroll_finished_block_into_view(&self.block_scroll, block);
         }
     }
 
-    /// Delete a block by ID (for right-click menu).
+    /// Delete a block by ID while keeping every parallel block-mode state in sync.
     pub fn delete_block_by_id(&self, block_id: u64) {
-        let mut finished = self.finished_blocks.borrow_mut();
-        if let Some(pos) = finished.iter().position(|b| b.id == block_id) {
-            let block_to_remove = finished.remove(pos);
-            let widget_to_release = block_to_remove.widget().clone();
-            self.block_list.remove(&widget_to_release);
-            // Return widget to pool for potential reuse
-            self.widget_pool.borrow_mut().release(widget_to_release);
-            // Keep the serializable record list in lockstep with the widget list;
-            // otherwise the two desync and count-based eviction / id lookups drift.
-            self.block_data.borrow_mut().retain(|b| b.id != block_id);
-        }
+        let _ = remove_finished_block(
+            block_id,
+            &self.finished_blocks,
+            &self.block_data,
+            &self.block_list,
+            &self.selected_block_id,
+            &self.bookmarks,
+            &self.visible_indices,
+        );
     }
 
     /// Most-recent-first deduplicated list of finished-block command lines.

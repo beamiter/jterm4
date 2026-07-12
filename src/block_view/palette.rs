@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::Terminal;
 
+use super::write_recalled_command;
 use crate::pty::OwnedPty;
 
 /// Subsequence fuzzy match: returns `Some(score)` if every char of `query`
@@ -42,6 +43,30 @@ pub(crate) fn fuzzy_score(query: &str, text: &str) -> Option<i64> {
     }
 }
 
+/// Compact multiline commands into one readable row while retaining the full
+/// command as the value inserted into the shell.
+fn command_preview(cmd: &str) -> String {
+    const MAX_CHARS: usize = 140;
+    let mut preview = String::new();
+    for (index, line) in cmd.lines().enumerate() {
+        if index > 0 {
+            preview.push_str("  ↵  ");
+        }
+        preview.push_str(line.trim());
+    }
+    if preview.is_empty() {
+        preview.push_str(cmd.trim());
+    }
+
+    let mut chars = preview.chars();
+    let shortened: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
 /// A command-history entry for the palette, carrying the outcome metadata the
 /// failed/slow filters need (the plain command list can't express those).
 pub(crate) struct PaletteEntry {
@@ -59,6 +84,7 @@ pub(crate) fn show_command_palette(
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
     pty_synced: Rc<Cell<bool>>,
+    bracketed_paste: Rc<Cell<bool>>,
     live_vte: Terminal,
 ) {
     let popover = gtk4::Popover::new();
@@ -89,6 +115,13 @@ pub(crate) fn show_command_palette(
     slow_toggle.add_css_class("flat");
     filter_row.append(&failed_toggle);
     filter_row.append(&slow_toggle);
+    let filter_spacer = gtk4::Box::new(Orientation::Horizontal, 0);
+    filter_spacer.set_hexpand(true);
+    filter_row.append(&filter_spacer);
+    let result_status = gtk4::Label::new(None);
+    result_status.add_css_class("block-filter-status");
+    result_status.set_halign(gtk4::Align::End);
+    filter_row.append(&result_status);
     vbox.append(&filter_row);
 
     let failed_only = Rc::new(Cell::new(false));
@@ -116,30 +149,42 @@ pub(crate) fn show_command_palette(
         let filtered = filtered.clone();
         let failed_only = failed_only.clone();
         let slow_only = slow_only.clone();
+        let result_status = result_status.clone();
         move |query: &str| {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
             let want_failed = failed_only.get();
             let want_slow = slow_only.get();
-            let mut scored: Vec<(i64, &str)> = entries
+            let mut scored: Vec<(i64, &PaletteEntry)> = entries
                 .iter()
                 .filter(|e| (!want_failed || e.failed) && (!want_slow || e.slow))
-                .filter_map(|e| fuzzy_score(query, &e.cmd).map(|s| (s, e.cmd.as_str())))
+                .filter_map(|e| fuzzy_score(query, &e.cmd).map(|s| (s, e)))
                 .collect();
             // Stable sort keeps recency (input order) as the tiebreak.
             scored.sort_by_key(|(s, _)| *s);
             let mut keep = Vec::with_capacity(scored.len());
-            for (_, c) in scored {
-                let row_label = gtk4::Label::new(Some(c));
+            for (_, palette_entry) in scored {
+                let preview = command_preview(&palette_entry.cmd);
+                let row_label = gtk4::Label::new(Some(&preview));
                 row_label.set_halign(gtk4::Align::Start);
                 row_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                row_label.set_tooltip_text(Some(&palette_entry.cmd));
                 row_label.add_css_class("command-palette-row");
                 let row = gtk4::ListBoxRow::new();
                 row.set_child(Some(&row_label));
                 list.append(&row);
-                keep.push(c.to_string());
+                keep.push(palette_entry.cmd.clone());
             }
+            let count = keep.len();
+            let status = if count == 0 {
+                "No matches".to_string()
+            } else if count == 1 {
+                "1 command".to_string()
+            } else {
+                format!("{count} commands")
+            };
+            result_status.set_text(&status);
             *filtered.borrow_mut() = keep;
             if let Some(first) = list.row_at_index(0) {
                 list.select_row(Some(&first));
@@ -176,14 +221,16 @@ pub(crate) fn show_command_palette(
         let scroll = parent.clone();
         Rc::new(move || {
             let idx = list.selected_row().map(|r| r.index()).unwrap_or(-1);
-            if idx >= 0 {
-                if let Some(cmd) = filtered.borrow().get(idx as usize) {
-                    pty.write_bytes(b"\x15");
-                    pty.write_bytes(cmd.as_bytes());
-                    pty_synced.set(true);
-                    typed_cmd.borrow_mut().clear();
-                }
-            }
+            let Some(cmd) = (idx >= 0)
+                .then(|| filtered.borrow().get(idx as usize).cloned())
+                .flatten()
+            else {
+                // Keep the palette open when filters produce zero matches.
+                return;
+            };
+            write_recalled_command(&pty, &cmd, bracketed_paste.get(), false);
+            pty_synced.set(true);
+            typed_cmd.borrow_mut().clear();
             popover.popdown();
             // Dismissing the popover returns focus to the live VTE, which makes the
             // ScrolledWindow scroll to reveal the holder's *top* (jumping up into
@@ -276,4 +323,24 @@ pub(crate) fn show_command_palette(
 
     popover.popup();
     entry.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_preview;
+
+    #[test]
+    fn multiline_command_preview_is_single_line() {
+        assert_eq!(
+            command_preview("printf one\nprintf two"),
+            "printf one  ↵  printf two"
+        );
+    }
+
+    #[test]
+    fn command_preview_is_bounded() {
+        let preview = command_preview(&"x".repeat(200));
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), 141);
+    }
 }
