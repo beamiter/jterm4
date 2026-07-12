@@ -251,18 +251,16 @@ fn filter_output_lines(
     case_sensitive: bool,
     invert: bool,
     context: usize,
-) -> String {
+) -> Result<String, regex::Error> {
     if query.is_empty() {
-        return full.to_string();
+        return Ok(full.to_string());
     }
     let re = if use_regex {
-        match regex::RegexBuilder::new(query)
-            .case_insensitive(!case_sensitive)
-            .build()
-        {
-            Ok(re) => Some(re),
-            Err(_) => return full.to_string(),
-        }
+        Some(
+            regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()?,
+        )
     } else {
         None
     };
@@ -311,7 +309,7 @@ fn filter_output_lines(
         }
         out.push_str(line);
     }
-    out
+    Ok(out)
 }
 
 fn output_row_count(text: &str) -> i64 {
@@ -634,8 +632,9 @@ impl FinishedBlock {
 
         // Selected blocks behave like a lightweight navigation mode. Keep the
         // available keyboard actions visible instead of making users memorize them.
-        let selection_hint =
-            gtk4::Label::new(Some("Enter recall   Ctrl+Enter run   Delete remove"));
+        let selection_hint = gtk4::Label::new(Some(
+            "↵ recall  ·  Ctrl+↵ run  ·  Del remove  ·  Esc cancel",
+        ));
         selection_hint.add_css_class("block-selection-hint");
         selection_hint.set_visible(false);
         selection_hint.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -977,8 +976,8 @@ impl FinishedBlock {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
                     let full_rows = output_row_count(&full);
-                    let shown = if q.is_empty() {
-                        full.to_string()
+                    let filtered = if q.is_empty() {
+                        Ok(full.to_string())
                     } else {
                         filter_output_lines(
                             full.as_str(),
@@ -988,6 +987,10 @@ impl FinishedBlock {
                             invert_tg.is_active(),
                             ctx_spin.value() as usize,
                         )
+                    };
+                    let (shown, invalid_regex) = match filtered {
+                        Ok(shown) => (shown, false),
+                        Err(_) => (full.to_string(), true),
                     };
                     let shown_rows = output_row_count(&shown);
                     let active_cap = if expanded.get() {
@@ -1008,7 +1011,12 @@ impl FinishedBlock {
                             .set_height_request((shown_rows.min(active_cap).max(1) as i32) * ch);
                     }
                     let has_query = !q.trim().is_empty();
-                    if has_query {
+                    if invalid_regex {
+                        filter_btn.add_css_class("block-action-active");
+                        filter_status.set_visible(true);
+                        filter_status.set_text("Invalid regular expression");
+                        filter_status.add_css_class("block-filter-empty");
+                    } else if has_query {
                         filter_btn.add_css_class("block-action-active");
                         filter_status.set_visible(true);
                         let hidden = full_rows.saturating_sub(shown_rows);
@@ -1366,7 +1374,8 @@ mod tests {
     #[test]
     fn filter_output_lines_matches_ascii_case_insensitive() {
         assert_eq!(
-            filter_output_lines("alpha\nERROR: nope\nomega", "error", false, false, false, 0),
+            filter_output_lines("alpha\nERROR: nope\nomega", "error", false, false, false, 0)
+                .unwrap(),
             "ERROR: nope"
         );
     }
@@ -1374,9 +1383,14 @@ mod tests {
     #[test]
     fn filter_output_lines_preserves_unicode_case_insensitive_search() {
         assert_eq!(
-            filter_output_lines("alpha\n你好世界\nomega", "你好", false, false, false, 0),
+            filter_output_lines("alpha\n你好世界\nomega", "你好", false, false, false, 0).unwrap(),
             "你好世界"
         );
+    }
+
+    #[test]
+    fn filter_output_lines_reports_invalid_regex() {
+        assert!(filter_output_lines("alpha", "[", true, false, false, 0).is_err());
     }
 
     #[test]
@@ -1394,7 +1408,7 @@ mod tests {
     #[test]
     fn filter_output_lines_includes_context_without_extra_alloc_join() {
         assert_eq!(
-            filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1),
+            filter_output_lines("one\ntwo\nthree\nfour", "three", false, true, false, 1).unwrap(),
             "two\nthree\nfour"
         );
     }

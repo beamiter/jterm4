@@ -58,6 +58,7 @@ pub(crate) fn show_command_palette(
     entries: Vec<PaletteEntry>,
     pty: Rc<OwnedPty>,
     typed_cmd: Rc<RefCell<String>>,
+    pty_synced: Rc<Cell<bool>>,
     live_vte: Terminal,
 ) {
     let popover = gtk4::Popover::new();
@@ -70,7 +71,8 @@ pub(crate) fn show_command_palette(
     popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(pw / 2, 0, 1, 1)));
 
     let vbox = gtk4::Box::new(Orientation::Vertical, 6);
-    vbox.set_size_request(540, -1);
+    // Respect narrow split panes instead of forcing a 540px-wide popover.
+    vbox.set_size_request(pw.saturating_sub(32).clamp(1, 540), -1);
 
     let entry = gtk4::SearchEntry::new();
     entry.set_placeholder_text(Some("Search command history…"));
@@ -98,8 +100,9 @@ pub(crate) fn show_command_palette(
 
     let scroller = ScrolledWindow::new();
     scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
-    scroller.set_min_content_height(300);
-    scroller.set_max_content_height(300);
+    let palette_height = parent.height().saturating_sub(140).clamp(160, 300);
+    scroller.set_min_content_height(palette_height);
+    scroller.set_max_content_height(palette_height);
     scroller.set_child(Some(&list));
     vbox.append(&scroller);
     popover.set_child(Some(&vbox));
@@ -165,6 +168,7 @@ pub(crate) fn show_command_palette(
         });
     }
 
+    let live_vte_for_choose = live_vte.clone();
     let choose: Rc<dyn Fn()> = {
         let list = list.clone();
         let filtered = filtered.clone();
@@ -176,6 +180,7 @@ pub(crate) fn show_command_palette(
                 if let Some(cmd) = filtered.borrow().get(idx as usize) {
                     pty.write_bytes(b"\x15");
                     pty.write_bytes(cmd.as_bytes());
+                    pty_synced.set(true);
                     typed_cmd.borrow_mut().clear();
                 }
             }
@@ -185,7 +190,7 @@ pub(crate) fn show_command_palette(
             // history). Re-pin to the bottom so the user lands back on the prompt
             // with the recalled command.
             let scroll = scroll.clone();
-            let live_vte = live_vte.clone();
+            let live_vte = live_vte_for_choose.clone();
             glib::idle_add_local_once(move || {
                 live_vte.grab_focus();
                 let adj = scroll.vadjustment();
@@ -261,8 +266,13 @@ pub(crate) fn show_command_palette(
     }
 
     // A Popover with an explicit parent must be unparented when dismissed or it
-    // leaks (and warns at teardown).
-    popover.connect_closed(|p| p.unparent());
+    // leaks (and warns at teardown). Restore terminal focus on Escape/click-away;
+    // previously only choosing a command returned focus to the prompt.
+    let live_vte_for_close = live_vte.clone();
+    popover.connect_closed(move |p| {
+        live_vte_for_close.grab_focus();
+        p.unparent();
+    });
 
     popover.popup();
     entry.grab_focus();

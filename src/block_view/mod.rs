@@ -200,7 +200,13 @@ fn select_finished_block(
     selected_block_id: &Rc<Cell<Option<u64>>>,
     new_id: Option<u64>,
 ) {
+    // Deferred callbacks and context menus can outlive the block they target.
+    // Filter the id here so selection state can never point at a deleted block.
+    let new_id = new_id.filter(|id| finished.iter().any(|block| block.id == *id));
     let prev = selected_block_id.get();
+    if prev == new_id {
+        return;
+    }
     if let Some(pid) = prev {
         if let Some(b) = finished.iter().find(|b| b.id == pid) {
             b.widget().remove_css_class("block-selected");
@@ -221,9 +227,51 @@ fn select_finished_block(
     selected_block_id.set(new_id);
 }
 
+/// Reveal a selected block with the smallest possible scroll movement. The old
+/// navigation path always moved the block to one-third of the viewport, making
+/// repeated Ctrl+Shift+Up/Down feel like the document jumped under the cursor.
+fn scroll_finished_block_into_view(scroll: &ScrolledWindow, block: &FinishedBlock) {
+    let scroll = scroll.clone();
+    let widget = block.widget().clone();
+    glib::idle_add_local_once(move || {
+        let Some(bounds) = widget.compute_bounds(&scroll) else {
+            return;
+        };
+        let adj = scroll.vadjustment();
+        let viewport_height = adj.page_size().max(scroll.height() as f64);
+        let delta = scroll_delta_to_reveal(
+            bounds.y() as f64,
+            (bounds.y() + bounds.height()) as f64,
+            viewport_height,
+            18.0,
+        );
+        if delta.abs() < 1.0 {
+            return;
+        }
+        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+        adj.set_value((adj.value() + delta).clamp(adj.lower(), max_value));
+    });
+}
+
+fn scroll_delta_to_reveal(top: f64, bottom: f64, viewport_height: f64, padding: f64) -> f64 {
+    if viewport_height <= 1.0 {
+        return 0.0;
+    }
+    let padding = padding.clamp(0.0, viewport_height / 4.0);
+    let usable_height = (viewport_height - padding * 2.0).max(1.0);
+    if bottom - top >= usable_height || top < padding {
+        top - padding
+    } else if bottom > viewport_height - padding {
+        bottom - (viewport_height - padding)
+    } else {
+        0.0
+    }
+}
+
 /// Remove one block and all of its parallel state. Keeping the GTK widgets,
 /// serializable history, selection, and bookmarks in lockstep prevents deleted
 /// blocks from reappearing in history/search or leaving stale keyboard targets.
+/// Returns the nearest surviving block so repeated Delete presses can keep going.
 fn remove_finished_block(
     block_id: u64,
     finished_blocks: &Rc<RefCell<Vec<FinishedBlock>>>,
@@ -232,7 +280,7 @@ fn remove_finished_block(
     selected_block_id: &Rc<Cell<Option<u64>>>,
     bookmarks: &Rc<RefCell<std::collections::HashSet<u64>>>,
     visible_indices: &Rc<RefCell<std::collections::HashSet<usize>>>,
-) -> bool {
+) -> Option<u64> {
     let removed = {
         let mut finished = finished_blocks.borrow_mut();
         finished
@@ -241,7 +289,7 @@ fn remove_finished_block(
             .map(|pos| (pos, finished.remove(pos)))
     };
     let Some((removed_pos, block)) = removed else {
-        return false;
+        return None;
     };
 
     block_list.remove(block.widget());
@@ -266,7 +314,16 @@ fn remove_finished_block(
     if selected_block_id.get() == Some(block_id) {
         selected_block_id.set(None);
     }
-    true
+
+    let finished = finished_blocks.borrow();
+    finished
+        .get(removed_pos)
+        .or_else(|| {
+            removed_pos
+                .checked_sub(1)
+                .and_then(|previous| finished.get(previous))
+        })
+        .map(|block| block.id)
 }
 
 /// Install the shared click-to-select behavior for a finished block. New blocks
@@ -294,10 +351,11 @@ fn install_finished_block_selection(
             gesture.set_state(gtk4::EventSequenceState::Denied);
             return;
         }
-        active_for_click.borrow().grab_focus();
-        // Header strip occupies the top of the block; a press there toggles
-        // this block's selection. Output clicks stay native VTE selection.
+        // Header clicks enter block-navigation mode. Output/filter clicks should
+        // retain their native VTE/SearchEntry focus instead of flashing the live
+        // prompt cursor on every text-selection gesture.
         if y <= header_for_click.height() as f64 {
+            active_for_click.borrow().grab_focus();
             let finished = finished_blocks_for_select.borrow();
             let target = if selected_for_click.get() == Some(this_id) {
                 None
@@ -839,6 +897,7 @@ impl ReaderCtx {
                                 let block_data_for_export = block_data_for_cb.clone();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
+                                    let selection_before_menu = selected_for_menu.get();
                                     {
                                         let finished = finished_blocks_for_menu.borrow();
                                         select_finished_block(
@@ -1009,7 +1068,7 @@ impl ReaderCtx {
                                         let block_id_del = block_id;
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
-                                            remove_finished_block(
+                                            let _ = remove_finished_block(
                                                 block_id_del,
                                                 &finished_blocks_for_delete,
                                                 &block_data_for_delete,
@@ -1023,7 +1082,18 @@ impl ReaderCtx {
                                     }
 
                                     popover.set_child(Some(&vbox));
+                                    let finished_for_close = finished_blocks_for_menu.clone();
+                                    let selected_for_close = selected_for_menu.clone();
                                     popover.connect_closed(move |p| {
+                                        // A context-menu highlight is temporary. Restore the
+                                        // previous selection so Copy/Export cannot leave Enter
+                                        // armed to recall a command the user never selected.
+                                        let finished = finished_for_close.borrow();
+                                        select_finished_block(
+                                            &finished,
+                                            &selected_for_close,
+                                            selection_before_menu,
+                                        );
                                         p.unparent();
                                     });
                                     popover.popup();
@@ -1526,6 +1596,9 @@ impl KeyCtx {
             // Shift+PageUp/PageDown: page the block history locally. The
             // vadjustment value_changed handler keeps scroll-lock in sync.
             if shift && !ctrl && !alt && matches!(keyval, Key::Page_Up | Key::Page_Down) {
+                if bstate_for_key.get() == BlockState::AltScreen {
+                    return glib::Propagation::Proceed;
+                }
                 let adj = block_scroll_for_key.vadjustment();
                 let step = (adj.page_size() * 0.9).max(1.0);
                 let delta = if keyval == Key::Page_Up { -step } else { step };
@@ -1534,14 +1607,16 @@ impl KeyCtx {
                 return glib::Propagation::Stop;
             }
 
-            // Ctrl+Shift+Up/Down: move the finished-block selection (Warp uses
-            // Ctrl+Up/Down, but VTE swallows plain Ctrl+arrow before the capture
-            // handler, so Shift is required in practice; the condition stays
-            // permissive so plain Ctrl+arrow also works where it is delivered).
-            if ctrl && !alt && matches!(keyval, Key::Up | Key::Down) {
+            // Ctrl+Shift+Up/Down: move the finished-block selection. Keep plain
+            // Ctrl+arrow available to readline and terminal applications on systems
+            // where VTE does deliver it.
+            if ctrl && shift && !alt && matches!(keyval, Key::Up | Key::Down) {
+                if bstate_for_key.get() == BlockState::AltScreen {
+                    return glib::Propagation::Proceed;
+                }
                 let finished = finished_blocks_for_key.borrow();
                 if finished.is_empty() {
-                    return glib::Propagation::Stop;
+                    return glib::Propagation::Proceed;
                 }
                 let current = selected_block_id_for_key.get();
                 let current_idx = current.and_then(|id| finished.iter().position(|b| b.id == id));
@@ -1562,17 +1637,7 @@ impl KeyCtx {
                 select_finished_block(&finished, &selected_block_id_for_key, new_id);
                 if let Some(idx) = new_idx {
                     if let Some(block) = finished.get(idx) {
-                        let widget = block.widget().clone();
-                        let scroll = block_scroll_for_key.clone();
-                        glib::idle_add_local_once(move || {
-                            if let Some(point) =
-                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
-                            {
-                                let adj = scroll.vadjustment();
-                                let target = (point.y() as f64) - adj.page_size() / 3.0;
-                                adj.set_value(target.max(0.0));
-                            }
-                        });
+                        scroll_finished_block_into_view(&block_scroll_for_key, block);
                     }
                 }
                 return glib::Propagation::Stop;
@@ -1611,7 +1676,7 @@ impl KeyCtx {
             // explicit mode, while Backspace remains available to the shell.
             if !ctrl && !shift && !alt && keyval == Key::Delete {
                 if let Some(sel_id) = selected_block_id_for_key.get() {
-                    remove_finished_block(
+                    let next_id = remove_finished_block(
                         sel_id,
                         &finished_blocks_for_key,
                         &block_data_for_key,
@@ -1620,6 +1685,13 @@ impl KeyCtx {
                         &bookmarks_for_key,
                         &visible_indices_for_key,
                     );
+                    let finished = finished_blocks_for_key.borrow();
+                    select_finished_block(&finished, &selected_block_id_for_key, next_id);
+                    if let Some(next_id) = next_id {
+                        if let Some(block) = finished.iter().find(|block| block.id == next_id) {
+                            scroll_finished_block_into_view(&block_scroll_for_key, block);
+                        }
+                    }
                     return glib::Propagation::Stop;
                 }
             }
@@ -1670,10 +1742,13 @@ impl KeyCtx {
             // SelectBookmarkUp/Down). VTE swallows Alt+arrow and plain Ctrl+arrow
             // before the capture handler sees them, so comma/period are used here.
             if ctrl && !alt && !shift && matches!(keyval, Key::comma | Key::period) {
+                if bstate_for_key.get() == BlockState::AltScreen {
+                    return glib::Propagation::Proceed;
+                }
                 let finished = finished_blocks_for_key.borrow();
                 let marks = bookmarks_for_key.borrow();
                 if marks.is_empty() {
-                    return glib::Propagation::Stop;
+                    return glib::Propagation::Proceed;
                 }
                 let marked_idx: Vec<usize> = finished
                     .iter()
@@ -1682,7 +1757,7 @@ impl KeyCtx {
                     .map(|(i, _)| i)
                     .collect();
                 if marked_idx.is_empty() {
-                    return glib::Propagation::Stop;
+                    return glib::Propagation::Proceed;
                 }
                 let cur = selected_block_id_for_key
                     .get()
@@ -1705,17 +1780,7 @@ impl KeyCtx {
                     let new_id = finished.get(idx).map(|b| b.id);
                     select_finished_block(&finished, &selected_block_id_for_key, new_id);
                     if let Some(block) = finished.get(idx) {
-                        let widget = block.widget().clone();
-                        let scroll = block_scroll_for_key.clone();
-                        glib::idle_add_local_once(move || {
-                            if let Some(point) =
-                                widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
-                            {
-                                let adj = scroll.vadjustment();
-                                let target = (point.y() as f64) - adj.page_size() / 3.0;
-                                adj.set_value(target.max(0.0));
-                            }
-                        });
+                        scroll_finished_block_into_view(&block_scroll_for_key, block);
                     }
                 }
                 return glib::Propagation::Stop;
@@ -1725,6 +1790,9 @@ impl KeyCtx {
             // the shell. (Plain Ctrl+L is left to the shell so readline's
             // clear-screen still works as users expect inside the live cell.)
             if ctrl && shift && !alt && matches!(keyval, Key::l | Key::L) {
+                if !command_recall_available(bstate_for_key.get()) {
+                    return glib::Propagation::Proceed;
+                }
                 let mut blocks = finished_blocks_for_key.borrow_mut();
                 for block in blocks.drain(..) {
                     block_list_for_key.remove(block.widget());
@@ -1748,6 +1816,9 @@ impl KeyCtx {
             // -first entry list from block_data (which carries exit code + duration
             // for the failed/slow filters) and pop it up.
             if ctrl && !shift && !alt && matches!(keyval, Key::p | Key::P) {
+                if !command_recall_available(bstate_for_key.get()) {
+                    return glib::Propagation::Proceed;
+                }
                 let mut seen = std::collections::HashSet::new();
                 let mut entries = Vec::new();
                 {
@@ -1771,6 +1842,7 @@ impl KeyCtx {
                     entries,
                     pty_for_key.clone(),
                     typed_cmd_for_key.clone(),
+                    pty_synced_for_key.clone(),
                     active_vte_for_key.clone(),
                 );
                 return glib::Propagation::Stop;
@@ -3285,9 +3357,9 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_bytes_events, compute_viewport_state, normalize_captured_command, strip_ansi,
-        strip_ansi_with_clear_detect, truncate_plain_output_for_height,
-        visible_indices_for_viewport, BlockData, ViewportState,
+        coalesce_bytes_events, compute_viewport_state, normalize_captured_command,
+        scroll_delta_to_reveal, strip_ansi, strip_ansi_with_clear_detect,
+        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, ViewportState,
     };
     use crate::parser::ParserEvent;
     use std::collections::VecDeque;
@@ -3367,6 +3439,22 @@ mod tests {
         assert!(visible.contains(&1010));
         assert!(!visible.contains(&1011));
         assert_eq!(visible.len(), 1001);
+    }
+
+    #[test]
+    fn reveal_scroll_keeps_fully_visible_blocks_stable() {
+        assert_eq!(scroll_delta_to_reveal(30.0, 80.0, 200.0, 18.0), 0.0);
+    }
+
+    #[test]
+    fn reveal_scroll_moves_only_enough_for_clipped_blocks() {
+        assert_eq!(scroll_delta_to_reveal(-12.0, 40.0, 200.0, 18.0), -30.0);
+        assert_eq!(scroll_delta_to_reveal(180.0, 230.0, 200.0, 18.0), 48.0);
+    }
+
+    #[test]
+    fn reveal_scroll_aligns_tall_blocks_to_the_top() {
+        assert_eq!(scroll_delta_to_reveal(40.0, 260.0, 200.0, 18.0), 22.0);
     }
 
     #[test]
