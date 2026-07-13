@@ -75,7 +75,7 @@ pub(crate) struct UiState {
     pub(crate) tab_counter: Rc<Cell<u32>>,
     pub(crate) font_scale: Rc<Cell<f64>>,
     pub(crate) window_opacity: Rc<Cell<f64>>,
-    pub(crate) shell_argv: Rc<Vec<String>>,
+    pub(crate) shell_argv: Rc<RefCell<Vec<String>>>,
     pub(crate) config: Rc<RefCell<Config>>,
     pub(crate) available_themes: Rc<Vec<Theme>>,
     pub(crate) search_bar: SearchBar,

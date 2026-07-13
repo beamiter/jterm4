@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod block_view;
+pub mod cli;
 pub mod config;
 pub mod git_meta;
 pub mod keybindings;
@@ -12,3 +13,7 @@ pub mod redact;
 pub mod state;
 pub mod terminal;
 pub mod workflows;
+
+#[path = "main.rs"]
+pub mod app;
+mod ui;

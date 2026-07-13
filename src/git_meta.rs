@@ -11,8 +11,11 @@
 //! error in the terminal UI.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const GIT_TIMEOUT: Duration = Duration::from_millis(500);
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoMeta {
@@ -107,19 +110,44 @@ fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
         .spawn()
         .ok()?;
 
-    // We can't easily impose a true timeout without a thread + kill, but
-    // the queries above are all O(1)-ish against the index and finish in
-    // <50ms on healthy repos. The cap below is the wall clock we'll wait
-    // for the process to die under wait_with_output(); if a repo is wedged
-    // (e.g. corrupt .git, hung lock) we accept that the first probe blocks
-    // briefly the first time. Future iterations can add a timer-kill.
-    let _ = Duration::from_millis(500); // documents intent
-
-    let out = child.wait_with_output().ok()?;
+    let out = wait_with_output_timeout(child, GIT_TIMEOUT).ok()??;
     if !out.status.success() {
         return None;
     }
     String::from_utf8(out.stdout).ok()
+}
+
+/// Wait for a child without ever leaving it running after the deadline. The
+/// timeout path sends SIGKILL through `Child::kill` and then always waits, so
+/// callers neither block indefinitely nor leave a zombie behind.
+fn wait_with_output_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map(Some),
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            // A racing natural exit can make kill fail with ESRCH/InvalidInput;
+            // wait still reaps it. After a successful kill, wait closes the same
+            // lifecycle and guarantees there is no zombie.
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed));
+    }
 }
 
 /// Format a RepoMeta into the compact strip text. Designed to read at a
@@ -149,6 +177,7 @@ pub fn format_strip(meta: &RepoMeta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     #[test]
     fn format_strip_clean_no_upstream() {
@@ -204,5 +233,46 @@ mod tests {
         };
         // No arrows when we're in sync.
         assert_eq!(format_strip(&m), "main");
+    }
+
+    #[test]
+    fn wait_timeout_preserves_successful_output() {
+        let child = Command::new("sh")
+            .args(["-c", "printf ready"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn short-lived child");
+
+        let out = wait_with_output_timeout(child, Duration::from_secs(2))
+            .expect("wait succeeds")
+            .expect("child finishes before timeout");
+
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"ready");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_timeout_kills_and_reaps_child() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeping child");
+        let pid = child.id();
+        let started = Instant::now();
+
+        let out = wait_with_output_timeout(child, Duration::from_millis(40))
+            .expect("timeout cleanup succeeds");
+
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out child must be reaped"
+        );
     }
 }

@@ -1,115 +1,101 @@
-# jterm4 配置文件示例
-# 将此文件复制到 ~/.config/jterm4/config.toml 并根据需要修改
+# jterm4 配置示例
+# 复制到 ~/.config/jterm4/config.toml，或用 jterm4 --config PATH 指定文件。
+# 修改后会自动热重载；也可按 Ctrl+Shift+R 手动重载。
+# 运行 `jterm4 --check-config` 可在启动 GUI 前检查语法和取值。
 
-# ============================================================================
-# 基础设置
-# ============================================================================
+# 基础 -----------------------------------------------------------------------
 
-# 终端模式: "block" 或 "vte"
-# - block: 块模式，命令历史以块形式显示（推荐）
-# - vte: 传统终端模式
+# "vte"：传统终端，支持分屏；"block"：结构化命令块视图。
+# Block 分屏目前会被安全拒绝，避免产生不可见的孤儿进程。
 terminal_mode = "vte"
+opacity = 0.95                 # 0.01 .. 1.0
+scrollback = 5000             # 0 .. 1000000
+font = "SauceCodePro Nerd Font Mono 14"
+font_scale = 1.0              # 0.1 .. 10.0
 
-# 窗口透明度 (0.0 - 1.0)
-# 0.0 = 完全透明，1.0 = 完全不透明
-opacity = 0.95
-
-# 回滚缓冲区行数
-# 保存的历史输出行数
-scrollback = 5000
-
-# 字体
-# 使用 Nerd Font 以获得最佳图标支持
-font = "SauceCodePro Nerd Font Regular 14"
-
-# 字体缩放
-# 1.0 = 正常大小，可以通过 Ctrl+Plus/Minus 动态调整
-font_scale = 1.0
-
-# 主题
-# 可选: "default", "light", 或其他内置主题
+# default, light, solarized-dark, solarized-light, gruvbox-dark,
+# gruvbox-light, dracula, nord
 theme = "default"
 
-# ============================================================================
-# 启动命令（可选）
-# ============================================================================
+# 可选：显式 shell 路径。默认依次寻找 rsh、bash、sh。
+# shell = "/bin/bash"
 
-# 新终端启动时自动执行的命令（逗号分隔）
-# 例如: "cd ~/projects, nix develop"
-# startup_commands = "cd ~/projects"
+# 兼容格式：按 ", " 分隔并依次写入新 shell。
+# startup_commands = "cd ~/projects, nix develop"
 
-# ============================================================================
-# 块模式优化（仅在 terminal_mode = "block" 时生效）
-# ============================================================================
+# 布局 -----------------------------------------------------------------------
 
-# ANSI 缓存容量
-# 缓存 ANSI 转换结果以提高性能
-ansi_cache_capacity = 1000
+tab_placement = "sidebar"     # "sidebar" 或 "top"
+sidebar_view = "tabs"         # "tabs" 或 "files"
+sidebar_width = 220            # 120 .. 800
 
-# 最大可见块数
-# 限制同时显示的命令块数量以提高性能
-max_visible_blocks = 100
+# Block 模式 -----------------------------------------------------------------
 
-# 输出批处理时间（毫秒）
-# 最小批处理延迟
-output_batch_min_ms = 8
+max_visible_blocks = 200
+lazy_load_threshold = 1000
+truncation_threshold_lines = 50000
+max_collapsed_output_lines = 25
+virtual_scroll_margin = 1
 
-# 最大批处理延迟
-output_batch_max_ms = 32
-
-# 虚拟滚动边距
-virtual_scroll_margin = 5
-
-# ============================================================================
-# 块历史（实验性）
-# ============================================================================
-
-# 块历史保存路径（可选）
-# block_history_path = "~/.local/share/jterm4/block_history"
-
-# 是否压缩块历史
+# 可选持久化历史。路径支持开头的 ~/，父目录会自动创建。
+# block_history_path = "~/.local/share/jterm4/block-history.bin"
 block_history_compress = true
-
-# Also retain completed output in the live VTE. This duplicates finished blocks,
-# so the default is false; enable only when native VTE PageUp history is preferred.
 preserve_live_scrollback = false
 
-# ============================================================================
-# 快捷键配置
-# ============================================================================
+# 终端协议与安全 -------------------------------------------------------------
 
-# 快捷键在 ~/.claude/keybindings.json 中配置
-# 运行 jterm4 后按 Ctrl+Shift+K 查看所有快捷键
+mouse_reporting_enabled = true
+scroll_reporting_enabled = true
+focus_reporting_enabled = true
 
-# ============================================================================
-# 常用快捷键
-# ============================================================================
+# OSC 52 可让终端程序改写系统剪贴板；远程内容不可信时应保持 false。
+allow_remote_clipboard_write = false
 
-# Tab 管理:
-#   Ctrl+Shift+T    - 新建 Tab
-#   Ctrl+Shift+W    - 关闭当前 Tab
-#   Ctrl+Tab        - 下一个 Tab
-#   Ctrl+Shift+Tab  - 上一个 Tab
-#   Alt+1-9         - 快速切换到 Tab 1-9
+# 长命令通知与 Git 状态 ------------------------------------------------------
 
-# 分屏:
-#   Ctrl+Shift+\    - 水平分屏
-#   Ctrl+Shift+|    - 垂直分屏
-#   Alt+方向键      - 切换焦点到不同的窗格
-#   Alt+Shift+方向键 - 调整窗格大小
-#   Ctrl+Shift+Z    - 最大化/恢复当前窗格
+notify_long_blocks = true
+notify_long_block_threshold_ms = 10000
+show_repo_strip = true
 
-# 其他:
-#   Ctrl+Shift+C    - 复制
-#   Ctrl+Shift+V    - 粘贴
-#   Ctrl+Shift+F    - 搜索
-#   Ctrl+Plus       - 放大字体
-#   Ctrl+Minus      - 缩小字体
-#   Ctrl+Shift+R    - 重载配置
+# AI 面板（需要在启动 jterm4 前设置 ANTHROPIC_API_KEY） ----------------------
 
-# ============================================================================
-# 高级配置
-# ============================================================================
+ai_panel_visible = false
+ai_panel_width = 360           # 240 .. 1200
+ai_model = "claude-sonnet-4-6"
+ai_max_tokens = 1024           # 64 .. 8192
+ai_redact_secrets = true
 
-# 如需更高级的配置，请参考:
-# https://github.com/your-repo/jterm4/blob/master/docs/configuration.md
+# 自定义颜色（可选；取消注释后覆盖主题对应颜色） ----------------------------
+
+# [colors]
+# foreground = "#f8f7e9"
+# background = "#121616"
+# cursor = "#7fb80e"
+# cursor_foreground = "#1b315e"
+
+# 快捷键 ---------------------------------------------------------------------
+# 值可为快捷键字符串；false、"none" 或 "disabled" 可解除绑定。
+# 完整 action 名称可在命令面板（Ctrl+Shift+P）中查看。
+
+# [keybindings]
+# new_tab = "Ctrl+Shift+T"
+# close_pane_or_tab = "Ctrl+Shift+W"
+# copy = "Ctrl+Shift+C"
+# paste = "Ctrl+Shift+V"
+# toggle_search = "Ctrl+Shift+F"
+# toggle_command_palette = "Ctrl+Shift+P"
+# reload_config = "Ctrl+Shift+R"
+# show_remote_picker = "Ctrl+Shift+S"
+# toggle_ai_panel = false
+
+# SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
+
+# [[remote_hosts]]
+# name = "dev"
+# host = "dev.example.com"
+# user = "alice"
+# remote_shell = "rsh"
+# session = "dev-main"
+# ssh_args = ["-p", "2222"]
+# login_shell = true
+# multiplex = true

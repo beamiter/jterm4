@@ -2,7 +2,7 @@
 //!
 //! A workflow is a small TOML file in `~/.config/jterm4/workflows/`
 //! that names a reusable command with `{placeholder}` slots. The
-//! Ctrl+Shift+W palette lists them; selecting one opens a dialog
+//! Ctrl+Shift+M palette lists them; selecting one opens a dialog
 //! asking for each placeholder's value, then writes the substituted
 //! command into the live PTY (no auto-Enter — the user reviews and
 //! presses Return).

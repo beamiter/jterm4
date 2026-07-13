@@ -164,6 +164,7 @@ impl Clone for FinishedBlock {
 ///   - quoted strings: green
 ///   - operators (`| & ; > <`): magenta
 ///   - `$VAR` references: cyan
+///
 /// Whitespace and all other text are emitted verbatim in the default color, so
 /// the reconstructed buffer text matches the command exactly.
 pub(crate) fn highlight_command_to_ansi(cmd: &str) -> String {
@@ -1396,7 +1397,7 @@ pub(crate) fn command_recall_available(state: BlockState) -> bool {
 /// commands. With bracketed paste enabled, the whole multiline edit buffer is
 /// safe; otherwise fall back to the first line.
 fn recalled_command_text(cmd: &str, bracketed_paste: bool) -> (&str, bool) {
-    let cmd = cmd.trim_end_matches(|c: char| matches!(c, '\r' | '\n'));
+    let cmd = cmd.trim_end_matches(['\r', '\n']);
     if bracketed_paste {
         return (cmd, false);
     }

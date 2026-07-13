@@ -51,13 +51,12 @@ pub struct CrossBlockHit {
 /// the match isn't near the start, but for the MVP we just hard-cap.
 fn snippet(line: &str) -> String {
     const CAP: usize = 240;
-    if line.len() <= CAP {
-        line.to_string()
-    } else {
-        let mut s = line[..CAP].to_string();
-        s.push('…');
-        s
+    let mut chars = line.chars();
+    let mut snippet: String = chars.by_ref().take(CAP).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
     }
+    snippet
 }
 
 fn find_match_block<'a>(
@@ -68,24 +67,6 @@ fn find_match_block<'a>(
         .get(fm.block_index)
         .filter(|block| block.id == fm.block_id)
         .or_else(|| finished.iter().find(|block| block.id == fm.block_id))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::snippet;
-
-    #[test]
-    fn snippet_passes_through_short_line() {
-        assert_eq!(snippet("hello world"), "hello world");
-    }
-
-    #[test]
-    fn snippet_truncates_long_line_with_ellipsis() {
-        let long: String = "a".repeat(500);
-        let out = snippet(&long);
-        assert!(out.ends_with('…'));
-        assert_eq!(out.chars().filter(|&c| c == 'a').count(), 240);
-    }
 }
 
 #[allow(dead_code)]
@@ -333,11 +314,12 @@ impl TermView {
     }
 
     /// Cross-block ripgrep-style flat-result scan over cached stripped output
-    /// + command text. Caller passes a literal substring (case-insensitive)
-    /// when `is_regex == false`, else a regex. Returns at most `max_hits`
-    /// hits in block-list order; each hit carries enough context (line
-    /// number + the raw line + cmd preview) to drive a palette UI that lets
-    /// the user pick one and jump to it.
+    /// and command text. Caller passes a literal substring (case-insensitive)
+    /// when `is_regex == false`, else a regex.
+    ///
+    /// Returns at most `max_hits` hits in block-list order; each hit carries
+    /// enough context (line number + the raw line + cmd preview) to drive a
+    /// palette UI that lets the user pick one and jump to it.
     ///
     /// Errors only on invalid regex; an empty pattern returns `Ok(vec![])`
     /// so the caller can clear results without a special branch.
@@ -504,5 +486,39 @@ impl TermView {
             ..Default::default()
         };
         self.search_blocks_with_filters("", &filters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet;
+
+    #[test]
+    fn snippet_passes_through_short_line() {
+        assert_eq!(snippet("hello world"), "hello world");
+    }
+
+    #[test]
+    fn snippet_truncates_long_line_with_ellipsis() {
+        let long: String = "a".repeat(500);
+        let out = snippet(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().filter(|&c| c == 'a').count(), 240);
+    }
+
+    #[test]
+    fn snippet_truncates_cjk_and_emoji_on_char_boundaries() {
+        for line in [
+            format!("a{}", "界".repeat(240)),
+            format!("a{}", "🙂".repeat(240)),
+        ] {
+            let out = snippet(&line);
+            assert!(out.ends_with('…'));
+            assert_eq!(out.chars().count(), 241);
+            assert_eq!(
+                out.chars().take(240).collect::<String>(),
+                line.chars().take(240).collect::<String>()
+            );
+        }
     }
 }

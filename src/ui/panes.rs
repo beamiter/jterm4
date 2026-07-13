@@ -47,9 +47,10 @@ impl UiState {
 
         // Split panes get a fresh session ID (new shell instance)
         let sid = generate_session_id();
+        let shell_argv = self.shell_argv.borrow();
         spawn_shell(
             &terminal,
-            self.shell_argv.as_ref(),
+            shell_argv.as_slice(),
             working_directory,
             Some(&sid),
             None,
@@ -58,6 +59,23 @@ impl UiState {
     }
 
     pub(crate) fn split_current(&self, orientation: Orientation) {
+        // A TermView owns a whole block list around its live VTE. Treating that
+        // inner VTE as a pane leaf starts an orphan shell because the widget
+        // cannot be replaced in the Notebook/Paned tree. Fail visibly and
+        // safely until block panes use the dedicated PaneLeaf abstraction.
+        if self.current_term_view().is_some() {
+            let dialog = adw::AlertDialog::new(
+                Some("Split panes require VTE mode"),
+                Some(
+                    "Block mode keeps command history in a structured view and cannot yet be split safely. Change terminal_mode to \"vte\" for split panes.",
+                ),
+            );
+            dialog.add_response("ok", "OK");
+            dialog.set_default_response(Some("ok"));
+            dialog.present(Some(&self.window));
+            log::warn!("Blocked an unsupported block-mode split before spawning a PTY");
+            return;
+        }
         let Some(current_term) = self.current_terminal() else {
             return;
         };

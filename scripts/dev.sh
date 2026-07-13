@@ -18,7 +18,7 @@ case "$CMD" in
 
     test)
         echo "🧪 Running tests..."
-        nix develop --command bash -c "cargo test --lib --test '*'"
+        nix develop --command bash -c "cargo test --all-targets --all-features --locked"
         ;;
 
     check)
@@ -33,7 +33,7 @@ case "$CMD" in
 
     clippy)
         echo "📎 Running clippy..."
-        nix develop --command bash -c "cargo clippy -- -D warnings"
+        nix develop --command bash -c "cargo clippy --all-targets --all-features --locked -- -D warnings"
         ;;
 
     clean)

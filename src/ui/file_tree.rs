@@ -128,8 +128,14 @@ impl UiState {
         if file_path.is_empty() {
             return;
         }
-        if let Some(term) = self.current_terminal() {
-            let snippet = format!("{} ", shell_quote(&file_path));
+        let snippet = format!("{} ", shell_quote(&file_path));
+        if let Some(term_view) = self.current_term_view() {
+            // Block mode owns its PTY instead of attaching it to the display VTE,
+            // so `Terminal::feed_child` has nowhere to write.  Route through the
+            // TermView input path just like keyboard input and clipboard paste.
+            term_view.write_input(snippet.as_bytes());
+            term_view.grab_focus();
+        } else if let Some(term) = self.current_terminal() {
             term.feed_child(snippet.as_bytes());
             term.grab_focus();
         }

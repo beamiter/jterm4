@@ -68,42 +68,6 @@ pub(crate) fn encode_mouse_wheel(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sgr_wheel_up_encodes_button_64() {
-        // delta_y < 0 → wheel up → button 64 (xterm convention).
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, -1.0, 10, 5).unwrap();
-        assert_eq!(seq, b"\x1b[<64;10;5M");
-    }
-
-    #[test]
-    fn sgr_wheel_down_encodes_button_65() {
-        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, 1.0, 1, 1).unwrap();
-        assert_eq!(seq, b"\x1b[<65;1;1M");
-    }
-
-    #[test]
-    fn x10_wheel_up_uses_value_plus_32() {
-        // Legacy mode: each field encoded as byte = value + 32.
-        let seq = encode_mouse_wheel(MouseReportingMode::Button, -1.0, 1, 1).unwrap();
-        assert_eq!(seq, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
-    }
-
-    #[test]
-    fn none_mode_returns_no_bytes() {
-        assert!(encode_mouse_wheel(MouseReportingMode::None, -1.0, 1, 1).is_none());
-    }
-
-    #[test]
-    fn zero_delta_returns_no_bytes() {
-        // Spurious 0 delta from GTK shouldn't paginate the app.
-        assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
-    }
-}
-
 // ─── VTE builder ─────────────────────────────────────────────────────────────
 
 /// The single persistent live VTE for block mode. It keeps `input_enabled(true)`
@@ -207,4 +171,40 @@ pub(crate) fn create_finished_terminal(
         terminal.match_add_regex(&regex, 0);
     }
     terminal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgr_wheel_up_encodes_button_64() {
+        // delta_y < 0 → wheel up → button 64 (xterm convention).
+        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, -1.0, 10, 5).unwrap();
+        assert_eq!(seq, b"\x1b[<64;10;5M");
+    }
+
+    #[test]
+    fn sgr_wheel_down_encodes_button_65() {
+        let seq = encode_mouse_wheel(MouseReportingMode::Sgr, 1.0, 1, 1).unwrap();
+        assert_eq!(seq, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn x10_wheel_up_uses_value_plus_32() {
+        // Legacy mode: each field encoded as byte = value + 32.
+        let seq = encode_mouse_wheel(MouseReportingMode::Button, -1.0, 1, 1).unwrap();
+        assert_eq!(seq, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
+    }
+
+    #[test]
+    fn none_mode_returns_no_bytes() {
+        assert!(encode_mouse_wheel(MouseReportingMode::None, -1.0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn zero_delta_returns_no_bytes() {
+        // Spurious 0 delta from GTK shouldn't paginate the app.
+        assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+    }
 }

@@ -92,10 +92,14 @@ impl UiState {
                 self.notebook.set_tab_reorderable(&paned, true);
 
                 // Add tab strip button
+                let strip_label = Label::new(Some(label));
                 let btn = gtk4::ToggleButton::builder()
-                    .label(label)
+                    .child(&strip_label)
                     .css_classes(["flat", "tab-strip-btn"])
                     .build();
+                unsafe {
+                    btn.set_data::<Label>("tab-title-label", strip_label);
+                }
                 btn.set_focus_on_click(false);
                 btn.set_can_focus(false);
                 btn.set_widget_name(&format!("tab-{}", new_page_num));

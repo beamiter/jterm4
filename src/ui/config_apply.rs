@@ -9,7 +9,9 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use super::*;
 use crate::block_view::TermView;
-use crate::config::{load_config, Theme};
+use crate::config::{
+    choose_shell_argv, config_file_path, load_config, validate_config_contents, Theme,
+};
 use crate::terminal::collect_terminals;
 
 impl UiState {
@@ -131,37 +133,68 @@ impl UiState {
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
-        let (new_config, themes, new_keybindings) = load_config();
+        let path = config_file_path();
+        if path.exists() {
+            let validation = std::fs::read_to_string(&path)
+                .map_err(|err| err.to_string())
+                .and_then(|contents| {
+                    validate_config_contents(&contents).map_err(|err| err.to_string())
+                });
+            match validation {
+                Ok(issues) if issues.iter().any(|issue| issue.is_error()) => {
+                    for issue in issues {
+                        log::error!("Config reload rejected: {issue}");
+                    }
+                    return;
+                }
+                Err(err) => {
+                    log::error!("Config reload rejected for {}: {err}", path.display());
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let (new_config, _themes, new_keybindings) = load_config();
+        let opacity = new_config.window_opacity;
+        let font_scale = new_config.default_font_scale;
+        let tab_placement = new_config.tab_placement;
+        let sidebar_view = new_config.sidebar_view;
+        let ai_visible = new_config.ai_panel_visible;
 
-        // Apply theme (finds the theme by name from the fresh theme list)
-        let theme = themes
-            .iter()
-            .find(|t| t.name == new_config.theme_name)
-            .unwrap_or(&themes[0])
-            .clone();
+        // New panes/tabs immediately use a changed shell; all other config is
+        // replaced as one coherent snapshot instead of retaining stale fields.
+        *self.shell_argv.borrow_mut() = choose_shell_argv(new_config.shell.as_deref());
+        *self.config.borrow_mut() = new_config;
 
-        {
-            let mut config = self.config.borrow_mut();
-            config.window_opacity = new_config.window_opacity;
-            config.terminal_scrollback_lines = new_config.terminal_scrollback_lines;
-            config.font_desc = new_config.font_desc;
-            config.default_font_scale = new_config.default_font_scale;
-            config.theme_name = new_config.theme_name;
-            config.foreground = theme.foreground;
-            config.background = theme.background;
-            config.cursor = theme.cursor;
-            config.cursor_foreground = theme.cursor_foreground;
-            config.palette = theme.palette;
-            config.startup_commands = new_config.startup_commands;
+        // TermView owns a shared clone used by long-lived callbacks. Refresh it
+        // as well so behavior changes do not require reopening block tabs.
+        for page in 0..self.notebook.n_pages() {
+            if let Some(widget) = self.notebook.nth_page(Some(page)) {
+                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
+                    let term_view = unsafe { term_view.as_ref() };
+                    term_view.reload_config(&self.config.borrow());
+                }
+            }
         }
 
         // Apply all visual changes
-        self.window_opacity.set(new_config.window_opacity);
-        self.window.set_opacity(new_config.window_opacity);
-        self.set_font_scale_all(new_config.default_font_scale);
+        self.window_opacity.set(opacity);
+        self.window.set_opacity(opacity);
+        self.set_font_scale_all(font_scale);
         self.apply_font_all();
         self.apply_colors_all();
         self.apply_scrollback_all();
+
+        self.tab_placement.set(tab_placement);
+        self.sidebar_view.set(sidebar_view);
+        self.apply_tab_placement();
+
+        self.ai_panel_visible.set(ai_visible);
+        if ai_visible {
+            self.ai_paned.set_end_child(Some(&self.ai_panel.root));
+        } else {
+            self.ai_paned.set_end_child(None::<&gtk4::Widget>);
+        }
 
         // Update keybindings
         *self.keybinding_map.borrow_mut() = new_keybindings;

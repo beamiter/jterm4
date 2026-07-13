@@ -1,17 +1,3 @@
-mod ai;
-mod block_view;
-mod config;
-mod git_meta;
-mod keybindings;
-mod notify;
-mod parser;
-mod pty;
-mod redact;
-mod state;
-mod terminal;
-mod ui;
-mod workflows;
-
 use adw::prelude::*;
 use gtk4::gdk::Key;
 use gtk4::gdk::ModifierType;
@@ -28,11 +14,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use config::{choose_shell_argv, config_file_path, load_config};
-use keybindings::{normalize_key, Action, KeyCombo};
-use state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
-use terminal::terminal_working_directory;
-use ui::UiState;
+use crate::config::{choose_shell_argv, config_file_path, load_config};
+use crate::keybindings::{normalize_key, Action, KeyCombo};
+use crate::state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
+use crate::terminal::terminal_working_directory;
+use crate::ui::{self, UiState};
 
 struct SimpleStderrLogger {
     level: LevelFilter,
@@ -77,7 +63,7 @@ fn init_logging() {
 }
 
 fn env_is_unset(k: &str) -> bool {
-    std::env::var_os(k).map_or(true, |v| v.is_empty())
+    std::env::var_os(k).is_none_or(|v| v.is_empty())
 }
 
 fn gtk_path_has_fcitx_module(path: &Path) -> bool {
@@ -146,7 +132,7 @@ fn should_use_xim_for_fcitx4(fcitx_gtk_path_found: bool, xim_gtk_path_found: boo
         && std::env::var("XMODIFIERS")
             .map(|s| s.contains("fcitx"))
             .unwrap_or(false)
-        && !std::env::var_os("DISPLAY").map_or(true, |v| v.is_empty())
+        && !std::env::var_os("DISPLAY").is_none_or(|v| v.is_empty())
 }
 
 /// Make the GTK4 input-method module discoverable before GTK initializes, so
@@ -158,13 +144,13 @@ fn init_input_method_env() {
     let ibus_gtk_path = candidates.iter().find(|p| gtk_path_has_ibus_module(p));
     let xim_gtk_path = candidates.iter().find(|p| gtk_path_has_xim_module(p));
 
-    if let Some(path) = fcitx_gtk_path.as_deref() {
+    if let Some(path) = fcitx_gtk_path {
         prepend_gtk_path_if_missing(path);
         log::debug!("Using fcitx GTK4 input module path {}", path.display());
-    } else if let Some(path) = ibus_gtk_path.as_deref() {
+    } else if let Some(path) = ibus_gtk_path {
         prepend_gtk_path_if_missing(path);
         log::debug!("Using ibus GTK4 input module path {}", path.display());
-    } else if let Some(path) = xim_gtk_path.as_deref() {
+    } else if let Some(path) = xim_gtk_path {
         prepend_gtk_path_if_missing(path);
         log::debug!("Using xim GTK4 input module path {}", path.display());
     }
@@ -186,7 +172,7 @@ fn init_input_method_env() {
         let module = if use_xim_for_fcitx4 {
             "xim"
         } else if xmods.contains("ibus")
-            || (!std::env::var_os("IBUS_ADDRESS").map_or(true, |v| v.is_empty())
+            || (!std::env::var_os("IBUS_ADDRESS").is_none_or(|v| v.is_empty())
                 && fcitx_gtk_path.is_none())
             || (fcitx_gtk_path.is_none() && ibus_gtk_path.is_some())
         {
@@ -246,7 +232,10 @@ fn connect_file_tree_handlers(file_tree: &gtk4::TreeView, ui: &UiState) {
     });
 }
 
-fn main() -> glib::ExitCode {
+pub fn run() -> glib::ExitCode {
+    if let Some(code) = crate::cli::handle_early_args() {
+        return code;
+    }
     init_logging();
     init_input_method_env();
 
@@ -261,7 +250,7 @@ fn main() -> glib::ExitCode {
         let (config, themes, keybinding_map) = load_config();
 
         // Cache shell selection once to avoid extra process probes per new tab.
-        let shell_argv = Rc::new(choose_shell_argv(config.shell.as_deref()));
+        let shell_argv = Rc::new(RefCell::new(choose_shell_argv(config.shell.as_deref())));
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
         let config = Rc::new(RefCell::new(config));
@@ -318,7 +307,7 @@ fn main() -> glib::ExitCode {
         let css_provider = CssProvider::new();
         css_provider.load_from_string(
             ".tab-strip-btn { padding: 4px 8px; border-radius: 4px; border-bottom: 1px solid alpha(currentColor, 0.1); margin-bottom: 2px; }
-             .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid #8be9fd; outline-offset: -2px; }
+             .tab-strip-btn:checked { font-weight: bold; border-radius: 4px; background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-strip-close { min-width: 16px; min-height: 16px; padding: 0; margin: 0; }
              .sidebar-box { min-width: 140px; padding: 2px 4px; }
              .top-bar { padding: 2px 4px; }
@@ -335,7 +324,7 @@ fn main() -> glib::ExitCode {
              .tab-drop-target { background-color: alpha(currentColor, 0.15); }
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
-             .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid #8be9fd; outline-offset: -2px; }
+             .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
              .tab-conn-dot { font-size: 0.7em; margin-right: 2px; }
              @keyframes conn-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.35; } 100% { opacity: 1.0; } }
              .tab-conn-dot.tab-connecting { color: #f1fa8c; animation: conn-pulse 1.2s ease-in-out infinite; }
@@ -345,9 +334,7 @@ fn main() -> glib::ExitCode {
              .top-tabs .tab-strip-btn { border-bottom: none; margin-bottom: 0; margin-right: 2px; }
              .file-tree-box { border-top: 1px solid alpha(currentColor, 0.15); }
              .file-tree-header { padding: 2px 4px; }
-             .file-tree-header, .file-tree-header button { color: #ffffff; }
-             .file-tree-root { font-size: 0.85em; opacity: 0.7; color: #ffffff; }
-             .sidebar-switcher button { color: #ffffff; }
+             .file-tree-root { font-size: 0.85em; opacity: 0.7; }
              .file-tree { padding: 2px; }",
         );
         gtk4::style_context_add_provider_for_display(
@@ -725,7 +712,31 @@ fn main() -> glib::ExitCode {
                 key: normalize_key(keyval),
             };
 
-            if let Some(action) = ui_clone.keybinding_map.borrow().lookup(&combo) {
+            let action = {
+                let bindings = ui_clone.keybinding_map.borrow();
+                bindings.lookup(&combo).or_else(|| {
+                    // Alt modifies Copy into "copy block output". The binding
+                    // map is intentionally exact, so retry only this one
+                    // documented variant without Alt instead of making every
+                    // shortcut accidentally accept extra modifiers.
+                    if mods.contains(
+                        ModifierType::CONTROL_MASK
+                            | ModifierType::SHIFT_MASK
+                            | ModifierType::ALT_MASK,
+                    ) {
+                        let copy_combo = KeyCombo {
+                            modifiers: mods & !ModifierType::ALT_MASK,
+                            key: normalize_key(keyval),
+                        };
+                        (bindings.lookup(&copy_combo) == Some(Action::Copy))
+                            .then_some(Action::Copy)
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some(action) = action {
                 match action {
                     Action::Copy => {
                         // Handle at the window level so the shortcut works no
@@ -827,19 +838,20 @@ fn main() -> glib::ExitCode {
             let mut child = tab_strip.first_child();
             while let Some(ref c) = child {
                 if let Ok(btn) = c.clone().downcast::<gtk4::ToggleButton>() {
-                    // Get the button's label text
-                    if let Some(label_widget) = btn.child() {
-                        if let Ok(label) = label_widget.clone().downcast::<gtk4::Box>() {
-                            // The first child is the text label
-                            if let Some(text_label) = label.first_child() {
-                                if let Ok(txt) = text_label.clone().downcast::<gtk4::Label>() {
-                                    let btn_text = txt.text().to_string().to_lowercase();
-                                    let matches = query.is_empty() || btn_text.contains(query.as_str());
-                                    c.set_visible(matches);
-                                }
-                            }
-                        }
+                    let title = unsafe {
+                        btn.data::<gtk4::Label>("tab-title-label")
+                            .map(|label| label.as_ref().text().to_string())
                     }
+                    // Compatibility fallback for old/restored strip buttons
+                    // that predate the explicit title-label data.
+                    .or_else(|| {
+                        btn.child()
+                            .and_then(|child| child.downcast::<gtk4::Label>().ok())
+                            .map(|label| label.text().to_string())
+                    })
+                    .unwrap_or_default()
+                    .to_lowercase();
+                    c.set_visible(query.is_empty() || title.contains(query.as_str()));
                 }
                 child = c.next_sibling();
             }
@@ -849,7 +861,12 @@ fn main() -> glib::ExitCode {
         let ui_for_switch = ui.clone();
         let notebook_for_switch = notebook.clone();
         notebook.connect_switch_page(move |_, widget, page_num| {
-            ui_for_switch.focus_terminal_in_page(widget);
+            if ui_for_switch.search_bar.is_search_mode() {
+                ui_for_switch.search_apply();
+                ui_for_switch.search_entry.grab_focus();
+            } else {
+                ui_for_switch.focus_terminal_in_page(widget);
+            }
             // `switch-page` runs before GTK has completed map/allocation and a
             // held Ctrl+PageUp can queue several switches in one event burst.
             // Reclaim focus on the next frame, but only if this is still the
@@ -860,7 +877,12 @@ fn main() -> glib::ExitCode {
             let ui_for_focus = ui_for_switch.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
                 if notebook_for_focus.current_page() == Some(page_num) {
-                    ui_for_focus.focus_terminal_in_page(&target_widget);
+                    if ui_for_focus.search_bar.is_search_mode() {
+                        ui_for_focus.search_apply();
+                        ui_for_focus.search_entry.grab_focus();
+                    } else {
+                        ui_for_focus.focus_terminal_in_page(&target_widget);
+                    }
                 }
             });
             // Clear activity/bell indicators for the tab being switched to
@@ -907,7 +929,7 @@ fn main() -> glib::ExitCode {
             // Persist the current sidebar width before teardown.
             let width = paned_for_close.position().max(120) as u32;
             config_for_close.borrow_mut().sidebar_width = width;
-            config::save_config(&config_for_close.borrow());
+            crate::config::save_config(&config_for_close.borrow());
 
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             kill_all_terminal_children(&notebook_for_close_request);

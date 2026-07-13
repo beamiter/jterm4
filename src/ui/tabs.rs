@@ -20,6 +20,18 @@ use crate::terminal::{
     VteTerminalView,
 };
 
+struct TabLaunch {
+    working_directory: Option<String>,
+    tab_name: Option<String>,
+    session_id: Option<String>,
+    initial_commands: Option<String>,
+    argv_override: Option<Vec<String>>,
+    remote: Option<(crate::config::RemoteHost, u32)>,
+    terminal_mode: crate::config::TerminalMode,
+}
+
+type TitleChangedCallback = Box<dyn Fn(&str)>;
+
 impl UiState {
     pub(crate) fn remove_tab_by_widget(&self, widget: &gtk4::Widget) {
         // Check for running process before closing
@@ -267,15 +279,15 @@ impl UiState {
         initial_commands: Option<String>,
     ) -> Terminal {
         let terminal_mode = self.config.borrow().terminal_mode.clone();
-        self.add_tab_with_argv(
+        self.add_tab_with_argv(TabLaunch {
             working_directory,
             tab_name,
             session_id,
             initial_commands,
-            None,
-            None,
+            argv_override: None,
+            remote: None,
             terminal_mode,
-        )
+        })
     }
 
     /// Open a new tab connecting to a saved remote host over ssh.
@@ -293,15 +305,15 @@ impl UiState {
         let argv = crate::config::build_remote_argv(host);
         let terminal_mode = self.config.borrow().terminal_mode.clone();
         log::info!("[remote] connecting to {} via {:?}", host.name, argv);
-        self.add_tab_with_argv(
-            None,
-            Some(host.name.clone()),
-            None,
-            None,
-            Some(argv),
-            Some((host.clone(), attempt)),
+        self.add_tab_with_argv(TabLaunch {
+            working_directory: None,
+            tab_name: Some(host.name.clone()),
+            session_id: None,
+            initial_commands: None,
+            argv_override: Some(argv),
+            remote: Some((host.clone(), attempt)),
             terminal_mode,
-        )
+        })
     }
 
     /// Mark a remote tab as connected (green badge). Called on first output.
@@ -454,16 +466,16 @@ impl UiState {
     /// argv (e.g. an ssh command) instead of the configured local shell. When
     /// `remote` is `Some`, the tab is tracked as an ssh connection (status badge +
     /// auto-reconnect) via `tab_connections`.
-    fn add_tab_with_argv(
-        &self,
-        working_directory: Option<String>,
-        tab_name: Option<String>,
-        session_id: Option<String>,
-        initial_commands: Option<String>,
-        argv_override: Option<Vec<String>>,
-        remote: Option<(crate::config::RemoteHost, u32)>,
-        terminal_mode: crate::config::TerminalMode,
-    ) -> Terminal {
+    fn add_tab_with_argv(&self, launch: TabLaunch) -> Terminal {
+        let TabLaunch {
+            working_directory,
+            tab_name,
+            session_id,
+            initial_commands,
+            argv_override,
+            remote,
+            terminal_mode,
+        } = launch;
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
@@ -484,9 +496,10 @@ impl UiState {
             );
         }
 
+        let configured_shell = self.shell_argv.borrow();
         let shell_argv: &[String] = argv_override
             .as_deref()
-            .unwrap_or(self.shell_argv.as_slice());
+            .unwrap_or(configured_shell.as_slice());
 
         // Create terminal view based on configured mode
         let (view_type, terminal) = {
@@ -637,7 +650,7 @@ impl UiState {
         // Keep the existing tab widgets alive for OSC 0/2 title changes.
         // Some applications animate their title with a spinner; replacing the
         // strip button for every frame loses in-flight click and drag gestures.
-        let update_title = |connect: &dyn Fn(Box<dyn Fn(&str)>)| {
+        let update_title = |connect: &dyn Fn(TitleChangedCallback)| {
             let label_for_title = label.clone();
             let strip_btn_label_for_title = strip_btn_label.clone();
             let custom_title_for_title = custom_title.clone();
@@ -753,6 +766,12 @@ impl UiState {
 
         let strip_btn = ToggleButton::new();
         strip_btn.set_child(Some(&strip_box));
+        // Keep an explicit handle to the title label. The strip also contains
+        // connection and process labels, so walking to the first Label filters
+        // on the status dot rather than the tab title.
+        unsafe {
+            strip_btn.set_data::<Label>("tab-title-label", strip_label.clone());
+        }
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
         strip_btn.set_active(true); // new tab is current

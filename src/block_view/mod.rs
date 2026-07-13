@@ -11,7 +11,7 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use crate::config::Config;
-use crate::parser::{ColorKind, Parser, ParserConfig, ParserEvent};
+use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
 use crate::terminal::{apply_terminal_theme, focus_terminal_deferred};
 
@@ -191,6 +191,29 @@ fn build_color_query_reply(config: &Config, kind: ColorKind) -> String {
     }
 }
 
+fn build_keyboard_query_reply(
+    query: KeyboardProtocolQuery,
+    cursor_col: i64,
+    cursor_row: i64,
+) -> String {
+    match query {
+        KeyboardProtocolQuery::KittyQuery => "\x1b[?0u".to_string(),
+        KeyboardProtocolQuery::ModifyOtherKeysQuery => "\x1b[>4;0m".to_string(),
+        KeyboardProtocolQuery::PrimaryDeviceAttributes => "\x1b[?1;2c".to_string(),
+        KeyboardProtocolQuery::SecondaryDeviceAttributes => "\x1b[>0;0;0c".to_string(),
+        KeyboardProtocolQuery::TertiaryDeviceAttributes => "\x1bP!|00000000\x1b\\".to_string(),
+        KeyboardProtocolQuery::XtVersion => {
+            format!("\x1bP>|jterm4 {}\x1b\\", env!("CARGO_PKG_VERSION"))
+        }
+        KeyboardProtocolQuery::DeviceStatus => "\x1b[0n".to_string(),
+        KeyboardProtocolQuery::CursorPosition => format!(
+            "\x1b[{};{}R",
+            cursor_row.saturating_add(1).max(1),
+            cursor_col.saturating_add(1).max(1)
+        ),
+    }
+}
+
 /// Move the finished-block selection to `new_id` (or clear it with `None`),
 /// updating the selected CSS class and persistent quick-action visibility on both
 /// the previously-selected and newly-selected blocks. Shared by click selection
@@ -288,9 +311,7 @@ fn remove_finished_block(
             .position(|b| b.id == block_id)
             .map(|pos| (pos, finished.remove(pos)))
     };
-    let Some((removed_pos, block)) = removed else {
-        return None;
-    };
+    let (removed_pos, block) = removed?;
 
     block_list.remove(block.widget());
     block_data.borrow_mut().retain(|b| b.id != block_id);
@@ -1355,7 +1376,11 @@ impl ReaderCtx {
                             pty_for_init.write_bytes(reply.as_bytes());
                         }
 
-                        ParserEvent::KeyboardProtocolQuery(_query) => {}
+                        ParserEvent::KeyboardProtocolQuery(query) => {
+                            let (col, row) = active_vte.cursor_position();
+                            let reply = build_keyboard_query_reply(*query, col, row);
+                            pty_for_init.write_bytes(reply.as_bytes());
+                        }
 
                         ParserEvent::RemoteSessionId(id) => {
                             for cb in remote_session_cbs.borrow().iter() {
@@ -1863,6 +1888,14 @@ impl KeyCtx {
 
 #[allow(dead_code)]
 impl TermView {
+    /// Replace the runtime configuration shared by parser/render callbacks.
+    /// Existing widgets receive their visual updates through UiState; this
+    /// updates behavioral options such as notifications, filtering, mouse
+    /// reporting, history limits, and clipboard policy for subsequent events.
+    pub(crate) fn reload_config(&self, config: &Config) {
+        *self.config.borrow_mut() = config.clone();
+    }
+
     pub fn new(
         config: &Config,
         shell_argv: &[String],
@@ -3352,11 +3385,12 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        coalesce_bytes_events, compute_viewport_state, normalize_captured_command,
-        scroll_delta_to_reveal, strip_ansi, strip_ansi_with_clear_detect,
-        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, ViewportState,
+        build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
+        normalize_captured_command, scroll_delta_to_reveal, strip_ansi,
+        strip_ansi_with_clear_detect, truncate_plain_output_for_height,
+        visible_indices_for_viewport, BlockData, ViewportState,
     };
-    use crate::parser::ParserEvent;
+    use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::collections::VecDeque;
 
     fn ev_summary(events: &[ParserEvent]) -> Vec<String> {
@@ -3386,6 +3420,39 @@ mod tests {
             normalize_captured_command("printf pwd", "yj ~ ❯"),
             "printf pwd"
         );
+    }
+
+    #[test]
+    fn keyboard_protocol_queries_have_safe_fallback_replies() {
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::KittyQuery, 0, 0),
+            "\x1b[?0u"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::ModifyOtherKeysQuery, 0, 0),
+            "\x1b[>4;0m"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::PrimaryDeviceAttributes, 0, 0),
+            "\x1b[?1;2c"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::DeviceStatus, 0, 0),
+            "\x1b[0n"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, 4, 2),
+            "\x1b[3;5R"
+        );
+        assert_eq!(
+            build_keyboard_query_reply(KeyboardProtocolQuery::CursorPosition, -8, -2),
+            "\x1b[1;1R"
+        );
+
+        let version = build_keyboard_query_reply(KeyboardProtocolQuery::XtVersion, 0, 0);
+        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+        assert!(version.starts_with("\x1bP>|jterm4 "));
+        assert!(version.ends_with("\x1b\\"));
     }
 
     fn block_with_height(estimated_height: i32) -> BlockData {

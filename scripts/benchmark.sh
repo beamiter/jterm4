@@ -7,23 +7,21 @@ echo "📊 jterm4 Performance Benchmark"
 echo "================================"
 echo ""
 
-# Build release version if needed
-if [ ! -f "target/release/jterm4" ]; then
-    echo "Building release version..."
-    nix develop --command bash -c "cargo build --release"
-fi
+# Always build the measured binary from the current sources.
+echo "Building release version..."
+nix develop --command bash -c "cargo build --release --locked"
 
 # Binary size
 echo "📦 Binary Size:"
 ls -lh target/release/jterm4 | awk '{print "   ", $5, $9}'
 echo ""
 
-# Startup time (rough estimate)
-echo "⚡ Startup Time (10 runs):"
+# Headless CLI startup time. This does not claim to measure GTK first-frame time.
+echo "⚡ Headless CLI Startup (10 runs):"
 total=0
 for i in {1..10}; do
     start=$(date +%s%N)
-    timeout 2 target/release/jterm4 --help &> /dev/null || true
+    target/release/jterm4 --version &> /dev/null
     end=$(date +%s%N)
     elapsed=$((($end - $start) / 1000000))
     total=$(($total + $elapsed))
@@ -46,16 +44,6 @@ echo ""
 echo "🧪 Test Suite Performance:"
 time_output=$(nix develop --command bash -c "cargo test --lib --test '*' 2>&1 | grep 'test result'")
 echo "   $time_output"
-echo ""
-
-# Build time
-echo "🔨 Incremental Build Time:"
-touch src/main.rs
-start=$(date +%s)
-nix develop --command bash -c "cargo build --release 2>&1" > /dev/null
-end=$(date +%s)
-elapsed=$(($end - $start))
-echo "   ${elapsed}s"
 echo ""
 
 # Dependency count

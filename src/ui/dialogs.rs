@@ -1219,10 +1219,17 @@ impl UiState {
             {
                 let item = make_item("Paste");
                 let popover_c = popover.clone();
-                let term_paste = term.clone();
+                let ui_paste = ui.clone();
+                let term_paste_target = term.clone();
                 item.connect_clicked(move |_| {
                     popover_c.popdown();
-                    term_paste.paste_clipboard();
+                    // In block mode the visible VTE is not attached to the shell
+                    // PTY.  Use the same view-aware path as Ctrl+Shift+V so
+                    // multiline and bracketed paste reach the real session. Focus
+                    // the clicked surface first so VTE split panes keep their
+                    // existing "paste into this pane" behavior.
+                    term_paste_target.grab_focus();
+                    ui_paste.execute_action(Action::Paste);
                 });
                 vbox.append(&item);
             }
@@ -1537,7 +1544,7 @@ impl UiState {
         term_view: Rc<crate::block_view::TermView>,
     ) {
         let dialog = adw::Dialog::builder()
-            .title(&format!("Workflow: {}", wf.name))
+            .title(format!("Workflow: {}", wf.name))
             .content_width(520)
             .build();
 

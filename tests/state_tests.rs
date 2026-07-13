@@ -208,7 +208,7 @@ fn test_parse_tabs_state_new_json_format() {
     let contents = format!(
         r#"current_page=0
 tab=Terminal 1	{}"#,
-        leaf_json.to_string()
+        leaf_json
     );
 
     let (current, tabs) = parse_tabs_state(&contents);

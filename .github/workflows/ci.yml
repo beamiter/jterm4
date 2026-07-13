@@ -65,7 +65,38 @@ jobs:
           shared-key: clippy
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rustdoc
+
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features --locked
 
   test:
     name: Tests

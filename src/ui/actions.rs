@@ -95,6 +95,10 @@ impl UiState {
                 log::debug!("Toggle settings panel");
                 self.toggle_settings_panel();
             }
+            Action::ReloadConfig => {
+                log::info!("Reload configuration");
+                self.reload_config();
+            }
             Action::ToggleSidebar => {
                 log::debug!("Toggle sidebar");
                 self.toggle_sidebar();
@@ -102,6 +106,10 @@ impl UiState {
             Action::FilterTabs => {
                 log::debug!("Filter tabs");
                 self.sidebar.set_visible(true);
+                // The search entry lives on the Tabs sidebar page even when
+                // tabs themselves are placed in the top bar. Show that page so
+                // the focused entry is never invisible.
+                self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
                 self.tab_search_entry.set_can_focus(true);
                 self.tab_search_entry.set_focusable(true);
                 self.tab_search_entry.grab_focus();
@@ -125,7 +133,9 @@ impl UiState {
                 self.switch_tab(1);
             }
             Action::ScrollUp => {
-                if let Some(ref term) = current_terminal {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.scroll_lines(-3);
+                } else if let Some(ref term) = current_terminal {
                     if let Some(adj) = term.vadjustment() {
                         let new_val = (adj.value() - adj.step_increment() * 3.0).max(adj.lower());
                         adj.set_value(new_val);
@@ -133,7 +143,9 @@ impl UiState {
                 }
             }
             Action::ScrollDown => {
-                if let Some(ref term) = current_terminal {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.scroll_lines(3);
+                } else if let Some(ref term) = current_terminal {
                     if let Some(adj) = term.vadjustment() {
                         let max_val = adj.upper() - adj.page_size();
                         let new_val = (adj.value() + adj.step_increment() * 3.0).min(max_val);

@@ -27,6 +27,15 @@ impl UiState {
     pub(crate) fn search_apply(&self) {
         let text = self.search_entry.text();
         if text.is_empty() {
+            // `search_changed` also fires when the user deletes the query.  Clear
+            // both search backends here; otherwise the previous highlights stay
+            // painted until the search bar itself is closed.
+            if let Some(term_view) = self.current_term_view() {
+                term_view.clear_find();
+            }
+            if let Some(term) = self.current_terminal() {
+                term.search_set_regex(None::<&vte4::Regex>, 0);
+            }
             return;
         }
 

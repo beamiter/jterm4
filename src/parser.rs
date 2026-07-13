@@ -4,6 +4,10 @@
 //! sequences that drive the block view. OSC 7/title sequences pass through to
 //! VTE so its native cwd/title signals stay authoritative.
 
+const MAX_OSC_BYTES: usize = 8 * 1024 * 1024;
+const MAX_APC_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
+
 /// Which color slot an OSC 10/11/12/4 query asked about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorKind {
@@ -52,7 +56,7 @@ pub enum ParserEvent {
     PromptEnd,
     /// OSC 133 ;C — user pressed Enter, command is executing.
     CommandStart,
-    /// OSC 133 ;D;<code> — command finished with exit code.
+    /// OSC 133 ;D with a numeric status — command finished with exit code.
     CommandEnd(i32),
     /// OSC 7770 — rsh-specific: the remote shell announces its session ID at
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
@@ -70,7 +74,7 @@ pub enum ParserEvent {
     ClipboardQuery,
     /// APC sequence (ESC _) — Kitty graphics protocol or similar.
     ApcSequence(Vec<u8>),
-    /// CSI ? <mode> h / l — DEC private mode change. Emitted in addition to
+    /// CSI private-mode set/reset — DEC private mode change. Emitted in addition to
     /// pass-through so block_view can track reporting modes.
     DecsetMode { mode: u32, set: bool },
     /// OSC 10/11/12/4 with a `?` — app is asking the terminal what color it uses.
@@ -509,6 +513,12 @@ impl Parser {
                     }
                     _ => {
                         buf.push(b);
+                        if buf.len() > MAX_OSC_BYTES {
+                            log::warn!(
+                                "Dropping unterminated OSC larger than {MAX_OSC_BYTES} bytes"
+                            );
+                            self.state = State::Ignore;
+                        }
                     }
                 },
 
@@ -535,6 +545,12 @@ impl Parser {
                     }
                     _ => {
                         buf.push(b);
+                        if buf.len() > MAX_APC_BYTES {
+                            log::warn!(
+                                "Dropping unterminated APC larger than {MAX_APC_BYTES} bytes"
+                            );
+                            self.state = State::Ignore;
+                        }
                     }
                 },
 
@@ -699,10 +715,16 @@ fn handle_osc(payload: &[u8], events: &mut Vec<ParserEvent>) {
             let b64_data = &rest[data_start + 1..];
             if b64_data == "?" {
                 events.push(ParserEvent::ClipboardQuery);
-            } else if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
-                if let Ok(text) = String::from_utf8(decoded) {
-                    events.push(ParserEvent::ClipboardSet(text));
+            } else if b64_data.len() <= MAX_CLIPBOARD_BASE64_BYTES {
+                if let Ok(decoded) = base64_decode(b64_data.as_bytes()) {
+                    if let Ok(text) = String::from_utf8(decoded) {
+                        events.push(ParserEvent::ClipboardSet(text));
+                    }
                 }
+            } else {
+                log::warn!(
+                    "Ignoring OSC 52 payload larger than {MAX_CLIPBOARD_BASE64_BYTES} bytes"
+                );
             }
         }
         return;
@@ -784,6 +806,19 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn oversized_unterminated_osc_is_bounded_and_parser_recovers() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        let mut input = Vec::with_capacity(MAX_OSC_BYTES + 16);
+        input.extend_from_slice(b"\x1b]");
+        input.resize(MAX_OSC_BYTES + 3, b'x');
+        input.extend_from_slice(b"\x07after");
+
+        parser.feed(&input, &mut events);
+        assert_eq!(collect_bytes(&events), b"after");
     }
 
     #[test]

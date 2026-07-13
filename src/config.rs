@@ -1,10 +1,11 @@
 use gtk4::gdk::RGBA;
 use gtk4::glib;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::keybindings::KeybindingMap;
+use crate::keybindings::{KeyCombo, KeybindingMap};
 
 // ---------------------------------------------------------------------------
 // Terminal Mode
@@ -405,7 +406,398 @@ fn env_rgba(name: &str) -> Option<RGBA> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn config_file_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("JTERM4_CONFIG").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
     glib::user_config_dir().join("jterm4").join("config.toml")
+}
+
+/// Severity reported by the headless config checker and startup diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigIssueLevel {
+    Warning,
+    Error,
+}
+
+/// One actionable problem in a TOML configuration file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigIssue {
+    pub level: ConfigIssueLevel,
+    pub path: String,
+    pub message: String,
+}
+
+impl ConfigIssue {
+    pub fn is_error(&self) -> bool {
+        self.level == ConfigIssueLevel::Error
+    }
+}
+
+impl std::fmt::Display for ConfigIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let level = match self.level {
+            ConfigIssueLevel::Warning => "warning",
+            ConfigIssueLevel::Error => "error",
+        };
+        write!(f, "{level}: {}: {}", self.path, self.message)
+    }
+}
+
+const KNOWN_CONFIG_KEYS: &[&str] = &[
+    "opacity",
+    "scrollback",
+    "font",
+    "font_scale",
+    "theme",
+    "colors",
+    "keybindings",
+    "shell",
+    "startup_commands",
+    "terminal_mode",
+    "tab_placement",
+    "sidebar_view",
+    "sidebar_width",
+    "max_visible_blocks",
+    "lazy_load_threshold",
+    "truncation_threshold_lines",
+    "max_collapsed_output_lines",
+    "virtual_scroll_margin",
+    "block_history_path",
+    "block_history_compress",
+    "remote_hosts",
+    "mouse_reporting_enabled",
+    "scroll_reporting_enabled",
+    "focus_reporting_enabled",
+    "preserve_live_scrollback",
+    "ai_panel_visible",
+    "ai_panel_width",
+    "ai_model",
+    "ai_max_tokens",
+    "ai_redact_secrets",
+    "allow_remote_clipboard_write",
+    "notify_long_blocks",
+    "notify_long_block_threshold_ms",
+    "show_repo_strip",
+];
+
+fn config_issue(
+    issues: &mut Vec<ConfigIssue>,
+    level: ConfigIssueLevel,
+    path: impl Into<String>,
+    message: impl Into<String>,
+) {
+    issues.push(ConfigIssue {
+        level,
+        path: path.into(),
+        message: message.into(),
+    });
+}
+
+fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
+    let strings = [
+        "font",
+        "theme",
+        "shell",
+        "startup_commands",
+        "terminal_mode",
+        "tab_placement",
+        "sidebar_view",
+        "block_history_path",
+        "ai_model",
+    ];
+    let integers = [
+        "scrollback",
+        "sidebar_width",
+        "max_visible_blocks",
+        "lazy_load_threshold",
+        "truncation_threshold_lines",
+        "max_collapsed_output_lines",
+        "virtual_scroll_margin",
+        "ai_panel_width",
+        "ai_max_tokens",
+        "notify_long_block_threshold_ms",
+    ];
+    let booleans = [
+        "block_history_compress",
+        "mouse_reporting_enabled",
+        "scroll_reporting_enabled",
+        "focus_reporting_enabled",
+        "preserve_live_scrollback",
+        "ai_panel_visible",
+        "ai_redact_secrets",
+        "allow_remote_clipboard_write",
+        "notify_long_blocks",
+        "show_repo_strip",
+    ];
+
+    for key in strings {
+        if table.get(key).is_some_and(|v| !v.is_str()) {
+            config_issue(issues, ConfigIssueLevel::Error, key, "expected a string");
+        }
+    }
+    for key in integers {
+        if table.get(key).is_some_and(|v| !v.is_integer()) {
+            config_issue(issues, ConfigIssueLevel::Error, key, "expected an integer");
+        }
+    }
+    for key in booleans {
+        if table.get(key).is_some_and(|v| !v.is_bool()) {
+            config_issue(
+                issues,
+                ConfigIssueLevel::Error,
+                key,
+                "expected true or false",
+            );
+        }
+    }
+    for key in ["opacity", "font_scale"] {
+        if table.get(key).is_some_and(|v| !v.is_float()) {
+            config_issue(
+                issues,
+                ConfigIssueLevel::Error,
+                key,
+                "expected a decimal number (for example 0.95)",
+            );
+        }
+    }
+}
+
+fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
+    use ConfigIssueLevel::{Error, Warning};
+
+    let mut issues = Vec::new();
+    for key in table.keys() {
+        if !KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
+            let message = match key.as_str() {
+                "ansi_cache_capacity" | "output_batch_min_ms" | "output_batch_max_ms" => {
+                    "obsolete option; remove it because batching and caching are automatic"
+                }
+                _ => "unknown option; it will be ignored",
+            };
+            config_issue(&mut issues, Warning, key, message);
+        }
+    }
+    validate_value_types(table, &mut issues);
+
+    let warn_float_range = |issues: &mut Vec<ConfigIssue>, key: &str, min: f64, max: f64| {
+        if let Some(value) = table.get(key).and_then(toml::Value::as_float) {
+            if !(min..=max).contains(&value) {
+                config_issue(
+                    issues,
+                    Warning,
+                    key,
+                    format!("{value} is outside {min}..={max}; it will be clamped"),
+                );
+            }
+        }
+    };
+    let warn_int_range = |issues: &mut Vec<ConfigIssue>, key: &str, min: i64, max: i64| {
+        if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
+            if !(min..=max).contains(&value) {
+                config_issue(
+                    issues,
+                    Warning,
+                    key,
+                    format!("{value} is outside {min}..={max}; it will be clamped"),
+                );
+            }
+        }
+    };
+    warn_float_range(&mut issues, "opacity", 0.01, 1.0);
+    warn_float_range(&mut issues, "font_scale", 0.1, 10.0);
+    warn_int_range(&mut issues, "scrollback", 0, 1_000_000);
+    warn_int_range(&mut issues, "sidebar_width", 120, 800);
+    warn_int_range(&mut issues, "max_visible_blocks", 1, 100_000);
+    warn_int_range(&mut issues, "lazy_load_threshold", 1, 10_000_000);
+    warn_int_range(&mut issues, "truncation_threshold_lines", 1, 10_000_000);
+    warn_int_range(&mut issues, "max_collapsed_output_lines", 1, 1_000_000);
+    warn_int_range(&mut issues, "virtual_scroll_margin", 0, 10_000);
+    warn_int_range(&mut issues, "ai_panel_width", 240, 1200);
+    warn_int_range(&mut issues, "ai_max_tokens", 64, 8192);
+    warn_int_range(&mut issues, "notify_long_block_threshold_ms", 0, i64::MAX);
+
+    if let Some(mode) = table.get("terminal_mode").and_then(toml::Value::as_str) {
+        if !matches!(mode.to_ascii_lowercase().as_str(), "block" | "vte") {
+            config_issue(
+                &mut issues,
+                Error,
+                "terminal_mode",
+                "expected 'block' or 'vte'",
+            );
+        }
+    }
+    if let Some(value) = table.get("tab_placement").and_then(toml::Value::as_str) {
+        if !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "sidebar" | "top" | "topbar" | "top_bar"
+        ) {
+            config_issue(
+                &mut issues,
+                Error,
+                "tab_placement",
+                "expected 'sidebar' or 'top'",
+            );
+        }
+    }
+    if let Some(value) = table.get("sidebar_view").and_then(toml::Value::as_str) {
+        if !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "tabs" | "files" | "file" | "filetree" | "file_tree"
+        ) {
+            config_issue(
+                &mut issues,
+                Error,
+                "sidebar_view",
+                "expected 'tabs' or 'files'",
+            );
+        }
+    }
+    if let Some(theme) = table.get("theme").and_then(toml::Value::as_str) {
+        if !builtin_themes()
+            .iter()
+            .any(|candidate| candidate.name == theme)
+        {
+            config_issue(
+                &mut issues,
+                Error,
+                "theme",
+                format!("unknown built-in theme '{theme}'"),
+            );
+        }
+    }
+
+    if let Some(colors) = table.get("colors") {
+        if let Some(colors) = colors.as_table() {
+            for key in colors.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "foreground" | "background" | "cursor" | "cursor_foreground"
+                ) {
+                    config_issue(
+                        &mut issues,
+                        Warning,
+                        format!("colors.{key}"),
+                        "unknown color option",
+                    );
+                }
+            }
+            for (key, value) in colors {
+                let path = format!("colors.{key}");
+                match value.as_str() {
+                    Some(raw) if RGBA::parse(raw).is_ok() => {}
+                    Some(raw) => config_issue(
+                        &mut issues,
+                        Error,
+                        path,
+                        format!("'{raw}' is not a valid CSS color"),
+                    ),
+                    None => config_issue(&mut issues, Error, path, "expected a color string"),
+                }
+            }
+        } else {
+            config_issue(&mut issues, Error, "colors", "expected a table");
+        }
+    }
+
+    if let Some(bindings) = table.get("keybindings") {
+        if let Some(bindings) = bindings.as_table() {
+            let known: std::collections::HashSet<&str> = crate::keybindings::Action::all_actions()
+                .into_iter()
+                .filter_map(|action| action.config_key())
+                .collect();
+            let mut chords: HashMap<KeyCombo, &str> = HashMap::new();
+            for (action, value) in bindings {
+                let path = format!("keybindings.{action}");
+                if !known.contains(action.as_str()) {
+                    config_issue(&mut issues, Error, &path, "unknown action");
+                    continue;
+                }
+                if value.as_bool() == Some(false) {
+                    continue;
+                }
+                let Some(chord) = value.as_str() else {
+                    config_issue(
+                        &mut issues,
+                        Error,
+                        &path,
+                        "expected a chord string or false",
+                    );
+                    continue;
+                };
+                if chord.trim().is_empty()
+                    || chord.eq_ignore_ascii_case("none")
+                    || chord.eq_ignore_ascii_case("disabled")
+                {
+                    continue;
+                }
+                match crate::keybindings::parse_key_combo(chord) {
+                    Ok(combo) => {
+                        if let Some(previous) = chords.insert(combo, action) {
+                            config_issue(
+                                &mut issues,
+                                Warning,
+                                &path,
+                                format!("same chord as keybindings.{previous}; last one wins"),
+                            );
+                        }
+                    }
+                    Err(err) => config_issue(&mut issues, Error, &path, err),
+                }
+            }
+        } else {
+            config_issue(&mut issues, Error, "keybindings", "expected a table");
+        }
+    }
+
+    if let Some(hosts) = table.get("remote_hosts") {
+        if let Some(hosts) = hosts.as_array() {
+            for (index, host) in hosts.iter().enumerate() {
+                let path = format!("remote_hosts[{index}]");
+                let Some(host) = host.as_table() else {
+                    config_issue(&mut issues, Error, path, "expected a table");
+                    continue;
+                };
+                match host.get("host").and_then(toml::Value::as_str) {
+                    Some(value) if !value.trim().is_empty() => {}
+                    _ => config_issue(
+                        &mut issues,
+                        Error,
+                        format!("{path}.host"),
+                        "missing non-empty host",
+                    ),
+                }
+                if let Some(args) = host.get("ssh_args") {
+                    if !args
+                        .as_array()
+                        .is_some_and(|values| values.iter().all(toml::Value::is_str))
+                    {
+                        config_issue(
+                            &mut issues,
+                            Error,
+                            format!("{path}.ssh_args"),
+                            "expected an array of strings",
+                        );
+                    }
+                }
+            }
+        } else {
+            config_issue(
+                &mut issues,
+                Error,
+                "remote_hosts",
+                "expected an array of tables",
+            );
+        }
+    }
+
+    issues
+}
+
+/// Parse and semantically validate TOML without starting GTK. Syntax errors are
+/// returned separately so CLI callers can show TOML's line/column diagnostic.
+pub fn validate_config_contents(contents: &str) -> Result<Vec<ConfigIssue>, toml::de::Error> {
+    let table = contents.parse::<toml::Table>()?;
+    Ok(validate_config_table(&table))
 }
 
 /// Parsed TOML config file structure.
@@ -452,6 +844,20 @@ struct FileConfig {
     show_repo_strip: Option<bool>,
 }
 
+fn table_u32(table: &toml::Table, key: &str) -> Option<u32> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn table_u64(table: &toml::Table, key: &str) -> Option<u64> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u64::try_from(value).ok())
+}
+
 fn load_file_config() -> FileConfig {
     let path = config_file_path();
     let Ok(contents) = fs::read_to_string(&path) else {
@@ -467,6 +873,12 @@ fn load_file_config() -> FileConfig {
             ..Default::default()
         };
     };
+    for issue in validate_config_table(&table) {
+        match issue.level {
+            ConfigIssueLevel::Warning => log::warn!("Config {issue}"),
+            ConfigIssueLevel::Error => log::error!("Config {issue}"),
+        }
+    }
 
     let colors = table.get("colors").and_then(|v| v.as_table());
     // Fall back to built-in defaults when the section is entirely absent (e.g. a
@@ -480,10 +892,7 @@ fn load_file_config() -> FileConfig {
 
     FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
-        scrollback: table
-            .get("scrollback")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+        scrollback: table_u32(&table, "scrollback"),
         font: table
             .get("font")
             .and_then(|v| v.as_str())
@@ -530,30 +939,12 @@ fn load_file_config() -> FileConfig {
             .get("sidebar_view")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        sidebar_width: table
-            .get("sidebar_width")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
-        max_visible_blocks: table
-            .get("max_visible_blocks")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
-        lazy_load_threshold: table
-            .get("lazy_load_threshold")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
-        truncation_threshold_lines: table
-            .get("truncation_threshold_lines")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
-        max_collapsed_output_lines: table
-            .get("max_collapsed_output_lines")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
-        virtual_scroll_margin: table
-            .get("virtual_scroll_margin")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+        sidebar_width: table_u32(&table, "sidebar_width"),
+        max_visible_blocks: table_u32(&table, "max_visible_blocks"),
+        lazy_load_threshold: table_u32(&table, "lazy_load_threshold"),
+        truncation_threshold_lines: table_u32(&table, "truncation_threshold_lines"),
+        max_collapsed_output_lines: table_u32(&table, "max_collapsed_output_lines"),
+        virtual_scroll_margin: table_u32(&table, "virtual_scroll_margin"),
         block_history_path: table
             .get("block_history_path")
             .and_then(|v| v.as_str())
@@ -575,27 +966,18 @@ fn load_file_config() -> FileConfig {
             .get("preserve_live_scrollback")
             .and_then(|v| v.as_bool()),
         ai_panel_visible: table.get("ai_panel_visible").and_then(|v| v.as_bool()),
-        ai_panel_width: table
-            .get("ai_panel_width")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+        ai_panel_width: table_u32(&table, "ai_panel_width"),
         ai_model: table
             .get("ai_model")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        ai_max_tokens: table
-            .get("ai_max_tokens")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u32),
+        ai_max_tokens: table_u32(&table, "ai_max_tokens"),
         ai_redact_secrets: table.get("ai_redact_secrets").and_then(|v| v.as_bool()),
         allow_remote_clipboard_write: table
             .get("allow_remote_clipboard_write")
             .and_then(|v| v.as_bool()),
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
-        notify_long_block_threshold_ms: table
-            .get("notify_long_block_threshold_ms")
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u64),
+        notify_long_block_threshold_ms: table_u64(&table, "notify_long_block_threshold_ms"),
         show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
     }
 }
@@ -684,33 +1066,10 @@ fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     toml::Value::Table(t)
 }
 
-/// Built-in remote hosts used when no config file exists yet, so a fresh
-/// install can connect without hand-writing `[[remote_hosts]]` first.
+/// No network target is assumed on a fresh install. Remote hosts are personal
+/// data and must be explicitly configured by the user.
 fn default_remote_hosts() -> Vec<RemoteHost> {
-    vec![
-        RemoteHost {
-            name: "home-dev".into(),
-            host: "100.99.153.18".into(),
-            user: Some("yj".into()),
-            // Full path: a non-interactive ssh PATH resolves bare `rsh` to the
-            // system ssh-alternative, not the block-mode rsh in ~/.cargo/bin.
-            remote_shell: "/home/yj/.cargo/bin/rsh".into(),
-            session: Some("cloud-test".into()),
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
-        },
-        RemoteHost {
-            name: "localhost-test".into(),
-            host: "localhost".into(),
-            user: Some("mm".into()),
-            remote_shell: "rsh".into(),
-            session: Some("local-test".into()),
-            ssh_args: Vec::new(),
-            login_shell: true,
-            multiplex: true,
-        },
-    ]
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -737,7 +1096,8 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .clamp(0.01, 1.0);
     let terminal_scrollback_lines = env_u32("JTERM4_SCROLLBACK")
         .or(fc.scrollback)
-        .unwrap_or(5000);
+        .unwrap_or(5000)
+        .min(1_000_000);
     let default_font_scale = env_f64("JTERM4_FONT_SCALE")
         .or(fc.font_scale)
         .unwrap_or(1.0)
@@ -770,19 +1130,24 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     // Block view optimization settings
     let max_visible_blocks = env_u32("JTERM4_MAX_BLOCKS")
         .or(fc.max_visible_blocks)
-        .unwrap_or(200);
+        .unwrap_or(200)
+        .clamp(1, 100_000);
     let lazy_load_threshold = env_u32("JTERM4_LAZY_LINES")
         .or(fc.lazy_load_threshold)
-        .unwrap_or(1000);
+        .unwrap_or(1000)
+        .clamp(1, 10_000_000);
     let truncation_threshold_lines = env_u32("JTERM4_TRUNCATION_LINES")
         .or(fc.truncation_threshold_lines)
-        .unwrap_or(50000);
+        .unwrap_or(50000)
+        .clamp(1, 10_000_000);
     let max_collapsed_output_lines = env_u32("JTERM4_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
-        .unwrap_or(25);
+        .unwrap_or(25)
+        .clamp(1, 1_000_000);
     let virtual_scroll_margin = env_u32("JTERM4_VSCROLL_MARGIN")
         .or(fc.virtual_scroll_margin)
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .min(10_000);
     let block_history_path = std::env::var("JTERM4_HISTORY_PATH")
         .ok()
         .or(fc.block_history_path);
@@ -793,9 +1158,13 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     let terminal_mode_str = env_string("JTERM4_MODE")
         .or(fc.terminal_mode)
         .unwrap_or_else(|| "vte".to_string());
-    let terminal_mode = match terminal_mode_str.to_lowercase().as_str() {
+    let terminal_mode = match terminal_mode_str.to_ascii_lowercase().as_str() {
+        "block" => TerminalMode::Block,
         "vte" => TerminalMode::Vte,
-        _ => TerminalMode::Block,
+        other => {
+            log::warn!("Unknown terminal_mode '{other}', using vte");
+            TerminalMode::Vte
+        }
     };
 
     let config = Config {
@@ -975,11 +1344,9 @@ pub(crate) fn save_config(config: &Config) {
     );
     table.insert("colors".into(), toml::Value::Table(colors));
 
-    // Seed the built-in default hosts on the FIRST save (when the file has no
-    // [[remote_hosts]] yet), so writing any other setting doesn't create a config
-    // that silently drops the context-menu remote-connect items. remote_hosts has
-    // no in-app editor, so once the section exists it is user-authored: never
-    // overwrite it here, or hand-edited hosts get clobbered on the next save.
+    // Preserve explicitly loaded hosts on the first save. Fresh installs use an
+    // empty list, so this never injects personal network targets. Once the
+    // section exists it is user-authored and is left untouched.
     if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
         let hosts: Vec<toml::Value> = config
             .remote_hosts
@@ -1160,5 +1527,51 @@ mod tests {
             !argv.iter().any(|a| a.contains("ControlMaster")),
             "argv: {argv:?}"
         );
+    }
+
+    #[test]
+    fn config_validator_reports_unknown_invalid_and_colliding_values() {
+        let input = r#"
+terminal_mode = "warp"
+opacity = 2.0
+obsolete_thing = true
+
+[colors]
+foreground = "definitely-not-a-color"
+
+[keybindings]
+copy = "Ctrl+Shift+X"
+paste = "Ctrl+Shift+X"
+unknown_action = "F8"
+"#;
+        let issues = validate_config_contents(input).unwrap();
+        assert!(issues.iter().any(|issue| {
+            issue.path == "terminal_mode" && issue.level == ConfigIssueLevel::Error
+        }));
+        assert!(issues.iter().any(|issue| issue.path == "opacity"));
+        assert!(issues.iter().any(|issue| issue.path == "obsolete_thing"));
+        assert!(issues.iter().any(|issue| issue.path == "colors.foreground"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "keybindings.unknown_action"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.message.contains("same chord")));
+    }
+
+    #[test]
+    fn disabled_keybinding_is_valid() {
+        let issues = validate_config_contents("[keybindings]\ncopy = false\n").unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn invalid_toml_is_rejected() {
+        assert!(validate_config_contents("opacity = [").is_err());
+    }
+
+    #[test]
+    fn fresh_install_has_no_personal_remote_targets() {
+        assert!(default_remote_hosts().is_empty());
     }
 }

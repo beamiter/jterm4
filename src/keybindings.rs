@@ -18,6 +18,7 @@ pub(crate) enum Action {
     ToggleSearch,
     ToggleCommandPalette,
     ToggleSettings,
+    ReloadConfig,
     ToggleSidebar,
     SplitHorizontal,
     SplitVertical,
@@ -83,6 +84,7 @@ impl Action {
             Action::ToggleSearch => "Toggle search",
             Action::ToggleCommandPalette => "Command palette",
             Action::ToggleSettings => "Toggle settings panel",
+            Action::ReloadConfig => "Reload configuration",
             Action::ToggleSidebar => "Toggle sidebar",
             Action::SplitHorizontal => "Split horizontal",
             Action::SplitVertical => "Split vertical",
@@ -149,6 +151,7 @@ impl Action {
             Action::ToggleSearch => Some("toggle_search"),
             Action::ToggleCommandPalette => Some("toggle_command_palette"),
             Action::ToggleSettings => Some("toggle_settings"),
+            Action::ReloadConfig => Some("reload_config"),
             Action::ToggleSidebar => Some("toggle_sidebar"),
             Action::SplitHorizontal => Some("split_horizontal"),
             Action::SplitVertical => Some("split_vertical"),
@@ -204,6 +207,7 @@ impl Action {
             Action::ToggleSearch,
             Action::ToggleCommandPalette,
             Action::ToggleSettings,
+            Action::ReloadConfig,
             Action::ToggleSidebar,
             Action::SplitHorizontal,
             Action::SplitVertical,
@@ -301,10 +305,10 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
     };
 
     for part in mod_parts {
-        match *part {
-            "Ctrl" => modifiers |= ModifierType::CONTROL_MASK,
-            "Shift" => modifiers |= ModifierType::SHIFT_MASK,
-            "Alt" => modifiers |= ModifierType::ALT_MASK,
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= ModifierType::CONTROL_MASK,
+            "shift" => modifiers |= ModifierType::SHIFT_MASK,
+            "alt" => modifiers |= ModifierType::ALT_MASK,
             other => return Err(format!("Unknown modifier: {other}")),
         }
     }
@@ -438,6 +442,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
+        bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
         bind("Ctrl+Shift+B", Action::ToggleTabPlacement);
@@ -452,10 +457,13 @@ impl KeybindingMap {
         bind("Ctrl+minus", Action::FontDecrease);
         bind("Ctrl+PageUp", Action::PrevTab);
         bind("Ctrl+PageDown", Action::NextTab);
-        for i in 0..=9u8 {
-            bind(&format!("Ctrl+{i}"), Action::QuickSwitchTab(i));
+        // Conventional numbering: Ctrl+1 selects the first tab, Ctrl+9 the
+        // ninth, and Ctrl+0 selects the last tab.
+        for digit in 1..=9u8 {
+            bind(&format!("Ctrl+{digit}"), Action::QuickSwitchTab(digit - 1));
         }
-        bind("Ctrl+Shift+R", Action::ShowRemotePicker);
+        bind("Ctrl+0", Action::QuickSwitchTab(9));
+        bind("Ctrl+Shift+S", Action::ShowRemotePicker);
         bind("Alt+Tab", Action::CyclePaneFocusForward);
         bind("Alt+Shift+Tab", Action::CyclePaneFocusBackward);
 
@@ -500,18 +508,35 @@ impl KeybindingMap {
                 log::warn!("Unknown keybinding action: {config_key}");
                 continue;
             };
-            let Some(key_str) = value.as_str() else {
-                log::warn!("Keybinding value for {config_key} must be a string");
-                continue;
-            };
-
             // Remove old bindings for this action
             self.bindings.retain(|_, a| *a != action);
+
+            // `false`, an empty string, "none", and "disabled" intentionally
+            // leave the action unbound. This makes it possible to resolve a
+            // desktop/window-manager conflict without inventing a dummy chord.
+            if value.as_bool() == Some(false) {
+                continue;
+            }
+            let Some(key_str) = value.as_str() else {
+                log::warn!("Keybinding value for {config_key} must be a chord string or false");
+                continue;
+            };
+            if key_str.trim().is_empty()
+                || key_str.eq_ignore_ascii_case("none")
+                || key_str.eq_ignore_ascii_case("disabled")
+            {
+                continue;
+            }
 
             // Parse and add new binding
             match parse_key_combo(key_str) {
                 Ok(combo) => {
-                    self.bindings.insert(combo, action);
+                    if let Some(displaced) = self.bindings.insert(combo, action) {
+                        log::warn!(
+                            "Keybinding '{key_str}' for {config_key} replaces {}",
+                            displaced.name()
+                        );
+                    }
                 }
                 Err(e) => {
                     log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
@@ -688,7 +713,8 @@ mod tests {
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
-            ("Ctrl+Shift+R", Action::ShowRemotePicker),
+            ("Ctrl+Shift+R", Action::ReloadConfig),
+            ("Ctrl+Shift+S", Action::ShowRemotePicker),
             // Selection copy out of finished blocks.
             ("Ctrl+Shift+C", Action::Copy),
             // Tab placement / sidebar — adjacent to the block list.
@@ -718,20 +744,24 @@ mod tests {
         }
     }
 
-    /// Quick-switch tab digits 0..=9 must each map to a distinct
-    /// QuickSwitchTab(N). This used to drift from the 0..=9 loop; assert
-    /// via lookup so a future refactor can't silently drop a digit.
+    /// Quick-switch digits use user-facing 1-based numbering; Ctrl+0 is the
+    /// conventional shortcut for the last tab.
     #[test]
     fn ctrl_digit_quick_switch_tab_bound_for_all_digits() {
         let map = KeybindingMap::from_defaults();
-        for n in 0u8..=9 {
-            let chord = format!("Ctrl+{n}");
+        for digit in 1u8..=9 {
+            let chord = format!("Ctrl+{digit}");
             let combo = parse_key_combo(&chord).expect("digit chord must parse");
             match map.lookup(&combo) {
-                Some(Action::QuickSwitchTab(got)) => assert_eq!(got, n),
-                other => panic!("{chord} expected QuickSwitchTab({n}), got {other:?}"),
+                Some(Action::QuickSwitchTab(got)) => assert_eq!(got, digit - 1),
+                other => panic!(
+                    "{chord} expected QuickSwitchTab({}), got {other:?}",
+                    digit - 1
+                ),
             }
         }
+        let zero = parse_key_combo("Ctrl+0").expect("digit chord must parse");
+        assert_eq!(map.lookup(&zero), Some(Action::QuickSwitchTab(9)));
     }
 
     /// `+` is also the chord separator, so it needs special-casing in
@@ -786,5 +816,23 @@ mod tests {
         let new = parse_key_combo("F11").unwrap();
         assert_eq!(map.lookup(&old), None, "old default must be removed");
         assert_eq!(map.lookup(&new), Some(Action::ScrollUp));
+    }
+
+    #[test]
+    fn modifier_names_are_case_insensitive() {
+        assert_eq!(
+            parse_key_combo("control+shift+t").unwrap(),
+            parse_key_combo("Ctrl+Shift+T").unwrap()
+        );
+    }
+
+    #[test]
+    fn user_can_explicitly_disable_a_binding() {
+        let mut map = KeybindingMap::from_defaults();
+        let original = parse_key_combo("Ctrl+Up").unwrap();
+        let mut table = toml::Table::new();
+        table.insert("scroll_up".into(), toml::Value::Boolean(false));
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&original), None);
     }
 }
