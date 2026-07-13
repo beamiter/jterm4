@@ -1,16 +1,16 @@
 name: Apply PaneNode migration
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/jterm4-pane-node
+      - master
 
 permissions:
   contents: write
 
 jobs:
   migrate:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'agent/jterm4-pane-node' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +71,6 @@ pub(crate) enum PaneNode {
 }
 
 impl PaneNode {
-    /// Reconstruct a typed pane tree from the GTK page root.
     pub(crate) fn from_widget(widget: &Widget) -> Option<Self> {
         if let Ok(paned) = widget.clone().downcast::<Paned>() {
             let start = paned.start_child()?;
@@ -100,12 +99,10 @@ impl PaneNode {
         }
     }
 
-    /// Prefer the focused live terminal, otherwise the first leaf in tree order.
     pub(crate) fn active_terminal(&self) -> Option<Terminal> {
         self.focused_terminal().or_else(|| self.first_terminal())
     }
 
-    /// Focus the currently active leaf, or the first leaf when no child owns focus.
     pub(crate) fn grab_focus(&self) {
         match self {
             Self::Leaf {
@@ -174,16 +171,14 @@ impl PaneNode {
           guard = '''        let page_node = self\n            .notebook\n            .current_page()\n            .and_then(|page| self.notebook.nth_page(Some(page)))\n            .and_then(|widget| PaneNode::from_widget(&widget));\n\n        // A Block leaf owns a structured history surface around its live VTE.\n        // Refuse before creating a second PTY until split construction itself\n        // creates typed Block leaves. Existing VTE split trees remain supported.\n        if page_node.as_ref().is_some_and(PaneNode::contains_block) {\n            let dialog = adw::AlertDialog::new(\n                Some("Split panes require VTE mode"),\n                Some(\n                    "Block mode keeps command history in a structured view and cannot yet be split safely. Change terminal_mode to \\"vte\\" for split panes.",\n                ),\n            );\n            dialog.add_response("ok", "OK");\n            dialog.set_default_response(Some("ok"));\n            dialog.present(Some(&self.window));\n            log::warn!("Blocked an unsupported block-mode split before spawning a PTY");\n            return;\n        }\n'''
           panes_path.write_text(panes[:guard_start] + guard + panes[guard_end:])
 
-          leftovers = []
-          for path in ui_dir.glob('*.rs'):
-              if 'TerminalViewType' in path.read_text():
-                  leftovers.append(str(path))
+          leftovers = [str(path) for path in ui_dir.glob('*.rs') if 'TerminalViewType' in path.read_text()]
           if leftovers:
               raise SystemExit(f'legacy alias remains in {leftovers}')
           PY
 
           cargo fmt --all
           git rm .github/workflows/apply-pane-node-migration.yml
+          git rm -f .pane-node-trigger
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add src/ui
