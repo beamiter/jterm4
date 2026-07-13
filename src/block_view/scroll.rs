@@ -1,8 +1,8 @@
 //! Block-view scrolling, follow-bottom settling, and widget virtualization.
-use gtk4 as gtk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::ScrolledWindow;
+use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
