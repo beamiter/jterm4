@@ -33,7 +33,11 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
 /// that change on its next frame and resets its retry/stability counters, giving
 /// newly-added virtualized content a full settling window without starting a
 /// second timer.
-fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cell<u64>) -> bool {
+fn request_bottom_pin(
+    user_scrolled: bool,
+    active: &Cell<bool>,
+    generation: &Cell<u64>,
+) -> bool {
     if user_scrolled {
         return false;
     }
@@ -164,20 +168,11 @@ impl ScrollDebouncer {
 
 // ─── Virtual Scrolling ────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub(crate) struct ViewportState {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
     pub(crate) total_height: i32,
-}
-
-impl Clone for ViewportState {
-    fn clone(&self) -> Self {
-        Self {
-            first_visible: self.first_visible,
-            last_visible: self.last_visible,
-            total_height: self.total_height,
-        }
-    }
 }
 
 pub(crate) struct WidgetPool {
@@ -208,11 +203,10 @@ impl WidgetPool {
         // recycle. The new FinishedBlock installs a fresh controller set.
         let controllers = widget.observe_controllers();
         while let Some(controller) = controllers.item(0) {
-            if let Ok(controller) = controller.downcast::<gtk::EventController>() {
-                widget.remove_controller(&controller);
-            } else {
+            let Ok(controller) = controller.downcast::<gtk::EventController>() else {
                 break;
-            }
+            };
+            widget.remove_controller(&controller);
         }
 
         self.available.push(widget);
