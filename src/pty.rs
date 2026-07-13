@@ -89,13 +89,7 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
 /// performed by a key, paste, or block-recall callback.
 fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
-        let written = unsafe {
-            libc::write(
-                fd,
-                data.as_ptr().cast::<libc::c_void>(),
-                data.len(),
-            )
-        };
+        let written = unsafe { libc::write(fd, data.as_ptr().cast::<libc::c_void>(), data.len()) };
         if written > 0 {
             data = &data[written as usize..];
             continue;
