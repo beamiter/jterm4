@@ -12,10 +12,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use vte4::Terminal;
 
-use crate::block_view::TermView;
 use crate::config::{Config, SidebarView, TabPlacement, Theme};
 use crate::keybindings::KeybindingMap;
-use crate::terminal::VteTerminalView;
 
 mod actions;
 mod ai_panel;
@@ -23,6 +21,7 @@ mod config_apply;
 mod dialogs;
 mod file_tree;
 mod layout;
+mod pane_leaf;
 mod panes;
 mod search;
 mod session;
@@ -31,12 +30,12 @@ mod tabs;
 mod zoom;
 
 pub(crate) use ai_panel::AiPanel;
+pub(crate) use pane_leaf::PaneLeaf;
 
-#[derive(Clone)]
-pub(crate) enum TerminalViewType {
-    Block(Rc<TermView>),
-    Vte(Rc<VteTerminalView>),
-}
+/// Compatibility name while existing GTK call sites migrate incrementally to
+/// the pane-oriented terminology. This remains the same typed enum, not a second
+/// controller or framework layer.
+pub(crate) type TerminalViewType = PaneLeaf;
 
 pub(crate) struct ZoomState {
     pub(crate) original_page: gtk4::Widget,
