@@ -314,15 +314,15 @@ impl UiState {
         }
     }
 
-    /// Focus the live terminal for a notebook page. A block-mode page contains
-    /// several read-only VTEs for completed blocks before its active input VTE,
-    /// so a generic depth-first terminal lookup targets the wrong widget once
-    /// history exists. The page stores its `TermView`; prefer it when present.
+    /// Focus a direct pane leaf through its typed controller. Split roots are
+    /// containers rather than leaves, so retain the focused/first-VTE fallback
+    /// until they are migrated to a typed `PaneNode` tree.
     pub(crate) fn focus_terminal_in_page(&self, widget: &gtk4::Widget) {
-        if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
-            let term_view = unsafe { term_view.as_ref() };
-            term_view.grab_focus();
-        } else if let Some(term) = find_first_terminal(widget) {
+        if let Some(leaf) = PaneLeaf::from_widget(widget) {
+            leaf.grab_focus();
+            return;
+        }
+        if let Some(term) = find_focused_terminal(widget).or_else(|| find_first_terminal(widget)) {
             focus_terminal_deferred(&term);
         }
     }
@@ -330,33 +330,30 @@ impl UiState {
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
         self.notebook.current_page().and_then(|page_num| {
             self.notebook.nth_page(Some(page_num)).and_then(|widget| {
-                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
-                    let term_view = unsafe { term_view.as_ref() };
-                    return Some(term_view.vte().clone());
+                if let Some(leaf) = PaneLeaf::from_widget(&widget) {
+                    return Some(leaf.terminal().clone());
                 }
-                // Try focused terminal first (for split panes), then fall back to first terminal
+                // A split page is not itself a leaf. Prefer the focused child,
+                // then fall back to the first VTE until PaneNode lands.
                 find_focused_terminal(&widget).or_else(|| find_first_terminal(&widget))
             })
         })
     }
 
+    pub(crate) fn current_pane_leaf(&self) -> Option<PaneLeaf> {
+        self.notebook
+            .current_page()
+            .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
+            .and_then(|widget| PaneLeaf::from_widget(&widget))
+    }
+
+    /// Compatibility accessor for call sites still using the old name. Both
+    /// names resolve to the same `PaneLeaf` enum; no second controller exists.
     pub(crate) fn current_terminal_view_type(&self) -> Option<TerminalViewType> {
-        self.notebook.current_page().and_then(|page_num| {
-            self.notebook.nth_page(Some(page_num)).and_then(|widget| {
-                // SAFETY: data() returns a NonNull to data we stored on the widget
-                unsafe {
-                    widget
-                        .data::<TerminalViewType>("terminal-view-type")
-                        .map(|ptr| ptr.as_ref().clone())
-                }
-            })
-        })
+        self.current_pane_leaf()
     }
 
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
-        match self.current_terminal_view_type() {
-            Some(TerminalViewType::Block(term_view)) => Some(term_view),
-            _ => None,
-        }
+        self.current_pane_leaf().and_then(|leaf| leaf.block_view())
     }
 }
