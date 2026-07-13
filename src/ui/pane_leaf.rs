@@ -8,6 +8,7 @@
 
 use std::rc::Rc;
 
+use gtk4::glib::prelude::ObjectExt;
 use vte4::Terminal;
 
 use crate::block_view::TermView;
