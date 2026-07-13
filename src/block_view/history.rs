@@ -210,8 +210,8 @@ impl TermView {
             log::debug!(
                 "Loaded historical block #{}: prompt={:?}, cmd={:?}, output_len={}, exit_code={}",
                 idx,
-                &block.prompt,
-                &block.cmd,
+                block.prompt,
+                block.cmd,
                 block.output.len(),
                 block.exit_code
             );

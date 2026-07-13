@@ -1,8 +1,8 @@
 //! Block-view scrolling, follow-bottom settling, and widget virtualization.
-use gtk4 as gtk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::ScrolledWindow;
+use gtk4 as gtk;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -164,20 +164,11 @@ impl ScrollDebouncer {
 
 // ─── Virtual Scrolling ────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub(crate) struct ViewportState {
     pub(crate) first_visible: usize,
     pub(crate) last_visible: usize,
     pub(crate) total_height: i32,
-}
-
-impl Clone for ViewportState {
-    fn clone(&self) -> Self {
-        Self {
-            first_visible: self.first_visible,
-            last_visible: self.last_visible,
-            total_height: self.total_height,
-        }
-    }
 }
 
 pub(crate) struct WidgetPool {
@@ -208,11 +199,10 @@ impl WidgetPool {
         // recycle. The new FinishedBlock installs a fresh controller set.
         let controllers = widget.observe_controllers();
         while let Some(controller) = controllers.item(0) {
-            if let Ok(controller) = controller.downcast::<gtk::EventController>() {
-                widget.remove_controller(&controller);
-            } else {
+            let Ok(controller) = controller.downcast::<gtk::EventController>() else {
                 break;
-            }
+            };
+            widget.remove_controller(&controller);
         }
 
         self.available.push(widget);
