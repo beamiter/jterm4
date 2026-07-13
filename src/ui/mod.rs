@@ -22,6 +22,7 @@ mod dialogs;
 mod file_tree;
 mod layout;
 mod pane_leaf;
+mod pane_node;
 mod panes;
 mod search;
 mod session;
@@ -31,11 +32,7 @@ mod zoom;
 
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use pane_leaf::PaneLeaf;
-
-/// Compatibility name while existing GTK call sites migrate incrementally to
-/// the pane-oriented terminology. This remains the same typed enum, not a second
-/// controller or framework layer.
-pub(crate) type TerminalViewType = PaneLeaf;
+pub(crate) use pane_node::PaneNode;
 
 pub(crate) struct ZoomState {
     pub(crate) original_page: gtk4::Widget,

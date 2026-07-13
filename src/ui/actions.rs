@@ -10,9 +10,7 @@ use vte4::TerminalExt;
 use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::{Action, Direction};
-use crate::terminal::{
-    find_first_terminal, find_focused_terminal, focus_terminal_deferred, terminal_working_directory,
-};
+use crate::terminal::terminal_working_directory;
 
 impl UiState {
     pub(crate) fn execute_action(&self, action: Action) {
@@ -314,30 +312,19 @@ impl UiState {
         }
     }
 
-    /// Focus a direct pane leaf through its typed controller. Split roots are
-    /// containers rather than leaves, so retain the focused/first-VTE fallback
-    /// until they are migrated to a typed `PaneNode` tree.
+    /// Focus the active leaf through the recursive typed pane tree.
     pub(crate) fn focus_terminal_in_page(&self, widget: &gtk4::Widget) {
-        if let Some(leaf) = PaneLeaf::from_widget(widget) {
-            leaf.grab_focus();
-            return;
-        }
-        if let Some(term) = find_focused_terminal(widget).or_else(|| find_first_terminal(widget)) {
-            focus_terminal_deferred(&term);
+        if let Some(node) = PaneNode::from_widget(widget) {
+            node.grab_focus();
         }
     }
 
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
-        self.notebook.current_page().and_then(|page_num| {
-            self.notebook.nth_page(Some(page_num)).and_then(|widget| {
-                if let Some(leaf) = PaneLeaf::from_widget(&widget) {
-                    return Some(leaf.terminal().clone());
-                }
-                // A split page is not itself a leaf. Prefer the focused child,
-                // then fall back to the first VTE until PaneNode lands.
-                find_focused_terminal(&widget).or_else(|| find_first_terminal(&widget))
-            })
-        })
+        self.notebook
+            .current_page()
+            .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
+            .and_then(|widget| PaneNode::from_widget(&widget))
+            .and_then(|node| node.active_terminal())
     }
 
     pub(crate) fn current_pane_leaf(&self) -> Option<PaneLeaf> {
@@ -345,12 +332,6 @@ impl UiState {
             .current_page()
             .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
             .and_then(|widget| PaneLeaf::from_widget(&widget))
-    }
-
-    /// Compatibility accessor for call sites still using the old name. Both
-    /// names resolve to the same `PaneLeaf` enum; no second controller exists.
-    pub(crate) fn current_terminal_view_type(&self) -> Option<TerminalViewType> {
-        self.current_pane_leaf()
     }
 
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
