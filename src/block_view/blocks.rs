@@ -13,7 +13,6 @@ use vte4::TerminalExt;
 
 /// Data for a finished command block (decoupled from widget representation)
 #[derive(Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[archive(check_bytes)]
 pub(crate) struct BlockData {
     pub(crate) id: u64,
     pub(crate) prompt: String,
@@ -124,7 +123,7 @@ pub(crate) struct FinishedBlock {
     pub(crate) status_icon: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
     pub(crate) cols: i64,
-    /// Visible-row cap (config.finished_block_viewport_rows).
+    /// Visible rows allocated to this full-height finished block.
     pub(crate) viewport_cap: i64,
     /// True only when this block has more output rows than can be shown at once.
     pub(crate) output_scrollable: bool,
@@ -687,10 +686,8 @@ impl FinishedBlock {
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
         let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
-        // Expand button: appears only when output_rows > viewport_cap; toggles
-        // the output VTE between the capped height and a roomier expanded height
-        // (`finished_block_max_expanded_rows`). Wired below once output_rows and
-        // the output VTE exist.
+        // Expand button: kept for the capped-height path. Full-height finished
+        // blocks hide it because their viewport already contains every row.
         let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
         expand_btn.set_tooltip_text(Some("Expand block"));
         for btn in [
@@ -733,15 +730,17 @@ impl FinishedBlock {
         outer.append(&header_row);
 
         // ── VTE-rendered command + output ─────────────────────────────────
-        // Command VTE: single-row read-only renderer for the executed command.
+        // Command VTE: full-height read-only renderer for the executed command.
         let cmd_bytes: Vec<u8> = match cmd_ansi {
             Some(ansi) if !ansi.is_empty() && !cmd.is_empty() => ansi.as_bytes().to_vec(),
             _ if cmd.is_empty() => b"(empty)".to_vec(),
             _ => highlight_command_to_ansi(cmd).into_bytes(),
         };
-        // Command typically fits one line; allow a few in case of multiline pastes.
-        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count().max(0) as i64 + 1;
-        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), 5);
+        // Multiline pastes and wrapped commands are part of the block canvas too;
+        // do not hide them in a five-row private scrollback.
+        let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
+        let cmd_rows = output_visual_row_count(cmd_display, cols);
+        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1));
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
         // realized, so feeding immediately wraps content at a smaller default
@@ -751,7 +750,7 @@ impl FinishedBlock {
         {
             let cmd_bytes_for_map = cmd_bytes.clone();
             let cols_for_map = cols.max(1);
-            let cmd_rows_for_map = cmd_rows.max(1).min(5);
+            let cmd_rows_for_map = cmd_rows.max(1);
             let fed = Cell::new(false);
             command_vte.connect_map(move |w| {
                 if fed.get() {
@@ -760,6 +759,10 @@ impl FinishedBlock {
                 fed.set(true);
                 w.set_size(cols_for_map, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
+                let ch = w.char_height() as i32;
+                if ch > 0 {
+                    w.set_height_request(cmd_rows_for_map as i32 * ch);
+                }
             });
         }
 

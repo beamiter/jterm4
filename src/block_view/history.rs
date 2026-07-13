@@ -49,7 +49,7 @@ impl TermView {
             .open(path)?;
 
         for block in blocks.iter() {
-            let serialized = rkyv::to_bytes::<_, 256>(block)
+            let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             let record: Cow<[u8]> = if compress {
@@ -125,7 +125,7 @@ impl TermView {
                 data
             };
 
-            if let Ok(block) = rkyv::from_bytes::<BlockData>(&decoded) {
+            if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
                 total_loaded += 1;
                 push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
             }
