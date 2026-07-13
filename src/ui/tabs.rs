@@ -513,7 +513,7 @@ impl UiState {
                         initial_commands.as_deref(),
                     ));
                     let terminal = term_view.vte().clone();
-                    (TerminalViewType::Block(term_view), terminal)
+                    (PaneLeaf::Block(term_view), terminal)
                 }
                 crate::config::TerminalMode::Vte => {
                     let vte_view = Rc::new(VteTerminalView::new(
@@ -524,7 +524,7 @@ impl UiState {
                         initial_commands.as_deref(),
                     ));
                     let terminal = vte_view.vte().clone();
-                    (TerminalViewType::Vte(vte_view), terminal)
+                    (PaneLeaf::Vte(vte_view), terminal)
                 }
             }
         };
@@ -535,7 +535,7 @@ impl UiState {
 
         // Connect callbacks based on view type
         match &view_type {
-            TerminalViewType::Block(term_view) => {
+            PaneLeaf::Block(term_view) => {
                 let ui_for_exit = UiState::clone(self);
                 let term_view_for_exit = term_view.clone();
                 let tab_num_for_exit = tab_num;
@@ -551,7 +551,7 @@ impl UiState {
                     }
                 });
             }
-            TerminalViewType::Vte(vte_view) => {
+            PaneLeaf::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);
                 let tab_num_for_exit = tab_num;
                 vte_view.connect_exited(move |code| {
@@ -615,7 +615,7 @@ impl UiState {
         let strip_btn_label_for_pwd = strip_btn_label.clone();
 
         match &view_type {
-            TerminalViewType::Block(term_view) => {
+            PaneLeaf::Block(term_view) => {
                 let term_view_for_pwd = term_view.clone();
                 term_view_for_pwd.connect_cwd_changed(move |dir| {
                     if custom_title_for_pwd.get() {
@@ -630,7 +630,7 @@ impl UiState {
                     }
                 });
             }
-            TerminalViewType::Vte(vte_view) => {
+            PaneLeaf::Vte(vte_view) => {
                 let vte_view_for_pwd = vte_view.clone();
                 vte_view_for_pwd.connect_cwd_changed(move |dir| {
                     if custom_title_for_pwd.get() {
@@ -665,10 +665,10 @@ impl UiState {
             }));
         };
         match &view_type {
-            TerminalViewType::Block(term_view) => {
+            PaneLeaf::Block(term_view) => {
                 update_title(&|callback| term_view.connect_title_changed(callback));
             }
-            TerminalViewType::Vte(vte_view) => {
+            PaneLeaf::Vte(vte_view) => {
                 update_title(&|callback| vte_view.connect_title_changed(callback));
             }
         }
@@ -683,29 +683,19 @@ impl UiState {
         tab_box.append(&label);
         tab_box.append(&close_button);
 
-        // Get the widget from the view
-        let term_wrapper = match &view_type {
-            TerminalViewType::Block(term_view) => {
-                let w = term_view.widget();
-                w.downcast::<gtk4::Box>()
-                    .expect("TermView root must be a Box")
-            }
-            TerminalViewType::Vte(vte_view) => {
-                let w = vte_view.widget();
-                w.downcast::<gtk4::Box>()
-                    .expect("VteTerminalView root must be a Box")
-            }
-        };
+        // PaneLeaf owns the distinction between Block and conventional VTE
+        // roots. Tab construction only requires the common GTK leaf widget.
+        let term_wrapper = view_type
+            .root_widget()
+            .downcast::<gtk4::Box>()
+            .expect("pane root must be a Box");
 
-        // Store the view type on the widget
+        // Keep controller attachment behind PaneLeaf's single GTK object-data
+        // boundary. Block tabs no longer publish a second legacy `term-view` key.
         let term_wrapper_for_name = term_wrapper.clone();
         term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
-        unsafe {
-            term_wrapper.set_data::<TerminalViewType>("terminal-view-type", view_type.clone());
-            if let TerminalViewType::Block(term_view) = &view_type {
-                term_wrapper.set_data::<Rc<TermView>>("term-view", term_view.clone());
-            }
-        }
+        let term_wrapper_widget = term_wrapper.clone().upcast::<gtk4::Widget>();
+        view_type.attach_to(&term_wrapper_widget);
 
         let ui_for_close = UiState::clone(self);
         let wrapper_for_close = term_wrapper.clone().upcast::<gtk4::Widget>();
@@ -1349,8 +1339,8 @@ impl UiState {
 
         // Focus the new terminal
         match &view_type {
-            TerminalViewType::Block(term_view) => term_view.grab_focus(),
-            TerminalViewType::Vte(vte_view) => vte_view.grab_focus(),
+            PaneLeaf::Block(term_view) => term_view.grab_focus(),
+            PaneLeaf::Vte(vte_view) => vte_view.grab_focus(),
         }
 
         terminal
