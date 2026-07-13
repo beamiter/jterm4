@@ -38,9 +38,6 @@ const G_IO_IN: u32 = 1;
 // A block command may continuously repaint a spinner or progress bar. Keep PTY
 // delivery at idle priority so GTK can dispatch pointer/button events first.
 const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
-/// Process one output chunk per GLib dispatch. Returning to the main loop after
-/// every chunk gives input, layout, and tab switching a scheduling opportunity.
-const MAX_MESSAGES_PER_DISPATCH: usize = 1;
 /// Bound queued output. Once this queue fills, the reader blocks and the kernel
 /// PTY buffer provides natural backpressure to a runaway producer.
 const PTY_QUEUE_CAPACITY: usize = 8;
@@ -92,7 +89,13 @@ fn unix_fd_add_local<F: FnMut() -> bool + 'static>(fd: RawFd, func: F) {
 /// performed by a key, paste, or block-recall callback.
 fn write_all_fd(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
-        let written = unsafe { libc::write(fd, data.as_ptr().cast::<libc::c_void>(), data.len()) };
+        let written = unsafe {
+            libc::write(
+                fd,
+                data.as_ptr().cast::<libc::c_void>(),
+                data.len(),
+            )
+        };
         if written > 0 {
             data = &data[written as usize..];
             continue;
@@ -335,37 +338,29 @@ impl OwnedPty {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
             }
 
-            let mut processed = 0usize;
-            loop {
-                match rx.try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
-                        processed += 1;
-                        if processed >= MAX_MESSAGES_PER_DISPATCH {
-                            // The read above consumed the aggregate eventfd count.
-                            // Re-signal queued data and return to GTK first.
-                            signal_eventfd(efd);
-                            return true;
-                        }
+            match rx.try_recv() {
+                Ok(PtyMsg::Data(data)) => {
+                    callback(data);
+                    // The read above consumed an aggregate wakeup counter. Re-arm
+                    // the fd so any remaining queued chunk gets a later dispatch.
+                    signal_eventfd(efd);
+                    true
+                }
+                Ok(PtyMsg::Exit(code)) => {
+                    if let Some(f) = on_exit.take() {
+                        f(code);
                     }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
-                        }
-                        unsafe {
-                            libc::close(efd);
-                        }
-                        return false;
+                    unsafe {
+                        libc::close(efd);
                     }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        return true;
+                    false
+                }
+                Err(mpsc::TryRecvError::Empty) => true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    unsafe {
+                        libc::close(efd);
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        unsafe {
-                            libc::close(efd);
-                        }
-                        return false;
-                    }
+                    false
                 }
             }
         });
@@ -441,29 +436,19 @@ impl OwnedPty {
         let rx = std::cell::RefCell::new(rx);
 
         glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
-            let mut processed = 0usize;
-            loop {
-                match rx.borrow().try_recv() {
-                    Ok(PtyMsg::Data(data)) => {
-                        callback(data);
-                        processed += 1;
-                        if processed >= MAX_MESSAGES_PER_DISPATCH {
-                            return glib::ControlFlow::Continue;
-                        }
-                    }
-                    Ok(PtyMsg::Exit(code)) => {
-                        if let Some(f) = on_exit.take() {
-                            f(code);
-                        }
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        return glib::ControlFlow::Continue;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return glib::ControlFlow::Break;
-                    }
+            match rx.borrow().try_recv() {
+                Ok(PtyMsg::Data(data)) => {
+                    callback(data);
+                    glib::ControlFlow::Continue
                 }
+                Ok(PtyMsg::Exit(code)) => {
+                    if let Some(f) = on_exit.take() {
+                        f(code);
+                    }
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
     }
@@ -486,23 +471,22 @@ impl Drop for OwnedPty {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
 
     #[test]
     fn complete_writer_delivers_the_entire_payload() {
-        let (mut reader, mut writer) = UnixStream::pair().expect("create socket pair");
-        let payload = vec![0x5a; 128 * 1024];
-        let expected = payload.clone();
+        let payload_len = 128 * 1024;
+        let (mut reader, writer) = UnixStream::pair().expect("create socket pair");
 
         let handle = std::thread::spawn(move || {
+            let payload = vec![0x5a; payload_len];
             write_all_fd(writer.as_raw_fd(), &payload).expect("write payload");
-            writer.flush().expect("flush writer");
         });
 
-        let mut received = vec![0; expected.len()];
+        let mut received = vec![0; payload_len];
         reader.read_exact(&mut received).expect("read payload");
         handle.join().expect("writer thread");
-        assert_eq!(received, expected);
+        assert!(received.iter().all(|byte| *byte == 0x5a));
     }
 }
