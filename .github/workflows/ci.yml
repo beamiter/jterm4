@@ -34,7 +34,23 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
+        id: fmt
         run: cargo fmt --all -- --check
+
+      - name: Generate formatting patch
+        if: ${{ failure() && steps.fmt.conclusion == 'failure' }}
+        run: |
+          cargo fmt --all
+          git diff -- src/pty.rs src/block_view/scroll.rs > rustfmt.patch
+
+      - name: Upload formatting diagnostics
+        if: ${{ failure() && steps.fmt.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-diagnostics
+          path: rustfmt.patch
+          if-no-files-found: error
+          retention-days: 1
 
   clippy:
     name: Clippy
@@ -65,7 +81,19 @@ jobs:
           shared-key: clippy
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        id: clippy
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee clippy.log
+
+      - name: Upload Clippy diagnostics
+        if: ${{ failure() && steps.clippy.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-diagnostics
+          path: clippy.log
+          if-no-files-found: error
+          retention-days: 1
 
   rustdoc:
     name: Rustdoc
