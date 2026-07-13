@@ -33,11 +33,7 @@ fn next_stable_frame_count(last_target: Option<f64>, target: f64, current: u8) -
 /// that change on its next frame and resets its retry/stability counters, giving
 /// newly-added virtualized content a full settling window without starting a
 /// second timer.
-fn request_bottom_pin(
-    user_scrolled: bool,
-    active: &Cell<bool>,
-    generation: &Cell<u64>,
-) -> bool {
+fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cell<u64>) -> bool {
     if user_scrolled {
         return false;
     }
