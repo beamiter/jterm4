@@ -1,0 +1,85 @@
+name: Apply PaneLeaf tab migration
+
+on:
+  push:
+    branches:
+      - agent/jterm4-pane-leaf-tab-creation
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm4-pane-leaf-tab-creation
+
+      - name: Route tab construction through PaneLeaf
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/ui/tabs.rs')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('TerminalViewType::', 'PaneLeaf::')
+
+          old_root = '''        // Get the widget from the view
+          let term_wrapper = match &view_type {
+              PaneLeaf::Block(term_view) => {
+                  let w = term_view.widget();
+                  w.downcast::<gtk4::Box>()
+                      .expect("TermView root must be a Box")
+              }
+              PaneLeaf::Vte(vte_view) => {
+                  let w = vte_view.widget();
+                  w.downcast::<gtk4::Box>()
+                      .expect("VteTerminalView root must be a Box")
+              }
+          };
+          '''
+          new_root = '''        // PaneLeaf owns the distinction between Block and conventional VTE
+          // roots. Tab construction only requires the common GTK leaf widget.
+          let term_wrapper = view_type
+              .root_widget()
+              .downcast::<gtk4::Box>()
+              .expect("pane root must be a Box");
+          '''
+          if old_root not in text:
+              raise SystemExit('root-widget construction block not found')
+          text = text.replace(old_root, new_root, 1)
+
+          old_attach = '''        // Store the view type on the widget
+          let term_wrapper_for_name = term_wrapper.clone();
+          term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
+          unsafe {
+              term_wrapper.set_data::<TerminalViewType>("terminal-view-type", view_type.clone());
+              if let PaneLeaf::Block(term_view) = &view_type {
+                  term_wrapper.set_data::<Rc<TermView>>("term-view", term_view.clone());
+              }
+          }
+          '''
+          new_attach = '''        // Keep controller attachment behind PaneLeaf's single GTK object-data
+          // boundary. Block tabs no longer publish a second legacy `term-view` key.
+          let term_wrapper_for_name = term_wrapper.clone();
+          term_wrapper_for_name.set_widget_name(&format!("tab-{}", tab_num));
+          let term_wrapper_widget = term_wrapper.clone().upcast::<gtk4::Widget>();
+          view_type.attach_to(&term_wrapper_widget);
+          '''
+          if old_attach not in text:
+              raise SystemExit('legacy controller attachment block not found')
+          text = text.replace(old_attach, new_attach, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          cargo fmt --all
+          rm .github/workflows/apply-pane-leaf-tab-creation.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ui/tabs.rs .github/workflows/apply-pane-leaf-tab-creation.yml
+          git commit -m "Route tab construction through PaneLeaf"
+          git push origin HEAD:agent/jterm4-pane-leaf-tab-creation
