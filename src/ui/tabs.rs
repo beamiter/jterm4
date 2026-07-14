@@ -1,7 +1,7 @@
 //! tabs — UiState methods extracted from ui (mechanical split, no logic changes)
 use adw::prelude::*;
 use gtk4::gdk::ffi::GDK_BUTTON_PRIMARY;
-use gtk4::{glib, Label, Paned};
+use gtk4::{glib, Label};
 use gtk4::{GestureClick, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -52,78 +52,28 @@ impl UiState {
         self.remove_tab_by_widget_internal(widget);
     }
 
-    /// Handle a terminal exiting: unsplit if in a Paned, or close the tab.
+    /// Handle a terminal exiting: collapse its split or close the whole tab.
     pub(crate) fn handle_terminal_exited(&self, term_widget: &gtk4::Widget) {
-        // Clear zoom state if the exiting terminal is the zoomed one
         {
             let zoom = self.zoom_state.borrow();
-            if let Some(ref zs) = *zoom {
-                if zs.zoomed_terminal.upcast_ref::<gtk4::Widget>() == term_widget {
+            if let Some(ref state) = *zoom {
+                if state.zoomed_terminal.upcast_ref::<gtk4::Widget>() == term_widget {
                     drop(zoom);
                     self.zoom_state.borrow_mut().take();
                 }
             }
         }
 
-        // The terminal may be wrapped in a scrollbar Box. The "effective widget"
-        // is the wrapper Box if present, otherwise the terminal itself.
-        let effective_widget = scrollbar_wrapper_of(term_widget)
-            .map(|bx| bx.upcast::<gtk4::Widget>())
+        let leaf_root = scrollbar_wrapper_of(term_widget)
+            .map(|wrapper| wrapper.upcast::<gtk4::Widget>())
             .unwrap_or_else(|| term_widget.clone());
 
-        let Some(parent) = effective_widget.parent() else {
-            return;
-        };
-
-        if let Ok(paned) = parent.clone().downcast::<Paned>() {
-            let start = paned.start_child();
-            let end = paned.end_child();
-            let sibling = if start.as_ref() == Some(&effective_widget) {
-                end
-            } else {
-                start
-            };
-
-            if let Some(sibling) = sibling {
-                paned.set_start_child(None::<&gtk4::Widget>);
-                paned.set_end_child(None::<&gtk4::Widget>);
-
-                let paned_widget = paned.upcast::<gtk4::Widget>();
-                if let Some(grandparent) = paned_widget.parent() {
-                    if let Ok(gp_paned) = grandparent.clone().downcast::<Paned>() {
-                        if gp_paned.start_child().as_ref() == Some(&paned_widget) {
-                            gp_paned.set_start_child(Some(&sibling));
-                        } else {
-                            gp_paned.set_end_child(Some(&sibling));
-                        }
-                    } else {
-                        for i in 0..self.notebook.n_pages() {
-                            if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
-                                if page_widget == paned_widget {
-                                    // Transfer widget name so strip button mapping is preserved
-                                    sibling.set_widget_name(&page_widget.widget_name());
-                                    let tab_label = self.notebook.tab_label(&page_widget);
-                                    self.notebook.remove_page(Some(i));
-                                    let new_page_num = self.notebook.insert_page(
-                                        &sibling,
-                                        tab_label.as_ref(),
-                                        Some(i),
-                                    );
-                                    self.notebook.set_tab_reorderable(&sibling, true);
-                                    self.notebook.set_current_page(Some(new_page_num));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(node) = PaneNode::from_widget(&sibling) {
-                    node.grab_focus();
-                }
+        if let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) {
+            if let Some(node) = PaneNode::from_widget(&sibling) {
+                node.grab_focus();
             }
         } else {
-            self.remove_tab_by_widget(&effective_widget);
+            self.remove_tab_by_widget(&leaf_root);
         }
     }
 
@@ -218,60 +168,51 @@ impl UiState {
         }
     }
 
-    /// Add an existing terminal widget as a new tab (used by move_pane_to_new_tab).
-    pub(crate) fn add_terminal_as_new_tab(
+    /// Add an existing typed pane leaf as a new tab.
+    pub(crate) fn add_pane_leaf_as_new_tab(
         &self,
-        terminal: Terminal,
+        leaf: PaneLeaf,
         working_directory: Option<String>,
     ) {
         let tab_num = self.tab_counter.get();
         self.tab_counter.set(tab_num + 1);
 
-        // Assign a session ID for the moved pane's new tab
         let sid = generate_session_id();
         self.session_ids.borrow_mut().insert(tab_num, sid);
-
         let tab_name = default_tab_title(tab_num, working_directory.as_deref());
 
-        // Use existing scrollbar wrapper if present, otherwise create one
-        let page_widget: gtk4::Widget =
-            scrollbar_wrapper_of(&terminal.clone().upcast::<gtk4::Widget>())
-                .map(|bx| bx.upcast::<gtk4::Widget>())
-                .unwrap_or_else(|| wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>());
+        let page_widget = leaf.root_widget();
         page_widget.set_widget_name(&format!("tab-{tab_num}"));
-
-        // Notebook label
         let label = Label::new(Some(&tab_name));
         let page_num = self.notebook.append_page(&page_widget, Some(&label));
         self.notebook.set_tab_reorderable(&page_widget, true);
 
-        // Tab strip button
-        let btn = ToggleButton::builder()
+        let button = ToggleButton::builder()
             .label(&tab_name)
             .css_classes(["flat", "tab-strip-btn"])
             .build();
-        btn.set_focus_on_click(false);
-        btn.set_can_focus(false);
-        btn.set_widget_name(&format!("tab-{tab_num}"));
+        button.set_focus_on_click(false);
+        button.set_can_focus(false);
+        button.set_widget_name(&format!("tab-{tab_num}"));
 
-        let ui_for_btn = self.clone();
-        btn.connect_clicked(move |b| {
-            let target_name = b.widget_name();
-            for i in 0..ui_for_btn.notebook.n_pages() {
-                if let Some(page_widget) = ui_for_btn.notebook.nth_page(Some(i)) {
-                    if page_widget.widget_name() == target_name {
-                        ui_for_btn.notebook.set_current_page(Some(i));
+        let ui_for_button = self.clone();
+        button.connect_clicked(move |button| {
+            let target_name = button.widget_name();
+            for index in 0..ui_for_button.notebook.n_pages() {
+                if let Some(candidate) = ui_for_button.notebook.nth_page(Some(index)) {
+                    if candidate.widget_name() == target_name {
+                        ui_for_button.notebook.set_current_page(Some(index));
                         break;
                     }
                 }
             }
         });
 
-        self.tab_strip.append(&btn);
+        self.tab_strip.append(&button);
         self.notebook.set_current_page(Some(page_num));
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
-        terminal.grab_focus();
+        leaf.grab_focus();
     }
 
     pub(crate) fn add_new_tab(

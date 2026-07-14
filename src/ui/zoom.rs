@@ -108,60 +108,15 @@ impl UiState {
         let Some(leaf) = node.active_leaf() else {
             return;
         };
-        let terminal = leaf.terminal().clone();
-        let effective_widget = leaf.root_widget();
-        let Some(parent) = effective_widget.parent() else {
+
+        let working_directory = terminal_working_directory(leaf.terminal());
+        let leaf_root = leaf.root_widget();
+        let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) else {
             return;
         };
-        let Ok(paned) = parent.clone().downcast::<Paned>() else {
-            return;
-        };
-
-        let start = paned.start_child();
-        let end = paned.end_child();
-        let sibling = if start.as_ref() == Some(&effective_widget) {
-            end
-        } else {
-            start
-        };
-        paned.set_start_child(None::<&gtk4::Widget>);
-        paned.set_end_child(None::<&gtk4::Widget>);
-
-        if let Some(sibling) = sibling {
-            let paned_widget = paned.upcast::<gtk4::Widget>();
-            if let Some(grandparent) = paned_widget.parent() {
-                if let Ok(grandparent_paned) = grandparent.clone().downcast::<Paned>() {
-                    if grandparent_paned.start_child().as_ref() == Some(&paned_widget) {
-                        grandparent_paned.set_start_child(Some(&sibling));
-                    } else {
-                        grandparent_paned.set_end_child(Some(&sibling));
-                    }
-                } else {
-                    for index in 0..self.notebook.n_pages() {
-                        if let Some(candidate) = self.notebook.nth_page(Some(index)) {
-                            if candidate == paned_widget {
-                                sibling.set_widget_name(&candidate.widget_name());
-                                let tab_label = self.notebook.tab_label(&candidate);
-                                self.notebook.remove_page(Some(index));
-                                let inserted = self.notebook.insert_page(
-                                    &sibling,
-                                    tab_label.as_ref(),
-                                    Some(index),
-                                );
-                                self.notebook.set_tab_reorderable(&sibling, true);
-                                self.notebook.set_current_page(Some(inserted));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(sibling_node) = PaneNode::from_widget(&sibling) {
-                sibling_node.grab_focus();
-            }
+        if let Some(node) = PaneNode::from_widget(&sibling) {
+            node.grab_focus();
         }
-
-        let working_directory = terminal_working_directory(&terminal);
-        self.add_terminal_as_new_tab(terminal, working_directory);
+        self.add_pane_leaf_as_new_tab(leaf, working_directory);
     }
 }
