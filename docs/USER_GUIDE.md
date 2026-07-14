@@ -18,7 +18,7 @@ jterm4 --print-config-path
 jterm4 --check-config
 ```
 
-这些命令在 GTK 初始化前完成，因此可在 SSH、TTY 和 CI 中运行。使用其他配置文件：
+这些命令在 GTK 初始化前完成，因此可在 SSH、TTY 和 CI 中运行。`--doctor` 还会报告 ready / active 会话快照数量。日志可用 `JTERM4_LOG=debug`，或使用 `RUST_LOG='warn,jterm4=debug,jterm4::state=trace'` 按模块设置；每行包含相对时间、级别和 target。使用其他配置文件：
 
 ```bash
 jterm4 --config ~/configs/work.toml

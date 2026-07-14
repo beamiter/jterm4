@@ -7,7 +7,6 @@ use gtk4::{
     Notebook, Orientation, ScrolledWindow, SearchBar, SearchEntry,
 };
 use libadwaita as adw;
-use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
@@ -16,53 +15,12 @@ use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config};
 use crate::keybindings::{normalize_key, Action, KeyCombo};
+use crate::logging::init_logging;
 use crate::state::{
     finalize_tabs_state, kill_all_terminal_children, load_tabs_state, save_tabs_state,
 };
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
-
-struct SimpleStderrLogger {
-    level: LevelFilter,
-}
-
-impl Log for SimpleStderrLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn parse_level_filter(input: &str) -> LevelFilter {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "off" => LevelFilter::Off,
-        "error" => LevelFilter::Error,
-        "warn" | "warning" => LevelFilter::Warn,
-        "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
-        _ => LevelFilter::Warn,
-    }
-}
-
-fn init_logging() {
-    let level = std::env::var("JTERM4_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .ok()
-        .as_deref()
-        .map(parse_level_filter)
-        .unwrap_or(LevelFilter::Warn);
-
-    let _ = log::set_boxed_logger(Box::new(SimpleStderrLogger { level }));
-    log::set_max_level(level);
-}
 
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())

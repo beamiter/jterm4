@@ -68,6 +68,15 @@ jterm4 --print-default-config
 
 配置文件保存后会自动热重载；`Ctrl+Shift+R` 可手动重载。无效的新配置不会覆盖当前正在运行的有效配置。
 
+日志支持普通级别和标准 target 指令，并输出进程内相对时间、级别与模块名：
+
+```bash
+JTERM4_LOG=debug jterm4
+RUST_LOG='warn,jterm4=debug,jterm4::state=trace' jterm4
+```
+
+`JTERM4_LOG` 优先于 `RUST_LOG`；未知指令会被忽略，默认级别保持 `warn`。
+
 Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 jterm1/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
 
 ## 核心快捷键
