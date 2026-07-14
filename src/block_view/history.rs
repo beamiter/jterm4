@@ -9,11 +9,27 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_DECODED_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+
+fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8>> {
+    let decoder = zstd::Decoder::new(data).map_err(|error| io::Error::other(error.to_string()))?;
+    let mut decoded = Vec::new();
+    decoder
+        .take(max_decoded_bytes + 1)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() as u64 > max_decoded_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("block history record expands beyond {max_decoded_bytes} bytes"),
+        ));
+    }
+    Ok(decoded)
+}
 
 /// Expand the shell-style `~/` prefix used in configuration, but leave every
 /// other tilde form alone (`~`, `~user/...`, and embedded tildes are literal).
@@ -164,7 +180,6 @@ impl TermView {
             return Ok(());
         }
 
-        use std::io::Read;
         let mut file = File::open(path)?;
         let mut recent_blocks = VecDeque::new();
         let mut total_loaded = 0usize;
@@ -186,8 +201,7 @@ impl TermView {
             file.read_exact(&mut data)?;
 
             let decoded = if compress {
-                zstd::decode_all(data.as_slice())
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                decode_zstd_bounded(data.as_slice(), MAX_DECODED_RECORD_BYTES)?
             } else {
                 data
             };
@@ -224,7 +238,7 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_write, expand_home_prefix_with, push_bounded_back};
+    use super::{atomic_write, decode_zstd_bounded, expand_home_prefix_with, push_bounded_back};
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
@@ -340,5 +354,14 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![target.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn compressed_record_decode_enforces_output_limit() {
+        let compressed = zstd::encode_all(&b"0123456789abcdef"[..], 1).unwrap();
+
+        let error = decode_zstd_bounded(&compressed, 8).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -6,7 +6,7 @@
 
 ### PTY 输出合并
 
-Block reader 会合并连续的 byte 事件，并限制每次 GTK idle 回调处理的消息数量，避免一批输出触发大量零碎重绘。高吞吐场景仍使用无界消息队列，这是后续需要改成有界 byte budget 的架构项。
+Block reader 使用容量为 8 的有界队列传递最多 32KiB 的输出块，GTK 每次事件回调只处理一块；当 UI 落后时，reader 和内核 PTY 缓冲区会自然施加背压。当前 eventfd 在持续输出时会立即重新就绪，尚未按固定帧间隔调度；极高吞吐下仍应以输入延迟和 frame time 验证是否需要显式节流。
 
 ### Block 输出上限
 
@@ -47,7 +47,7 @@ block_history_compress = true
 
 ### Git 状态探测
 
-Git 分支、dirty、ahead/behind 查询有 500ms 子进程硬超时；超时会 kill 并 wait，避免僵尸进程或无限冻结。查询目前仍在 GTK 主线程执行，多次慢查询可能造成短暂停顿，后续应迁移到可取消后台 worker。
+Git 分支、dirty、ahead/behind 通过单个 `git status --porcelain=v2 --branch` 获取。进程级 worker 会合并同一路径的并发请求并缓存最近结果；GTK 主线程最多等待 12ms，慢查询继续在后台执行。Git 子进程仍有 500ms 硬超时，超时会 kill 并 wait，避免僵尸进程。
 
 ### Release 配置
 
@@ -114,8 +114,8 @@ show_repo_strip = false
 ## 已知架构瓶颈
 
 - Block 完成记录使用多个 VTE widget 和多份输出表示，尚未实现 model-backed renderer recycling。
-- 自管 PTY reader 使用无界队列，极端生产速率可能超过 UI 消费速度。
-- 文件树、历史加载和部分 Git 工作仍有主线程 I/O。
+- 自管 PTY reader 已有约 256KiB 的队列上限，但持续就绪的 eventfd 尚未提供显式帧边界。
+- 文件树和历史加载仍有主线程 I/O。
 - `TermView` 的状态由较多 `Rc<RefCell<_>>` 回调共享，难以做纯 reducer 基准。
 
 后续性能工作应先建立 parser microbenchmark、PTY soak test、固定虚拟显示的 GUI smoke benchmark，再以 byte budget 和 frame time 为验收指标。
