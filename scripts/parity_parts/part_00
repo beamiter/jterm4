@@ -66,11 +66,15 @@ replace_once(path, """            Action::ClearBlockFilter => Some("clear_block_
 
 replace_once(path, """            Action::ClearBlockFilter,
             Action::JumpToPrevPinned,
+            Action::JumpToNextPinned,
+            Action::ToggleDebugDashboard,
 """, """            Action::ClearBlockFilter,
             Action::SelectAllBlocks,
             Action::ClearBlocks,
             Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
+            Action::JumpToNextPinned,
+            Action::ToggleDebugDashboard,
 """)
 
 replace_once(path, """        bind("Ctrl+Shift++", Action::FontIncrease);
