@@ -34,13 +34,13 @@ mod zoom;
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
-pub(crate) use pane_tree_edit::detach_leaf_and_promote;
+pub(crate) use pane_tree_edit::{
+    detach_leaf_and_promote, detach_leaf_for_zoom, restore_zoomed_leaf, ZoomPageSwap,
+};
 
 pub(crate) struct ZoomState {
-    pub(crate) original_page: gtk4::Widget,
+    pub(crate) swap: ZoomPageSwap,
     pub(crate) zoomed_terminal: Terminal,
-    pub(crate) page_index: u32,
-    pub(crate) tab_label: Option<gtk4::Widget>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
