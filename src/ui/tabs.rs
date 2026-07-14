@@ -16,7 +16,7 @@ use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_p
 use crate::terminal::{
     collect_terminals, default_tab_title, find_first_terminal, scrollbar_wrapper_of,
     setup_terminal_click_handler, show_rename_dialog, show_rename_dialog_with_strip,
-    terminal_working_directory, wrap_with_scrollbar, VteTerminalView,
+    terminal_working_directory, VteTerminalView,
 };
 
 struct TabLaunch {
