@@ -1,8 +1,8 @@
 name: Port remaining jterm1 block parity
 
 on:
-  push:
-    branches: [agent/jterm1-block-mode-parity]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   port:
-    if: ${{ !contains(github.event.head_commit.message, '[port-step]') }}
+    if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' && !contains(github.event.pull_request.title, '[port-step]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -29,8 +29,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/block_view/mod.rs
-          git commit -m "fix: correct block reinput fullscreen guard [port-step]"
-          git push origin HEAD:agent/jterm1-block-mode-parity
+          if ! git diff --cached --quiet; then
+            git commit -m "fix: correct block reinput fullscreen guard [port-step]"
+            git push origin HEAD:agent/jterm1-block-mode-parity
+          fi
 
       - name: Fetch validated jterm1 parity commits
         shell: bash
@@ -50,5 +52,3 @@ jobs:
           git add -A
           git commit -m "feat: port remaining jterm1 block parity [port-step]"
           git push origin HEAD:agent/jterm1-block-mode-parity
-
-# Trigger after the workflow file exists on the branch.
