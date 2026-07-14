@@ -16,7 +16,9 @@ use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config};
 use crate::keybindings::{normalize_key, Action, KeyCombo};
-use crate::state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
+use crate::state::{
+    finalize_tabs_state, kill_all_terminal_children, load_tabs_state, save_tabs_state,
+};
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
 
@@ -612,8 +614,9 @@ pub fn run() -> glib::ExitCode {
             ui_for_add.add_new_tab(working_directory, None, None, startup);
         });
 
-        // Restore tabs from last session snapshot (and delete it immediately).
-        // Each instance saves its own state on close; the last one closed wins.
+        // Atomically claim one ready window snapshot. Other running instances
+        // keep separate active files, so concurrent windows cannot overwrite or
+        // restore one another's state.
         let (saved_current, saved_tabs) = load_tabs_state();
         if saved_tabs.is_empty() {
             let startup = ui.config.borrow().startup_commands.clone();
@@ -898,6 +901,9 @@ pub fn run() -> glib::ExitCode {
             while notebook_for_close_request.n_pages() > 0 {
                 notebook_for_close_request.remove_page(Some(0));
             }
+            // Make the final snapshot visible only after this window is fully
+            // quiesced. Any queued auto-save callbacks become no-ops.
+            finalize_tabs_state();
 
             // Directly quit the application
             app_for_close.quit();
