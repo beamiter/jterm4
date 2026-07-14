@@ -24,7 +24,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base64 --decode scripts/jterm1-long-nav.patch.gz.b64 | gzip --decompress > /tmp/jterm1-long-nav.patch
+          base64 --decode scripts/jterm1-long-nav.patch.gz.b64 | gzip --decompress > /tmp/jterm1-long-nav-full.patch
+          awk 'BEGIN { keep = 0 } /^diff --git a\/README.md b\/README.md$/ { keep = 1 } keep { print }' \
+            /tmp/jterm1-long-nav-full.patch > /tmp/jterm1-long-nav.patch
+          test -s /tmp/jterm1-long-nav.patch
           git apply --check /tmp/jterm1-long-nav.patch
           git apply /tmp/jterm1-long-nav.patch
           cargo fmt --all
