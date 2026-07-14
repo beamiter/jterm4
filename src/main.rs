@@ -568,6 +568,7 @@ pub fn run() -> glib::ExitCode {
             sidebar_view: Rc::new(Cell::new(config.borrow().sidebar_view)),
             file_tree_store: file_tree_store.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
+            file_tree_scan_generation: Rc::new(Cell::new(0)),
             file_tree_root_label: file_tree_root_label.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),

@@ -96,6 +96,7 @@ pub(crate) struct UiState {
     pub(crate) sidebar_view: Rc<Cell<SidebarView>>,
     pub(crate) file_tree_store: TreeStore,
     pub(crate) file_tree_root: Rc<RefCell<PathBuf>>,
+    pub(crate) file_tree_scan_generation: Rc<Cell<u64>>,
     pub(crate) file_tree_root_label: gtk4::Label,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
