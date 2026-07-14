@@ -1,0 +1,34 @@
+name: Export current round2 source
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: ${{ github.head_ref == 'agent/jterm1-block-parity-round2' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout round2 branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-parity-round2
+
+      - name: Pack source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=target -czf /tmp/jterm4-round2-current.tar.gz .
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm4-round2-current
+          path: /tmp/jterm4-round2-current.tar.gz
+          if-no-files-found: error
+          retention-days: 1
