@@ -23,6 +23,7 @@ mod file_tree;
 mod layout;
 mod pane_leaf;
 mod pane_node;
+mod pane_tree_edit;
 mod panes;
 mod search;
 mod session;
@@ -33,6 +34,7 @@ mod zoom;
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
+pub(crate) use pane_tree_edit::detach_leaf_and_promote;
 
 pub(crate) struct ZoomState {
     pub(crate) original_page: gtk4::Widget,
