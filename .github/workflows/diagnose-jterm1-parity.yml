@@ -1,0 +1,46 @@
+name: Diagnose jterm1 parity migration
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout migration branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-mode-parity
+
+      - name: Run migration with concise log
+        id: migration
+        shell: bash
+        run: |
+          set +e
+          cat scripts/parity_parts/part_00 > /tmp/apply-jterm1-parity.py
+          for part in scripts/parity_parts/part_*.b64; do
+            base64 --decode "$part" >> /tmp/apply-jterm1-parity.py
+          done
+          python3 /tmp/apply-jterm1-parity.py > migration.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          tail -n 80 migration.log
+          exit 0
+
+      - name: Upload migration diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-parity-migration-log
+          path: migration.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Fail when migration did not apply
+        if: ${{ steps.migration.outputs.status != '0' }}
+        run: exit 1
