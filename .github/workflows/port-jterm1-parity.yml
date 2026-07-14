@@ -50,3 +50,5 @@ jobs:
           git add -A
           git commit -m "feat: port remaining jterm1 block parity [port-step]"
           git push origin HEAD:agent/jterm1-block-mode-parity
+
+# Trigger after the workflow file exists on the branch.
