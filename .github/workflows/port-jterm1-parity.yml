@@ -1,4 +1,4 @@
-name: Export parity source snapshots
+name: Apply long-block parity patch
 
 on:
   pull_request:
@@ -6,45 +6,36 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  snapshot:
+  apply:
     if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Checkout jterm4 parity branch
+      - name: Checkout parity branch
         uses: actions/checkout@v7
         with:
           ref: agent/jterm1-block-mode-parity
           fetch-depth: 0
 
-      - name: Fetch jterm1 reference
+      - name: Apply long-block navigation patch
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/beamiter/jterm1.git /tmp/jterm1
+          base64 --decode scripts/jterm1-long-nav.patch.gz.b64 | gzip --decompress > /tmp/jterm1-long-nav.patch
+          git apply --check /tmp/jterm1-long-nav.patch
+          git apply /tmp/jterm1-long-nav.patch
+          cargo fmt --all
+          rm -f scripts/jterm1-long-nav.patch.gz.b64 .github/workflows/port-jterm1-parity.yml
 
-      - name: Pack source snapshots
+      - name: Commit generated source
         shell: bash
         run: |
           set -euo pipefail
-          tar --exclude=.git --exclude=target -czf /tmp/jterm4-parity-source.tar.gz .
-          tar --exclude=.git --exclude=target -C /tmp/jterm1 -czf /tmp/jterm1-reference-source.tar.gz .
-
-      - name: Upload jterm4 source
-        uses: actions/upload-artifact@v4
-        with:
-          name: jterm4-parity-source
-          path: /tmp/jterm4-parity-source.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload jterm1 source
-        uses: actions/upload-artifact@v4
-        with:
-          name: jterm1-reference-source
-          path: /tmp/jterm1-reference-source.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: align long block navigation with jterm1 [generated]"
+          git push origin HEAD:agent/jterm1-block-mode-parity
