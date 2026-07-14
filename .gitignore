@@ -5,3 +5,7 @@
 .vscode/
 *.swp
 *.swo
+
+# Local CI diagnostics
+clippy.log
+rustfmt.patch
