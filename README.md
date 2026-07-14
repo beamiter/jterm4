@@ -82,9 +82,14 @@ jterm4 --print-default-config
 | 配置 / 重载 | `Ctrl+Shift+O` / `Ctrl+Shift+R` |
 | SSH 主机选择 | `Ctrl+Shift+S` |
 | Block 历史 / 跨块搜索 | `Ctrl+Shift+H` / `Ctrl+Shift+G` |
-| AI 面板 / 询问选中块 | `Ctrl+Shift+A` / `Ctrl+Shift+Q` |
+| 全选 Block / 回填选中命令 / 清空 Block | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
+| AI 面板 / 询问选中块 | `Ctrl+Alt+Shift+A` / `Ctrl+Shift+Q` |
 
 全部命令和当前绑定可在 `Ctrl+Shift+P` 中搜索。快捷键可在 `[keybindings]` 中覆盖，设为 `false` 可解除绑定。
+
+Block 模式与 jterm1 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
+扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
+可编辑文本而不执行，`Escape` 取消选择。右键多选区域可批量复制命令、输出或完整块。
 
 ## 安全默认值
 

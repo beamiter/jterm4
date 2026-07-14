@@ -86,7 +86,11 @@ ai_redact_secrets = true
 # toggle_command_palette = "Ctrl+Shift+P"
 # reload_config = "Ctrl+Shift+R"
 # show_remote_picker = "Ctrl+Shift+S"
-# toggle_ai_panel = false
+# select_all_blocks = "Ctrl+Shift+A"
+# reinput_selected_commands = "Ctrl+Shift+I"
+# clear_blocks = "Ctrl+Shift+K"
+# toggle_ai_panel = "Ctrl+Alt+Shift+A"
+# opacity_increase = "Ctrl+Alt+Shift+K"
 
 # SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
 

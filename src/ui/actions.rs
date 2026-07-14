@@ -243,6 +243,24 @@ impl UiState {
                     term_view.clear_block_filter();
                 }
             }
+            Action::SelectAllBlocks => {
+                log::info!("Select all finished blocks");
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.select_all_blocks();
+                }
+            }
+            Action::ClearBlocks => {
+                log::info!("Clear finished blocks");
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.clear_blocks();
+                }
+            }
+            Action::ReinputSelectedCommands => {
+                log::info!("Reinput selected commands");
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.reinput_selected_commands();
+                }
+            }
             Action::JumpToPrevPinned => {
                 if let Some(term_view) = self.current_term_view() {
                     term_view.jump_to_pinned(-1);
