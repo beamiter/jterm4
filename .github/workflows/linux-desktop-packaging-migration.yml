@@ -56,7 +56,29 @@ jobs:
           shared-key: linux-desktop-packaging-migration
 
       - name: Apply migration
-        run: python3 scripts/migrate_linux_desktop_packaging.py
+        run: |
+          python3 scripts/migrate_linux_desktop_packaging.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          desktop = Path("data/io.github.beamiter.jterm4.desktop")
+          desktop.write_text(desktop.read_text().replace(
+              "Categories=System;TerminalEmulator;Development;",
+              "Categories=System;TerminalEmulator;",
+          ))
+
+          metainfo = Path("data/io.github.beamiter.jterm4.metainfo.xml")
+          metainfo.write_text(metainfo.read_text().replace(
+              "<metadata_license>LicenseRef-proprietary</metadata_license>",
+              "<metadata_license>CC0-1.0</metadata_license>",
+          ))
+
+          guide = Path("docs/FLATPAK.md")
+          guide.write_text(guide.read_text().replace(
+              "The AppStream metadata uses `LicenseRef-proprietary` until that decision is made; the",
+              "The AppStream document metadata uses `CC0-1.0`, while the project license remains `LicenseRef-proprietary`; the",
+          ))
+          PY
 
       - name: Generate Cargo sources and raster icons
         run: |
