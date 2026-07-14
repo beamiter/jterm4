@@ -4,8 +4,12 @@
 //! sequences that drive the block view. OSC 7/title sequences pass through to
 //! VTE so its native cwd/title signals stay authoritative.
 
-const MAX_OSC_BYTES: usize = 8 * 1024 * 1024;
-const MAX_APC_BYTES: usize = 64 * 1024 * 1024;
+/// OSC carries titles and clipboard data. One MiB is ample for supported
+/// payloads while bounding malformed strings that never send a terminator.
+const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Kitty graphics uses APC. Keep a practical encoded-image ceiling while
+/// preventing one unterminated sequence from retaining arbitrary PTY output.
+const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
@@ -98,10 +102,18 @@ enum State {
     Osc { buf: Vec<u8> },
     /// Just saw ESC while in OSC — next byte should be '\' for ST
     OscEsc { payload: Vec<u8> },
+    /// OSC exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    OscDiscard,
+    /// Saw ESC while discarding an oversized OSC; '\' completes ST.
+    OscDiscardEsc,
     /// Inside APC (ESC _): collecting bytes for Kitty graphics etc.
     Apc { buf: Vec<u8> },
     /// Saw ESC while in APC — next byte should be '\' for ST
     ApcEsc { payload: Vec<u8> },
+    /// APC exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    ApcDiscard,
+    /// Saw ESC while discarding an oversized APC; '\' completes ST.
+    ApcDiscardEsc,
     /// Inside DCS (ESC P): collect until ST. Unlike `Ignore`, the bytes are
     /// rewrapped as `ESC P ... ESC \` and passed through to the active VTE so
     /// sixel graphics, DECRQSS replies, and tmux passthrough survive block mode.
@@ -512,12 +524,13 @@ impl Parser {
                         self.state = State::OscEsc { payload };
                     }
                     _ => {
-                        buf.push(b);
-                        if buf.len() > MAX_OSC_BYTES {
-                            log::warn!(
-                                "Dropping unterminated OSC larger than {MAX_OSC_BYTES} bytes"
-                            );
-                            self.state = State::Ignore;
+                        if buf.len() >= MAX_OSC_PAYLOAD_BYTES {
+                            log::warn!("Dropping OSC larger than {MAX_OSC_PAYLOAD_BYTES} bytes");
+                            // Release the accumulated payload immediately, then
+                            // resynchronise only at this string's terminator.
+                            self.state = State::OscDiscard;
+                        } else {
+                            buf.push(b);
                         }
                     }
                 },
@@ -532,6 +545,20 @@ impl Parser {
                     }
                 }
 
+                State::OscDiscard => match b {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::OscDiscardEsc,
+                    _ => {}
+                },
+
+                State::OscDiscardEsc => {
+                    self.state = match b {
+                        b'\\' | 0x07 => State::Ground,
+                        0x1b => State::OscDiscardEsc,
+                        _ => State::OscDiscard,
+                    };
+                }
+
                 State::Apc { buf } => match b {
                     0x07 => {
                         let payload = std::mem::take(buf);
@@ -544,12 +571,11 @@ impl Parser {
                         self.state = State::ApcEsc { payload };
                     }
                     _ => {
-                        buf.push(b);
-                        if buf.len() > MAX_APC_BYTES {
-                            log::warn!(
-                                "Dropping unterminated APC larger than {MAX_APC_BYTES} bytes"
-                            );
-                            self.state = State::Ignore;
+                        if buf.len() >= MAX_APC_PAYLOAD_BYTES {
+                            log::warn!("Dropping APC larger than {MAX_APC_PAYLOAD_BYTES} bytes");
+                            self.state = State::ApcDiscard;
+                        } else {
+                            buf.push(b);
                         }
                     }
                 },
@@ -565,6 +591,20 @@ impl Parser {
                         events.push(ParserEvent::ApcSequence(payload));
                         self.passthrough.push(b);
                     }
+                }
+
+                State::ApcDiscard => match b {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::ApcDiscardEsc,
+                    _ => {}
+                },
+
+                State::ApcDiscardEsc => {
+                    self.state = match b {
+                        b'\\' | 0x07 => State::Ground,
+                        0x1b => State::ApcDiscardEsc,
+                        _ => State::ApcDiscard,
+                    };
                 }
 
                 State::Dcs { buf } => match b {
@@ -809,16 +849,49 @@ mod tests {
     }
 
     #[test]
-    fn oversized_unterminated_osc_is_bounded_and_parser_recovers() {
+    fn oversized_osc_is_discarded_and_recovers_from_split_st() {
         let mut parser = Parser::new();
         let mut events = Vec::new();
-        let mut input = Vec::with_capacity(MAX_OSC_BYTES + 16);
-        input.extend_from_slice(b"\x1b]");
-        input.resize(MAX_OSC_BYTES + 3, b'x');
-        input.extend_from_slice(b"\x07after");
+        parser.feed(b"\x1b]0;", &mut events);
 
-        parser.feed(&input, &mut events);
-        assert_eq!(collect_bytes(&events), b"after");
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..=(MAX_OSC_PAYLOAD_BYTES / chunk.len()) {
+            parser.feed(&chunk, &mut events);
+        }
+
+        assert!(events.is_empty());
+        assert!(matches!(parser.state, State::OscDiscard));
+
+        parser.feed(b"\x1b", &mut events);
+        assert!(matches!(parser.state, State::OscDiscardEsc));
+        parser.feed(b"Xstill-hidden\x1b", &mut events);
+        assert!(matches!(parser.state, State::OscDiscardEsc));
+        parser.feed(b"\\visible", &mut events);
+
+        assert!(matches!(parser.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"visible");
+    }
+
+    #[test]
+    fn oversized_apc_is_discarded_and_recovers_at_bel() {
+        let mut parser = Parser::new();
+        let mut events = Vec::new();
+        parser.feed(b"\x1b_Ga=T;", &mut events);
+
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..=(MAX_APC_PAYLOAD_BYTES / chunk.len()) {
+            parser.feed(&chunk, &mut events);
+        }
+
+        assert!(events.is_empty());
+        assert!(matches!(parser.state, State::ApcDiscard));
+
+        parser.feed(b"\x07visible", &mut events);
+        assert!(matches!(parser.state, State::Ground));
+        assert_eq!(collect_bytes(&events), b"visible");
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, ParserEvent::ApcSequence(_))));
     }
 
     #[test]
