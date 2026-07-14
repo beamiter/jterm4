@@ -32,3 +32,5 @@ jobs:
           path: /tmp/jterm4-round2-current.tar.gz
           if-no-files-found: error
           retention-days: 1
+
+# Trigger after workflow registration.
