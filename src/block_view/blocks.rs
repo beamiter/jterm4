@@ -457,16 +457,32 @@ pub(crate) fn estimated_cell_height_px(config: &Config) -> i32 {
         .last()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(14.0);
-    (base_size * config.default_font_scale * (96.0 / 72.0) * 1.2)
+    (base_size
+        * config.default_font_scale
+        * (96.0 / 72.0)
+        * 1.2
+        * super::alt_screen::BLOCK_CELL_HEIGHT_SCALE)
         .ceil()
         .max(1.0) as i32
 }
 
-pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: usize) -> i32 {
+pub(crate) fn estimated_finished_block_height(config: &Config, output_rows: i64) -> i32 {
     let cell = estimated_cell_height_px(config);
-    // Header + command row + output rows + margins/borders/filter slack.
-    let rows = output_rows.max(1) as i32;
-    (rows + 2) * cell + 34
+    let rows = output_rows.clamp(1, i32::MAX as i64) as i32;
+    rows.saturating_add(2)
+        .saturating_mul(cell)
+        .saturating_add(34)
+}
+
+/// Virtualization metadata must follow terminal visual rows rather than logical
+/// newlines. Wide glyphs and long stack-trace lines can wrap many times.
+pub(crate) fn estimated_finished_block_height_for_text(
+    config: &Config,
+    output: &str,
+    cols: i64,
+) -> i32 {
+    let rows = output_visual_row_count(output, cols).max(1);
+    estimated_finished_block_height(config, rows)
 }
 
 fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
@@ -481,36 +497,58 @@ fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static
     });
 }
 
-/// Render `bytes` into a read-only finished VTE: reset the grid, resize to the
-/// new visible-row count (so the chrome shrinks/grows on filter), then feed
-/// the bytes in one shot. Used for filter changes — the initial feed happens
-/// once at construction.
+/// Render a finished snapshot with enough temporary capture capacity for VTE's
+/// real terminal semantics. The post-feed settle pass expands short/full-height
+/// blocks to the actual retained buffer span, covering ANSI cursor movement,
+/// carriage-return redraws, combining/wide glyphs, tabs, and soft wrapping.
 pub(crate) fn render_bytes_into_finished_vte(
     vte: &vte4::Terminal,
     text: &str,
     cols: i64,
     output_rows: i64,
     viewport_cap: i64,
+    capture_rows: i64,
+    expand_to_buffer: bool,
 ) {
     let display_text = output_display_text(text);
-    let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = if output_rows > visible_rows {
-        output_rows.saturating_sub(visible_rows).saturating_add(64)
-    } else {
-        0
-    };
+    let visible_rows = output_rows.min(viewport_cap).clamp(1, 32);
+    let overflow_rows = output_rows.saturating_sub(visible_rows).saturating_add(64);
+    let scrollback = capture_rows.max(overflow_rows).max(64);
     vte.set_scroll_on_output(false);
-    // Set size BEFORE reset/feed so VTE's internal grid is sized correctly when
-    // bytes are processed. If we feed first and resize later, VTE wraps lines
-    // at the pre-resize default width (root cause of the ls-output misalignment
-    // bug: `ls` formats for N cols but VTE wrapped at a narrower width,
-    // producing mid-word splits like "ta\nuri-sandbox").
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
     vte.reset(true, true);
-    // reset() can clamp dimensions on some VTE builds — re-assert.
     vte.set_size(cols.max(1), visible_rows);
+    vte.set_scrollback_lines(scrollback);
     vte.feed(display_text.as_bytes());
+    if expand_to_buffer {
+        settle_finished_terminal_after_feed(vte);
+    }
+    if let Some(adj) = vte.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+}
+
+/// VTE treats a bare LF as “move down, retain column”. Captured command text
+/// uses ordinary logical newlines, so convert only bare LF bytes to CRLF before
+/// feeding the read-only command snapshot.
+fn terminalize_line_breaks(bytes: &[u8]) -> Vec<u8> {
+    let extra_crs = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+        .count();
+    if extra_crs == 0 {
+        return bytes.to_vec();
+    }
+    let mut terminal_bytes = Vec::with_capacity(bytes.len() + extra_crs);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
+            terminal_bytes.push(b'\r');
+        }
+        terminal_bytes.push(byte);
+    }
+    terminal_bytes
 }
 
 impl FinishedBlock {
@@ -587,6 +625,9 @@ impl FinishedBlock {
         let viewport_cap = output_rows.max(1);
         let max_expanded_cap = viewport_cap;
         let long_output = output_rows > (config.finished_block_viewport_rows as i64).max(1);
+        let capture_rows = output_rows
+            .max(config.truncation_threshold_lines as i64)
+            .max(4096);
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -830,11 +871,10 @@ impl FinishedBlock {
             _ if cmd.is_empty() => b"(empty)".to_vec(),
             _ => highlight_command_to_ansi(cmd).into_bytes(),
         };
-        // Multiline pastes and wrapped commands are part of the block canvas too;
-        // do not hide them in a five-row private scrollback.
-        let cmd_display = if cmd.is_empty() { "(empty)" } else { cmd };
-        let cmd_rows = output_visual_row_count(cmd_display, cols);
-        let command_vte = create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1));
+        let cmd_bytes = terminalize_line_breaks(&cmd_bytes);
+        let cmd_rows = cmd_bytes.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
+        let command_vte =
+            create_finished_terminal(config, cols, cmd_rows.max(1), cmd_rows.max(1), false);
         // Defer feeds until the widget is actually mapped — VTE's internal
         // grid resize from set_size() doesn't take effect until the widget is
         // realized, so feeding immediately wraps content at a smaller default
@@ -853,6 +893,7 @@ impl FinishedBlock {
                 fed.set(true);
                 w.set_size(cols_for_map, cmd_rows_for_map);
                 w.feed(&cmd_bytes_for_map);
+                settle_finished_terminal_after_feed(w);
                 let ch = w.char_height() as i32;
                 if ch > 0 {
                     w.set_height_request(cmd_rows_for_map as i32 * ch);
@@ -865,7 +906,7 @@ impl FinishedBlock {
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let output_scrollable = output_rows > viewport_cap;
-        let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap);
+        let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap, false);
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
         output_vte
             .set_height_request(initial_visible_rows as i32 * estimated_cell_height_px(config));
@@ -887,7 +928,15 @@ impl FinishedBlock {
                     cap_for_map
                 };
                 let visible_rows = rows.min(cap).max(1);
-                render_bytes_into_finished_vte(w, &text, cols_for_map, rows, cap);
+                render_bytes_into_finished_vte(
+                    w,
+                    &text,
+                    cols_for_map,
+                    rows,
+                    cap,
+                    capture_rows,
+                    true,
+                );
                 // Pin a minimum pixel height so GTK's vertical Box layout cannot
                 // shrink this VTE below what set_size requested. Without this,
                 // finished VTEs can be allocated at ~1 row and VTE scrolls their
@@ -1050,6 +1099,7 @@ impl FinishedBlock {
             filter_row.set_margin_top(2);
             filter_row.set_margin_bottom(2);
 
+            let filter_enabled = Rc::new(Cell::new(false));
             let filter_entry = gtk4::SearchEntry::new();
             filter_entry.set_placeholder_text(Some("Filter output…"));
             filter_entry.set_hexpand(true);
@@ -1083,6 +1133,7 @@ impl FinishedBlock {
                 let output_vte = output_vte.clone();
                 let full_output = full_output.clone();
                 let displayed_output = displayed_output.clone();
+                let filter_enabled = filter_enabled.clone();
                 let filter_entry = filter_entry.clone();
                 let regex_tg = regex_tg.clone();
                 let case_tg = case_tg.clone();
@@ -1097,7 +1148,7 @@ impl FinishedBlock {
                     let q = filter_entry.text().to_string();
                     let full = full_output.borrow();
                     let full_rows = output_row_count(&full);
-                    let filtered = if q.is_empty() {
+                    let filtered = if !filter_enabled.get() || q.is_empty() {
                         Ok(full.to_string())
                     } else {
                         filter_output_lines(
@@ -1133,6 +1184,8 @@ impl FinishedBlock {
                         cols,
                         shown_visual_rows,
                         active_cap,
+                        capture_rows,
+                        true,
                     );
                     let ch = output_vte.char_height() as i32;
                     if ch > 0 {
@@ -1140,7 +1193,7 @@ impl FinishedBlock {
                             (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
                         );
                     }
-                    let has_query = !q.trim().is_empty();
+                    let has_query = filter_enabled.get() && !q.trim().is_empty();
                     if invalid_regex {
                         filter_btn.add_css_class("block-action-active");
                         filter_status.set_visible(true);
@@ -1190,6 +1243,7 @@ impl FinishedBlock {
 
             let filter_row_for_toggle = filter_row.downgrade();
             let entry_for_toggle = filter_entry.downgrade();
+            let filter_enabled_for_toggle = filter_enabled.clone();
             let apply_for_toggle = apply.clone();
             let filter_btn_for_toggle = filter_btn.downgrade();
             let set_collapsed_for_filter = set_collapsed.clone();
@@ -1202,6 +1256,7 @@ impl FinishedBlock {
                     return;
                 };
                 let show = !filter_row.is_visible();
+                filter_enabled_for_toggle.set(show);
                 filter_row.set_visible(show);
                 if show {
                     set_collapsed_for_filter(false);
@@ -1284,6 +1339,16 @@ impl FinishedBlock {
             block_for_jump.scroll_to_edge(&outer_for_jump, true);
         });
 
+        let command_scroll =
+            gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        command_scroll.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let outer_for_command = outer.clone();
+        command_scroll.connect_scroll(move |_, _dx, dy| {
+            forward_outer_scroll(&outer_for_command, dy);
+            glib::Propagation::Stop
+        });
+        self.command_vte.add_controller(command_scroll);
+
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let vte = self.output_vte.clone();
@@ -1317,12 +1382,14 @@ impl FinishedBlock {
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
     /// Kept separate from construction because handlers need the clipboard, PTY,
     /// and active block, which only the owning `TermView` has.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_actions(
         &self,
         vte: &Terminal,
         pty: &Rc<crate::pty::OwnedPty>,
         pty_synced: &Rc<Cell<bool>>,
         active: &Rc<RefCell<ActiveBlock>>,
+        typed_cmd: &Rc<RefCell<String>>,
         bstate: &Rc<Cell<BlockState>>,
         bracketed_paste: &Rc<Cell<bool>>,
     ) {
@@ -1351,30 +1418,23 @@ impl FinishedBlock {
         let pty_for_rerun = Rc::clone(pty);
         let pty_synced_for_rerun = pty_synced.clone();
         let active_for_rerun = active.clone();
+        let typed_cmd_for_rerun = typed_cmd.clone();
         let bstate_for_rerun = bstate.clone();
         let bracketed_for_rerun = bracketed_paste.clone();
         let cmd_for_rerun = self.cmd_text.clone();
         self.rerun_btn.connect_clicked(move |btn| {
-            // Never inject a recalled command into stdin of a running command or
-            // an alt-screen application. Wait until OSC-133 says the prompt is ready.
-            if !command_recall_available(bstate_for_rerun.get()) {
-                active_for_rerun.borrow().grab_focus();
-                flash_button_label(btn, "\u{f071}", "Wait for the prompt");
-                return;
-            }
-
-            let first_line_only = write_recalled_command(
+            if recall_command_at_prompt(
                 &pty_for_rerun,
+                &pty_synced_for_rerun,
+                &typed_cmd_for_rerun,
+                bstate_for_rerun.get(),
                 &cmd_for_rerun,
                 bracketed_for_rerun.get(),
-                false,
-            );
-            pty_synced_for_rerun.set(true);
-            active_for_rerun.borrow().grab_focus();
-            if first_line_only {
-                flash_button_label(btn, "\u{f071}", "First line inserted");
-            } else {
+            ) {
+                active_for_rerun.borrow().grab_focus();
                 flash_button_label(btn, "\u{f00c}", "Command inserted");
+            } else {
+                flash_button_label(btn, "\u{f071}", "Wait for an editable prompt");
             }
         });
     }
@@ -1580,7 +1640,7 @@ pub(crate) fn write_recalled_command(
 mod tests {
     use super::{
         block_clipboard_text, collapsed_output_summary, command_recall_available,
-        filter_output_lines, BlockState,
+        filter_output_lines, terminalize_line_breaks, BlockState,
     };
 
     #[test]
@@ -1618,6 +1678,18 @@ mod tests {
         assert_eq!(
             super::recalled_command_text("printf one\nprintf two", false),
             ("printf one", true)
+        );
+    }
+
+    #[test]
+    fn terminalize_command_line_breaks_return_to_the_command_column() {
+        assert_eq!(
+            terminalize_line_breaks(b"cd /tmp\npython3 demo.py"),
+            b"cd /tmp\r\npython3 demo.py"
+        );
+        assert_eq!(
+            terminalize_line_breaks(b"\x1b[36mrun\x1b[0m\r\nnext"),
+            b"\x1b[36mrun\x1b[0m\r\nnext"
         );
     }
 

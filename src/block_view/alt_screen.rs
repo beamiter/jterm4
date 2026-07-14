@@ -7,8 +7,14 @@
 //! No frame-merge / pager-snapshot path runs, matching Warp.
 use crate::config::Config;
 use crate::terminal::apply_terminal_theme;
+use gtk4::glib;
+use gtk4::prelude::*;
 use vte4::TerminalExt;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
+
+/// Give dense block output the same breathing room as jterm1. Patched
+/// monospace fonts often paint close to VTE's default cell boundary.
+pub(crate) const BLOCK_CELL_HEIGHT_SCALE: f64 = 1.12;
 
 // ─── Mouse Reporting Mode ─────────────────────────────────────────────────────
 
@@ -68,6 +74,64 @@ pub(crate) fn encode_mouse_wheel(
     }
 }
 
+/// Convert VTE's adjustment extent into the number of rows retained by a
+/// finished snapshot. Negative `lower` represents wrapped/overflow rows in
+/// scrollback; `upper - lower` covers both that scrollback and the visible grid.
+fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i64) -> i64 {
+    let visible_rows = visible_rows.max(1);
+    if !lower.is_finite() || !upper.is_finite() || upper <= lower {
+        return visible_rows;
+    }
+    let span = (upper - lower).ceil();
+    if span >= i64::MAX as f64 {
+        i64::MAX
+    } else {
+        (span as i64).max(visible_rows)
+    }
+}
+
+/// Grow a read-only finished VTE from its provisional grid to every row VTE
+/// actually rendered. Measuring the post-feed terminal buffer covers ANSI
+/// controls, tabs, combining/wide glyphs, CR redraws, and automatic wrapping.
+pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
+    let visible_rows = terminal.row_count().max(1);
+    let rows = terminal
+        .vadjustment()
+        .map(|adj| finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows))
+        .unwrap_or(visible_rows);
+    let cols = terminal.column_count().max(1);
+
+    if rows > visible_rows {
+        terminal.set_size(cols, rows);
+    }
+    let cell_height = (terminal.char_height() as i32).max(1);
+    let rows_i32 = rows.clamp(1, i32::MAX as i64) as i32;
+    terminal.set_height_request(rows_i32.saturating_mul(cell_height));
+    if let Some(adj) = terminal.vadjustment() {
+        adj.set_value(adj.lower());
+    }
+}
+
+/// VTE updates its buffer asynchronously after `feed()`. Two idle passes fold
+/// all retained rows into the finished card, then a final pass pins the snapshot
+/// to its first row.
+pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
+    let terminal = terminal.clone();
+    glib::idle_add_local_once(move || {
+        expand_finished_terminal_to_buffer(&terminal);
+        let terminal = terminal.clone();
+        glib::idle_add_local_once(move || {
+            expand_finished_terminal_to_buffer(&terminal);
+            let terminal = terminal.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(adj) = terminal.vadjustment() {
+                    adj.set_value(adj.lower());
+                }
+            });
+        });
+    });
+}
+
 // ─── VTE builder ─────────────────────────────────────────────────────────────
 
 /// The single persistent live VTE for block mode. It keeps `input_enabled(true)`
@@ -90,6 +154,7 @@ pub(crate) fn create_active_terminal(config: &Config) -> Terminal {
         .cursor_blink_mode(CursorBlinkMode::System)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
+        .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
@@ -131,13 +196,17 @@ pub(crate) fn create_finished_terminal(
     cols: i64,
     output_rows: i64,
     viewport_cap: i64,
+    expand_to_buffer: bool,
 ) -> Terminal {
     let visible_rows = output_rows.min(viewport_cap).max(1);
-    let scrollback = if output_rows > visible_rows {
-        output_rows.saturating_sub(visible_rows).saturating_add(64) as u32
-    } else {
-        0
-    };
+    // Estimates can be low for cursor movement, CR redraws, tabs, wide glyphs,
+    // and wrapping. Keep temporary capture capacity until the post-feed settle
+    // pass folds VTE's actual buffer rows into the card.
+    let capture_rows = output_rows
+        .max(viewport_cap)
+        .max(config.truncation_threshold_lines as i64)
+        .max(4096)
+        .clamp(1, u32::MAX as i64) as u32;
     let terminal = Terminal::builder()
         .hexpand(true)
         .vexpand(false)
@@ -145,25 +214,31 @@ pub(crate) fn create_finished_terminal(
         .allow_hyperlink(true)
         .bold_is_bright(true)
         .input_enabled(false)
-        .scrollback_lines(scrollback)
+        .scrollback_lines(capture_rows)
         .cursor_blink_mode(CursorBlinkMode::Off)
         .cursor_shape(CursorShape::Block)
         .font_scale(config.default_font_scale)
+        .cell_height_scale(BLOCK_CELL_HEIGHT_SCALE)
         .opacity(1.0)
         .pointer_autohide(true)
         .enable_sixel(true)
-        // Finished blocks are snapshots. Short output is rendered statically;
-        // long output anchors at the top so `git log`-style output starts from
-        // the first line instead of snapping to the tail.
         .scroll_on_output(false)
         .scroll_on_keystroke(false)
         .build();
     terminal.set_mouse_autohide(true);
-    // Hide the read-only block's cursor — the completed output should not show a
-    // blinking caret at the end of the last line.
     apply_snapshot_theme_to_vte(&terminal, config);
     terminal.set_size(cols.max(1), visible_rows);
-    // URL detection — mirror the live-VTE pattern at src/terminal.rs:52-56.
+
+    if expand_to_buffer {
+        let expanded = std::cell::Cell::new(false);
+        terminal.connect_map(move |terminal| {
+            if expanded.replace(true) {
+                return;
+            }
+            settle_finished_terminal_after_feed(terminal);
+        });
+    }
+
     if let Ok(regex) = vte4::Regex::for_match(
         r"[a-z]+://[[:graph:]]+",
         pcre2_sys::PCRE2_CASELESS | pcre2_sys::PCRE2_MULTILINE,
@@ -206,5 +281,16 @@ mod tests {
     fn zero_delta_returns_no_bytes() {
         // Spurious 0 delta from GTK shouldn't paginate the app.
         assert!(encode_mouse_wheel(MouseReportingMode::Sgr, 0.0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn finished_buffer_rows_include_wrapped_scrollback() {
+        assert_eq!(finished_buffer_rows_from_adjustment(-7.0, 5.0, 5), 12);
+    }
+
+    #[test]
+    fn finished_buffer_rows_never_shrink_the_provisional_grid() {
+        assert_eq!(finished_buffer_rows_from_adjustment(0.0, 1.0, 5), 5);
+        assert_eq!(finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3), 3);
     }
 }
