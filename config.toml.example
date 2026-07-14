@@ -34,8 +34,10 @@ sidebar_width = 220            # 120 .. 800
 max_visible_blocks = 200
 lazy_load_threshold = 1000
 truncation_threshold_lines = 50000
+finished_block_viewport_rows = 24
 max_collapsed_output_lines = 25
 virtual_scroll_margin = 1
+block_compact = false
 
 # 可选持久化历史。路径支持开头的 ~/，父目录会自动创建。
 # block_history_path = "~/.local/share/jterm4/block-history.bin"

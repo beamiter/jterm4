@@ -205,11 +205,16 @@ pub struct Config {
     pub(crate) max_visible_blocks: u32,
     pub(crate) lazy_load_threshold: u32,
     pub(crate) truncation_threshold_lines: u32,
+    /// Output rows shown before a finished block is considered long and gains
+    /// top/bottom navigation controls.
+    pub(crate) finished_block_viewport_rows: u32,
     #[allow(dead_code)]
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
+    /// Use jterm1/Warp-style denser block spacing.
+    pub(crate) block_compact: bool,
     /// Saved SSH targets selectable from the context menu.
     pub(crate) remote_hosts: Vec<RemoteHost>,
     /// Forward mouse button events (CSI ?1000/?1002/?1003/?1006 etc.) to apps.
@@ -460,10 +465,12 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "max_visible_blocks",
     "lazy_load_threshold",
     "truncation_threshold_lines",
+    "finished_block_viewport_rows",
     "max_collapsed_output_lines",
     "virtual_scroll_margin",
     "block_history_path",
     "block_history_compress",
+    "block_compact",
     "remote_hosts",
     "mouse_reporting_enabled",
     "scroll_reporting_enabled",
@@ -511,6 +518,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "max_visible_blocks",
         "lazy_load_threshold",
         "truncation_threshold_lines",
+        "finished_block_viewport_rows",
         "max_collapsed_output_lines",
         "virtual_scroll_margin",
         "ai_panel_width",
@@ -519,6 +527,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
     ];
     let booleans = [
         "block_history_compress",
+        "block_compact",
         "mouse_reporting_enabled",
         "scroll_reporting_enabled",
         "focus_reporting_enabled",
@@ -610,6 +619,7 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     warn_int_range(&mut issues, "max_visible_blocks", 1, 100_000);
     warn_int_range(&mut issues, "lazy_load_threshold", 1, 10_000_000);
     warn_int_range(&mut issues, "truncation_threshold_lines", 1, 10_000_000);
+    warn_int_range(&mut issues, "finished_block_viewport_rows", 3, 5_000);
     warn_int_range(&mut issues, "max_collapsed_output_lines", 1, 1_000_000);
     warn_int_range(&mut issues, "virtual_scroll_margin", 0, 10_000);
     warn_int_range(&mut issues, "ai_panel_width", 240, 1200);
@@ -824,10 +834,12 @@ struct FileConfig {
     max_visible_blocks: Option<u32>,
     lazy_load_threshold: Option<u32>,
     truncation_threshold_lines: Option<u32>,
+    finished_block_viewport_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
+    block_compact: Option<bool>,
     remote_hosts: Vec<RemoteHost>,
     mouse_reporting_enabled: Option<bool>,
     scroll_reporting_enabled: Option<bool>,
@@ -943,6 +955,7 @@ fn load_file_config() -> FileConfig {
         max_visible_blocks: table_u32(&table, "max_visible_blocks"),
         lazy_load_threshold: table_u32(&table, "lazy_load_threshold"),
         truncation_threshold_lines: table_u32(&table, "truncation_threshold_lines"),
+        finished_block_viewport_rows: table_u32(&table, "finished_block_viewport_rows"),
         max_collapsed_output_lines: table_u32(&table, "max_collapsed_output_lines"),
         virtual_scroll_margin: table_u32(&table, "virtual_scroll_margin"),
         block_history_path: table
@@ -952,6 +965,7 @@ fn load_file_config() -> FileConfig {
         block_history_compress: table
             .get("block_history_compress")
             .and_then(|v| v.as_bool()),
+        block_compact: table.get("block_compact").and_then(|v| v.as_bool()),
         remote_hosts,
         mouse_reporting_enabled: table
             .get("mouse_reporting_enabled")
@@ -1140,6 +1154,10 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.truncation_threshold_lines)
         .unwrap_or(50000)
         .clamp(1, 10_000_000);
+    let finished_block_viewport_rows = env_u32("JTERM4_FINISHED_VIEWPORT_ROWS")
+        .or(fc.finished_block_viewport_rows)
+        .unwrap_or(24)
+        .clamp(3, 5_000);
     let max_collapsed_output_lines = env_u32("JTERM4_MAX_COLLAPSED_LINES")
         .or(fc.max_collapsed_output_lines)
         .unwrap_or(25)
@@ -1152,6 +1170,13 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .ok()
         .or(fc.block_history_path);
     let block_history_compress = fc.block_history_compress.unwrap_or(true);
+    let block_compact = match std::env::var("JTERM4_BLOCK_COMPACT").ok().as_deref() {
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        _ => None,
+    }
+    .or(fc.block_compact)
+    .unwrap_or(false);
     let shell = std::env::var("JTERM4_SHELL").ok().or(fc.shell);
 
     // Parse terminal mode (default: vte)
@@ -1191,10 +1216,12 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         max_visible_blocks,
         lazy_load_threshold,
         truncation_threshold_lines,
+        finished_block_viewport_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
         block_history_path,
         block_history_compress,
+        block_compact,
         remote_hosts: fc.remote_hosts,
         mouse_reporting_enabled: fc.mouse_reporting_enabled.unwrap_or(true),
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
@@ -1319,6 +1346,14 @@ pub(crate) fn save_config(config: &Config) {
     table.insert(
         "notify_long_block_threshold_ms".into(),
         toml::Value::Integer(config.notify_long_block_threshold_ms as i64),
+    );
+    table.insert(
+        "finished_block_viewport_rows".into(),
+        toml::Value::Integer(config.finished_block_viewport_rows as i64),
+    );
+    table.insert(
+        "block_compact".into(),
+        toml::Value::Boolean(config.block_compact),
     );
     table.insert(
         "show_repo_strip".into(),

@@ -1041,7 +1041,7 @@ impl FinishedBlock {
         // Per-block output filter (Warp's BlockFilterQuery): the funnel button in
         // the action box toggles a compact row that narrows the output to lines
         // matching the query, honoring regex / case / invert / context-lines.
-        {
+        let toggle_filter = {
             let filter_row = gtk4::Box::new(Orientation::Horizontal, 4);
             filter_row.add_css_class("block-filter-row");
             filter_row.set_visible(false);

@@ -1393,6 +1393,7 @@ impl ReaderCtx {
 
                                 let finished_menu_clone = finished_clone.clone();
                                 let block_data_for_export = block_data_for_cb.clone();
+                                let block_scroll_for_menu = block_scroll_rc.clone();
                                 right_click.connect_pressed(move |gesture, _n_press, x, y| {
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                                     {
@@ -1577,7 +1578,7 @@ impl ReaderCtx {
                                         let item = make_item("Scroll to Block Top");
                                         let popover_c = popover.clone();
                                         let block = finished_menu_clone.clone();
-                                        let scroll = block_scroll_rc.clone();
+                                        let scroll = block_scroll_for_menu.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             block.scroll_to_edge(&scroll, false);
@@ -1588,7 +1589,7 @@ impl ReaderCtx {
                                         let item = make_item("Jump to Block Bottom");
                                         let popover_c = popover.clone();
                                         let block = finished_menu_clone.clone();
-                                        let scroll = block_scroll_rc.clone();
+                                        let scroll = block_scroll_for_menu.clone();
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             block.scroll_to_edge(&scroll, true);
