@@ -1,5 +1,6 @@
 name: Apply modern GTK4 file-tree migration
 
+# This workflow is intentionally branch-local and removes itself after success.
 on:
   push:
     branches:
