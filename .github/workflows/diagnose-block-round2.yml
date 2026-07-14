@@ -1,0 +1,52 @@
+name: Diagnose block round2 compile
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: ${{ github.head_ref == 'agent/jterm1-block-parity-round2' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-parity-round2
+
+      - name: Install GTK dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Capture cargo check
+        id: check
+        shell: bash
+        run: |
+          set +e
+          cargo check --all-targets --all-features --locked > check.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          tail -n 120 check.log
+          exit 0
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: block-round2-check-log
+          path: check.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Fail when check failed
+        if: ${{ steps.check.outputs.status != '0' }}
+        run: exit 1
