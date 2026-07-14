@@ -1,0 +1,41 @@
+name: Apply jterm1 block parity
+
+on:
+  push:
+    branches: [agent/jterm1-block-mode-parity]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[generated parity]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout migration branch
+        uses: actions/checkout@v7
+
+      - name: Assemble and apply source migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat scripts/parity_parts/part_00 > /tmp/apply-jterm1-parity.py
+          for part in scripts/parity_parts/part_*.b64; do
+            base64 --decode "$part" >> /tmp/apply-jterm1-parity.py
+          done
+          python3 -m py_compile /tmp/apply-jterm1-parity.py
+          python3 /tmp/apply-jterm1-parity.py
+          cargo fmt --all
+          rm -rf scripts/parity_parts .github/workflows/apply-jterm1-block-parity.yml
+
+      - name: Commit generated source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: align block actions with jterm1 [generated parity]"
+          git push
