@@ -2,6 +2,7 @@
 use adw::prelude::*;
 use gtk4::{Orientation, Paned};
 use libadwaita as adw;
+use std::rc::Rc;
 use vte4::Terminal;
 use vte4::TerminalExt;
 
@@ -9,53 +10,65 @@ use super::*;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{
-    collect_terminals, create_terminal, scrollbar_wrapper_of, setup_terminal_click_handler,
-    spawn_shell, terminal_working_directory, wrap_with_scrollbar,
+    collect_terminals, scrollbar_wrapper_of, setup_terminal_click_handler,
+    terminal_working_directory, VteTerminalView,
 };
 
 impl UiState {
-    pub(crate) fn create_split_terminal(
+    /// Create a managed conventional-VTE pane leaf.
+    ///
+    /// Runtime splits and restored split layouts share this constructor so every
+    /// leaf root stores a `PaneLeaf` controller. This keeps process callbacks and
+    /// GTK object ownership attached to the same widget that enters the pane tree.
+    pub(crate) fn create_vte_leaf(
         &self,
         working_directory: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
         tab_widget_name: Option<String>,
-    ) -> Terminal {
-        let terminal = create_terminal(&self.config.borrow());
+    ) -> PaneLeaf {
+        let sid = session_id
+            .map(str::to_owned)
+            .unwrap_or_else(generate_session_id);
+        let shell_argv = self.shell_argv.borrow();
+        let view = Rc::new(VteTerminalView::new(
+            self.config.clone(),
+            shell_argv.as_slice(),
+            working_directory,
+            Some(&sid),
+            initial_commands,
+        ));
+        drop(shell_argv);
+
+        let terminal = view.vte().clone();
         setup_terminal_click_handler(&terminal);
         self.setup_context_menu(&terminal);
 
         let ui_for_exit = UiState::clone(self);
-        let terminal_clone = terminal.clone();
-        terminal.connect_child_exited(move |_, _| {
-            ui_for_exit.handle_terminal_exited(&terminal_clone.clone().upcast::<gtk4::Widget>());
+        let terminal_for_exit = terminal.clone();
+        view.connect_exited(move |_| {
+            ui_for_exit
+                .handle_terminal_exited(&terminal_for_exit.clone().upcast::<gtk4::Widget>());
         });
 
-        // Bell and activity signals for split pane terminals
-        if let Some(ref name) = tab_widget_name {
+        if let Some(name) = tab_widget_name {
             let ui_for_bell = self.clone();
             let bell_name = name.clone();
-            terminal.connect_bell(move |_| {
+            view.connect_bell(move || {
                 log::debug!("Bell signal received (split)");
                 ui_for_bell.mark_tab_bell(&bell_name);
             });
 
             let ui_for_activity = self.clone();
-            let activity_name = name.clone();
-            terminal.connect_commit(move |_, _, _| {
-                ui_for_activity.mark_tab_activity(&activity_name);
+            view.connect_activity(move || {
+                ui_for_activity.mark_tab_activity(&name);
             });
         }
 
-        // Split panes get a fresh session ID (new shell instance)
-        let sid = generate_session_id();
-        let shell_argv = self.shell_argv.borrow();
-        spawn_shell(
-            &terminal,
-            shell_argv.as_slice(),
-            working_directory,
-            Some(&sid),
-            None,
-        );
-        terminal
+        let leaf = PaneLeaf::Vte(view);
+        let root = leaf.root_widget();
+        leaf.attach_to(&root);
+        leaf
     }
 
     pub(crate) fn split_current(&self, orientation: Orientation) {
@@ -100,8 +113,13 @@ impl UiState {
             .unwrap_or_else(|| current_term.clone().upcast::<gtk4::Widget>());
         let parent = current_widget.parent();
 
-        let new_term = self.create_split_terminal(working_directory.as_deref(), tab_widget_name);
-        let new_widget = wrap_with_scrollbar(&new_term);
+        let new_leaf = self.create_vte_leaf(
+            working_directory.as_deref(),
+            None,
+            None,
+            tab_widget_name,
+        );
+        let new_widget = new_leaf.root_widget();
 
         let paned = Paned::new(orientation);
         paned.set_hexpand(true);
@@ -141,7 +159,7 @@ impl UiState {
             }
         }
 
-        new_term.grab_focus();
+        new_leaf.grab_focus();
     }
 
     pub(crate) fn cycle_pane_focus(&self, direction: i32) {
@@ -160,12 +178,10 @@ impl UiState {
         let focused_idx = terms.iter().position(|t| t.has_focus()).unwrap_or(0);
         let next_idx = if direction > 0 {
             (focused_idx + 1) % terms.len()
+        } else if focused_idx == 0 {
+            terms.len() - 1
         } else {
-            if focused_idx == 0 {
-                terms.len() - 1
-            } else {
-                focused_idx - 1
-            }
+            focused_idx - 1
         };
         terms[next_idx].grab_focus();
     }
