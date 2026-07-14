@@ -39,3 +39,5 @@ jobs:
           git add -A
           git commit -m "feat: align block actions with jterm1 [generated parity]"
           git push
+
+# This second branch push intentionally triggers the newly-added workflow.
