@@ -144,6 +144,28 @@ jobs:
       - name: Remove migration script
         run: rm scripts/migrate_linux_desktop_packaging.py
 
+      - name: Normalize generated text files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", "--diff-filter=ACM"], text=True
+          ).splitlines()
+          for name in changed:
+              path = Path(name)
+              if not path.is_file():
+                  continue
+              try:
+                  text = path.read_text()
+              except UnicodeDecodeError:
+                  continue
+              normalized = "\n".join(line.rstrip(" \t") for line in text.splitlines()).rstrip("\n") + "\n"
+              if normalized != text:
+                  path.write_text(normalized)
+          PY
+
       - name: Verify patch cleanliness
         run: git diff --check
 
