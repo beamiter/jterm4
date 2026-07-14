@@ -10,7 +10,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
 
-use super::{contains_case_insensitive, select_finished_block, BlockFilters, TermView};
+use super::{contains_case_insensitive, replace_finished_block_selection, BlockFilters, TermView};
 
 /// One hit from a find-within-blocks pass. With VTE-backed blocks the match
 /// position lives inside the VTE itself (highlighted automatically by
@@ -402,14 +402,22 @@ impl TermView {
         let Some(block) = finished.iter().find(|b| b.id == block_id) else {
             return false;
         };
-        select_finished_block(&finished, &self.selected_block_id, Some(block_id));
+        replace_finished_block_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+            Some(block_id),
+        );
         block.widget().grab_focus();
         let adj = self.block_scroll.vadjustment();
         if let Some(value) = block
             .widget()
             .compute_point(&self.block_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
         {
-            adj.set_value(value.y() as f64);
+            let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+            let target = adj.value() + value.y() as f64;
+            adj.set_value(target.clamp(adj.lower(), max_value));
         }
         true
     }

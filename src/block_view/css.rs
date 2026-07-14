@@ -221,8 +221,13 @@ pub(crate) fn install_block_css(config: &Config) {
             box-shadow: 0 4px 14px rgba(0,0,0,0.22);
         }}
         .block-selected {{
-            background-color: rgba({acc_r},{acc_g},{acc_b},0.12);
-            border-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.08);
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.48);
+            box-shadow: inset 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.65);
+        }}
+        .block-selected.block-selection-active {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.14);
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.92);
             box-shadow: inset 0 0 0 2px {accent}, 0 0 0 1px rgba({acc_r},{acc_g},{acc_b},0.55);
         }}
         .block-active {{

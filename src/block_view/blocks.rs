@@ -76,6 +76,16 @@ impl BlockData {
     }
 }
 
+pub(crate) fn block_clipboard_text(cmd: &str, output: &str, output_only: bool) -> String {
+    if output_only || cmd.trim().is_empty() {
+        output.to_string()
+    } else if output.trim().is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{}\n{}", cmd, output)
+    }
+}
+
 /// Filters for searching/filtering blocks
 #[derive(Clone, Default)]
 pub struct BlockFilters {
@@ -541,6 +551,7 @@ impl FinishedBlock {
             }
             reused.remove_css_class("block-hovered");
             reused.remove_css_class("block-selected");
+            reused.remove_css_class("block-selection-active");
             reused.remove_css_class("block-bookmarked");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
@@ -570,6 +581,9 @@ impl FinishedBlock {
         // ── Header row ──────────────────────────────────────────────────────
         let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
         header_row.add_css_class("block-header");
+        header_row.set_tooltip_text(Some(
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls",
+        ));
         header_row.set_margin_start(12);
         header_row.set_margin_end(8);
         header_row.set_margin_top(6);
@@ -714,9 +728,8 @@ impl FinishedBlock {
         let action_box_for_leave = action_box.clone();
         hover_ctrl.connect_leave(move |_| {
             outer_for_leave.remove_css_class("block-hovered");
-            // Keep the quick actions visible while the block is selected so they
-            // stay reachable without re-hovering.
-            if !outer_for_leave.has_css_class("block-selected") {
+            // Only the active edge of a multi-selection owns persistent actions.
+            if !outer_for_leave.has_css_class("block-selection-active") {
                 action_box_for_leave.set_visible(false);
             }
         });
@@ -1441,8 +1454,16 @@ pub(crate) fn write_recalled_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        collapsed_output_summary, command_recall_available, filter_output_lines, BlockState,
+        block_clipboard_text, collapsed_output_summary, command_recall_available,
+        filter_output_lines, BlockState,
     };
+
+    #[test]
+    fn whole_block_copy_preserves_terminal_grouping() {
+        assert_eq!(block_clipboard_text("echo ok", "ok", false), "echo ok\nok");
+        assert_eq!(block_clipboard_text("echo ok", "ok", true), "ok");
+        assert_eq!(block_clipboard_text("pwd", "", false), "pwd");
+    }
 
     #[test]
     fn command_recall_is_only_available_at_the_prompt() {

@@ -220,21 +220,37 @@ impl UiState {
                 self.toggle_tab_placement();
             }
             Action::FilterFailedBlocks => {
-                log::info!("Filter failed blocks");
+                log::info!("Jump to first failed block");
                 if let Some(term_view) = self.current_term_view() {
                     term_view.apply_failed_filter();
                 }
             }
             Action::FilterSlowBlocks => {
-                log::info!("Filter slow blocks");
+                log::info!("Jump to first slow block");
                 if let Some(term_view) = self.current_term_view() {
                     term_view.apply_slow_filter();
                 }
             }
+            Action::FilterPinnedBlocks => {
+                log::info!("Jump to first bookmarked block");
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.apply_pinned_filter();
+                }
+            }
             Action::ClearBlockFilter => {
-                log::info!("Clear block filter");
+                log::info!("Jump to oldest block");
                 if let Some(term_view) = self.current_term_view() {
                     term_view.clear_block_filter();
+                }
+            }
+            Action::JumpToPrevPinned => {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.jump_to_pinned(-1);
+                }
+            }
+            Action::JumpToNextPinned => {
+                if let Some(term_view) = self.current_term_view() {
+                    term_view.jump_to_pinned(1);
                 }
             }
             Action::ToggleDebugDashboard => {
