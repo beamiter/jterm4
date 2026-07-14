@@ -54,3 +54,5 @@ jobs:
       - name: Fail when tests failed
         if: ${{ steps.tests.outputs.status != '0' }}
         run: exit 1
+
+# Trigger after registration on the PR branch.
