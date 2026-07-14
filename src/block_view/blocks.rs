@@ -1382,6 +1382,7 @@ impl FinishedBlock {
     /// Wire the hover quick-action buttons (copy command, copy output, re-run).
     /// Kept separate from construction because handlers need the clipboard, PTY,
     /// and active block, which only the owning `TermView` has.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_actions(
         &self,
         vte: &Terminal,
