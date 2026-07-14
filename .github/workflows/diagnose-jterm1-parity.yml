@@ -17,20 +17,27 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: agent/jterm1-block-mode-parity
+          fetch-depth: 0
 
-      - name: Run migration with concise log
+      - name: Run full migration stage with concise log
         id: migration
         shell: bash
         run: |
           set +e
-          cat scripts/parity_parts/part_00 > /tmp/apply-jterm1-parity.py
-          for part in scripts/parity_parts/part_*.b64; do
-            base64 --decode "$part" >> /tmp/apply-jterm1-parity.py
-          done
-          python3 /tmp/apply-jterm1-parity.py > migration.log 2>&1
+          {
+            cat scripts/parity_parts/part_00 > /tmp/apply-jterm1-parity.py
+            for part in scripts/parity_parts/part_*.b64; do
+              base64 --decode "$part" >> /tmp/apply-jterm1-parity.py
+            done
+            python3 /tmp/apply-jterm1-parity.py
+            cargo fmt --all
+            rm -rf scripts/parity_parts .github/workflows/apply-jterm1-block-parity.yml
+            git fetch origin master --depth=1
+            git show origin/master:.github/workflows/ci.yml > .github/workflows/ci.yml
+          } > migration.log 2>&1
           status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
-          tail -n 80 migration.log
+          tail -n 120 migration.log
           exit 0
 
       - name: Upload migration diagnostics
@@ -44,5 +51,3 @@ jobs:
       - name: Fail when migration did not apply
         if: ${{ steps.migration.outputs.status != '0' }}
         run: exit 1
-
-# Trigger after the workflow exists on the PR branch.
