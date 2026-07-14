@@ -7,6 +7,12 @@ on:
     paths:
       - scripts/migrate_modern_file_tree.py
       - .github/workflows/modern-file-tree-migration.yml
+  pull_request:
+    branches:
+      - master
+    paths:
+      - scripts/migrate_modern_file_tree.py
+      - .github/workflows/modern-file-tree-migration.yml
 
 permissions:
   contents: write
