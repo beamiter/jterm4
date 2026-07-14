@@ -1066,6 +1066,13 @@ impl UiState {
         scrollback_row.set_title("Scrollback Lines");
         group.add(&scrollback_row);
 
+        let block_compact_row = adw::SwitchRow::builder()
+            .title("Compact Block Spacing")
+            .subtitle("Use the denser jterm1/Warp-style layout for new Block panes")
+            .active(config.block_compact)
+            .build();
+        group.add(&block_compact_row);
+
         page.add(&group);
         dialog.add(&page);
 
@@ -1139,6 +1146,12 @@ impl UiState {
             let val = row.value() as u32;
             ui.config.borrow_mut().terminal_scrollback_lines = val;
             ui.apply_scrollback_all();
+            save_config(&ui.config.borrow());
+        });
+
+        let ui = self.clone();
+        block_compact_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().block_compact = row.is_active();
             save_config(&ui.config.borrow());
         });
 

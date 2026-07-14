@@ -1587,7 +1587,7 @@ impl ReaderCtx {
                                     }
 
                                     {
-                                        let item = make_item("Scroll to Block Top");
+                                        let item = make_item("Scroll to Top of Block");
                                         let popover_c = popover.clone();
                                         let block = finished_menu_clone.clone();
                                         let scroll = block_scroll_for_menu.clone();
@@ -1598,7 +1598,7 @@ impl ReaderCtx {
                                         vbox.append(&item);
                                     }
                                     if finished_menu_clone.long_output {
-                                        let item = make_item("Jump to Block Bottom");
+                                        let item = make_item("Jump to Bottom of Block");
                                         let popover_c = popover.clone();
                                         let block = finished_menu_clone.clone();
                                         let scroll = block_scroll_for_menu.clone();
@@ -1615,6 +1615,35 @@ impl ReaderCtx {
                                         item.connect_clicked(move |_| {
                                             popover_c.popdown();
                                             (block.toggle_filter)();
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    {
+                                        let bookmarked =
+                                            bookmarks_for_menu.borrow().contains(&block_id);
+                                        let item = make_item(if bookmarked {
+                                            "Remove Bookmark"
+                                        } else {
+                                            "Bookmark Block"
+                                        });
+                                        let popover_c = popover.clone();
+                                        let block = finished_menu_clone.clone();
+                                        let bookmarks = bookmarks_for_menu.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            let mut marks = bookmarks.borrow_mut();
+                                            let now_bookmarked = if marks.remove(&block_id) {
+                                                false
+                                            } else {
+                                                marks.insert(block_id);
+                                                true
+                                            };
+                                            block.bookmark_star.set_visible(now_bookmarked);
+                                            if now_bookmarked {
+                                                block.widget().add_css_class("block-bookmarked");
+                                            } else {
+                                                block.widget().remove_css_class("block-bookmarked");
+                                            }
                                         });
                                         vbox.append(&item);
                                     }
