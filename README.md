@@ -68,6 +68,8 @@ jterm4 --print-default-config
 
 配置文件保存后会自动热重载；`Ctrl+Shift+R` 可手动重载。无效的新配置不会覆盖当前正在运行的有效配置。
 
+Block 模式可通过 `finished_block_viewport_rows` 调整长块出现顶部/底部导航控件的行数阈值；`block_compact = true` 可启用更接近 jterm1/Warp 的紧凑块间距。两项配置均保持 GTK4 原生实现，不增加运行时依赖。
+
 ## 核心快捷键
 
 | 功能 | 快捷键 |
@@ -91,6 +93,8 @@ jterm4 --print-default-config
 Block 模式与 jterm1 保持相同的选择语义：`Ctrl+Up` 从最新块进入选择，`Shift+Up/Down`
 扩展范围，普通 `Up/Down` 移动 active edge，`Enter` 按终端顺序把所有选中命令回填为
 可编辑文本而不执行，`Escape` 取消选择。右键多选区域可批量复制命令、输出或完整块；长 Block 提供顶部/底部跳转与 sticky header，后台异步输出使用独立 Block 样式。
+
+后台输出只会在提示符空闲且用户尚未开始编辑时归入独立 Block；一旦输入开始，后续输出保持在当前终端中，避免把 shell 回显、补全或交互输出错误拆块。
 
 ## 安全默认值
 
