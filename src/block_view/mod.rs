@@ -3731,7 +3731,7 @@ impl TermView {
 
     /// Reinsert all selected commands in terminal order without executing them.
     pub fn reinput_selected_commands(&self) {
-        if self.fulscreen.get() {
+        if self.fullscreen.get() {
             return;
         }
         let finished = self.finished_blocks.borrow();
