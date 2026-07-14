@@ -1,4 +1,4 @@
-name: Diagnose block round2 compile
+name: Fix block round2 GTK traits
 
 on:
   pull_request:
@@ -6,49 +6,45 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  fix:
     if: ${{ github.head_ref == 'agent/jterm1-block-parity-round2' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - name: Checkout branch
         uses: actions/checkout@v7
         with:
           ref: agent/jterm1-block-parity-round2
+          fetch-depth: 0
 
-      - name: Install GTK dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libpcre2-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Capture cargo check
-        id: check
+      - name: Add GTK extension traits
         shell: bash
         run: |
-          set +e
-          cargo check --all-targets --all-features --locked > check.log 2>&1
-          status=$?
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          tail -n 120 check.log
-          exit 0
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/block_view/alt_screen.rs')
+          text = path.read_text()
+          needle = 'use gtk4::glib;\n'
+          replacement = 'use gtk4::glib;\nuse gtk4::prelude::*;\n'
+          if replacement not in text:
+              if text.count(needle) != 1:
+                  raise SystemExit('unexpected gtk4::glib import count')
+              text = text.replace(needle, replacement, 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          rm -f .github/workflows/diagnose-block-round2.yml
 
-      - name: Upload diagnostics
-        uses: actions/upload-artifact@v4
-        with:
-          name: block-round2-check-log
-          path: check.log
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Fail when check failed
-        if: ${{ steps.check.outputs.status != '0' }}
-        run: exit 1
-
-# Trigger after workflow registration.
+      - name: Commit fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: import GTK traits for finished block settling"
+          git push origin HEAD:agent/jterm1-block-parity-round2
