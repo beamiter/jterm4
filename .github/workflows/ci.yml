@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -41,7 +41,7 @@ jobs:
         if: ${{ failure() && steps.fmt.conclusion == 'failure' }}
         run: |
           cargo fmt --all
-          git diff -- src/pty.rs src/block_view/scroll.rs > rustfmt.patch
+          git diff -- . > rustfmt.patch
 
       - name: Upload formatting diagnostics
         if: ${{ failure() && steps.fmt.conclusion == 'failure' }}
@@ -51,6 +51,26 @@ jobs:
           path: rustfmt.patch
           if-no-files-found: error
           retention-days: 1
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Check installer scripts
+        run: |
+          bash -n scripts/install.sh scripts/uninstall.sh
+          shellcheck scripts/install.sh scripts/uninstall.sh
+          scripts/install.sh --help >/dev/null
+          scripts/uninstall.sh --help >/dev/null
 
   clippy:
     name: Clippy
