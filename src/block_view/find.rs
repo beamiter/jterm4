@@ -59,6 +59,24 @@ fn snippet(line: &str) -> String {
     snippet
 }
 
+fn duration_matches(duration: Option<u64>, filters: &BlockFilters) -> bool {
+    let needs_duration =
+        filters.min_duration_ms.is_some() || filters.max_duration_ms.is_some() || filters.slow_only;
+    if !needs_duration {
+        return true;
+    }
+    let Some(duration) = duration else {
+        return false;
+    };
+    if filters.min_duration_ms.is_some_and(|min| duration < min) {
+        return false;
+    }
+    if filters.max_duration_ms.is_some_and(|max| duration > max) {
+        return false;
+    }
+    !filters.slow_only || duration >= filters.slow_threshold_ms
+}
+
 fn find_match_block<'a>(
     finished: &'a [super::FinishedBlock],
     fm: &FindMatch,
@@ -123,25 +141,8 @@ impl TermView {
                     return false;
                 }
 
-                // Duration predicates require a known duration. Background
-                // output and legacy history with no timing metadata must not
-                // leak into slow/min/max result sets.
-                if filters.min_duration_ms.is_some()
-                    || filters.max_duration_ms.is_some()
-                    || filters.slow_only
-                {
-                    let Some(duration) = b.duration_ms else {
-                        return false;
-                    };
-                    if filters.min_duration_ms.is_some_and(|min| duration < min) {
-                        return false;
-                    }
-                    if filters.max_duration_ms.is_some_and(|max| duration > max) {
-                        return false;
-                    }
-                    if filters.slow_only && duration < filters.slow_threshold_ms {
-                        return false;
-                    }
+                if !duration_matches(b.duration_ms, filters) {
+                    return false;
                 }
 
                 true
@@ -504,7 +505,36 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::snippet;
+    use super::{duration_matches, snippet};
+    use crate::block_view::BlockFilters;
+
+    #[test]
+    fn unknown_duration_does_not_match_duration_filters() {
+        let filters = BlockFilters {
+            slow_only: true,
+            slow_threshold_ms: 1_000,
+            ..Default::default()
+        };
+        assert!(!duration_matches(None, &filters));
+    }
+
+    #[test]
+    fn duration_boundaries_are_inclusive() {
+        let filters = BlockFilters {
+            min_duration_ms: Some(500),
+            max_duration_ms: Some(1_500),
+            ..Default::default()
+        };
+        assert!(duration_matches(Some(500), &filters));
+        assert!(duration_matches(Some(1_500), &filters));
+        assert!(!duration_matches(Some(499), &filters));
+        assert!(!duration_matches(Some(1_501), &filters));
+    }
+
+    #[test]
+    fn duration_is_irrelevant_without_duration_predicates() {
+        assert!(duration_matches(None, &BlockFilters::default()));
+    }
 
     #[test]
     fn snippet_passes_through_short_line() {

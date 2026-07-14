@@ -867,6 +867,9 @@ pub struct TermView {
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
     resize_tick_id: RefCell<Option<gtk4::TickCallbackId>>,
+    /// Periodic sticky-header refresh. Remove it explicitly on tab close so its
+    /// GTK captures cannot retain a detached block tree.
+    sticky_timer_id: RefCell<Option<glib::SourceId>>,
     /// Tracks per-VTE selections so a drag that crosses block boundaries can be
     /// copied as one contiguous string via Ctrl+Shift+C.
     cross_selection: Rc<CrossSelection>,
@@ -875,7 +878,13 @@ pub struct TermView {
 
 impl Drop for TermView {
     fn drop(&mut self) {
+        if let Err(err) = self.save_history() {
+            log::warn!("save block history on close: {err}");
+        }
         if let Some(id) = self.resize_tick_id.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.sticky_timer_id.borrow_mut().take() {
             id.remove();
         }
     }
@@ -3226,7 +3235,7 @@ impl TermView {
         // ── Sticky command header ────────────────────────────────────────
         // Running commands keep their status header; oversized finished blocks
         // pin their command after the original header scrolls above the viewport.
-        {
+        let sticky_timer_id = {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
             let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
@@ -3310,8 +3319,8 @@ impl TermView {
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue
-            });
-        }
+            })
+        };
 
         // ── VTE is used as a display-only widget (fed via feed() in alt-screen mode)
         //    so we do NOT attach it to the PTY. Our reader thread handles all I/O.
@@ -3572,6 +3581,7 @@ impl TermView {
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
             resize_tick_id: RefCell::new(None),
+            sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,
             block_finished_callbacks,
         };
