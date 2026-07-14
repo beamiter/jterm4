@@ -21,6 +21,8 @@ jobs:
           components: rustfmt
       - name: Apply formatter and lint cleanup
         run: |
+          # Keep this exact cleanup next to the formatter so the follow-up CI
+          # validates the same final source tree on every runner.
           sed -i '/use vte4::TerminalExt;/d' src/ui/panes.rs
           cargo fmt --all
           git rm .github/workflows/format-pr9.yml
