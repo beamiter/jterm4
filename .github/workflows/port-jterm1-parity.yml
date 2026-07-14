@@ -1,0 +1,52 @@
+name: Port remaining jterm1 block parity
+
+on:
+  push:
+    branches: [agent/jterm1-block-mode-parity]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    if: ${{ !contains(github.event.head_commit.message, '[port-step]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout parity branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-mode-parity
+          fetch-depth: 0
+
+      - name: Fix current compile blocker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/self\.fulscreen/self.fullscreen/' src/block_view/mod.rs
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/block_view/mod.rs
+          git commit -m "fix: correct block reinput fullscreen guard [port-step]"
+          git push origin HEAD:agent/jterm1-block-mode-parity
+
+      - name: Fetch validated jterm1 parity commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add jterm1 https://github.com/beamiter/jterm1.git
+          git fetch --no-tags jterm1 3aeb62fa0b861196a12254dee24f12a6a3ce7900 48eb38407f50ee729d5cde6402eb430e1fbe63c8
+
+      - name: Apply long-block and background-block changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cherry-pick -m 1 --no-commit 3aeb62fa0b861196a12254dee24f12a6a3ce7900
+          git cherry-pick -m 1 --no-commit 48eb38407f50ee729d5cde6402eb430e1fbe63c8
+          cargo fmt --all
+          rm .github/workflows/port-jterm1-parity.yml
+          git add -A
+          git commit -m "feat: port remaining jterm1 block parity [port-step]"
+          git push origin HEAD:agent/jterm1-block-mode-parity
