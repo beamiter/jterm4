@@ -1,4 +1,4 @@
-name: Export parity branch snapshot
+name: Export parity source snapshots
 
 on:
   pull_request:
@@ -14,19 +14,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Checkout parity branch
+      - name: Checkout jterm4 parity branch
         uses: actions/checkout@v7
         with:
           ref: agent/jterm1-block-mode-parity
           fetch-depth: 0
 
-      - name: Pack source snapshot
+      - name: Fetch jterm1 reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/beamiter/jterm1.git /tmp/jterm1
+
+      - name: Pack source snapshots
         shell: bash
         run: |
           set -euo pipefail
           tar --exclude=.git --exclude=target -czf /tmp/jterm4-parity-source.tar.gz .
+          tar --exclude=.git --exclude=target -C /tmp/jterm1 -czf /tmp/jterm1-reference-source.tar.gz .
 
-      - name: Upload source snapshot
+      - name: Upload jterm4 source
         uses: actions/upload-artifact@v4
         with:
           name: jterm4-parity-source
@@ -34,4 +41,10 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-# Trigger after the export workflow is registered on the PR branch.
+      - name: Upload jterm1 source
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-reference-source
+          path: /tmp/jterm1-reference-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
