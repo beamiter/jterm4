@@ -191,47 +191,6 @@ fn init_input_method_env() {
     }
 }
 
-#[allow(deprecated)]
-// TreeView/TreeStore are deprecated in GTK 4.10. The current sidebar file tree
-// still uses them; migrating to ColumnView/TreeListModel should be a focused UI
-// rewrite, not mixed into warning cleanup.
-fn build_file_tree_widgets() -> (gtk4::TreeStore, gtk4::TreeView) {
-    let file_tree_store = gtk4::TreeStore::new(&[
-        glib::types::Type::STRING, // 0: display name
-        glib::types::Type::STRING, // 1: absolute path
-        glib::types::Type::BOOL,   // 2: is directory
-        glib::types::Type::STRING, // 3: icon name
-    ]);
-    let file_tree = gtk4::TreeView::with_model(&file_tree_store);
-    file_tree.set_headers_visible(false);
-    file_tree.set_can_focus(true);
-    file_tree.add_css_class("file-tree");
-
-    let column = gtk4::TreeViewColumn::new();
-    let icon_renderer = gtk4::CellRendererPixbuf::new();
-    gtk4::prelude::CellLayoutExt::pack_start(&column, &icon_renderer, false);
-    gtk4::prelude::CellLayoutExt::add_attribute(&column, &icon_renderer, "icon-name", 3);
-    let text_renderer = gtk4::CellRendererText::new();
-    gtk4::prelude::CellLayoutExt::pack_start(&column, &text_renderer, true);
-    gtk4::prelude::CellLayoutExt::add_attribute(&column, &text_renderer, "text", 0);
-    file_tree.append_column(&column);
-
-    (file_tree_store, file_tree)
-}
-
-#[allow(deprecated)]
-fn connect_file_tree_handlers(file_tree: &gtk4::TreeView, ui: &UiState) {
-    let ui_for_ft_expand = ui.clone();
-    file_tree.connect_test_expand_row(move |_tv, iter, _path| {
-        ui_for_ft_expand.file_tree_on_expand(iter);
-        glib::Propagation::Proceed
-    });
-    let ui_for_ft_act = ui.clone();
-    file_tree.connect_row_activated(move |tv, path, _col| {
-        ui_for_ft_act.file_tree_on_activate(tv, path);
-    });
-}
-
 pub fn run() -> glib::ExitCode {
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
@@ -437,7 +396,7 @@ pub fn run() -> glib::ExitCode {
         sidebar_tabs_page.append(&tab_strip_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
-        let (file_tree_store, file_tree) = build_file_tree_widgets();
+        let (file_tree_model, file_tree) = ui::build_file_tree_widgets();
 
         let file_tree_scroll = ScrolledWindow::new();
         file_tree_scroll.set_hexpand(false);
@@ -566,9 +525,8 @@ pub fn run() -> glib::ExitCode {
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),
             sidebar_files_btn: sidebar_files_btn.clone(),
             sidebar_view: Rc::new(Cell::new(config.borrow().sidebar_view)),
-            file_tree_store: file_tree_store.clone(),
+            file_tree_model: file_tree_model.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
-            file_tree_scan_generation: Rc::new(Cell::new(0)),
             file_tree_root_label: file_tree_root_label.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
@@ -619,8 +577,8 @@ pub fn run() -> glib::ExitCode {
             ui_for_ft_up.file_tree_go_up();
         });
 
-        // Wire file-tree lazy expansion and row activation.
-        connect_file_tree_handlers(&file_tree, &ui);
+        // Wire file-tree expansion and file activation.
+        ui.connect_file_tree_handlers(&file_tree);
 
         // Wire sidebar Tabs/Files segmented switcher
         let ui_for_tabs_view = ui.clone();

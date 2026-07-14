@@ -1,10 +1,5 @@
-#![allow(deprecated)]
-// The sidebar file tree still uses GTK's deprecated TreeStore type. Keep the
-// allowance local to the UI module until the file browser is migrated to
-// ColumnView/TreeListModel.
-
 use gtk4::Notebook;
-use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton, TreeStore};
+use gtk4::{CssProvider, ScrolledWindow, SearchBar, SearchEntry, Stack, ToggleButton};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -32,6 +27,7 @@ mod tabs;
 mod zoom;
 
 pub(crate) use ai_panel::AiPanel;
+pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
 pub(crate) use pane_tree_edit::{
@@ -94,9 +90,8 @@ pub(crate) struct UiState {
     pub(crate) sidebar_files_btn: ToggleButton,
     /// Which sidebar view the user prefers (persisted).
     pub(crate) sidebar_view: Rc<Cell<SidebarView>>,
-    pub(crate) file_tree_store: TreeStore,
+    pub(crate) file_tree_model: FileTreeModel,
     pub(crate) file_tree_root: Rc<RefCell<PathBuf>>,
-    pub(crate) file_tree_scan_generation: Rc<Cell<u64>>,
     pub(crate) file_tree_root_label: gtk4::Label,
     pub(crate) tab_search_entry: SearchEntry,
     pub(crate) selected_tabs: Rc<RefCell<Vec<String>>>,
