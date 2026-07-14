@@ -1,0 +1,31 @@
+name: Apply round 10 zoom editor
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.head_ref == 'agent/jterm4-zoom-tree-editor' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm4-zoom-tree-editor
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Move zoom structural edits into tree editor
+        run: |
+          python3 .github/scripts/migrate_round10.py
+          cargo fmt --all
+          git rm .github/scripts/migrate_round10.py .github/workflows/apply-round10.yml .round10-trigger
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ui/mod.rs src/ui/pane_tree_edit.rs src/ui/zoom.rs
+          git commit -m "Centralize zoom pane tree edits"
+          git push origin HEAD:agent/jterm4-zoom-tree-editor
