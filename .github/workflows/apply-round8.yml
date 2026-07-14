@@ -1,0 +1,31 @@
+name: Apply round 8 pane operations
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.head_ref == 'agent/jterm4-pane-node-operations' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm4-pane-node-operations
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Route pane operations through PaneNode
+        run: |
+          python3 .github/scripts/migrate_round8.py
+          cargo fmt --all
+          git rm .github/scripts/migrate_round8.py .github/workflows/apply-round8.yml .round8-trigger
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ui/pane_node.rs src/ui/panes.rs src/ui/zoom.rs src/ui/tabs.rs
+          git commit -m "Route pane operations through PaneNode"
+          git push origin HEAD:agent/jterm4-pane-node-operations
