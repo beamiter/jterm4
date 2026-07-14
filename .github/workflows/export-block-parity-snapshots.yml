@@ -1,0 +1,49 @@
+name: Export block parity snapshots
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: ${{ github.head_ref == 'agent/jterm1-block-parity-round2' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout jterm4 parity branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-parity-round2
+
+      - name: Fetch jterm1 reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/beamiter/jterm1.git /tmp/jterm1
+
+      - name: Pack snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=target -czf /tmp/jterm4-block-parity.tar.gz .
+          tar --exclude=.git --exclude=target -C /tmp/jterm1 -czf /tmp/jterm1-block-reference.tar.gz .
+
+      - name: Upload jterm4 snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm4-block-parity
+          path: /tmp/jterm4-block-parity.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload jterm1 snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-block-reference
+          path: /tmp/jterm1-block-reference.tar.gz
+          if-no-files-found: error
+          retention-days: 1
