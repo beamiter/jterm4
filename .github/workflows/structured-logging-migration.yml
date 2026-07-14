@@ -49,7 +49,43 @@ jobs:
           shared-key: structured-logging-migration
 
       - name: Apply migration
-        run: python3 scripts/migrate_structured_logging.py
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/migrate_structured_logging.py")
+          text = path.read_text()
+          text = text.replace(
+              "use log::{LevelFilter, Log, Metadata, Record};\nuse std::time::Instant;",
+              "use log::{LevelFilter, Log, Metadata, Record};\nuse std::cmp::Reverse;\nuse std::time::Instant;",
+              1,
+          )
+          text = text.replace(
+              """    fn max_level(&self) -> LevelFilter {
+                  self.directives
+                      .iter()
+                      .map(|(_, level)| *level)
+                      .fold(self.default_level, std::cmp::max)
+              }
+          """,
+              """    fn max_level(&self) -> LevelFilter {
+                  let mut max_level = self.default_level;
+                  for (_, level) in &self.directives {
+                      max_level = max_level.max(*level);
+                  }
+                  max_level
+              }
+          """,
+              1,
+          )
+          text = text.replace(
+              "directives.sort_by(|left, right| right.0.len().cmp(&left.0.len()));",
+              "directives.sort_by_key(|(target, _)| Reverse(target.len()));",
+              1,
+          )
+          path.write_text(text)
+          PY
+          python3 scripts/migrate_structured_logging.py
 
       - name: Format sources
         run: cargo fmt --all
@@ -58,7 +94,19 @@ jobs:
         run: cargo test --all-features --locked
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        id: clippy
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee clippy.log
+
+      - name: Upload Clippy diagnostics
+        if: ${{ failure() && steps.clippy.conclusion == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: structured-logging-clippy
+          path: clippy.log
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Check documentation
         env:
