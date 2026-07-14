@@ -47,12 +47,12 @@ replace_once(path, """    FilterPinnedBlocks,
 """)
 
 replace_once(path, """            Action::ClearBlockFilter => "Jump to oldest block",
-            Action::JumpToPrevPinned => "Jump to previous pinned block",
+            Action::JumpToPrevPinned => "Jump to previous bookmarked block",
 """, """            Action::ClearBlockFilter => "Jump to oldest block",
             Action::SelectAllBlocks => "Select all blocks",
             Action::ClearBlocks => "Clear blocks",
             Action::ReinputSelectedCommands => "Reinput selected commands",
-            Action::JumpToPrevPinned => "Jump to previous pinned block",
+            Action::JumpToPrevPinned => "Jump to previous bookmarked block",
 """)
 
 replace_once(path, """            Action::ClearBlockFilter => Some("clear_block_filter"),
