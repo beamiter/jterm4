@@ -5,18 +5,20 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      time: "04:17"
+      timezone: Etc/UTC
     open-pull-requests-limit: 5
     groups:
-      rust-dependencies:
-        patterns:
-          - "*"
+      rust-minor-and-patch:
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 3
     groups:
       github-actions:
         patterns:

@@ -5,6 +5,7 @@ edition = "2021"
 description = "A session-aware GTK4 terminal with structured command blocks"
 repository = "https://github.com/beamiter/jterm4"
 readme = "README.md"
+publish = false
 categories = ["command-line-utilities", "development-tools"]
 autobins = false
 

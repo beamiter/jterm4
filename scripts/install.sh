@@ -1,60 +1,191 @@
 #!/usr/bin/env bash
-# jterm4 installation script
+# Install jterm4 from a source checkout using Nix or Cargo.
 
-set -e
+set -Eeuo pipefail
+umask 077
 
-echo "🚀 Installing jterm4..."
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+HOME_DIR="${HOME:-}"
+DESTDIR="${DESTDIR:-}"
+PREFIX="${HOME_DIR}/.local"
+BIN_DIR=""
+BACKEND="auto"
+INSTALL_CONFIG=1
+DRY_RUN=0
 
-# Check if nix is available
-if ! command -v nix &> /dev/null; then
-    echo "❌ Error: nix is required but not found"
-    echo "   Please install nix first: https://nixos.org/download.html"
+usage() {
+    cat <<'USAGE'
+Usage: ./scripts/install.sh [options]
+
+Options:
+  --prefix PATH          Runtime prefix (default: ~/.local)
+  --bin-dir PATH         Runtime binary directory (overrides --prefix)
+  --backend auto|nix|cargo
+                         Build backend (default: auto; prefers Nix)
+  --no-config            Do not install config.toml.example
+  --dry-run              Print commands without changing files
+  -h, --help             Show this help
+
+Environment:
+  DESTDIR                Optional staging root for packaging
+  XDG_CONFIG_HOME        Config base (default: ~/.config)
+  CARGO_TARGET_DIR       Cargo target directory (default: <repo>/target)
+USAGE
+}
+
+die() {
+    printf 'jterm4 install: %s\n' "$*" >&2
     exit 1
+}
+
+print_command() {
+    printf '  '
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+run() {
+    print_command "$@"
+    if ((DRY_RUN == 0)); then
+        "$@"
+    fi
+}
+
+run_in_repo() {
+    printf '  (cd %q && ' "${REPO_ROOT}"
+    printf '%q ' "$@"
+    printf ')\n'
+    if ((DRY_RUN == 0)); then
+        (cd -- "${REPO_ROOT}" && "$@")
+    fi
+}
+
+require_command() {
+    if command -v "$1" >/dev/null 2>&1; then
+        return
+    fi
+    ((DRY_RUN == 1)) || die "required command not found: $1"
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --prefix)
+            (($# >= 2)) || die "--prefix requires a path"
+            PREFIX="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            PREFIX="${1#*=}"
+            shift
+            ;;
+        --bin-dir)
+            (($# >= 2)) || die "--bin-dir requires a path"
+            BIN_DIR="$2"
+            shift 2
+            ;;
+        --bin-dir=*)
+            BIN_DIR="${1#*=}"
+            shift
+            ;;
+        --backend)
+            (($# >= 2)) || die "--backend requires auto, nix, or cargo"
+            BACKEND="$2"
+            shift 2
+            ;;
+        --backend=*)
+            BACKEND="${1#*=}"
+            shift
+            ;;
+        --no-config)
+            INSTALL_CONFIG=0
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            (($# == 0)) || die "unexpected positional arguments: $*"
+            ;;
+        *)
+            die "unknown option: $1"
+            ;;
+    esac
+done
+
+[[ -n "${HOME_DIR}" ]] || die "HOME is not set"
+[[ -n "${PREFIX}" ]] || die "prefix must not be empty"
+[[ "${PREFIX}" == /* ]] || die "--prefix must be an absolute path"
+if [[ -z "${BIN_DIR}" ]]; then
+    BIN_DIR="${PREFIX}/bin"
+fi
+[[ "${BIN_DIR}" == /* ]] || die "--bin-dir must be an absolute path"
+if [[ -n "${DESTDIR}" ]]; then
+    [[ "${DESTDIR}" == /* ]] || die "DESTDIR must be an absolute path"
+    DESTDIR="${DESTDIR%/}"
 fi
 
-# Build release version
-echo "📦 Building release version..."
-nix develop --command bash -c "cargo build --release"
+case "${BACKEND}" in
+    auto)
+        if command -v nix >/dev/null 2>&1; then
+            BACKEND="nix"
+        else
+            BACKEND="cargo"
+        fi
+        ;;
+    nix|cargo) ;;
+    *) die "invalid backend '${BACKEND}'; expected auto, nix, or cargo" ;;
+esac
 
-# Check if build succeeded
-if [ ! -f "target/release/jterm4" ]; then
-    echo "❌ Build failed"
-    exit 1
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+if [[ "${TARGET_DIR}" != /* ]]; then
+    TARGET_DIR="${REPO_ROOT}/${TARGET_DIR}"
+fi
+export CARGO_TARGET_DIR="${TARGET_DIR}"
+
+printf 'Building jterm4 with %s...\n' "${BACKEND}"
+case "${BACKEND}" in
+    nix)
+        require_command nix
+        run_in_repo nix develop --command cargo build --release --locked
+        ;;
+    cargo)
+        require_command cargo
+        run_in_repo cargo build --release --locked
+        ;;
+esac
+
+BINARY="${TARGET_DIR}/release/jterm4"
+if ((DRY_RUN == 0)) && [[ ! -x "${BINARY}" ]]; then
+    die "release binary was not produced at ${BINARY}"
 fi
 
-# Install binary
-INSTALL_DIR="${HOME}/.local/bin"
-mkdir -p "${INSTALL_DIR}"
+require_command install
+STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
+run install -d -m 0755 "${STAGED_BIN_DIR}"
+run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm4"
 
-echo "📥 Installing to ${INSTALL_DIR}/jterm4..."
-cp target/release/jterm4 "${INSTALL_DIR}/jterm4"
-chmod +x "${INSTALL_DIR}/jterm4"
-
-# Create config directory
-CONFIG_DIR="${HOME}/.config/jterm4"
-mkdir -p "${CONFIG_DIR}"
-
-# Copy example config if no config exists
-if [ ! -f "${CONFIG_DIR}/config.toml" ]; then
-    if [ -f "config.toml.example" ]; then
-        echo "📝 Creating default config at ${CONFIG_DIR}/config.toml..."
-        cp config.toml.example "${CONFIG_DIR}/config.toml"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
+[[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
+CONFIG_DIR="${CONFIG_HOME}/jterm4"
+STAGED_CONFIG_DIR="${DESTDIR}${CONFIG_DIR}"
+if ((INSTALL_CONFIG == 1)); then
+    run install -d -m 0700 "${STAGED_CONFIG_DIR}"
+    if [[ ! -e "${STAGED_CONFIG_DIR}/config.toml" ]]; then
+        run install -m 0600 "${REPO_ROOT}/config.toml.example" "${STAGED_CONFIG_DIR}/config.toml"
+    else
+        printf 'Keeping existing config: %s\n' "${CONFIG_DIR}/config.toml"
     fi
 fi
 
-echo ""
-echo "✅ Installation complete!"
-echo ""
-echo "🎉 jterm4 is now installed at ${INSTALL_DIR}/jterm4"
-echo ""
-echo "📖 Next steps:"
-echo "   1. Make sure ${INSTALL_DIR} is in your PATH"
-echo "   2. Run: jterm4"
-echo "   3. Edit config: ${CONFIG_DIR}/config.toml"
-echo ""
-echo "💡 Tips:"
-echo "   - Press Ctrl+Shift+P to search all commands and shortcuts"
-echo "   - Use Ctrl+Shift+E / Ctrl+Shift+D for VTE split panes"
-echo "   - Validate config with: jterm4 --check-config"
-echo "   - Session state is automatically saved and restored"
-echo ""
+printf 'Installed jterm4 to %s\n' "${BIN_DIR}/jterm4"
+if [[ -n "${DESTDIR}" ]]; then
+    printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm4"
+fi
+printf 'Validate with: %s --doctor\n' "${BIN_DIR}/jterm4"

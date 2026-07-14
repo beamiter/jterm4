@@ -18,7 +18,7 @@ jterm4 --print-config-path
 jterm4 --check-config
 ```
 
-这些命令在 GTK 初始化前完成，因此可在 SSH、TTY 和 CI 中运行。使用其他配置文件：
+这些命令在 GTK 初始化前完成，因此可在 SSH、TTY 和 CI 中运行。`--doctor` 还会报告 ready / active 会话快照数量。日志可用 `JTERM4_LOG=debug`，或使用 `RUST_LOG='warn,jterm4=debug,jterm4::state=trace'` 按模块设置；每行包含相对时间、级别和 target。使用其他配置文件：
 
 ```bash
 jterm4 --config ~/configs/work.toml
@@ -52,6 +52,8 @@ Block 模式目前不开放分屏。旧实现会先启动 PTY、随后因内部 
 | 标签栏位置 | `Ctrl+Shift+B` |
 
 标签支持拖放排序、双击重命名、固定、标记、复制以及右键菜单。侧栏可在 Tabs 与 Files 之间切换；标签移到顶栏时，过滤动作仍会显示可见的搜索输入框。
+
+每个 jterm4 窗口维护独立的活动快照。正常关闭后，快照才会发布给未来窗口；同时运行的窗口不会读取或覆盖彼此状态。多个窗口关闭后，后续启动会逐个原子领取最近的快照。异常退出留下的活动快照会在确认原进程已结束后自动回收，旧版 `tabs.state` 也会在首次启动时无损迁移。`jterm4 --doctor` 只报告 ready / active 数量，不暴露路径或标签内容。
 
 ## 4. VTE 分屏
 

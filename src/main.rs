@@ -7,7 +7,6 @@ use gtk4::{
     Notebook, Orientation, ScrolledWindow, SearchBar, SearchEntry,
 };
 use libadwaita as adw;
-use log::{LevelFilter, Log, Metadata, Record};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
@@ -16,51 +15,12 @@ use std::rc::Rc;
 
 use crate::config::{choose_shell_argv, config_file_path, load_config};
 use crate::keybindings::{normalize_key, Action, KeyCombo};
-use crate::state::{kill_all_terminal_children, load_tabs_state, save_tabs_state};
+use crate::logging::init_logging;
+use crate::state::{
+    finalize_tabs_state, kill_all_terminal_children, load_tabs_state, save_tabs_state,
+};
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
-
-struct SimpleStderrLogger {
-    level: LevelFilter,
-}
-
-impl Log for SimpleStderrLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn parse_level_filter(input: &str) -> LevelFilter {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "off" => LevelFilter::Off,
-        "error" => LevelFilter::Error,
-        "warn" | "warning" => LevelFilter::Warn,
-        "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
-        _ => LevelFilter::Warn,
-    }
-}
-
-fn init_logging() {
-    let level = std::env::var("JTERM4_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .ok()
-        .as_deref()
-        .map(parse_level_filter)
-        .unwrap_or(LevelFilter::Warn);
-
-    let _ = log::set_boxed_logger(Box::new(SimpleStderrLogger { level }));
-    log::set_max_level(level);
-}
 
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())
@@ -189,47 +149,6 @@ fn init_input_method_env() {
             unsafe { std::env::set_var("XMODIFIERS", format!("@im={module}")) };
         }
     }
-}
-
-#[allow(deprecated)]
-// TreeView/TreeStore are deprecated in GTK 4.10. The current sidebar file tree
-// still uses them; migrating to ColumnView/TreeListModel should be a focused UI
-// rewrite, not mixed into warning cleanup.
-fn build_file_tree_widgets() -> (gtk4::TreeStore, gtk4::TreeView) {
-    let file_tree_store = gtk4::TreeStore::new(&[
-        glib::types::Type::STRING, // 0: display name
-        glib::types::Type::STRING, // 1: absolute path
-        glib::types::Type::BOOL,   // 2: is directory
-        glib::types::Type::STRING, // 3: icon name
-    ]);
-    let file_tree = gtk4::TreeView::with_model(&file_tree_store);
-    file_tree.set_headers_visible(false);
-    file_tree.set_can_focus(true);
-    file_tree.add_css_class("file-tree");
-
-    let column = gtk4::TreeViewColumn::new();
-    let icon_renderer = gtk4::CellRendererPixbuf::new();
-    gtk4::prelude::CellLayoutExt::pack_start(&column, &icon_renderer, false);
-    gtk4::prelude::CellLayoutExt::add_attribute(&column, &icon_renderer, "icon-name", 3);
-    let text_renderer = gtk4::CellRendererText::new();
-    gtk4::prelude::CellLayoutExt::pack_start(&column, &text_renderer, true);
-    gtk4::prelude::CellLayoutExt::add_attribute(&column, &text_renderer, "text", 0);
-    file_tree.append_column(&column);
-
-    (file_tree_store, file_tree)
-}
-
-#[allow(deprecated)]
-fn connect_file_tree_handlers(file_tree: &gtk4::TreeView, ui: &UiState) {
-    let ui_for_ft_expand = ui.clone();
-    file_tree.connect_test_expand_row(move |_tv, iter, _path| {
-        ui_for_ft_expand.file_tree_on_expand(iter);
-        glib::Propagation::Proceed
-    });
-    let ui_for_ft_act = ui.clone();
-    file_tree.connect_row_activated(move |tv, path, _col| {
-        ui_for_ft_act.file_tree_on_activate(tv, path);
-    });
 }
 
 pub fn run() -> glib::ExitCode {
@@ -437,7 +356,7 @@ pub fn run() -> glib::ExitCode {
         sidebar_tabs_page.append(&tab_strip_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
-        let (file_tree_store, file_tree) = build_file_tree_widgets();
+        let (file_tree_model, file_tree) = ui::build_file_tree_widgets();
 
         let file_tree_scroll = ScrolledWindow::new();
         file_tree_scroll.set_hexpand(false);
@@ -566,9 +485,8 @@ pub fn run() -> glib::ExitCode {
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),
             sidebar_files_btn: sidebar_files_btn.clone(),
             sidebar_view: Rc::new(Cell::new(config.borrow().sidebar_view)),
-            file_tree_store: file_tree_store.clone(),
+            file_tree_model: file_tree_model.clone(),
             file_tree_root: Rc::new(RefCell::new(std::path::PathBuf::new())),
-            file_tree_scan_generation: Rc::new(Cell::new(0)),
             file_tree_root_label: file_tree_root_label.clone(),
             tab_search_entry: tab_search_entry.clone(),
             selected_tabs: Rc::new(RefCell::new(Vec::new())),
@@ -619,8 +537,8 @@ pub fn run() -> glib::ExitCode {
             ui_for_ft_up.file_tree_go_up();
         });
 
-        // Wire file-tree lazy expansion and row activation.
-        connect_file_tree_handlers(&file_tree, &ui);
+        // Wire file-tree expansion and file activation.
+        ui.connect_file_tree_handlers(&file_tree);
 
         // Wire sidebar Tabs/Files segmented switcher
         let ui_for_tabs_view = ui.clone();
@@ -654,8 +572,9 @@ pub fn run() -> glib::ExitCode {
             ui_for_add.add_new_tab(working_directory, None, None, startup);
         });
 
-        // Restore tabs from last session snapshot (and delete it immediately).
-        // Each instance saves its own state on close; the last one closed wins.
+        // Atomically claim one ready window snapshot. Other running instances
+        // keep separate active files, so concurrent windows cannot overwrite or
+        // restore one another's state.
         let (saved_current, saved_tabs) = load_tabs_state();
         if saved_tabs.is_empty() {
             let startup = ui.config.borrow().startup_commands.clone();
@@ -940,6 +859,9 @@ pub fn run() -> glib::ExitCode {
             while notebook_for_close_request.n_pages() > 0 {
                 notebook_for_close_request.remove_page(Some(0));
             }
+            // Make the final snapshot visible only after this window is fully
+            // quiesced. Any queued auto-save callbacks become no-ops.
+            finalize_tabs_state();
 
             // Directly quit the application
             app_for_close.quit();

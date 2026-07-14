@@ -177,6 +177,9 @@ fn doctor() -> bool {
         true
     };
 
+    let (ready_snapshots, active_snapshots) = crate::state::session_snapshot_counts();
+    println!("session snapshots: {ready_snapshots} ready, {active_snapshots} active");
+
     let (config, _, _) = load_config();
     let shell = choose_shell_argv(config.shell.as_deref());
     println!("shell: {}", shell.join(" "));

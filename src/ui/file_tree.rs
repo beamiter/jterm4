@@ -1,12 +1,15 @@
-//! file_tree — sidebar file browser for UiState.
-#![allow(deprecated)]
-// This module owns the current TreeView/TreeStore implementation. GTK 4.10
-// deprecates it in favor of ColumnView/TreeListModel, which is a larger rewrite.
+//! file_tree — asynchronous GTK4 sidebar file browser for UiState.
+//!
+//! The browser uses `TreeListModel` + `ListView`, the supported GTK4 model-view
+//! stack. Directory enumeration remains off the UI thread and is created lazily
+//! when a directory row is expanded.
 
 use gtk4::prelude::*;
-use gtk4::{glib, TreeIter, TreePath, TreeRowReference, TreeStore, TreeView};
+use gtk4::{gio, glib, ListView, SignalListItemFactory, TreeListModel, TreeListRow};
+use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 use vte4::TerminalExt;
@@ -14,14 +17,9 @@ use vte4::TerminalExt;
 use super::*;
 use crate::terminal::terminal_working_directory;
 
-// TreeStore column indices.
-const COL_NAME: i32 = 0;
-const COL_PATH: i32 = 1;
-const COL_IS_DIR: i32 = 2;
-const COL_ICON: i32 = 3;
 const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FileEntry {
     name: String,
     path: PathBuf,
@@ -80,37 +78,202 @@ where
     Ok(())
 }
 
-fn append_entries(store: &TreeStore, parent: Option<&TreeIter>, entries: Vec<FileEntry>) {
-    for FileEntry { name, path, is_dir } in entries {
-        let icon = if is_dir {
+fn append_entries(store: &gio::ListStore, entries: Vec<FileEntry>) {
+    for entry in entries {
+        store.append(&glib::BoxedAnyObject::new(entry));
+    }
+}
+
+fn entry_from_row(row: &TreeListRow) -> Option<FileEntry> {
+    let object = row.item()?;
+    let boxed = object.downcast::<glib::BoxedAnyObject>().ok()?;
+    let entry = boxed.try_borrow::<FileEntry>().ok()?;
+    Some((*entry).clone())
+}
+
+/// Owns the root list, flattened tree model, and cancellation generation for the
+/// current sidebar root. Cloning this value only clones the underlying GLib
+/// objects and shared generation counter.
+#[derive(Clone)]
+pub(crate) struct FileTreeModel {
+    root_store: gio::ListStore,
+    tree_model: TreeListModel,
+    generation: Rc<Cell<u64>>,
+}
+
+impl FileTreeModel {
+    fn new() -> Self {
+        let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let generation = Rc::new(Cell::new(0_u64));
+        let tree_model = TreeListModel::new(root_store.clone(), false, false, {
+            let generation = generation.clone();
+            move |object| {
+                let boxed = object.downcast_ref::<glib::BoxedAnyObject>()?;
+                let entry = boxed.try_borrow::<FileEntry>().ok()?;
+                if !entry.is_dir {
+                    return None;
+                }
+                let path = entry.path.clone();
+                drop(entry);
+
+                let children = gio::ListStore::new::<glib::BoxedAnyObject>();
+                let children_for_scan = children.clone();
+                let generation_for_scan = generation.clone();
+                let expected_generation = generation.get();
+                let path_for_result = path.clone();
+                let path_for_error = path.clone();
+                if let Err(error) = request_dir_scan(path, move |result| {
+                    if generation_for_scan.get() != expected_generation {
+                        return;
+                    }
+                    match result {
+                        Ok(entries) => append_entries(&children_for_scan, entries),
+                        Err(error) => log::warn!(
+                            "failed to scan directory {}: {error}",
+                            path_for_result.display()
+                        ),
+                    }
+                }) {
+                    log::warn!(
+                        "failed to start directory scan for {}: {error}",
+                        path_for_error.display()
+                    );
+                }
+
+                Some(children.upcast())
+            }
+        });
+
+        Self {
+            root_store,
+            tree_model,
+            generation,
+        }
+    }
+
+    fn reset(&self) -> u64 {
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        self.root_store.remove_all();
+        generation
+    }
+
+    fn replace_root(&self, generation: u64, entries: Vec<FileEntry>) -> bool {
+        if self.generation.get() != generation {
+            return false;
+        }
+        self.root_store.remove_all();
+        append_entries(&self.root_store, entries);
+        true
+    }
+
+    fn row_entry(&self, position: u32) -> Option<(TreeListRow, FileEntry)> {
+        let row = self.tree_model.row(position)?;
+        let entry = entry_from_row(&row)?;
+        Some((row, entry))
+    }
+}
+
+/// Build the modern GTK4 list-model file browser.
+pub(crate) fn build_file_tree_widgets() -> (FileTreeModel, ListView) {
+    let model = FileTreeModel::new();
+    let factory = SignalListItemFactory::new();
+
+    factory.connect_setup(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+
+        let icon = gtk4::Image::new();
+        icon.set_pixel_size(16);
+        let label = gtk4::Label::new(None);
+        label.set_hexpand(true);
+        label.set_xalign(0.0);
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+        let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        row_box.append(&icon);
+        row_box.append(&label);
+
+        let expander = gtk4::TreeExpander::new();
+        expander.set_child(Some(&row_box));
+        list_item.set_child(Some(&expander));
+    });
+
+    factory.connect_bind(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+            return;
+        };
+        let Some(row) = list_item
+            .item()
+            .and_then(|item| item.downcast::<TreeListRow>().ok())
+        else {
+            return;
+        };
+        let Some(expander) = list_item
+            .child()
+            .and_then(|child| child.downcast::<gtk4::TreeExpander>().ok())
+        else {
+            return;
+        };
+        expander.set_list_row(Some(&row));
+
+        let Some(entry) = entry_from_row(&row) else {
+            return;
+        };
+        let Some(row_box) = expander
+            .child()
+            .and_then(|child| child.downcast::<gtk4::Box>().ok())
+        else {
+            return;
+        };
+        let Some(icon) = row_box
+            .first_child()
+            .and_then(|child| child.downcast::<gtk4::Image>().ok())
+        else {
+            return;
+        };
+        let Some(label) = row_box
+            .last_child()
+            .and_then(|child| child.downcast::<gtk4::Label>().ok())
+        else {
+            return;
+        };
+
+        icon.set_icon_name(Some(if entry.is_dir {
             "folder-symbolic"
         } else {
             "text-x-generic-symbolic"
+        }));
+        label.set_text(&entry.name);
+        let path = entry.path.to_string_lossy();
+        label.set_tooltip_text(Some(path.as_ref()));
+    });
+
+    factory.connect_unbind(|_, object| {
+        let Some(list_item) = object.downcast_ref::<gtk4::ListItem>() else {
+            return;
         };
-        let path_str = path.to_string_lossy().into_owned();
-        let iter = store.insert_with_values(
-            parent,
-            None,
-            &[
-                (COL_NAME as u32, &name),
-                (COL_PATH as u32, &path_str),
-                (COL_IS_DIR as u32, &is_dir),
-                (COL_ICON as u32, &icon),
-            ],
-        );
-        if is_dir {
-            store.insert_with_values(
-                Some(&iter),
-                None,
-                &[
-                    (COL_NAME as u32, &""),
-                    (COL_PATH as u32, &""),
-                    (COL_IS_DIR as u32, &false),
-                    (COL_ICON as u32, &""),
-                ],
-            );
-        }
-    }
+        let Some(expander) = list_item
+            .child()
+            .and_then(|child| child.downcast::<gtk4::TreeExpander>().ok())
+        else {
+            return;
+        };
+        expander.set_list_row(None);
+    });
+
+    let selection = gtk4::SingleSelection::new(Some(model.tree_model.clone()));
+    selection.set_autoselect(false);
+    selection.set_can_unselect(true);
+
+    let file_tree = ListView::new(Some(selection), Some(factory));
+    file_tree.set_single_click_activate(false);
+    file_tree.set_show_separators(false);
+    file_tree.set_can_focus(true);
+    file_tree.add_css_class("file-tree");
+
+    (model, file_tree)
 }
 
 impl UiState {
@@ -121,32 +284,32 @@ impl UiState {
             .as_ref()
             .and_then(terminal_working_directory)
             .map(PathBuf::from)
-            .filter(|p| p.is_dir())
+            .filter(|path| path.is_dir())
             .or_else(home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         self.set_file_tree_root(start);
     }
 
-    /// Rebuild the tree with `root` at the top.
+    /// Rebuild the tree with `root` at the top. Results from older scans are
+    /// ignored, so rapid cwd changes cannot repopulate the browser with stale data.
     pub(crate) fn set_file_tree_root(&self, root: PathBuf) {
-        let generation = self.file_tree_scan_generation.get().wrapping_add(1);
-        self.file_tree_scan_generation.set(generation);
-        self.file_tree_store.clear();
+        let generation = self.file_tree_model.reset();
         self.file_tree_root_label.set_text(&display_path(&root));
         self.file_tree_root_label
             .set_tooltip_text(Some(&root.to_string_lossy()));
         *self.file_tree_root.borrow_mut() = root.clone();
 
-        let store = self.file_tree_store.clone();
-        let active_generation = self.file_tree_scan_generation.clone();
-        let active_root = self.file_tree_root.clone();
+        let model = self.file_tree_model.clone();
         let expected_root = root.clone();
+        let active_root = self.file_tree_root.clone();
         if let Err(error) = request_dir_scan(root, move |result| {
-            if active_generation.get() != generation || *active_root.borrow() != expected_root {
+            if *active_root.borrow() != expected_root {
                 return;
             }
             match result {
-                Ok(entries) => append_entries(&store, None, entries),
+                Ok(entries) => {
+                    model.replace_root(generation, entries);
+                }
                 Err(error) => log::warn!(
                     "failed to scan file-tree root {}: {error}",
                     expected_root.display()
@@ -164,7 +327,7 @@ impl UiState {
             .as_ref()
             .and_then(terminal_working_directory)
             .map(PathBuf::from)
-            .filter(|p| p.is_dir());
+            .filter(|path| path.is_dir());
         match cwd {
             Some(dir) => {
                 if *self.file_tree_root.borrow() != dir {
@@ -172,8 +335,8 @@ impl UiState {
                 }
             }
             None => {
-                // No reportable cwd (e.g. remote shell) — leave the tree as-is,
-                // unless it was never initialized.
+                // No reportable cwd (for example, a remote shell). Keep the
+                // current tree unless it has never been initialized.
                 if self.file_tree_root.borrow().as_os_str().is_empty() {
                     if let Some(home) = home_dir() {
                         self.set_file_tree_root(home);
@@ -191,125 +354,31 @@ impl UiState {
         }
     }
 
-    /// Lazily fill a directory row's real children on first expansion.
-    pub(crate) fn file_tree_on_expand(&self, iter: &TreeIter) {
-        // A not-yet-loaded directory has a single placeholder child (empty path).
-        let Some(first_child) = self.file_tree_store.iter_children(Some(iter)) else {
-            return;
-        };
-        let child_path: String = self
-            .file_tree_store
-            .get_value(&first_child, COL_PATH)
-            .get()
-            .unwrap_or_default();
-        if !child_path.is_empty() {
-            return; // already populated
-        }
-        let scan_in_progress: bool = self
-            .file_tree_store
-            .get_value(&first_child, COL_IS_DIR)
-            .get()
-            .unwrap_or(false);
-        if scan_in_progress {
-            return;
-        }
-        let dir_path: String = self
-            .file_tree_store
-            .get_value(iter, COL_PATH)
-            .get()
-            .unwrap_or_default();
-        if dir_path.is_empty() {
-            return;
-        }
-        let Some(row_ref) =
-            TreeRowReference::new(&self.file_tree_store, &self.file_tree_store.path(iter))
-        else {
-            return;
-        };
+    /// Connect activation after UiState exists. Directory activation toggles the
+    /// corresponding TreeListRow; file activation inserts a shell-quoted path.
+    pub(crate) fn connect_file_tree_handlers(&self, file_tree: &ListView) {
+        let ui = self.clone();
+        file_tree.connect_activate(move |_, position| {
+            let Some((row, entry)) = ui.file_tree_model.row_entry(position) else {
+                return;
+            };
+            if entry.is_dir {
+                row.set_expanded(!row.is_expanded());
+                return;
+            }
 
-        // Reuse the invisible placeholder's boolean column as an in-flight bit.
-        self.file_tree_store
-            .set(&first_child, &[(COL_IS_DIR as u32, &true)]);
-        let store = self.file_tree_store.clone();
-        let active_generation = self.file_tree_scan_generation.clone();
-        let generation = active_generation.get();
-        let expected_path = dir_path.clone();
-        if let Err(error) = request_dir_scan(PathBuf::from(dir_path), move |result| {
-            if active_generation.get() != generation {
-                return;
+            let file_path = entry.path.to_string_lossy();
+            let snippet = format!("{} ", shell_quote(file_path.as_ref()));
+            if let Some(term_view) = ui.current_term_view() {
+                // Block mode owns its PTY instead of attaching it to the display
+                // VTE, so route through the shared TermView input path.
+                term_view.write_input(snippet.as_bytes());
+                term_view.grab_focus();
+            } else if let Some(term) = ui.current_terminal() {
+                term.feed_child(snippet.as_bytes());
+                term.grab_focus();
             }
-            let Some(row_path) = row_ref.path() else {
-                return;
-            };
-            let Some(parent) = store.iter(&row_path) else {
-                return;
-            };
-            let current_path: String = store.get_value(&parent, COL_PATH).get().unwrap_or_default();
-            if current_path != expected_path {
-                return;
-            }
-            let Some(placeholder) = store.iter_children(Some(&parent)) else {
-                return;
-            };
-            let placeholder_path: String = store
-                .get_value(&placeholder, COL_PATH)
-                .get()
-                .unwrap_or_default();
-            if !placeholder_path.is_empty() {
-                return;
-            }
-            store.remove(&placeholder);
-            match result {
-                Ok(entries) => append_entries(&store, Some(&parent), entries),
-                Err(error) => {
-                    log::warn!("failed to scan directory {expected_path}: {error}")
-                }
-            }
-        }) {
-            self.file_tree_store
-                .set(&first_child, &[(COL_IS_DIR as u32, &false)]);
-            log::warn!("failed to start directory scan: {error}");
-        }
-    }
-
-    /// Double-click / Enter: expand directories, insert file paths into the
-    /// active terminal.
-    pub(crate) fn file_tree_on_activate(&self, tv: &TreeView, path: &TreePath) {
-        let Some(iter) = self.file_tree_store.iter(path) else {
-            return;
-        };
-        let is_dir: bool = self
-            .file_tree_store
-            .get_value(&iter, COL_IS_DIR)
-            .get()
-            .unwrap_or(false);
-        if is_dir {
-            if tv.row_expanded(path) {
-                tv.collapse_row(path);
-            } else {
-                tv.expand_row(path, false);
-            }
-            return;
-        }
-        let file_path: String = self
-            .file_tree_store
-            .get_value(&iter, COL_PATH)
-            .get()
-            .unwrap_or_default();
-        if file_path.is_empty() {
-            return;
-        }
-        let snippet = format!("{} ", shell_quote(&file_path));
-        if let Some(term_view) = self.current_term_view() {
-            // Block mode owns its PTY instead of attaching it to the display VTE,
-            // so `Terminal::feed_child` has nowhere to write.  Route through the
-            // TermView input path just like keyboard input and clipboard paste.
-            term_view.write_input(snippet.as_bytes());
-            term_view.grab_focus();
-        } else if let Some(term) = self.current_terminal() {
-            term.feed_child(snippet.as_bytes());
-            term.grab_focus();
-        }
+        });
     }
 }
 
@@ -320,19 +389,19 @@ fn home_dir() -> Option<PathBuf> {
 /// Abbreviate the home directory to `~` for the header label.
 fn display_path(path: &Path) -> String {
     if let Some(home) = home_dir() {
-        if let Ok(rel) = path.strip_prefix(&home) {
-            if rel.as_os_str().is_empty() {
+        if let Ok(relative) = path.strip_prefix(&home) {
+            if relative.as_os_str().is_empty() {
                 return "~".to_string();
             }
-            return format!("~/{}", rel.to_string_lossy());
+            return format!("~/{}", relative.to_string_lossy());
         }
     }
     path.to_string_lossy().to_string()
 }
 
 /// Single-quote a path for safe shell insertion.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -368,5 +437,10 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["Able", "beta", "Alpha.txt", "Zulu.txt"]);
+    }
+
+    #[test]
+    fn shell_quote_preserves_spaces_and_apostrophes() {
+        assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
     }
 }
