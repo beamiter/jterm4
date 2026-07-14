@@ -1,0 +1,56 @@
+name: Diagnose block parity tests
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-log:
+    if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout parity branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/jterm1-block-mode-parity
+
+      - name: Install GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests with captured output
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          cargo test --all-features --locked > test.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          tail -n 160 test.log
+          exit 0
+
+      - name: Upload test diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: block-parity-test-log
+          path: test.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Fail when tests failed
+        if: ${{ steps.tests.outputs.status != '0' }}
+        run: exit 1
