@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -71,19 +72,25 @@ fn atomic_write(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(parent)?;
 
     let temp_path = parent.join(temp_file_name(target)?);
     let result = (|| {
         let mut temp = OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(0o600)
             .open(&temp_path)?;
+        temp.set_permissions(fs::Permissions::from_mode(0o600))?;
         write_contents(&mut temp)?;
         temp.flush()?;
         temp.sync_all()?;
         drop(temp);
         fs::rename(&temp_path, target)?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
 
         // Persist the directory entry as well as the file contents. Directory
         // syncing is supported on the Unix platforms jterm4 targets.
@@ -242,6 +249,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -325,6 +333,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"first");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(target.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
 
         atomic_write(&target, |file| {
             use std::io::Write as _;

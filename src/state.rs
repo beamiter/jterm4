@@ -4,7 +4,9 @@ use gtk4::{Label, Notebook, Paned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -29,6 +31,37 @@ struct WindowStatePaths {
 
 static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+fn make_file_private(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+fn write_private_file(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)?.sync_all()
+}
 
 fn window_state_directory() -> PathBuf {
     glib::user_config_dir().join("jterm4").join("windows")
@@ -111,7 +144,15 @@ fn recover_stale_active_snapshots(directory: &Path) {
         }
         let ready = active.with_extension(READY_STATE_EXTENSION);
         match fs::rename(&active, &ready) {
-            Ok(()) => log::info!("Recovered interrupted window snapshot {}", ready.display()),
+            Ok(()) => {
+                if let Err(error) = make_file_private(&ready) {
+                    log::warn!(
+                        "Failed to tighten snapshot permissions {}: {error}",
+                        ready.display()
+                    );
+                }
+                log::info!("Recovered interrupted window snapshot {}", ready.display());
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
                 "Failed to recover interrupted window snapshot {}: {error}",
@@ -148,7 +189,7 @@ fn prune_ready_snapshots_in(directory: &Path, keep: usize) {
 
 fn prepare_active_tabs_state_path() -> PathBuf {
     let paths = window_state_paths();
-    if let Err(error) = fs::create_dir_all(&paths.directory) {
+    if let Err(error) = ensure_private_directory(&paths.directory) {
         log::warn!(
             "Failed to create window-state directory {}: {error}",
             paths.directory.display()
@@ -167,6 +208,12 @@ fn prepare_active_tabs_state_path() -> PathBuf {
     if legacy.exists() {
         match fs::rename(&legacy, &paths.active) {
             Ok(()) => {
+                if let Err(error) = make_file_private(&paths.active) {
+                    log::warn!(
+                        "Failed to tighten legacy snapshot permissions {}: {error}",
+                        paths.active.display()
+                    );
+                }
                 log::info!("Claimed legacy tabs snapshot {}", legacy.display());
                 return paths.active.clone();
             }
@@ -179,6 +226,12 @@ fn prepare_active_tabs_state_path() -> PathBuf {
     }
 
     if let Some(claimed) = claim_ready_snapshot_in(&paths.directory, &paths.active) {
+        if let Err(error) = make_file_private(&paths.active) {
+            log::warn!(
+                "Failed to tighten claimed snapshot permissions {}: {error}",
+                paths.active.display()
+            );
+        }
         log::info!("Claimed window snapshot {}", claimed.display());
     }
     prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
@@ -448,6 +501,18 @@ pub(crate) fn finalize_tabs_state() {
     }
     match fs::rename(&paths.active, &paths.ready) {
         Ok(()) => {
+            if let Err(error) = make_file_private(&paths.ready) {
+                log::warn!(
+                    "Failed to tighten published snapshot permissions {}: {error}",
+                    paths.ready.display()
+                );
+            }
+            if let Err(error) = sync_parent_directory(&paths.ready) {
+                log::debug!(
+                    "Failed to sync window-state directory {}: {error}",
+                    paths.directory.display()
+                );
+            }
             prune_ready_snapshots_in(&paths.directory, MAX_READY_WINDOW_STATES);
             log::info!("Published window snapshot {}", paths.ready.display());
         }
@@ -751,7 +816,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     log::info!("Saving tabs state to: {}", path.display());
 
     if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
+        if let Err(err) = ensure_private_directory(parent) {
             log::error!("Failed to create state dir {}: {err}", parent.display());
             return;
         }
@@ -798,7 +863,7 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
             .unwrap_or_else(|| "tabs.state.tmp".to_string()),
     );
 
-    if let Err(err) = fs::write(&tmp_path, &payload) {
+    if let Err(err) = write_private_file(&tmp_path, payload.as_bytes()) {
         log::error!(
             "Failed to write temp state file {}: {err}",
             tmp_path.display()
@@ -820,6 +885,18 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         }
     }
 
+    if let Err(err) = make_file_private(&path) {
+        log::warn!(
+            "Failed to tighten state permissions {}: {err}",
+            path.display()
+        );
+    }
+    if let Err(err) = sync_parent_directory(&path) {
+        log::debug!(
+            "Failed to sync state directory for {}: {err}",
+            path.display()
+        );
+    }
     log::info!("Successfully saved tabs state to {}", path.display());
 }
 
@@ -889,5 +966,26 @@ mod tests {
         prune_ready_snapshots_in(&directory, 2);
         assert_eq!(ready_snapshots_in(&directory).len(), 2);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn private_state_storage_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_state_dir("private-permissions");
+        let directory = root.join("windows");
+        let snapshot = directory.join("window-1-1.active");
+        ensure_private_directory(&directory).unwrap();
+        write_private_file(&snapshot, b"state").unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

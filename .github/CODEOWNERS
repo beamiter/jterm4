@@ -1,0 +1,6 @@
+* @beamiter
+/.github/workflows/ @beamiter
+/src/state.rs @beamiter
+/src/pty.rs @beamiter
+/src/block_view/ @beamiter
+/SECURITY.md @beamiter
