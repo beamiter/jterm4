@@ -59,11 +59,16 @@ impl UiState {
     }
 
     pub(crate) fn split_current(&self, orientation: Orientation) {
-        // A TermView owns a whole block list around its live VTE. Treating that
-        // inner VTE as a pane leaf starts an orphan shell because the widget
-        // cannot be replaced in the Notebook/Paned tree. Fail visibly and
-        // safely until block panes use the dedicated PaneLeaf abstraction.
-        if self.current_term_view().is_some() {
+        let page_node = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+            .and_then(|widget| PaneNode::from_widget(&widget));
+
+        // A Block leaf owns a structured history surface around its live VTE.
+        // Refuse before creating a second PTY until split construction itself
+        // creates typed Block leaves. Existing VTE split trees remain supported.
+        if page_node.as_ref().is_some_and(PaneNode::contains_block) {
             let dialog = adw::AlertDialog::new(
                 Some("Split panes require VTE mode"),
                 Some(
