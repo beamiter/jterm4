@@ -119,8 +119,8 @@ impl UiState {
                     }
                 }
 
-                if let Some(term) = find_first_terminal(&sibling) {
-                    term.grab_focus();
+                if let Some(node) = PaneNode::from_widget(&sibling) {
+                    node.grab_focus();
                 }
             }
         } else {
@@ -189,15 +189,19 @@ impl UiState {
     }
 
     pub(crate) fn close_focused_pane_or_tab(&self) {
-        if let Some(page_num) = self.notebook.current_page() {
-            if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
-                // If the page has splits, close the focused pane only
-                if widget.clone().downcast::<Paned>().is_ok() {
-                    if let Some(term) = find_focused_terminal(&widget) {
-                        kill_terminal_child(&term);
-                        self.handle_terminal_exited(&term.upcast::<gtk4::Widget>());
-                        return;
-                    }
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
+        if let Some(node) = PaneNode::from_widget(&page_widget) {
+            if node.is_split() {
+                if let Some(leaf) = node.active_leaf() {
+                    let terminal = leaf.terminal().clone();
+                    kill_terminal_child(&terminal);
+                    self.handle_terminal_exited(&terminal.upcast::<gtk4::Widget>());
+                    return;
                 }
             }
         }

@@ -1,8 +1,8 @@
 //! Typed structural view of a notebook pane tree.
 //!
 //! Every direct or split pane root carries a `PaneLeaf` controller. Reconstructing
-//! the GTK `Paned` hierarchy into this recursive model gives focus, active-terminal
-//! lookup, and split safety checks one ownership-aware path without introducing
+//! the GTK `Paned` hierarchy into this recursive model gives navigation, focus,
+//! close, move, and zoom operations one ownership-aware path without introducing
 //! Relm4 or enabling Block splits.
 
 use gtk4::prelude::*;
@@ -34,6 +34,10 @@ impl PaneNode {
         PaneLeaf::from_widget(widget).map(Self::Leaf)
     }
 
+    pub(crate) fn is_split(&self) -> bool {
+        matches!(self, Self::Split { .. })
+    }
+
     pub(crate) fn contains_block(&self) -> bool {
         match self {
             Self::Leaf(controller) => controller.is_block(),
@@ -41,48 +45,49 @@ impl PaneNode {
         }
     }
 
+    pub(crate) fn leaves(&self) -> Vec<PaneLeaf> {
+        let mut leaves = Vec::new();
+        self.collect_leaves(&mut leaves);
+        leaves
+    }
+
+    pub(crate) fn focused_leaf(&self) -> Option<PaneLeaf> {
+        match self {
+            Self::Leaf(controller) if controller.terminal().has_focus() => Some(controller.clone()),
+            Self::Leaf(_) => None,
+            Self::Split { start, end } => start.focused_leaf().or_else(|| end.focused_leaf()),
+        }
+    }
+
+    pub(crate) fn active_leaf(&self) -> Option<PaneLeaf> {
+        self.focused_leaf().or_else(|| self.first_leaf())
+    }
+
     pub(crate) fn active_terminal(&self) -> Option<Terminal> {
-        self.focused_terminal().or_else(|| self.first_terminal())
+        self.active_leaf()
+            .map(|controller| controller.terminal().clone())
     }
 
     pub(crate) fn grab_focus(&self) {
+        if let Some(controller) = self.active_leaf() {
+            controller.grab_focus();
+        }
+    }
+
+    fn collect_leaves(&self, leaves: &mut Vec<PaneLeaf>) {
         match self {
-            Self::Leaf(controller) => controller.grab_focus(),
+            Self::Leaf(controller) => leaves.push(controller.clone()),
             Self::Split { start, end } => {
-                if start.contains_focus() {
-                    start.grab_focus();
-                } else if end.contains_focus() {
-                    end.grab_focus();
-                } else {
-                    start.grab_focus();
-                }
+                start.collect_leaves(leaves);
+                end.collect_leaves(leaves);
             }
         }
     }
 
-    fn contains_focus(&self) -> bool {
+    fn first_leaf(&self) -> Option<PaneLeaf> {
         match self {
-            Self::Leaf(controller) => controller.terminal().has_focus(),
-            Self::Split { start, end } => start.contains_focus() || end.contains_focus(),
-        }
-    }
-
-    fn focused_terminal(&self) -> Option<Terminal> {
-        match self {
-            Self::Leaf(controller) if controller.terminal().has_focus() => {
-                Some(controller.terminal().clone())
-            }
-            Self::Leaf(_) => None,
-            Self::Split { start, end } => {
-                start.focused_terminal().or_else(|| end.focused_terminal())
-            }
-        }
-    }
-
-    fn first_terminal(&self) -> Option<Terminal> {
-        match self {
-            Self::Leaf(controller) => Some(controller.terminal().clone()),
-            Self::Split { start, end } => start.first_terminal().or_else(|| end.first_terminal()),
+            Self::Leaf(controller) => Some(controller.clone()),
+            Self::Split { start, end } => start.first_leaf().or_else(|| end.first_leaf()),
         }
     }
 }
