@@ -5,7 +5,8 @@ use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use crate::state::terminate_terminal_process;
 
@@ -43,6 +44,9 @@ const G_PRIORITY_DEFAULT_IDLE: i32 = 200;
 const PTY_QUEUE_CAPACITY: usize = 8;
 /// Smaller chunks cap the amount of VTE feeding performed in one UI callback.
 const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
+/// Keep a continuously-ready PTY from monopolizing GTK's main loop. The first
+/// chunk is dispatched immediately; queued follow-ups are paced at this rate.
+const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 struct FdWatchData<F: FnMut() -> bool> {
     callback: F,
@@ -242,11 +246,11 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        let fd = match self
+        let reader_fd = match self
             .master
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|fd| fd.as_raw_fd()))
+            .and_then(|guard| guard.as_ref().and_then(|fd| fd.try_clone().ok()))
         {
             Some(fd) => fd,
             None => return,
@@ -258,101 +262,54 @@ impl OwnedPty {
         // Create an eventfd for signaling data availability to the main thread.
         let efd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if efd < 0 {
-            // Fallback to 1ms polling if eventfd creation fails.
-            self.start_reader_polling(fd, child_pid, tx, rx, callback, on_exit);
+            self.start_reader_polling(reader_fd, child_pid, tx, rx, callback, on_exit);
             return;
         }
-
-        let efd_for_thread = efd;
-
-        std::thread::Builder::new()
-            .name("jterm4-pty-reader".to_string())
-            .spawn(move || {
-                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-                let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
-                loop {
-                    match file.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            std::mem::forget(file);
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
-                                std::mem::forget(file);
-                                return;
-                            }
-                            signal_eventfd(efd_for_thread);
-                        }
-                    }
-                }
-
-                let max_wait_secs = 5;
-                for _ in 0..(max_wait_secs * 10) {
-                    match nix::sys::wait::waitpid(
-                        child_pid,
-                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                    ) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                            let _ = tx.send(PtyMsg::Exit(code));
-                            signal_eventfd(efd_for_thread);
-                            return;
-                        }
-                        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                            let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
-                            signal_eventfd(efd_for_thread);
-                            return;
-                        }
-                        Err(_) | Ok(_) => {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    }
-                }
-
-                match nix::sys::wait::waitpid(child_pid, None) {
-                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                        let _ = tx.send(PtyMsg::Exit(code));
-                    }
-                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                        let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
-                    }
-                    _ => {
-                        let _ = tx.send(PtyMsg::Exit(1));
-                    }
-                }
-                signal_eventfd(efd_for_thread);
-            })
-            .expect("failed to spawn PTY reader thread");
+        let eventfd = Arc::new(unsafe { OwnedFd::from_raw_fd(efd) });
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let eventfd_for_thread = Arc::clone(&eventfd);
+        let wake_pending_for_thread = Arc::clone(&wake_pending);
+        spawn_reader_thread(reader_fd, child_pid, tx, "jterm4-pty-reader", move || {
+            notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
+        });
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
-        unix_fd_add_local(efd, move || {
-            // Drain the eventfd counter.
-            let mut val: u64 = 0;
-            unsafe {
-                libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
-            }
+        unix_fd_add_local(eventfd.as_raw_fd(), move || {
+            drain_eventfd(eventfd.as_raw_fd());
 
-            match rx.try_recv() {
-                Ok(PtyMsg::Data(data)) => {
+            // A producer may enqueue between the first empty read and clearing
+            // `wake_pending`. Recheck after clearing so that transition cannot
+            // lose its only eventfd notification.
+            let message = match rx.try_recv() {
+                Ok(message) => message,
+                Err(mpsc::TryRecvError::Empty) => {
+                    wake_pending.store(false, Ordering::Release);
+                    match rx.try_recv() {
+                        Ok(message) => {
+                            wake_pending.store(true, Ordering::Release);
+                            drain_eventfd(eventfd.as_raw_fd());
+                            message
+                        }
+                        Err(mpsc::TryRecvError::Empty) => return true,
+                        Err(mpsc::TryRecvError::Disconnected) => return false,
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            };
+
+            match message {
+                PtyMsg::Data(data) => {
                     callback(data);
-                    // The read above consumed an aggregate wakeup counter. Re-arm
-                    // the fd so any remaining queued chunk gets a later dispatch.
-                    signal_eventfd(efd);
+                    let eventfd = Arc::clone(&eventfd);
+                    glib::timeout_add_local_once(PTY_DISPATCH_INTERVAL, move || {
+                        signal_eventfd(eventfd.as_raw_fd());
+                    });
                     true
                 }
-                Ok(PtyMsg::Exit(code)) => {
+                PtyMsg::Exit(code) => {
                     if let Some(f) = on_exit.take() {
                         f(code);
-                    }
-                    unsafe {
-                        libc::close(efd);
-                    }
-                    false
-                }
-                Err(mpsc::TryRecvError::Empty) => true,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    unsafe {
-                        libc::close(efd);
                     }
                     false
                 }
@@ -362,7 +319,7 @@ impl OwnedPty {
 
     fn start_reader_polling<F, E>(
         &self,
-        fd: RawFd,
+        reader_fd: OwnedFd,
         child_pid: Pid,
         tx: mpsc::SyncSender<PtyMsg>,
         rx: mpsc::Receiver<PtyMsg>,
@@ -372,64 +329,12 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        std::thread::Builder::new()
-            .name("jterm4-pty-reader-poll".to_string())
-            .spawn(move || {
-                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-                let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
-                loop {
-                    match file.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            std::mem::forget(file);
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(PtyMsg::Data(buf[..n].to_vec())).is_err() {
-                                std::mem::forget(file);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                let max_wait_secs = 5;
-                for _ in 0..(max_wait_secs * 10) {
-                    match nix::sys::wait::waitpid(
-                        child_pid,
-                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
-                    ) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                            let _ = tx.send(PtyMsg::Exit(code));
-                            return;
-                        }
-                        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                            let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
-                            return;
-                        }
-                        Err(_) | Ok(_) => {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    }
-                }
-
-                match nix::sys::wait::waitpid(child_pid, None) {
-                    Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
-                        let _ = tx.send(PtyMsg::Exit(code));
-                    }
-                    Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => {
-                        let _ = tx.send(PtyMsg::Exit(128 + sig as i32));
-                    }
-                    _ => {
-                        let _ = tx.send(PtyMsg::Exit(1));
-                    }
-                }
-            })
-            .expect("failed to spawn polling PTY reader thread");
+        spawn_reader_thread(reader_fd, child_pid, tx, "jterm4-pty-reader-poll", || {});
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
 
-        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
+        glib::timeout_add_local(PTY_DISPATCH_INTERVAL, move || {
             match rx.borrow().try_recv() {
                 Ok(PtyMsg::Data(data)) => {
                     callback(data);
@@ -445,6 +350,107 @@ impl OwnedPty {
                 Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             }
         });
+    }
+}
+
+fn spawn_reader_thread(
+    reader_fd: OwnedFd,
+    child_pid: Pid,
+    tx: mpsc::SyncSender<PtyMsg>,
+    thread_name: &'static str,
+    notify: impl Fn() + Send + 'static,
+) {
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let mut file = std::fs::File::from(reader_fd);
+            let fd = file.as_raw_fd();
+            let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                    Ok(n) => {
+                        let mut combined = Vec::with_capacity(PTY_READ_CHUNK_BYTES);
+                        combined.extend_from_slice(&buf[..n]);
+                        coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                        if tx.send(PtyMsg::Data(combined)).is_err() {
+                            return;
+                        }
+                        notify();
+                    }
+                }
+            }
+
+            let code = wait_for_child_exit(child_pid);
+            if tx.send(PtyMsg::Exit(code)).is_ok() {
+                notify();
+            }
+        })
+        .expect("failed to spawn PTY reader thread");
+}
+
+fn wait_for_child_exit(child_pid: Pid) -> i32 {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+
+    for _ in 0..50 {
+        match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => return code,
+            Ok(WaitStatus::Signaled(_, signal, _)) => return 128 + signal as i32,
+            Err(_) | Ok(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    match waitpid(child_pid, None) {
+        Ok(WaitStatus::Exited(_, code)) => code,
+        Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
+        _ => 1,
+    }
+}
+
+/// Merge bytes already waiting on the PTY into one bounded delivery. This
+/// reduces GTK crossings for programs that emit a repaint in several writes.
+fn coalesce_pending(fd: RawFd, file: &mut std::fs::File, buf: &mut [u8], combined: &mut Vec<u8>) {
+    const MAX_FOLLOWUP_READS: u32 = 8;
+    let mut follow_ups = 0u32;
+    while combined.len() < PTY_READ_CHUNK_BYTES && follow_ups < MAX_FOLLOWUP_READS {
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 1) };
+        if ready <= 0 || (poll_fd.revents & libc::POLLIN) == 0 {
+            break;
+        }
+
+        let remaining = PTY_READ_CHUNK_BYTES - combined.len();
+        let read_len = remaining.min(buf.len());
+        match file.read(&mut buf[..read_len]) {
+            Ok(0) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+            Ok(read) => combined.extend_from_slice(&buf[..read]),
+        }
+        follow_ups += 1;
+    }
+}
+
+fn notify_eventfd_once(eventfd: &OwnedFd, wake_pending: &AtomicBool) {
+    if !wake_pending.swap(true, Ordering::AcqRel) {
+        signal_eventfd(eventfd.as_raw_fd());
+    }
+}
+
+fn drain_eventfd(eventfd: RawFd) {
+    let mut value = 0u64;
+    unsafe {
+        libc::read(
+            eventfd,
+            (&mut value as *mut u64).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        );
     }
 }
 
@@ -482,5 +488,40 @@ mod tests {
         reader.read_exact(&mut received).expect("read payload");
         handle.join().expect("writer thread");
         assert!(received.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn eventfd_wakeup_is_coalesced_until_consumer_rearms() {
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let eventfd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let wake_pending = AtomicBool::new(false);
+
+        notify_eventfd_once(&eventfd, &wake_pending);
+        notify_eventfd_once(&eventfd, &wake_pending);
+
+        let mut value = 0u64;
+        let read = unsafe {
+            libc::read(
+                eventfd.as_raw_fd(),
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<u64>());
+        assert_eq!(value, 1);
+
+        wake_pending.store(false, Ordering::Release);
+        notify_eventfd_once(&eventfd, &wake_pending);
+        value = 0;
+        let read = unsafe {
+            libc::read(
+                eventfd.as_raw_fd(),
+                (&mut value as *mut u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(read as usize, std::mem::size_of::<u64>());
+        assert_eq!(value, 1);
     }
 }

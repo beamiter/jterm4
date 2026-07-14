@@ -6,7 +6,7 @@
 
 ### PTY 输出合并
 
-Block reader 使用容量为 8 的有界队列传递最多 32KiB 的输出块，GTK 每次事件回调只处理一块；当 UI 落后时，reader 和内核 PTY 缓冲区会自然施加背压。当前 eventfd 在持续输出时会立即重新就绪，尚未按固定帧间隔调度；极高吞吐下仍应以输入延迟和 frame time 验证是否需要显式节流。
+Block reader 使用容量为 8 的有界队列传递最多 32KiB 的输出块，GTK 每次事件回调只处理一块；当 UI 落后时，reader 和内核 PTY 缓冲区会自然施加背压。首次 eventfd 唤醒立即分发，持续积压的后续块按 8ms 间隔调度，避免输出源反复立即就绪而长期占用 GTK 主循环。
 
 ### Block 输出上限
 
@@ -114,7 +114,7 @@ show_repo_strip = false
 ## 已知架构瓶颈
 
 - Block 完成记录使用多个 VTE widget 和多份输出表示，尚未实现 model-backed renderer recycling。
-- 自管 PTY reader 已有约 256KiB 的队列上限，但持续就绪的 eventfd 尚未提供显式帧边界。
+- 自管 PTY reader 已有约 256KiB 的队列上限和 8ms 积压调度间隔；仍需用 soak test 校验多 PTY 同时输出时的吞吐、公平性和输入延迟。
 - 文件树和历史加载仍有主线程 I/O。
 - `TermView` 的状态由较多 `Rc<RefCell<_>>` 回调共享，难以做纯 reducer 基准。
 
