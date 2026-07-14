@@ -89,6 +89,9 @@ ai_redact_secrets = true
 # select_all_blocks = "Ctrl+Shift+A"
 # reinput_selected_commands = "Ctrl+Shift+I"
 # clear_blocks = "Ctrl+Shift+K"
+# toggle_tab_placement = "Ctrl+Alt+B"
+# focus_pane_up = "Ctrl+Alt+Shift+Up"
+# focus_pane_down = "Ctrl+Alt+Shift+Down"
 # toggle_ai_panel = "Ctrl+Alt+Shift+A"
 # opacity_increase = "Ctrl+Alt+Shift+K"
 

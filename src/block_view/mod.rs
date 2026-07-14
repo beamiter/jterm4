@@ -663,21 +663,7 @@ fn scroll_selected_finished_block_edge(
     let Some(block) = finished.iter().find(|block| block.id == id) else {
         return false;
     };
-    let widget = block.widget().clone();
-    let scroll = scroll.clone();
-    glib::idle_add_local_once(move || {
-        let Some(bounds) = widget.compute_bounds(&scroll) else {
-            return;
-        };
-        let adj = scroll.vadjustment();
-        let delta = if bottom {
-            (bounds.y() + bounds.height()) as f64 - adj.page_size() + 18.0
-        } else {
-            bounds.y() as f64 - 18.0
-        };
-        let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
-        adj.set_value((adj.value() + delta).clamp(adj.lower(), max_value));
-    });
+    block.scroll_to_edge(scroll, bottom);
     true
 }
 
@@ -1528,6 +1514,39 @@ impl ReaderCtx {
                                         vbox.append(&item);
                                     }
 
+                                    {
+                                        let item = make_item("Scroll to Block Top");
+                                        let popover_c = popover.clone();
+                                        let block = finished_menu_clone.clone();
+                                        let scroll = block_scroll_rc.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            block.scroll_to_edge(&scroll, false);
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    if finished_menu_clone.long_output {
+                                        let item = make_item("Jump to Block Bottom");
+                                        let popover_c = popover.clone();
+                                        let block = finished_menu_clone.clone();
+                                        let scroll = block_scroll_rc.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            block.scroll_to_edge(&scroll, true);
+                                        });
+                                        vbox.append(&item);
+                                    }
+                                    {
+                                        let item = make_item("Toggle Output Filter");
+                                        let popover_c = popover.clone();
+                                        let block = finished_menu_clone.clone();
+                                        item.connect_clicked(move |_| {
+                                            popover_c.popdown();
+                                            (block.toggle_filter)();
+                                        });
+                                        vbox.append(&item);
+                                    }
+
                                     let separator =
                                         gtk4::Separator::new(gtk4::Orientation::Horizontal);
                                     vbox.append(&separator);
@@ -2302,13 +2321,31 @@ impl KeyCtx {
                 return glib::Propagation::Proceed;
             }
 
-            // Ctrl+B: toggle a bookmark on the selected block (Warp's
-            // ToggleBookmarkBlock). Shows the gutter star + accent stripe.
+            // Linux Warp toggles the selected/latest block's output filter with Alt+Shift+F.
+            if alt
+                && shift
+                && !ctrl
+                && matches!(keyval, Key::f | Key::F)
+                && bstate_for_key.get() != BlockState::AltScreen
+            {
+                let finished = finished_blocks_for_key.borrow();
+                let target = selected_block_id_for_key
+                    .get()
+                    .and_then(|id| finished.iter().find(|block| block.id == id))
+                    .or_else(|| finished.last());
+                if let Some(block) = target {
+                    (block.toggle_filter)();
+                    return glib::Propagation::Stop;
+                }
+            }
+
+            // Ctrl+Shift+B: toggle a bookmark on the selected block (Warp's
+            // Linux binding). Shows the gutter star + accent stripe.
             // Only consume the key when bookmark logic actually fires — in
             // alt-screen (vim/less) or with no selection, let VTE deliver
             // Ctrl+B to the running app (e.g. vim's page-up).
             if ctrl
-                && !shift
+                && shift
                 && !alt
                 && matches!(keyval, Key::b | Key::B)
                 && bstate_for_key.get() != BlockState::AltScreen
@@ -2522,13 +2559,49 @@ impl TermView {
         sticky_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         sticky_label.set_hexpand(true);
         sticky_label.add_css_class("sticky-running-label");
-        let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        let sticky_jump_bottom_btn = gtk4::Button::with_label("\u{f103}");
+        sticky_jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        sticky_jump_bottom_btn.add_css_class("sticky-header-control");
+        sticky_jump_bottom_btn.add_css_class("flat");
+        sticky_jump_bottom_btn.set_focusable(false);
+        sticky_jump_bottom_btn.set_visible(false);
+        let sticky_minimize_btn = gtk4::Button::with_label("\u{f077}");
+        sticky_minimize_btn.set_tooltip_text(Some("Minimize sticky command header"));
+        sticky_minimize_btn.add_css_class("sticky-header-control");
+        sticky_minimize_btn.add_css_class("flat");
+        sticky_minimize_btn.set_focusable(false);
+        let sticky_bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         sticky_bar.add_css_class("sticky-running-header");
         sticky_bar.append(&sticky_label);
+        sticky_bar.append(&sticky_jump_bottom_btn);
+        sticky_bar.append(&sticky_minimize_btn);
         sticky_bar.set_halign(gtk4::Align::Fill);
         sticky_bar.set_valign(gtk4::Align::Start);
         sticky_bar.set_visible(false);
         sticky_bar.set_can_focus(false);
+        let sticky_target_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
+        let sticky_minimized: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let minimized = sticky_minimized.clone();
+            let label = sticky_label.clone();
+            let jump = sticky_jump_bottom_btn.clone();
+            let bar = sticky_bar.clone();
+            sticky_minimize_btn.connect_clicked(move |button| {
+                let now = !minimized.get();
+                minimized.set(now);
+                label.set_visible(!now);
+                jump.set_visible(false);
+                if now {
+                    bar.add_css_class("sticky-minimized");
+                    button.set_label("\u{f078}");
+                    button.set_tooltip_text(Some("Expand sticky command header"));
+                } else {
+                    bar.remove_css_class("sticky-minimized");
+                    button.set_label("\u{f077}");
+                    button.set_tooltip_text(Some("Minimize sticky command header"));
+                }
+            });
+        }
 
         let scroll_overlay = gtk4::Overlay::new();
         scroll_overlay.set_child(Some(&block_scroll));
@@ -2759,6 +2832,42 @@ impl TermView {
         // navigated with Ctrl+,/Ctrl+.. Not persisted (avoids an rkyv schema bump).
         let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
+        {
+            let target = sticky_target_id.clone();
+            let finished = finished_blocks_rc.clone();
+            let scroll = block_scroll.clone();
+            let click = gtk4::GestureClick::new();
+            click.set_button(1);
+            click.connect_released(move |_, n_press, _, _| {
+                if n_press != 1 {
+                    return;
+                }
+                let Some(id) = target.get() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let Some(block) = finished.iter().find(|block| block.id == id) else {
+                    return;
+                };
+                block.scroll_to_edge(&scroll, false);
+            });
+            sticky_label.add_controller(click);
+        }
+        {
+            let target = sticky_target_id.clone();
+            let finished = finished_blocks_rc.clone();
+            let scroll = block_scroll.clone();
+            sticky_jump_bottom_btn.connect_clicked(move |_| {
+                let Some(id) = target.get() else {
+                    return;
+                };
+                let finished = finished.borrow();
+                let Some(block) = finished.iter().find(|block| block.id == id) else {
+                    return;
+                };
+                block.scroll_to_edge(&scroll, true);
+            });
+        }
         // Sticky running-command header state: true while a command is executing,
         // plus the command text captured at CommandStart.
         let cmd_running: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -3040,27 +3149,35 @@ impl TermView {
             });
         }
 
-        // ── Sticky running-command header: poll-driven refresh ────────────
-        // Shown only while a command is executing AND the user has scrolled up
-        // (so the live prompt is off-screen). Polling lets one place own both the
-        // visibility decision and the elapsed-time tick without threading updates
-        // through the reader's CommandStart/End and the scroll handler.
+        // ── Sticky command header ────────────────────────────────────────
+        // Running commands keep their status header; oversized finished blocks
+        // pin their command after the original header scrolls above the viewport.
         {
             let sticky = sticky_bar.clone();
             let sticky_label = sticky_label.clone();
+            let sticky_jump_bottom = sticky_jump_bottom_btn.clone();
+            let sticky_target = sticky_target_id.clone();
+            let sticky_minimized = sticky_minimized.clone();
             let cmd_running = cmd_running.clone();
             let running_cmd = running_cmd.clone();
             let block_start_time = block_start_time.clone();
             let user_scrolled = user_scrolled_up.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-                // Stop the timer once the view is torn down (tab closed), so it
-                // doesn't leak by keeping the widgets/state alive forever. The bar
-                // is parented to the overlay at construction, so a None parent means
-                // the overlay was disposed.
+            let finished = finished_blocks_rc.clone();
+            let scroll = block_scroll.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
                 }
-                if cmd_running.get() && user_scrolled.get() {
+                let minimized = sticky_minimized.get();
+                if !user_scrolled.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
+                if cmd_running.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
                     let cmd = running_cmd.borrow();
                     let cmd_disp = cmd.trim();
                     let elapsed = block_start_time
@@ -3079,10 +3196,43 @@ impl TermView {
                         format!("\u{25b6}  {}    {}", cmd_disp, elapsed_str)
                     };
                     sticky_label.set_text(&label);
-                    if !sticky.get_visible() {
-                        sticky.set_visible(true);
+                    sticky_label.set_visible(!minimized);
+                    sticky.set_visible(true);
+                    return glib::ControlFlow::Continue;
+                }
+                let sticky_height = sticky.height().max(1) as f32;
+                let candidate = finished.borrow().iter().find_map(|block| {
+                    let header = block.header_row.compute_bounds(&scroll)?;
+                    let card = block.widget().compute_bounds(&scroll)?;
+                    let header_bottom = header.y() + header.height();
+                    let card_bottom = card.y() + card.height();
+                    if header_bottom <= 0.0 && card_bottom > sticky_height + 4.0 {
+                        let command = block
+                            .cmd_text
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        Some((block.id, command, block.long_output))
+                    } else {
+                        None
                     }
-                } else if sticky.get_visible() {
+                });
+                if let Some((id, command, long_output)) = candidate {
+                    sticky_target.set(Some(id));
+                    let command = if command.is_empty() {
+                        "Background output".to_string()
+                    } else {
+                        command
+                    };
+                    sticky_label.set_text(&format!("\u{276f}  {}", command));
+                    sticky_label.set_visible(!minimized);
+                    sticky_jump_bottom.set_visible(!minimized && long_output);
+                    sticky.set_visible(true);
+                } else {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
                     sticky.set_visible(false);
                 }
                 glib::ControlFlow::Continue

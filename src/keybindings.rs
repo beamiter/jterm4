@@ -475,7 +475,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+A", Action::SelectAllBlocks);
         bind("Ctrl+Shift+I", Action::ReinputSelectedCommands);
         bind("Ctrl+Shift+K", Action::ClearBlocks);
-        bind("Ctrl+Shift+B", Action::ToggleTabPlacement);
+        // Keep Warp's Ctrl+Shift+B available for block bookmarks.
+        bind("Ctrl+Alt+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
@@ -518,8 +519,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+M", Action::WorkflowsPalette);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
-        bind("Alt+Up", Action::FocusPaneUp);
-        bind("Alt+Down", Action::FocusPaneDown);
+        bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
+        bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
 
         KeybindingMap { bindings }
     }
@@ -716,8 +717,9 @@ mod tests {
             "Alt+Shift+Tab",
             "Alt+Left",
             "Alt+Right",
-            "Alt+Up",
-            "Alt+Down",
+            "Ctrl+Alt+Shift+Up",
+            "Ctrl+Alt+Shift+Down",
+            "Ctrl+Alt+B",
             "F12",
             "Ctrl+0",
             "Ctrl+9",
@@ -743,8 +745,8 @@ mod tests {
             // Pane focus (used in block mode to jump between paned block lists).
             ("Alt+Left", Action::FocusPaneLeft),
             ("Alt+Right", Action::FocusPaneRight),
-            ("Alt+Up", Action::FocusPaneUp),
-            ("Alt+Down", Action::FocusPaneDown),
+            ("Ctrl+Alt+Shift+Up", Action::FocusPaneUp),
+            ("Ctrl+Alt+Shift+Down", Action::FocusPaneDown),
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
@@ -753,7 +755,7 @@ mod tests {
             // Selection copy out of finished blocks.
             ("Ctrl+Shift+C", Action::Copy),
             // Tab placement / sidebar — adjacent to the block list.
-            ("Ctrl+Shift+B", Action::ToggleTabPlacement),
+            ("Ctrl+Alt+B", Action::ToggleTabPlacement),
             ("Ctrl+backslash", Action::ToggleSidebar),
             // Tab filter palette.
             ("Ctrl+Shift+L", Action::FilterTabs),

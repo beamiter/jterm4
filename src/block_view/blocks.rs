@@ -40,6 +40,10 @@ pub(crate) struct BlockData {
 }
 
 impl BlockData {
+    pub(crate) fn is_background(&self) -> bool {
+        self.cmd.trim().is_empty()
+    }
+
     /// Export block to JSON format
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
@@ -49,15 +53,19 @@ impl BlockData {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
 
-        md.push_str("## Command Block\n\n");
+        if self.is_background() {
+            md.push_str("## Background Output\n\n");
+        } else {
+            md.push_str("## Command Block\n\n");
 
-        if !self.prompt.is_empty() {
-            md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+            if !self.prompt.is_empty() {
+                md.push_str(&format!("**Prompt:** `{}`\n\n", self.prompt));
+            }
+
+            md.push_str("**Command:**\n```bash\n");
+            md.push_str(&self.cmd);
+            md.push_str("\n```\n\n");
         }
-
-        md.push_str("**Command:**\n```bash\n");
-        md.push_str(&self.cmd);
-        md.push_str("\n```\n\n");
 
         if !self.output.is_empty() {
             md.push_str("**Output:**\n```\n");
@@ -65,7 +73,9 @@ impl BlockData {
             md.push_str("\n```\n\n");
         }
 
-        md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+        if !self.is_background() {
+            md.push_str(&format!("**Exit Code:** {}\n\n", self.exit_code));
+        }
 
         if let Some(dur) = self.duration_ms {
             let dur_sec = dur as f64 / 1000.0;
@@ -100,6 +110,8 @@ pub struct BlockFilters {
 
 pub(crate) struct FinishedBlock {
     pub(crate) id: u64,
+    /// Commandless output emitted while the shell prompt was idle.
+    pub(crate) is_background: bool,
     pub(crate) widget: gtk4::Box,
     pub(crate) prompt_text: String,
     /// Read-only VTE displaying the executed command line (single-row typically).
@@ -129,6 +141,10 @@ pub(crate) struct FinishedBlock {
     pub(crate) action_box: gtk4::Box,
     /// Keyboard affordances shown only while this block is selected.
     pub(crate) selection_hint: gtk4::Label,
+    /// Toggle the output filter while preserving the current query.
+    pub(crate) toggle_filter: Rc<dyn Fn()>,
+    /// Warp-style jump affordance for oversized output.
+    pub(crate) jump_bottom_btn: gtk4::Button,
     pub(crate) bookmark_star: gtk4::Label,
     pub(crate) status_icon: gtk4::Label,
     /// Column count the output VTE is sized to — needed for re-feed (filter).
@@ -137,12 +153,15 @@ pub(crate) struct FinishedBlock {
     pub(crate) viewport_cap: i64,
     /// True only when this block has more output rows than can be shown at once.
     pub(crate) output_scrollable: bool,
+    /// Whether this block exceeds the configured long-output threshold.
+    pub(crate) long_output: bool,
 }
 
 impl Clone for FinishedBlock {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
+            is_background: self.is_background,
             widget: self.widget.clone(),
             prompt_text: self.prompt_text.clone(),
             command_vte: self.command_vte.clone(),
@@ -157,11 +176,14 @@ impl Clone for FinishedBlock {
             header_row: self.header_row.clone(),
             action_box: self.action_box.clone(),
             selection_hint: self.selection_hint.clone(),
+            toggle_filter: self.toggle_filter.clone(),
+            jump_bottom_btn: self.jump_bottom_btn.clone(),
             bookmark_star: self.bookmark_star.clone(),
             status_icon: self.status_icon.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
             output_scrollable: self.output_scrollable,
+            long_output: self.long_output,
         }
     }
 }
@@ -402,6 +424,25 @@ fn collapsed_output_summary(rows: i64) -> String {
     format!("▸ {} hidden — click to show", line_count_text(rows))
 }
 
+fn block_edge_scroll_target(
+    current: f64,
+    relative_top: f64,
+    block_height: f64,
+    page_size: f64,
+    lower: f64,
+    upper: f64,
+    bottom: bool,
+) -> f64 {
+    let max_value = (upper - page_size).max(lower);
+    let absolute_top = current + relative_top;
+    let target = if bottom {
+        absolute_top + block_height - page_size
+    } else {
+        absolute_top
+    };
+    target.clamp(lower, max_value)
+}
+
 fn forward_outer_scroll(outer: &gtk4::ScrolledWindow, dy: f64) {
     let outer_adj = outer.vadjustment();
     let step = outer_adj.step_increment().max(outer_adj.page_size() * 0.1);
@@ -539,11 +580,13 @@ impl FinishedBlock {
         cols: i64,
         recycled: Option<gtk4::Box>,
     ) -> Self {
-        // Finished blocks are full-height cards on one vertically scrolling
-        // canvas. The global truncation limit still bounds pathological output.
+        let is_background = cmd.trim().is_empty();
+        // Finished blocks stay on jterm4's full-height, virtualized outer canvas.
+        // `long_output` is only an interaction threshold for explicit navigation.
         let output_rows = output_visual_row_count(output, cols);
         let viewport_cap = output_rows.max(1);
         let max_expanded_cap = viewport_cap;
+        let long_output = output_rows > (config.finished_block_viewport_rows as i64).max(1);
 
         let outer = if let Some(reused) = recycled {
             while let Some(child) = reused.first_child() {
@@ -555,19 +598,32 @@ impl FinishedBlock {
             reused.remove_css_class("block-bookmarked");
             reused.remove_css_class("block-success");
             reused.remove_css_class("block-failed");
+            reused.remove_css_class("block-background");
+            reused.remove_css_class("block-compact");
             reused
         } else {
             let b = gtk4::Box::new(Orientation::Vertical, 0);
             b.add_css_class("block-finished");
-            b.set_margin_top(4);
-            b.set_margin_bottom(4);
-            b.set_margin_start(8);
-            b.set_margin_end(8);
             b
         };
+        if config.block_compact {
+            outer.add_css_class("block-compact");
+            outer.set_margin_top(1);
+            outer.set_margin_bottom(1);
+            outer.set_margin_start(4);
+            outer.set_margin_end(4);
+        } else {
+            outer.remove_css_class("block-compact");
+            outer.set_margin_top(4);
+            outer.set_margin_bottom(4);
+            outer.set_margin_start(8);
+            outer.set_margin_end(8);
+        }
 
-        // Status stripe: green left border on success, red on failure.
-        outer.add_css_class(if exit_code == 0 {
+        // Status stripe: green on success, red on failure, cyan for idle output.
+        outer.add_css_class(if is_background {
+            "block-background"
+        } else if exit_code == 0 {
             "block-success"
         } else {
             "block-failed"
@@ -581,13 +637,22 @@ impl FinishedBlock {
         // ── Header row ──────────────────────────────────────────────────────
         let header_row = gtk4::Box::new(Orientation::Horizontal, 8);
         header_row.add_css_class("block-header");
-        header_row.set_tooltip_text(Some(
-            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls",
-        ));
-        header_row.set_margin_start(12);
-        header_row.set_margin_end(8);
-        header_row.set_margin_top(6);
-        header_row.set_margin_bottom(2);
+        header_row.set_tooltip_text(Some(if is_background {
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle"
+        } else {
+            "Click to select · Shift-click range · Ctrl+Shift-click toggle · Enter recalls"
+        }));
+        if config.block_compact {
+            header_row.set_margin_start(8);
+            header_row.set_margin_end(6);
+            header_row.set_margin_top(3);
+            header_row.set_margin_bottom(1);
+        } else {
+            header_row.set_margin_start(12);
+            header_row.set_margin_end(8);
+            header_row.set_margin_top(6);
+            header_row.set_margin_bottom(2);
+        }
 
         // Bookmark star (gutter marker), hidden until the block is bookmarked.
         let bookmark_star = gtk4::Label::new(Some("\u{f02e}")); // nf-fa-bookmark
@@ -596,20 +661,29 @@ impl FinishedBlock {
         bookmark_star.set_visible(false);
         header_row.append(&bookmark_star);
 
-        // Status icon: ✓ for success, ✗ for failure.
-        // Nerd Font glyphs: nf-fa-check () on success, nf-fa-times () on failure.
-        let status_icon = gtk4::Label::new(Some(if exit_code == 0 {
+        // Status icon: success, failure, or asynchronous/background output.
+        let status_icon = gtk4::Label::new(Some(if is_background {
+            "\u{f110}"
+        } else if exit_code == 0 {
             "\u{f00c}"
         } else {
             "\u{f00d}"
         }));
-        status_icon.add_css_class(if exit_code == 0 {
+        status_icon.add_css_class(if is_background {
+            "block-status-background"
+        } else if exit_code == 0 {
             "block-status-ok"
         } else {
             "block-status-bad"
         });
         status_icon.set_halign(gtk4::Align::Start);
         header_row.append(&status_icon);
+        if is_background {
+            let chip = gtk4::Label::new(Some("Background output"));
+            chip.add_css_class("block-background-chip");
+            chip.set_halign(gtk4::Align::Start);
+            header_row.append(&chip);
+        }
 
         // Context chips (Warp-style): cwd pill + git-branch pill.
         if let Some(cwd_path) = cwd {
@@ -668,7 +742,7 @@ impl FinishedBlock {
         }
 
         // Exit code badge
-        if exit_code != 0 {
+        if !is_background && exit_code != 0 {
             let badge = gtk4::Label::new(Some(&format!("exit:{}", exit_code)));
             badge.add_css_class("block-exit-bad");
             header_row.append(&badge);
@@ -699,8 +773,13 @@ impl FinishedBlock {
         copy_output_btn.set_tooltip_text(Some("Copy output"));
         let rerun_btn = gtk4::Button::with_label("\u{f021}"); // nf-fa-refresh  re-run
         rerun_btn.set_tooltip_text(Some("Insert command at prompt"));
+        copy_cmd_btn.set_visible(!is_background);
+        rerun_btn.set_visible(!is_background);
         let filter_btn = gtk4::Button::with_label("\u{f0b0}"); // nf-fa-filter  filter output
         filter_btn.set_tooltip_text(Some("Filter output"));
+        let jump_bottom_btn = gtk4::Button::with_label("\u{f103}");
+        jump_bottom_btn.set_tooltip_text(Some("Jump to bottom of this block"));
+        jump_bottom_btn.set_visible(long_output);
         // Expand button: kept for the capped-height path. Full-height finished
         // blocks hide it because their viewport already contains every row.
         let expand_btn = gtk4::Button::with_label("\u{f065}"); // nf-fa-expand
@@ -710,6 +789,7 @@ impl FinishedBlock {
             &copy_output_btn,
             &rerun_btn,
             &filter_btn,
+            &jump_bottom_btn,
             &expand_btn,
         ] {
             btn.add_css_class("block-action-btn");
@@ -866,6 +946,7 @@ impl FinishedBlock {
         cmd_row.append(&command_vte);
 
         outer.append(&cmd_row);
+        cmd_row.set_visible(!is_background);
         // Always use a read-only VTE, including short output. The previous Label
         // fast path stripped ANSI SGR bytes, so `ls` and `git status` lost the
         // colors users see in regular VTE mode.
@@ -1107,28 +1188,38 @@ impl FinishedBlock {
                 ctx_spin.connect_value_changed(move |_| a());
             }
 
-            let filter_row_for_btn = filter_row.clone();
-            let entry_for_btn = filter_entry.clone();
-            let apply_for_btn = apply.clone();
-            let filter_btn_for_toggle = filter_btn.clone();
+            let filter_row_for_toggle = filter_row.downgrade();
+            let entry_for_toggle = filter_entry.downgrade();
+            let apply_for_toggle = apply.clone();
+            let filter_btn_for_toggle = filter_btn.downgrade();
             let set_collapsed_for_filter = set_collapsed.clone();
-            filter_btn.connect_clicked(move |_| {
-                let show = !filter_row_for_btn.is_visible();
-                filter_row_for_btn.set_visible(show);
+            let toggle: Rc<dyn Fn()> = Rc::new(move || {
+                let (Some(filter_row), Some(entry), Some(button)) = (
+                    filter_row_for_toggle.upgrade(),
+                    entry_for_toggle.upgrade(),
+                    filter_btn_for_toggle.upgrade(),
+                ) else {
+                    return;
+                };
+                let show = !filter_row.is_visible();
+                filter_row.set_visible(show);
                 if show {
                     set_collapsed_for_filter(false);
-                    filter_btn_for_toggle.add_css_class("block-action-active");
-                    entry_for_btn.grab_focus();
+                    button.add_css_class("block-action-active");
+                    entry.grab_focus();
                 } else {
-                    filter_btn_for_toggle.remove_css_class("block-action-active");
-                    entry_for_btn.set_text("");
-                    apply_for_btn();
+                    button.remove_css_class("block-action-active");
                 }
+                apply_for_toggle();
             });
-        }
+            let toggle_for_button = toggle.clone();
+            filter_btn.connect_clicked(move |_| toggle_for_button());
+            toggle
+        };
 
         FinishedBlock {
             id,
+            is_background,
             widget: outer,
             prompt_text: prompt.to_string(),
             command_vte,
@@ -1143,16 +1234,41 @@ impl FinishedBlock {
             header_row,
             action_box,
             selection_hint,
+            toggle_filter,
+            jump_bottom_btn,
             bookmark_star,
             status_icon,
             cols,
             viewport_cap,
             output_scrollable,
+            long_output,
         }
     }
 
     pub(crate) fn widget(&self) -> &gtk4::Box {
         &self.widget
+    }
+
+    /// Scroll this block's top or bottom edge into the outer history canvas.
+    pub(crate) fn scroll_to_edge(&self, outer: &gtk4::ScrolledWindow, bottom: bool) {
+        let widget = self.widget.clone();
+        let outer = outer.clone();
+        glib::idle_add_local_once(move || {
+            let Some(bounds) = widget.compute_bounds(&outer) else {
+                return;
+            };
+            let adj = outer.vadjustment();
+            let target = block_edge_scroll_target(
+                adj.value(),
+                bounds.y() as f64,
+                bounds.height() as f64,
+                adj.page_size(),
+                adj.lower(),
+                adj.upper(),
+                bottom,
+            );
+            adj.set_value(target);
+        });
     }
 
     /// Forward wheel events on the output VTE to the outer ScrolledWindow once
@@ -1162,6 +1278,12 @@ impl FinishedBlock {
     /// page never resumes. Closes the perceptual gap with a single-scrollback
     /// VTE pane (terminator/xterm).
     pub(crate) fn connect_scroll_forwarding(&self, outer: &gtk4::ScrolledWindow) {
+        let block_for_jump = self.clone();
+        let outer_for_jump = outer.clone();
+        self.jump_bottom_btn.connect_clicked(move |_| {
+            block_for_jump.scroll_to_edge(&outer_for_jump, true);
+        });
+
         let scroll_ctrl =
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let vte = self.output_vte.clone();
@@ -1277,6 +1399,9 @@ impl ActiveBlock {
     pub(crate) fn new(config: &Config) -> Self {
         let widget = gtk4::Box::new(Orientation::Vertical, 0);
         widget.add_css_class("block-active");
+        if config.block_compact {
+            widget.add_css_class("block-compact");
+        }
         // focusable(false) keeps the holder Box from being a focus target, but we
         // must NOT set can_focus(false): in GTK4 that blocks all descendants
         // (including active_vte) from ever receiving focus.
