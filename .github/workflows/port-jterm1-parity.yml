@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   port:
-    if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' && !contains(github.event.pull_request.title, '[port-step]') }}
+    if: ${{ github.head_ref == 'agent/jterm1-block-mode-parity' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -20,20 +20,6 @@ jobs:
           ref: agent/jterm1-block-mode-parity
           fetch-depth: 0
 
-      - name: Fix current compile blocker
-        shell: bash
-        run: |
-          set -euo pipefail
-          sed -i 's/self\.fulscreen/self.fullscreen/' src/block_view/mod.rs
-          cargo fmt --all
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/block_view/mod.rs
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: correct block reinput fullscreen guard [port-step]"
-            git push origin HEAD:agent/jterm1-block-mode-parity
-          fi
-
       - name: Fetch validated jterm1 parity commits
         shell: bash
         run: |
@@ -42,13 +28,52 @@ jobs:
           git fetch --no-tags jterm1 3aeb62fa0b861196a12254dee24f12a6a3ce7900 48eb38407f50ee729d5cde6402eb430e1fbe63c8
 
       - name: Apply long-block and background-block changes
+        id: apply
+        shell: bash
+        run: |
+          set +e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git cherry-pick -m 1 --no-commit 3aeb62fa0b861196a12254dee24f12a6a3ce7900 > port.log 2>&1
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            git cherry-pick -m 1 --no-commit 48eb38407f50ee729d5cde6402eb430e1fbe63c8 >> port.log 2>&1
+            status=$?
+          fi
+          {
+            echo
+            echo '=== git status ==='
+            git status --short
+            echo
+            echo '=== unresolved files ==='
+            git diff --name-only --diff-filter=U
+            echo
+            echo '=== conflict diff ==='
+            git diff --cc
+          } >> port.log 2>&1
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload port diagnostics
+        if: ${{ steps.apply.outputs.status != '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm1-parity-port-conflicts
+          path: port.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Commit clean port
+        if: ${{ steps.apply.outputs.status == '0' }}
         shell: bash
         run: |
           set -euo pipefail
-          git cherry-pick -m 1 --no-commit 3aeb62fa0b861196a12254dee24f12a6a3ce7900
-          git cherry-pick -m 1 --no-commit 48eb38407f50ee729d5cde6402eb430e1fbe63c8
           cargo fmt --all
           rm .github/workflows/port-jterm1-parity.yml
           git add -A
           git commit -m "feat: port remaining jterm1 block parity [port-step]"
           git push origin HEAD:agent/jterm1-block-mode-parity
+
+      - name: Fail on conflicts
+        if: ${{ steps.apply.outputs.status != '0' }}
+        run: exit 1
