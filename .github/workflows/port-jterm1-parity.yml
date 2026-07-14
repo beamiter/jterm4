@@ -33,3 +33,5 @@ jobs:
           path: /tmp/jterm4-parity-source.tar.gz
           if-no-files-found: error
           retention-days: 1
+
+# Trigger after the export workflow is registered on the PR branch.
