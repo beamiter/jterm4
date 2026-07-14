@@ -75,17 +75,35 @@ jobs:
         run: cargo fmt --all
 
       - name: Validate shell and desktop files
+        id: validate
+        continue-on-error: true
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
-          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
-          scripts/install.sh --help >/dev/null
-          scripts/uninstall.sh --help >/dev/null
-          HOME=/tmp/jterm4-home scripts/install.sh \
-            --dry-run --backend cargo --prefix /tmp/jterm4-prefix --no-config >/dev/null
-          HOME=/tmp/jterm4-home scripts/uninstall.sh \
-            --dry-run --prefix /tmp/jterm4-prefix >/dev/null
-          desktop-file-validate data/${APP_ID}.desktop
-          appstreamcli validate --no-net data/${APP_ID}.metainfo.xml
+          set -o pipefail
+          {
+            bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+            shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+            scripts/install.sh --help >/dev/null
+            scripts/uninstall.sh --help >/dev/null
+            HOME=/tmp/jterm4-home scripts/install.sh \
+              --dry-run --backend cargo --prefix /tmp/jterm4-prefix --no-config >/dev/null
+            HOME=/tmp/jterm4-home scripts/uninstall.sh \
+              --dry-run --prefix /tmp/jterm4-prefix >/dev/null
+            desktop-file-validate data/${APP_ID}.desktop
+            appstreamcli validate --no-net data/${APP_ID}.metainfo.xml
+          } 2>&1 | tee packaging-validation.log
+
+      - name: Upload packaging validation diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-validation-${{ github.run_id }}
+          path: packaging-validation.log
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Require packaging validation
+        if: ${{ steps.validate.outcome == 'failure' }}
+        run: exit 1
 
       - name: Run tests
         run: cargo test --all-features --locked
