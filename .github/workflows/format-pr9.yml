@@ -1,0 +1,31 @@
+name: Format typed split leaves
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.head_ref == 'agent/jterm4-typed-split-leaves' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/jterm4-typed-split-leaves
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply formatter and lint cleanup
+        run: |
+          sed -i '/use vte4::TerminalExt;/d' src/ui/panes.rs
+          cargo fmt --all
+          git rm .github/workflows/format-pr9.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ui/panes.rs src/ui/pane_node.rs src/ui/session.rs
+          git commit -m "Format typed split leaves"
+          git push origin HEAD:agent/jterm4-typed-split-leaves
