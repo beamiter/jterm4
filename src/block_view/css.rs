@@ -239,6 +239,24 @@ pub(crate) fn install_block_css(config: &Config) {
             background-color: {bg_hex};
             box-shadow: 0 2px 8px rgba(0,0,0,0.18);
         }}
+        .block-finished.block-background {{
+            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.72);
+        }}
+        .block-background-chip {{
+            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.10);
+            border-radius: 999px;
+            padding: 1px 7px;
+            font-size: 0.88em;
+        }}
+        .block-status-background {{
+            color: rgba({acc_r},{acc_g},{acc_b},0.92);
+        }}
+        .block-finished.block-compact, .block-active.block-compact {{
+            border-radius: 6px;
+            padding: 0;
+            box-shadow: none;
+        }}
         .block-prompt-chevron {{
             color: {accent};
             font-family: "{font_family}";
@@ -507,6 +525,20 @@ pub(crate) fn install_block_css(config: &Config) {
             font-family: "{font_family}";
             font-size: 0.92em;
             font-weight: bold;
+        }}
+        .sticky-header-control {{
+            min-width: 24px;
+            min-height: 22px;
+            padding: 0 5px;
+            border-radius: 5px;
+            color: rgba({fg_r},{fg_g},{fg_b},0.78);
+        }}
+        .sticky-header-control:hover {{
+            color: {accent};
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.12);
+        }}
+        .sticky-running-header.sticky-minimized {{
+            padding-left: 4px;
         }}
         .repo-strip {{
             color: rgba({acc_r},{acc_g},{acc_b},0.85);

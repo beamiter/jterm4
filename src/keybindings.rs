@@ -52,6 +52,12 @@ pub(crate) enum Action {
     FilterSlowBlocks,
     FilterPinnedBlocks,
     ClearBlockFilter,
+    /// Select every finished block in the active block-mode pane.
+    SelectAllBlocks,
+    /// Remove every finished block from the active block-mode pane.
+    ClearBlocks,
+    /// Put selected commands back into the live editor in terminal order.
+    ReinputSelectedCommands,
     JumpToPrevPinned,
     JumpToNextPinned,
     ToggleDebugDashboard,
@@ -132,6 +138,9 @@ impl Action {
             Action::FilterSlowBlocks => "Jump to first slow block",
             Action::FilterPinnedBlocks => "Jump to first bookmarked block",
             Action::ClearBlockFilter => "Jump to oldest block",
+            Action::SelectAllBlocks => "Select all blocks",
+            Action::ClearBlocks => "Clear blocks",
+            Action::ReinputSelectedCommands => "Reinput selected commands",
             Action::JumpToPrevPinned => "Jump to previous bookmarked block",
             Action::JumpToNextPinned => "Jump to next bookmarked block",
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
@@ -191,6 +200,9 @@ impl Action {
             Action::FilterSlowBlocks => Some("filter_slow_blocks"),
             Action::FilterPinnedBlocks => Some("filter_pinned_blocks"),
             Action::ClearBlockFilter => Some("clear_block_filter"),
+            Action::SelectAllBlocks => Some("select_all_blocks"),
+            Action::ClearBlocks => Some("clear_blocks"),
+            Action::ReinputSelectedCommands => Some("reinput_selected_commands"),
             Action::JumpToPrevPinned => Some("jump_to_prev_pinned"),
             Action::JumpToNextPinned => Some("jump_to_next_pinned"),
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
@@ -249,6 +261,9 @@ impl Action {
             Action::FilterSlowBlocks,
             Action::FilterPinnedBlocks,
             Action::ClearBlockFilter,
+            Action::SelectAllBlocks,
+            Action::ClearBlocks,
+            Action::ReinputSelectedCommands,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
             Action::ToggleDebugDashboard,
@@ -448,16 +463,20 @@ impl KeybindingMap {
         bind("Ctrl+Shift+C", Action::Copy);
         bind("Ctrl+Shift+V", Action::Paste);
         bind("Ctrl+Shift++", Action::FontIncrease);
-        bind("Ctrl+Shift+I", Action::FontDecrease);
         bind("Ctrl+Shift+J", Action::OpacityDecrease);
-        bind("Ctrl+Shift+K", Action::OpacityIncrease);
+        // Keep jterm1/Warp's I=reinput and K=clear block chords free.
+        bind("Ctrl+Alt+Shift+K", Action::OpacityIncrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
         bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
-        bind("Ctrl+Shift+B", Action::ToggleTabPlacement);
+        bind("Ctrl+Shift+A", Action::SelectAllBlocks);
+        bind("Ctrl+Shift+I", Action::ReinputSelectedCommands);
+        bind("Ctrl+Shift+K", Action::ClearBlocks);
+        // Keep Warp's Ctrl+Shift+B available for block bookmarks.
+        bind("Ctrl+Alt+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
         bind("Ctrl+Shift+PageUp", Action::PrevTab);
@@ -487,7 +506,7 @@ impl KeybindingMap {
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
-        bind("Ctrl+Shift+A", Action::ToggleAiPanel);
+        bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
@@ -500,8 +519,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+M", Action::WorkflowsPalette);
         bind("Alt+Left", Action::FocusPaneLeft);
         bind("Alt+Right", Action::FocusPaneRight);
-        bind("Alt+Up", Action::FocusPaneUp);
-        bind("Alt+Down", Action::FocusPaneDown);
+        bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
+        bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
 
         KeybindingMap { bindings }
     }
@@ -684,6 +703,8 @@ mod tests {
             "Ctrl+Shift+V",
             "Ctrl+Shift++",
             "Ctrl+Shift+!",
+            "Ctrl+Alt+Shift+A",
+            "Ctrl+Alt+Shift+K",
             "Ctrl+backslash",
             "Ctrl+minus",
             "Ctrl+Up",
@@ -696,8 +717,9 @@ mod tests {
             "Alt+Shift+Tab",
             "Alt+Left",
             "Alt+Right",
-            "Alt+Up",
-            "Alt+Down",
+            "Ctrl+Alt+Shift+Up",
+            "Ctrl+Alt+Shift+Down",
+            "Ctrl+Alt+B",
             "F12",
             "Ctrl+0",
             "Ctrl+9",
@@ -723,8 +745,8 @@ mod tests {
             // Pane focus (used in block mode to jump between paned block lists).
             ("Alt+Left", Action::FocusPaneLeft),
             ("Alt+Right", Action::FocusPaneRight),
-            ("Alt+Up", Action::FocusPaneUp),
-            ("Alt+Down", Action::FocusPaneDown),
+            ("Ctrl+Alt+Shift+Up", Action::FocusPaneUp),
+            ("Ctrl+Alt+Shift+Down", Action::FocusPaneDown),
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
@@ -733,12 +755,16 @@ mod tests {
             // Selection copy out of finished blocks.
             ("Ctrl+Shift+C", Action::Copy),
             // Tab placement / sidebar — adjacent to the block list.
-            ("Ctrl+Shift+B", Action::ToggleTabPlacement),
+            ("Ctrl+Alt+B", Action::ToggleTabPlacement),
             ("Ctrl+backslash", Action::ToggleSidebar),
             // Tab filter palette.
             ("Ctrl+Shift+L", Action::FilterTabs),
-            // AI sidebar.
-            ("Ctrl+Shift+A", Action::ToggleAiPanel),
+            // jterm1/Warp block actions.
+            ("Ctrl+Shift+A", Action::SelectAllBlocks),
+            ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
+            ("Ctrl+Shift+K", Action::ClearBlocks),
+            // AI sidebar keeps a non-conflicting chord.
+            ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
@@ -849,5 +875,20 @@ mod tests {
         table.insert("scroll_up".into(), toml::Value::Boolean(false));
         map.apply_user_overrides(&table);
         assert_eq!(map.lookup(&original), None);
+    }
+    #[test]
+    fn jterm1_block_action_defaults_are_not_shadowed() {
+        let map = KeybindingMap::from_defaults();
+        let cases = [
+            ("Ctrl+Shift+A", Action::SelectAllBlocks),
+            ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
+            ("Ctrl+Shift+K", Action::ClearBlocks),
+            ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
+            ("Ctrl+Alt+Shift+K", Action::OpacityIncrease),
+        ];
+        for (binding, expected) in cases {
+            let combo = parse_key_combo(binding).expect("valid built-in binding");
+            assert_eq!(map.lookup(&combo), Some(expected), "{binding}");
+        }
     }
 }
