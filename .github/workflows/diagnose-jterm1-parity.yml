@@ -44,3 +44,5 @@ jobs:
       - name: Fail when migration did not apply
         if: ${{ steps.migration.outputs.status != '0' }}
         run: exit 1
+
+# Trigger after the workflow exists on the PR branch.
