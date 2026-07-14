@@ -47,3 +47,5 @@ jobs:
           path: /tmp/jterm1-block-reference.tar.gz
           if-no-files-found: error
           retention-days: 1
+
+# Trigger after workflow registration on the PR branch.
