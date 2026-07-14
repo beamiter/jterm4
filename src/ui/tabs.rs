@@ -14,10 +14,9 @@ use crate::block_view::TermView;
 use crate::keybindings::Action;
 use crate::state::{generate_session_id, kill_terminal_child, kill_widget_child_processes};
 use crate::terminal::{
-    collect_terminals, default_tab_title, find_first_terminal, find_focused_terminal,
-    scrollbar_wrapper_of, setup_terminal_click_handler, show_rename_dialog,
-    show_rename_dialog_with_strip, terminal_working_directory, wrap_with_scrollbar,
-    VteTerminalView,
+    collect_terminals, default_tab_title, find_first_terminal, scrollbar_wrapper_of,
+    setup_terminal_click_handler, show_rename_dialog, show_rename_dialog_with_strip,
+    terminal_working_directory, wrap_with_scrollbar, VteTerminalView,
 };
 
 struct TabLaunch {
@@ -119,8 +118,8 @@ impl UiState {
                     }
                 }
 
-                if let Some(term) = find_first_terminal(&sibling) {
-                    term.grab_focus();
+                if let Some(node) = PaneNode::from_widget(&sibling) {
+                    node.grab_focus();
                 }
             }
         } else {
@@ -189,15 +188,19 @@ impl UiState {
     }
 
     pub(crate) fn close_focused_pane_or_tab(&self) {
-        if let Some(page_num) = self.notebook.current_page() {
-            if let Some(widget) = self.notebook.nth_page(Some(page_num)) {
-                // If the page has splits, close the focused pane only
-                if widget.clone().downcast::<Paned>().is_ok() {
-                    if let Some(term) = find_focused_terminal(&widget) {
-                        kill_terminal_child(&term);
-                        self.handle_terminal_exited(&term.upcast::<gtk4::Widget>());
-                        return;
-                    }
+        let Some(page_num) = self.notebook.current_page() else {
+            return;
+        };
+        let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
+        if let Some(node) = PaneNode::from_widget(&page_widget) {
+            if node.is_split() {
+                if let Some(leaf) = node.active_leaf() {
+                    let terminal = leaf.terminal().clone();
+                    kill_terminal_child(&terminal);
+                    self.handle_terminal_exited(&terminal.upcast::<gtk4::Widget>());
+                    return;
                 }
             }
         }

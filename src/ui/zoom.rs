@@ -4,10 +4,7 @@ use gtk4::Paned;
 use libadwaita as adw;
 
 use super::*;
-use crate::terminal::{
-    find_first_terminal, find_focused_terminal, reattach_terminal_to_tree, scrollbar_wrapper_of,
-    terminal_working_directory,
-};
+use crate::terminal::{reattach_terminal_to_tree, terminal_working_directory};
 
 impl UiState {
     pub(crate) fn toggle_pane_zoom(&self) {
@@ -27,30 +24,26 @@ impl UiState {
         let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
             return;
         };
-
-        // Only zoom if there are splits (page is a Paned)
-        if page_widget.clone().downcast::<Paned>().is_err() {
-            return;
-        }
-
-        let Some(term) = find_focused_terminal(&page_widget) else {
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
             return;
         };
-        // The effective widget (wrapper box or bare terminal) is what sits in the Paned.
-        let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
-            .map(|bx| bx.upcast::<gtk4::Widget>())
-            .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
-        let Some(parent) = eff_widget.parent() else {
+        if !node.is_split() {
+            return;
+        }
+        let Some(leaf) = node.active_leaf() else {
+            return;
+        };
+        let terminal = leaf.terminal().clone();
+        let effective_widget = leaf.root_widget();
+        let Some(parent) = effective_widget.parent() else {
             return;
         };
         let Ok(parent_paned) = parent.downcast::<Paned>() else {
             return;
         };
-
         let tab_label = self.notebook.tab_label(&page_widget);
 
-        // Detach terminal from its parent paned (leave None slot for reattach)
-        if parent_paned.start_child().as_ref() == Some(&eff_widget) {
+        if parent_paned.start_child().as_ref() == Some(&effective_widget) {
             parent_paned.set_start_child(None::<&gtk4::Widget>);
         } else {
             parent_paned.set_end_child(None::<&gtk4::Widget>);
@@ -58,20 +51,18 @@ impl UiState {
 
         let widget_name = page_widget.widget_name().to_string();
         self.notebook.remove_page(Some(page_num));
-
-        // Add terminal (with scrollbar wrapper) as a standalone page
-        eff_widget.set_widget_name(&widget_name);
-        let new_page = self
-            .notebook
-            .insert_page(&eff_widget, tab_label.as_ref(), Some(page_num));
-        self.notebook.set_tab_reorderable(&eff_widget, true);
-        self.notebook.set_current_page(Some(new_page));
-        self.sync_tab_strip_active(Some(new_page));
-        term.grab_focus();
+        effective_widget.set_widget_name(&widget_name);
+        let inserted =
+            self.notebook
+                .insert_page(&effective_widget, tab_label.as_ref(), Some(page_num));
+        self.notebook.set_tab_reorderable(&effective_widget, true);
+        self.notebook.set_current_page(Some(inserted));
+        self.sync_tab_strip_active(Some(inserted));
+        leaf.grab_focus();
 
         *self.zoom_state.borrow_mut() = Some(ZoomState {
             original_page: page_widget,
-            zoomed_terminal: term,
+            zoomed_terminal: terminal,
             page_index: page_num,
             tab_label,
         });
@@ -81,29 +72,23 @@ impl UiState {
         let Some(page_num) = self.notebook.current_page() else {
             return;
         };
-
-        // Remove the zoomed terminal's standalone page
+        let Some(effective_widget) = self.notebook.nth_page(Some(page_num)) else {
+            return;
+        };
+        let widget_name = effective_widget.widget_name().to_string();
         self.notebook.remove_page(Some(page_num));
 
-        // Re-attach the effective widget (wrapper box or terminal) to the Paned tree
-        let eff_widget =
-            scrollbar_wrapper_of(&state.zoomed_terminal.clone().upcast::<gtk4::Widget>())
-                .map(|bx| bx.upcast::<gtk4::Widget>())
-                .unwrap_or_else(|| state.zoomed_terminal.clone().upcast::<gtk4::Widget>());
-        reattach_terminal_to_tree(&state.original_page, &eff_widget);
-
-        // Re-add the original Paned tree as the page
-        let widget_name = eff_widget.widget_name().to_string();
+        reattach_terminal_to_tree(&state.original_page, &effective_widget);
         state.original_page.set_widget_name(&widget_name);
-        let new_page = self.notebook.insert_page(
+        let inserted = self.notebook.insert_page(
             &state.original_page,
             state.tab_label.as_ref(),
             Some(state.page_index),
         );
         self.notebook
             .set_tab_reorderable(&state.original_page, true);
-        self.notebook.set_current_page(Some(new_page));
-        self.sync_tab_strip_active(Some(new_page));
+        self.notebook.set_current_page(Some(inserted));
+        self.sync_tab_strip_active(Some(inserted));
         state.zoomed_terminal.grab_focus();
     }
 
@@ -114,19 +99,18 @@ impl UiState {
         let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
             return;
         };
-
-        // Only works if there are splits
-        if page_widget.clone().downcast::<Paned>().is_err() {
-            return;
-        }
-
-        let Some(term) = find_focused_terminal(&page_widget) else {
+        let Some(node) = PaneNode::from_widget(&page_widget) else {
             return;
         };
-        let eff_widget = scrollbar_wrapper_of(&term.clone().upcast::<gtk4::Widget>())
-            .map(|bx| bx.upcast::<gtk4::Widget>())
-            .unwrap_or_else(|| term.clone().upcast::<gtk4::Widget>());
-        let Some(parent) = eff_widget.parent() else {
+        if !node.is_split() {
+            return;
+        }
+        let Some(leaf) = node.active_leaf() else {
+            return;
+        };
+        let terminal = leaf.terminal().clone();
+        let effective_widget = leaf.root_widget();
+        let Some(parent) = effective_widget.parent() else {
             return;
         };
         let Ok(paned) = parent.clone().downcast::<Paned>() else {
@@ -135,54 +119,49 @@ impl UiState {
 
         let start = paned.start_child();
         let end = paned.end_child();
-        let sibling = if start.as_ref() == Some(&eff_widget) {
+        let sibling = if start.as_ref() == Some(&effective_widget) {
             end
         } else {
             start
         };
-
-        // Detach both children
         paned.set_start_child(None::<&gtk4::Widget>);
         paned.set_end_child(None::<&gtk4::Widget>);
 
-        // Promote sibling (same logic as handle_terminal_exited)
         if let Some(sibling) = sibling {
             let paned_widget = paned.upcast::<gtk4::Widget>();
             if let Some(grandparent) = paned_widget.parent() {
-                if let Ok(gp_paned) = grandparent.clone().downcast::<Paned>() {
-                    if gp_paned.start_child().as_ref() == Some(&paned_widget) {
-                        gp_paned.set_start_child(Some(&sibling));
+                if let Ok(grandparent_paned) = grandparent.clone().downcast::<Paned>() {
+                    if grandparent_paned.start_child().as_ref() == Some(&paned_widget) {
+                        grandparent_paned.set_start_child(Some(&sibling));
                     } else {
-                        gp_paned.set_end_child(Some(&sibling));
+                        grandparent_paned.set_end_child(Some(&sibling));
                     }
                 } else {
-                    for i in 0..self.notebook.n_pages() {
-                        if let Some(pw) = self.notebook.nth_page(Some(i)) {
-                            if pw == paned_widget {
-                                sibling.set_widget_name(&pw.widget_name());
-                                let tab_label = self.notebook.tab_label(&pw);
-                                self.notebook.remove_page(Some(i));
-                                let new_page_num = self.notebook.insert_page(
+                    for index in 0..self.notebook.n_pages() {
+                        if let Some(candidate) = self.notebook.nth_page(Some(index)) {
+                            if candidate == paned_widget {
+                                sibling.set_widget_name(&candidate.widget_name());
+                                let tab_label = self.notebook.tab_label(&candidate);
+                                self.notebook.remove_page(Some(index));
+                                let inserted = self.notebook.insert_page(
                                     &sibling,
                                     tab_label.as_ref(),
-                                    Some(i),
+                                    Some(index),
                                 );
                                 self.notebook.set_tab_reorderable(&sibling, true);
-                                self.notebook.set_current_page(Some(new_page_num));
+                                self.notebook.set_current_page(Some(inserted));
                                 break;
                             }
                         }
                     }
                 }
             }
-
-            if let Some(sibling_term) = find_first_terminal(&sibling) {
-                sibling_term.grab_focus();
+            if let Some(sibling_node) = PaneNode::from_widget(&sibling) {
+                sibling_node.grab_focus();
             }
         }
 
-        // Now the terminal is detached - add it as a new tab
-        let working_directory = terminal_working_directory(&term);
-        self.add_terminal_as_new_tab(term, working_directory);
+        let working_directory = terminal_working_directory(&terminal);
+        self.add_terminal_as_new_tab(terminal, working_directory);
     }
 }
