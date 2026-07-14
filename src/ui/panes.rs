@@ -4,7 +4,6 @@ use gtk4::{Orientation, Paned};
 use libadwaita as adw;
 use std::rc::Rc;
 use vte4::Terminal;
-use vte4::TerminalExt;
 
 use super::*;
 use crate::keybindings::Direction;
@@ -47,8 +46,7 @@ impl UiState {
         let ui_for_exit = UiState::clone(self);
         let terminal_for_exit = terminal.clone();
         view.connect_exited(move |_| {
-            ui_for_exit
-                .handle_terminal_exited(&terminal_for_exit.clone().upcast::<gtk4::Widget>());
+            ui_for_exit.handle_terminal_exited(&terminal_for_exit.clone().upcast::<gtk4::Widget>());
         });
 
         if let Some(name) = tab_widget_name {
@@ -113,12 +111,8 @@ impl UiState {
             .unwrap_or_else(|| current_term.clone().upcast::<gtk4::Widget>());
         let parent = current_widget.parent();
 
-        let new_leaf = self.create_vte_leaf(
-            working_directory.as_deref(),
-            None,
-            None,
-            tab_widget_name,
-        );
+        let new_leaf =
+            self.create_vte_leaf(working_directory.as_deref(), None, None, tab_widget_name);
         let new_widget = new_leaf.root_widget();
 
         let paned = Paned::new(orientation);

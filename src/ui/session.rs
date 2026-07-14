@@ -125,12 +125,7 @@ impl UiState {
                 cmds,
                 pinned,
             } => {
-                let leaf = self.create_vte_leaf(
-                    Some(&dir),
-                    Some(&sid),
-                    cmds.as_deref(),
-                    None,
-                );
+                let leaf = self.create_vte_leaf(Some(&dir), Some(&sid), cmds.as_deref(), None);
                 let root = leaf.root_widget();
                 if pinned == Some(true) {
                     unsafe {
