@@ -8,6 +8,7 @@
 use crate::config::Config;
 use crate::terminal::apply_terminal_theme;
 use gtk4::glib;
+use gtk4::prelude::*;
 use vte4::TerminalExt;
 use vte4::{CursorBlinkMode, CursorShape, Terminal};
 
