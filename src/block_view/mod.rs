@@ -895,6 +895,13 @@ struct ReaderCtx {
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
+    /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
+    /// Empty-command blocks are inferred from this separate buffer, so no history
+    /// schema change is needed.
+    background_output_rc: Rc<RefCell<Vec<u8>>>,
+    /// Once the user starts editing at an idle prompt, output is intentionally left
+    /// inline: shell echo/completion and true background output are ambiguous then.
+    idle_input_dirty_rc: Rc<Cell<bool>>,
     /// Command text read from the live VTE at CommandStart; primary source
     /// for the finished block.
     vte_typed_cmd_rc: Rc<RefCell<String>>,
@@ -999,6 +1006,21 @@ fn is_post_command_metadata(bytes: &[u8]) -> bool {
         || bytes.starts_with(b"\x1b]2;")
 }
 
+/// Background output is meaningful only when stripping terminal decoration leaves
+/// at least one visible character. Prompt redraw control sequences and blank CR/LF
+/// bursts should not create empty history cards.
+fn background_output_has_visible_text(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    strip_ansi(text.as_ref())
+        .chars()
+        .any(|ch| !ch.is_whitespace() && !ch.is_control())
+}
+
+fn take_background_output(pending: &RefCell<Vec<u8>>) -> Option<String> {
+    let bytes = std::mem::take(&mut *pending.borrow_mut());
+    background_output_has_visible_text(&bytes).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl ReaderCtx {
     fn install(self, pty: &Rc<OwnedPty>) {
         let ReaderCtx {
@@ -1009,6 +1031,8 @@ impl ReaderCtx {
             osc133_depth_rc,
             prompt_buf_rc,
             typed_cmd_rc,
+            background_output_rc,
+            idle_input_dirty_rc,
             vte_typed_cmd_rc,
             prompt_end_pos_rc,
             prompt_display_rc,
@@ -1099,9 +1123,18 @@ impl ReaderCtx {
                                     true
                                 }
                                 BlockState::AwaitingCommand => {
-                                    // The command text is read off the live VTE
-                                    // at CommandStart (`text_range_format`), so
-                                    // no shadow accumulation is needed here.
+                                    // Warp separates asynchronous output only when it
+                                    // arrives before the user begins editing. Once input
+                                    // is dirty, PTY echo/completion is indistinguishable
+                                    // from a background process and remains inline.
+                                    if !idle_input_dirty_rc.get() {
+                                        let mut pending = background_output_rc.borrow_mut();
+                                        pending.extend_from_slice(bytes);
+                                        if pending.len() > MAX_RAW_OUTPUT_BYTES {
+                                            let drop = pending.len() - MAX_RAW_OUTPUT_BYTES;
+                                            pending.drain(..drop);
+                                        }
+                                    }
                                     scroll_debouncer.mark_dirty(&block_scroll_rc);
                                     true
                                 }
@@ -1137,22 +1170,33 @@ impl ReaderCtx {
                             {
                                 continue;
                             }
-                            // Finalize the previous command (deferred from CommandEnd).
-                            if state == BlockState::PostCommand {
+                            let background_output = if state == BlockState::AwaitingCommand {
+                                take_background_output(&background_output_rc)
+                            } else {
+                                None
+                            };
+                            let is_background = background_output.is_some();
+                            // Finalize the previous command (deferred from CommandEnd),
+                            // or turn commandless async output into a first-class block.
+                            if state == BlockState::PostCommand || is_background {
                                 // The VTE-text capture taken at CommandStart is
                                 // authoritative — it reflects what was on screen
                                 // when the user pressed Enter. Fall back to the
                                 // keystroke shadow only if the VTE read came back
                                 // empty (which would indicate the prompt-end
                                 // anchor never captured a valid cursor position).
-                                let vte_cmd = vte_typed_cmd_rc.borrow().trim().to_string();
-                                let cmd = if !vte_cmd.is_empty() {
-                                    vte_cmd
+                                let cmd = if is_background {
+                                    String::new()
                                 } else {
-                                    typed_cmd_rc.borrow().trim().to_string()
+                                    let vte_cmd = vte_typed_cmd_rc.borrow().trim().to_string();
+                                    if !vte_cmd.is_empty() {
+                                        vte_cmd
+                                    } else {
+                                        typed_cmd_rc.borrow().trim().to_string()
+                                    }
                                 };
 
-                                if cmd.is_empty() {
+                                if cmd.is_empty() && !is_background {
                                     // Nothing meaningful to record; just reset.
                                     let preserve = config_for_cb.borrow().preserve_live_scrollback;
                                     active_rc.borrow().reset_active(preserve);
@@ -1162,7 +1206,11 @@ impl ReaderCtx {
                                     continue;
                                 }
 
-                                let prompt = prompt_display_rc.borrow().clone();
+                                let prompt = if is_background {
+                                    String::new()
+                                } else {
+                                    prompt_display_rc.borrow().clone()
+                                };
 
                                 // The raw bytes already carry CRLF — the PTY's
                                 // ONLCR turns `\n` into `\r\n` on the master side
@@ -1171,7 +1219,8 @@ impl ReaderCtx {
                                 // like the live VTE did while the command ran. So
                                 // we feed the captured bytes verbatim, with no
                                 // reconstruction pass.
-                                let output_with_ansi = active_rc.borrow().output_text();
+                                let output_with_ansi = background_output
+                                    .unwrap_or_else(|| active_rc.borrow().output_text());
 
                                 let output_plain = strip_ansi(&output_with_ansi);
 
@@ -1187,7 +1236,11 @@ impl ReaderCtx {
                                     line_count,
                                 );
 
-                                let start_time = block_start_time_for_cb.get();
+                                let start_time = if is_background {
+                                    None
+                                } else {
+                                    block_start_time_for_cb.get()
+                                };
                                 let now = SystemTime::now();
                                 let end_time_ms = now
                                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -1211,7 +1264,11 @@ impl ReaderCtx {
                                     }
                                 };
 
-                                let exit_code = pending_exit_code_rc.get();
+                                let exit_code = if is_background {
+                                    0
+                                } else {
+                                    pending_exit_code_rc.get()
+                                };
 
                                 // Single id shared by the serializable BlockData and
                                 // the GTK FinishedBlock so id-keyed lookups (export,
@@ -1288,14 +1345,16 @@ impl ReaderCtx {
 
                                 finished_blocks_for_cb.borrow_mut().push(finished);
 
-                                let output_sample = sample_output_for_event(&output_plain);
-                                for cb in block_finished_cbs.borrow().iter() {
-                                    cb(cmd.clone(), exit_code, output_sample.clone());
+                                if !is_background {
+                                    let output_sample = sample_output_for_event(&output_plain);
+                                    for cb in block_finished_cbs.borrow().iter() {
+                                        cb(cmd.clone(), exit_code, output_sample.clone());
+                                    }
                                 }
 
                                 {
                                     let cfg = config_for_cb.borrow();
-                                    if cfg.notify_long_blocks {
+                                    if !is_background && cfg.notify_long_blocks {
                                         if let Some(ms) = duration_ms {
                                             if ms >= cfg.notify_long_block_threshold_ms {
                                                 crate::notify::long_block_finished(
@@ -1705,6 +1764,8 @@ impl ReaderCtx {
                             prompt_buf_rc.borrow_mut().clear();
                             typed_cmd_rc.borrow_mut().clear();
                             vte_typed_cmd_rc.borrow_mut().clear();
+                            background_output_rc.borrow_mut().clear();
+                            idle_input_dirty_rc.set(false);
                             // Snapshot the live VTE cursor at the moment the
                             // prompt finishes drawing — this is where the user's
                             // command starts. CommandStart will read text from
@@ -1743,6 +1804,11 @@ impl ReaderCtx {
                                 continue;
                             }
                             osc133_depth_rc.set(0);
+                            // A command start without an intervening PromptStart is
+                            // an ambiguous shell-integration edge. Keep those bytes
+                            // visible in the live VTE but do not merge them into the
+                            // command's output block.
+                            background_output_rc.borrow_mut().clear();
                             active_rc.borrow().reset_output_buffer();
                             block_start_time_for_cb.set(Some(SystemTime::now()));
                             // Read the typed command directly off the live VTE,
@@ -2680,6 +2746,8 @@ impl TermView {
         // off the VTE at CommandStart; this remains a best-effort fallback when
         // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let background_output: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Command text snapshot taken at CommandStart from the VTE itself,
         // between `prompt_end_pos` and the current cursor. This is what
         // finalize uses to record the run.
@@ -2991,6 +3059,8 @@ impl TermView {
                 osc133_depth_rc,
                 prompt_buf_rc,
                 typed_cmd_rc,
+                background_output_rc: background_output.clone(),
+                idle_input_dirty_rc: idle_input_dirty.clone(),
                 vte_typed_cmd_rc,
                 prompt_end_pos_rc,
                 prompt_display_rc,
@@ -3251,6 +3321,7 @@ impl TermView {
             let pty_for_commit = pty.clone();
             let bstate_for_commit = bstate.clone();
             let typed_cmd_for_commit = typed_cmd.clone();
+            let idle_input_dirty_for_commit = idle_input_dirty.clone();
             let pty_synced_for_commit = pty_synced.clone();
             let finished_blocks_for_commit = finished_blocks_rc.clone();
             let selected_block_ids_for_commit = selected_block_ids.clone();
@@ -3270,12 +3341,13 @@ impl TermView {
                     );
                 }
 
-                if bstate_for_commit.get() == BlockState::AwaitingCommand
-                    && text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n')
-                {
-                    // A later recall must replace this edited readline buffer,
-                    // not append to it. PromptEnd resets the flag for a new line.
-                    pty_synced_for_commit.set(true);
+                if bstate_for_commit.get() == BlockState::AwaitingCommand {
+                    idle_input_dirty_for_commit.set(true);
+                    if text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n') {
+                        // A later recall must replace this edited readline buffer,
+                        // not append to it. PromptEnd resets the flag for a new line.
+                        pty_synced_for_commit.set(true);
+                    }
                 }
 
                 pty_for_commit.write_bytes(text.as_bytes());
@@ -4250,13 +4322,34 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_command_recall, build_keyboard_query_reply, coalesce_bytes_events,
-        compute_viewport_state, normalize_captured_command, scroll_delta_to_reveal,
-        selected_command_text, selected_id_range, strip_ansi, strip_ansi_with_clear_detect,
-        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, ViewportState,
+        background_output_has_visible_text, build_command_recall, build_keyboard_query_reply,
+        coalesce_bytes_events, compute_viewport_state, normalize_captured_command,
+        scroll_delta_to_reveal, selected_command_text, selected_id_range, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
+        visible_indices_for_viewport, BlockData, ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
+    use std::cell::RefCell;
     use std::collections::{HashSet, VecDeque};
+
+    #[test]
+    fn background_output_requires_visible_text() {
+        assert!(!background_output_has_visible_text(b"\r\n\x1b[0m"));
+        assert!(background_output_has_visible_text(
+            b"\x1b[36mworker finished\x1b[0m\r\n"
+        ));
+    }
+
+    #[test]
+    fn taking_background_output_drains_the_pending_buffer() {
+        let pending = RefCell::new(b"async line\r\n".to_vec());
+        assert_eq!(
+            take_background_output(&pending).as_deref(),
+            Some("async line\r\n")
+        );
+        assert!(pending.borrow().is_empty());
+        assert!(take_background_output(&pending).is_none());
+    }
 
     fn ev_summary(events: &[ParserEvent]) -> Vec<String> {
         events
