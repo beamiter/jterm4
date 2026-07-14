@@ -5,7 +5,6 @@ use gtk4::ToggleButton;
 use libadwaita as adw;
 
 use super::*;
-use crate::terminal::wrap_with_scrollbar;
 
 impl UiState {
     /// Recursively restore a pane layout from saved state
@@ -110,7 +109,12 @@ impl UiState {
         }
     }
 
-    /// Internal helper for recursive pane restoration
+    /// Internal helper for recursive pane restoration.
+    ///
+    /// Saved split layouts are necessarily VTE layouts because Block splitting is
+    /// rejected before a second PTY is created. Rebuild each leaf through the same
+    /// typed constructor used for interactive splits so `PaneNode` can require a
+    /// controller at every leaf.
     fn restore_pane_layout_internal(&self, layout: crate::state::PaneLayout) -> gtk4::Widget {
         use crate::state::PaneLayout;
 
@@ -121,17 +125,19 @@ impl UiState {
                 cmds,
                 pinned,
             } => {
-                let terminal = self.add_new_tab(Some(dir), None, Some(sid), cmds);
-                let page_num = self.notebook.n_pages().saturating_sub(1);
-                if let Some(page_widget) = self.notebook.nth_page(Some(page_num)) {
-                    if pinned == Some(true) {
-                        unsafe {
-                            page_widget.set_data::<bool>("pinned", true);
-                        }
+                let leaf = self.create_vte_leaf(
+                    Some(&dir),
+                    Some(&sid),
+                    cmds.as_deref(),
+                    None,
+                );
+                let root = leaf.root_widget();
+                if pinned == Some(true) {
+                    unsafe {
+                        root.set_data::<bool>("pinned", true);
                     }
                 }
-                // Get the wrapped terminal widget
-                wrap_with_scrollbar(&terminal).upcast::<gtk4::Widget>()
+                root
             }
             PaneLayout::Split {
                 orientation,
