@@ -123,17 +123,21 @@ impl TermView {
                     return false;
                 }
 
-                // Duration filters
-                if let Some(duration) = b.duration_ms {
-                    if let Some(min_dur) = filters.min_duration_ms {
-                        if duration < min_dur {
-                            return false;
-                        }
+                // Duration predicates require a known duration. Background
+                // output and legacy history with no timing metadata must not
+                // leak into slow/min/max result sets.
+                if filters.min_duration_ms.is_some()
+                    || filters.max_duration_ms.is_some()
+                    || filters.slow_only
+                {
+                    let Some(duration) = b.duration_ms else {
+                        return false;
+                    };
+                    if filters.min_duration_ms.is_some_and(|min| duration < min) {
+                        return false;
                     }
-                    if let Some(max_dur) = filters.max_duration_ms {
-                        if duration > max_dur {
-                            return false;
-                        }
+                    if filters.max_duration_ms.is_some_and(|max| duration > max) {
+                        return false;
                     }
                     if filters.slow_only && duration < filters.slow_threshold_ms {
                         return false;
@@ -307,8 +311,9 @@ impl TermView {
                 widget.compute_point(&scroll, &gtk4::graphene::Point::new(0.0, 0.0))
             {
                 let adj = scroll.vadjustment();
-                let target = (point.y() as f64) - adj.page_size() / 3.0;
-                adj.set_value(target.max(0.0));
+                let max_value = (adj.upper() - adj.page_size()).max(adj.lower());
+                let target = adj.value() + point.y() as f64 - adj.page_size() / 3.0;
+                adj.set_value(target.clamp(adj.lower(), max_value));
             }
         });
     }

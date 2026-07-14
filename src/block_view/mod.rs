@@ -1231,9 +1231,11 @@ impl ReaderCtx {
                                         &output_plain,
                                         truncation_limit,
                                     );
-                                let estimated_height = estimated_finished_block_height(
+                                let cols_for_height = active_rc.borrow().grid_cols() as i64;
+                                let estimated_height = estimated_finished_block_height_for_text(
                                     &config_for_cb.borrow(),
-                                    line_count,
+                                    &output_plain,
+                                    cols_for_height,
                                 );
 
                                 let start_time = if is_background {
@@ -1338,6 +1340,7 @@ impl ReaderCtx {
                                     &pty_for_init,
                                     &pty_synced_rc,
                                     &active_rc,
+                                    &typed_cmd_rc,
                                     &bstate_rc,
                                     &bracketed_paste_rc,
                                 );
@@ -3613,6 +3616,7 @@ impl TermView {
                     &term_view.pty,
                     &pty_synced,
                     &term_view.active,
+                    &term_view.typed_cmd,
                     &term_view.bstate,
                     &term_view.bracketed_paste,
                 );
