@@ -141,8 +141,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release --all-features --locked
 
-      - name: Remove migration script
-        run: rm scripts/migrate_linux_desktop_packaging.py
+      - name: Remove bootstrap-only files
+        run: |
+          rm scripts/migrate_linux_desktop_packaging.py
+          rm .github/workflows/flatpak.yml
 
       - name: Normalize generated text files
         run: |
