@@ -136,6 +136,16 @@ impl OwnedPty {
     }
 
     pub fn spawn(argv: &[&str], cwd: Option<&str>, env_extra: &[(&str, &str)]) -> io::Result<Self> {
+        let argv_owned: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+        let host_bridge = crate::host::is_flatpak();
+        let executable_argv = crate::host::wrap_argv(&argv_owned, cwd, env_extra);
+        if executable_argv.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty PTY argv",
+            ));
+        }
+
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -162,15 +172,20 @@ impl OwnedPty {
                 }
                 drop(slave);
 
-                if let Some(dir) = cwd {
-                    let _ = std::env::set_current_dir(dir);
+                if !host_bridge {
+                    if let Some(dir) = cwd {
+                        let _ = std::env::set_current_dir(dir);
+                    }
                 }
                 for (key, val) in env_extra {
                     unsafe { std::env::set_var(key, val) };
                 }
                 unsafe { std::env::set_var("TERM", "xterm-256color") };
 
-                let c_argv: Vec<CString> = argv.iter().map(|a| CString::new(*a).unwrap()).collect();
+                let c_argv: Vec<CString> = executable_argv
+                    .iter()
+                    .map(|argument| CString::new(argument.as_str()).unwrap())
+                    .collect();
                 let _ = unistd::execvp(&c_argv[0], &c_argv);
                 std::process::exit(127);
             }

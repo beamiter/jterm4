@@ -161,7 +161,7 @@ pub fn run() -> glib::ExitCode {
     // NON_UNIQUE: each launch is its own process with its own window, instead of
     // the second invocation activating the first instance and then exiting.
     let app = adw::Application::builder()
-        .application_id("app.jterm4")
+        .application_id(crate::host::APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 

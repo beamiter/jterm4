@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Install jterm4 from a source checkout using Nix or Cargo.
+# Install jterm4 and its Linux desktop integration from a source checkout.
 
 set -Eeuo pipefail
 umask 077
 
+APP_ID="io.github.beamiter.jterm4"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 HOME_DIR="${HOME:-}"
@@ -12,6 +13,7 @@ PREFIX="${HOME_DIR}/.local"
 BIN_DIR=""
 BACKEND="auto"
 INSTALL_CONFIG=1
+INSTALL_DESKTOP=1
 DRY_RUN=0
 
 usage() {
@@ -24,6 +26,7 @@ Options:
   --backend auto|nix|cargo
                          Build backend (default: auto; prefers Nix)
   --no-config            Do not install config.toml.example
+  --no-desktop           Do not install desktop, AppStream, or icon files
   --dry-run              Print commands without changing files
   -h, --help             Show this help
 
@@ -101,6 +104,10 @@ while (($# > 0)); do
             INSTALL_CONFIG=0
             shift
             ;;
+        --no-desktop)
+            INSTALL_DESKTOP=0
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -171,6 +178,20 @@ STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
 run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm4"
 
+if ((INSTALL_DESKTOP == 1)); then
+    SHARE_DIR="${DESTDIR}${PREFIX}/share"
+    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.desktop" \
+        "${SHARE_DIR}/applications/${APP_ID}.desktop"
+    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
+        "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
+    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.svg" \
+        "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}-128.png" \
+        "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
+    run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}-256.png" \
+        "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
+fi
+
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"
 [[ "${CONFIG_HOME}" == /* ]] || die "XDG_CONFIG_HOME must be an absolute path"
 CONFIG_DIR="${CONFIG_HOME}/jterm4"
@@ -185,6 +206,9 @@ if ((INSTALL_CONFIG == 1)); then
 fi
 
 printf 'Installed jterm4 to %s\n' "${BIN_DIR}/jterm4"
+if ((INSTALL_DESKTOP == 1)); then
+    printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
+fi
 if [[ -n "${DESTDIR}" ]]; then
     printf 'Staged file: %s\n' "${STAGED_BIN_DIR}/jterm4"
 fi

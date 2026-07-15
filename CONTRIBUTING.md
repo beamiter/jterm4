@@ -22,8 +22,10 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 cargo build --release --all-features --locked
 bash -n scripts/install.sh scripts/uninstall.sh
-shellcheck scripts/install.sh scripts/uninstall.sh
+shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
 ```
+
+For packaging changes, also run `desktop-file-validate`, `appstreamcli validate --no-net`, regenerate `packaging/flatpak/cargo-sources.json`, build the Flatpak manifest, and execute `scripts/smoke-flatpak.sh` inside a D-Bus session.
 
 For UI changes, smoke-test both Wayland and X11 when practical, VTE and Block modes, CJK input, tab closing, process cleanup, and session restoration. Changes to Block rendering should also follow `docs/BLOCK_MODE_ACCEPTANCE.md`.
 

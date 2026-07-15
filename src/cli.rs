@@ -168,6 +168,7 @@ fn env_presence(name: &str) -> &'static str {
 fn doctor() -> bool {
     let path = config_file_path();
     println!("jterm4 {} doctor", env!("CARGO_PKG_VERSION"));
+    println!("application id: {}", crate::host::APP_ID);
     println!("config: {}", path.display());
 
     let config_ok = if path.exists() {
@@ -176,6 +177,20 @@ fn doctor() -> bool {
         println!("config status: not created (built-in defaults will be used)");
         true
     };
+
+    let flatpak = crate::host::is_flatpak();
+    let bridge_ok = crate::host::bridge_available();
+    println!("runtime: {}", if flatpak { "flatpak" } else { "native" });
+    if flatpak {
+        println!(
+            "host bridge: {}",
+            if bridge_ok {
+                "available"
+            } else {
+                "missing (terminal launch unavailable)"
+            }
+        );
+    }
 
     let (ready_snapshots, active_snapshots) = crate::state::session_snapshot_counts();
     println!("session snapshots: {ready_snapshots} ready, {active_snapshots} active");
@@ -193,12 +208,20 @@ fn doctor() -> bool {
         ("curl", "AI panel"),
         ("notify-send", "long-command notifications"),
     ] {
-        match find_on_path(name) {
-            Some(found) => println!("{name}: {} ({purpose})", found.display()),
-            None => println!("{name}: not found ({purpose} unavailable)"),
+        if flatpak {
+            if crate::host::command_available(name) {
+                println!("{name}: available on host ({purpose})");
+            } else {
+                println!("{name}: not found on host ({purpose} unavailable)");
+            }
+        } else {
+            match find_on_path(name) {
+                Some(found) => println!("{name}: {} ({purpose})", found.display()),
+                None => println!("{name}: not found ({purpose} unavailable)"),
+            }
         }
     }
-    config_ok
+    config_ok && bridge_ok
 }
 
 /// Handle options that must complete without initializing a display. Returns

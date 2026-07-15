@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -199,14 +199,14 @@ fn parse_ahead_behind(value: &str) -> Option<(u32, u32)> {
 /// Run one bounded Git process. A helper drains stdout so a very dirty worktree
 /// cannot fill the pipe and deadlock before the child exits.
 fn run_git_status(cwd: &Path) -> Option<String> {
-    let mut child = Command::new("git")
+    let mut command = crate::host::command_with_cwd("git", cwd);
+    let mut child = command
         .args([
             "status",
             "--porcelain=v2",
             "--branch",
             "--untracked-files=normal",
         ])
-        .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())

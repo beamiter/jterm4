@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Remove a jterm4 installation while preserving user data by default.
+# Remove jterm4 while preserving user configuration and state by default.
 
 set -Eeuo pipefail
 
+APP_ID="io.github.beamiter.jterm4"
 HOME_DIR="${HOME:-}"
 DESTDIR="${DESTDIR:-}"
 PREFIX="${HOME_DIR}/.local"
@@ -42,6 +43,13 @@ run() {
     print_command "$@"
     if ((DRY_RUN == 0)); then
         "$@"
+    fi
+}
+
+remove_file() {
+    local path="$1"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        run rm -f -- "${path}"
     fi
 }
 
@@ -99,12 +107,13 @@ if [[ -n "${DESTDIR}" ]]; then
     DESTDIR="${DESTDIR%/}"
 fi
 
-BINARY="${DESTDIR}${BIN_DIR}/jterm4"
-if [[ -e "${BINARY}" || -L "${BINARY}" ]]; then
-    run rm -f -- "${BINARY}"
-else
-    printf 'Binary not present: %s\n' "${BIN_DIR}/jterm4"
-fi
+remove_file "${DESTDIR}${BIN_DIR}/jterm4"
+SHARE_DIR="${DESTDIR}${PREFIX}/share"
+remove_file "${SHARE_DIR}/applications/${APP_ID}.desktop"
+remove_file "${SHARE_DIR}/metainfo/${APP_ID}.metainfo.xml"
+remove_file "${SHARE_DIR}/icons/hicolor/scalable/apps/${APP_ID}.svg"
+remove_file "${SHARE_DIR}/icons/hicolor/128x128/apps/${APP_ID}.png"
+remove_file "${SHARE_DIR}/icons/hicolor/256x256/apps/${APP_ID}.png"
 
 if ((PURGE_CONFIG == 1)); then
     CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_DIR}/.config}"

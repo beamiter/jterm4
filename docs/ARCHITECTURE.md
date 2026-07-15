@@ -27,7 +27,23 @@ Each process owns one active window snapshot. A snapshot becomes available to a 
 
 Session snapshots and Block history use owner-only Unix permissions. File contents are written to a sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes.
 
-## Configuration and observability
+
+    ## Native and Flatpak execution boundary
+
+    Native builds execute shells and helper tools directly. Flatpak builds keep the
+    GTK process sandboxed but route interactive shells, SSH, Git metadata, curl, and
+    notifications through a single `host` module backed by
+    `flatpak-spawn --host --watch-bus`. Cwd and selected environment values are
+    encoded as argv options before process creation, so VTE and Block PTYs share the
+    same explicit host boundary and cleanup rules. The stable application ID is
+    `io.github.beamiter.jterm4`.
+
+    The Flatpak is intentionally granted host filesystem and command access because a
+    terminal emulator is not a command sandbox. That authority is documented and
+    validated rather than hidden behind a package that only works inside its own
+    container.
+
+    ## Configuration and observability
 
 Configuration is parsed and validated before replacing the active runtime value. File monitoring provides hot reload while manual reload remains available. The lightweight logger supports plain levels and target-specific `RUST_LOG` directives; each line includes relative time, severity, and target. `--doctor` reports configuration status, display/input environment, optional tools, shell choice, and ready/active snapshot counts without exposing snapshot contents.
 

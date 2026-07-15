@@ -6,6 +6,8 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Reproducible GNOME 50 Flatpak packaging, stable desktop application ID, AppStream metadata, scalable/raster icons, checksummed CI bundles, and X11/Wayland VTE/Block smoke tests.
+- A Flatpak host-command bridge so shells, SSH, Git probes, AI curl requests, and desktop notifications operate on the host instead of the application sandbox.
 - Modern GTK4 `TreeListModel`/`ListView` file browser with asynchronous lazy directory scans.
 - Per-window session snapshots with atomic claiming, stale-process recovery, legacy migration, retention, and doctor counts.
 - Target-aware `JTERM4_LOG` / `RUST_LOG` filtering with relative timestamps and module targets.

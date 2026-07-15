@@ -139,11 +139,11 @@ pub(crate) fn send_blocking(
         .map_err(|e| AiError::Transport(format!("encode request: {e}")))?;
 
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // -w writes the HTTP status as the last line of stdout AFTER the body,
     // so we can split them deterministically without a `-D headers` tempfile.
-    let mut child = Command::new("curl")
+    let mut child = crate::host::command("curl")
         .args([
             "--silent",
             "--show-error",

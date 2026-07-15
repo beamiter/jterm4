@@ -17,3 +17,10 @@ Pay particular attention to PTY lifecycle and process-group signalling, OSC/clip
 ## Disclosure
 
 Please allow time for a fix and coordinated release before public disclosure. Confirmed vulnerabilities may receive a GitHub security advisory and CVE when appropriate.
+
+## Flatpak host authority
+
+The Flatpak intentionally uses `flatpak-spawn --host` and host filesystem access
+so terminal commands operate on the user's real account. Reports about unintended
+privilege expansion, command-argument confusion, leaked environment values, or a
+host process surviving after its owning pane closes are security-sensitive.

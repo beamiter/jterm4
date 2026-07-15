@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=jterm4
+GenericName=Terminal Emulator
+Comment=Session-aware GTK4 terminal with structured command blocks
+Exec=jterm4
+Icon=io.github.beamiter.jterm4
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;command;developer;ssh;blocks;
+StartupNotify=true
+StartupWMClass=io.github.beamiter.jterm4
+X-GNOME-UsesNotifications=true
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=jterm4
