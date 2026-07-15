@@ -16,7 +16,63 @@ finish-args:
   - --filesystem=host
   - --talk-name=org.freedesktop.Flatpak
 
+cleanup:
+  - /bin/vte-2.91-gtk4
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/gir-1.0
+  - /share/gtk-doc
+  - /share/man
+  - /share/pkgconfig
+  - /share/vala
+  - '*.a'
+  - '*.la'
+
 modules:
+  - name: fast_float
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/fastfloat/fast_float.git
+        tag: v8.2.5
+        commit: 05087a303dad9c98768b33c829d398223a649bc6
+        x-checker-data:
+          type: anitya
+          project-id: 214353
+          tag-template: v$version
+
+  - name: simdutf
+    buildsystem: cmake-ninja
+    sources:
+      - type: git
+        url: https://github.com/simdutf/simdutf.git
+        tag: v9.0.0
+        commit: ca7acbcea967b5dcbab490066e99e3a6e6925539
+        x-checker-data:
+          type: anitya
+          project-id: 378662
+          tag-template: v$version
+
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+      - -Dgtk3=false
+      - -Dgtk4=true
+      - -Dglade=false
+      - -Dgir=false
+      - -Dvapi=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/vte/0.84/vte-0.84.0.tar.xz
+        sha256: 0414e31583836aeb7878da25f67c515f7e8879917ecc37c92e26b83e8d8fc3e3
+        x-checker-data:
+          type: gnome
+          version-scheme: odd-minor-is-unstable
+          name: vte
+
   - name: jterm4
     buildsystem: simple
     build-options:
