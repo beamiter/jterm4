@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: flatpak-${{ github.event.pull_request.number || github.ref }}
@@ -74,25 +74,23 @@ jobs:
             diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
           } 2>&1 | tee cargo-sources-verify.log
 
+      - name: Stage generated Cargo source manifest
+        if: ${{ always() }}
+        run: |
+          if [[ -f /tmp/cargo-sources.json ]]; then
+            cp /tmp/cargo-sources.json generated-cargo-sources.json
+          fi
+
       - name: Upload Cargo source diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: cargo-sources-diagnostics-${{ github.run_id }}
-          path: cargo-sources-verify.log
+          path: |
+            cargo-sources-verify.log
+            generated-cargo-sources.json
           if-no-files-found: error
           retention-days: 1
-
-      - name: Refresh stale Cargo source manifest
-        if: ${{ steps.cargo_sources.outcome == 'failure' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
-        run: |
-          cp /tmp/cargo-sources.json packaging/flatpak/cargo-sources.json
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add packaging/flatpak/cargo-sources.json
-          git diff --cached --quiet && exit 0
-          git commit -m "Refresh Flatpak Cargo sources"
-          git push origin HEAD:${{ github.head_ref }}
 
       - name: Require generated Cargo sources
         if: ${{ steps.cargo_sources.outcome == 'failure' }}
