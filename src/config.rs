@@ -1430,7 +1430,50 @@ fn find_executable_in_path(exe_name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+fn choose_flatpak_host_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
+    if let Some(shell) = configured_shell.filter(|value| !value.trim().is_empty()) {
+        let shell_name = Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if shell_name == "rsh" && crate::host::command_available("bash") {
+            return vec![
+                "bash".to_string(),
+                "-ic".to_string(),
+                format!("exec {}", shell_single_quote(shell)),
+            ];
+        }
+        return vec![shell.to_string()];
+    }
+
+    if crate::host::command_available("rsh") {
+        if crate::host::command_available("bash") {
+            return vec![
+                "bash".to_string(),
+                "-ic".to_string(),
+                "exec rsh".to_string(),
+            ];
+        }
+        return vec!["rsh".to_string()];
+    }
+
+    if let Some(shell) = std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return vec![shell, "-l".to_string()];
+    }
+    if crate::host::command_available("bash") {
+        return vec!["bash".to_string(), "-l".to_string()];
+    }
+    vec!["sh".to_string()]
+}
+
 pub(crate) fn choose_shell_argv(configured_shell: Option<&str>) -> Vec<String> {
+    if crate::host::is_flatpak() {
+        return choose_flatpak_host_shell_argv(configured_shell);
+    }
+
     // Explicit config / env var wins (needed when PATH is stripped by launchers like wofi).
     if let Some(path) = configured_shell {
         if is_executable(Path::new(path)) {

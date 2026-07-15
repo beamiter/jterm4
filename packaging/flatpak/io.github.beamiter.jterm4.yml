@@ -1,0 +1,45 @@
+app-id: io.github.beamiter.jterm4
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: jterm4
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=ssh-auth
+  - --device=dri
+  - --filesystem=host
+  - --talk-name=org.freedesktop.Flatpak
+
+modules:
+  - name: jterm4
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/jterm4/cargo
+        CARGO_NET_OFFLINE: 'true'
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo build --offline --release --all-features --locked
+      - install -Dm0755 target/release/jterm4 ${FLATPAK_DEST}/bin/jterm4
+      - install -Dm0644 data/io.github.beamiter.jterm4.desktop ${FLATPAK_DEST}/share/applications/io.github.beamiter.jterm4.desktop
+      - install -Dm0644 data/io.github.beamiter.jterm4.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.beamiter.jterm4.metainfo.xml
+      - install -Dm0644 data/io.github.beamiter.jterm4.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm4.svg
+      - install -Dm0644 data/io.github.beamiter.jterm4-128.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.beamiter.jterm4.png
+      - install -Dm0644 data/io.github.beamiter.jterm4-256.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.beamiter.jterm4.png
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .flatpak-builder
+          - flatpak-build
+          - flatpak-repo
+          - target
+      - cargo-sources.json

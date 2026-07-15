@@ -65,10 +65,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck
 
-      - name: Check installer scripts
+      - name: Check installer and smoke scripts
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh
-          shellcheck scripts/install.sh scripts/uninstall.sh
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
 

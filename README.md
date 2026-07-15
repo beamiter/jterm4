@@ -50,7 +50,26 @@ cargo build --release --all-features --locked
 ./scripts/uninstall.sh --purge-config   # 明确删除全部配置和状态
 ```
 
-## 配置
+
+    ## Flatpak 与桌面集成
+
+    项目使用稳定应用 ID `io.github.beamiter.jterm4`，提供 desktop、AppStream、
+    SVG/PNG 图标以及可复现 Flatpak 清单。Flatpak 中的 Shell、SSH、Git、curl
+    和通知命令通过 `flatpak-spawn --host` 运行，因此终端操作的是宿主环境而
+    不是一次性沙箱；原生安装路径保持直接执行。
+
+    ```bash
+    flatpak-builder --user --install-deps-from=flathub --force-clean \
+      --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
+      packaging/flatpak/io.github.beamiter.jterm4.yml
+    flatpak build-bundle flatpak-repo io.github.beamiter.jterm4.flatpak \
+      io.github.beamiter.jterm4
+    ```
+
+    权限模型、宿主桥接、安全边界、安装命令与已知限制见
+    [Flatpak 指南](docs/FLATPAK.md)。
+
+    ## 配置
 
 默认配置路径为 `~/.config/jterm4/config.toml`。从完整示例开始：
 

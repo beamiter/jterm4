@@ -5,6 +5,7 @@ pub mod block_view;
 pub mod cli;
 pub mod config;
 pub mod git_meta;
+pub mod host;
 pub mod keybindings;
 pub mod logging;
 pub mod notify;

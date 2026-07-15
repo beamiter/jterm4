@@ -361,14 +361,22 @@ pub(crate) fn spawn_shell(
             argv_vec.push(sid.to_string());
         }
     }
+    let home = std::env::var("HOME").ok();
+    let requested_working_directory = working_directory.or(home.as_deref());
+    let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &[]);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // Use empty envv to inherit all environment variables from parent process
+    // Use empty envv to inherit all environment variables from parent process.
+    // In Flatpak mode, cwd and host environment forwarding are encoded in the
+    // flatpak-spawn argv above instead of being applied to the sandbox helper.
     let envv: &[&str] = &[];
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
-    let home = std::env::var("HOME").ok();
-    let working_directory = working_directory.or(home.as_deref());
+    let spawn_working_directory = if crate::host::is_flatpak() {
+        None
+    } else {
+        requested_working_directory
+    };
     let terminal_for_pid = terminal.clone();
 
     // If initial commands are provided, send them after the shell starts.
@@ -377,7 +385,7 @@ pub(crate) fn spawn_shell(
 
     terminal.spawn_async(
         PtyFlags::DEFAULT,
-        working_directory,
+        spawn_working_directory,
         &argv,
         envv,
         spawn_flags,

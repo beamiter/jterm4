@@ -109,7 +109,22 @@ Block 历史选择与 jterm1 保持一致：
 
 Block 模式的路径插入走其自管 PTY 输入通道；VTE 模式走 VTE child 输入。
 
-## 7. SSH 远程会话
+## 7. Flatpak 与桌面安装
+
+Flatpak 应用 ID 为 `io.github.beamiter.jterm4`。打包版本会通过
+`flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免用户
+误以为终端命令运行在真实系统、实际却被限制在应用沙箱。该设计也意味着
+jterm4 Flatpak 不是命令隔离边界。
+
+```bash
+flatpak run io.github.beamiter.jterm4 --doctor
+flatpak run io.github.beamiter.jterm4
+```
+
+文件树需要宿主文件系统权限；AI 密钥必须通过可信启动器或显式 Flatpak 环境
+覆盖提供。完整权限说明和构建流程见 `docs/FLATPAK.md`。
+
+## 8. SSH 远程会话
 
 jterm4 不会预置任何个人主机。在配置中显式添加：
 
@@ -127,7 +142,7 @@ multiplex = true
 
 按 `Ctrl+Shift+S` 打开主机选择器。连接复用通过 OpenSSH ControlMaster 完成，异常断开会按上限退避重连；用户正常退出不会重连。
 
-## 8. 工作流模板
+## 9. 工作流模板
 
 将一个或多个 TOML 文件放到 `~/.config/jterm4/workflows/`：
 
@@ -148,7 +163,7 @@ default = "staging"
 
 `Ctrl+Shift+M` 选择模板并填写参数。生成的命令只写入编辑行，不会自动按 Enter。
 
-## 9. AI 面板
+## 10. AI 面板
 
 启动前设置密钥：
 
@@ -161,7 +176,7 @@ jterm4
 
 AI 请求目前依赖系统 `curl`。运行 `jterm4 --doctor` 可检查其是否可用。不要把终端脱敏当成唯一的秘密保护边界，发送前仍应检查上下文。
 
-## 10. 配置与快捷键
+## 11. 配置与快捷键
 
 完整字段见仓库根目录的 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 可手动重载。语法或语义错误的热重载会被拒绝，当前有效配置保持不变。
 

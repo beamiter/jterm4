@@ -9,3 +9,8 @@
 # Local CI diagnostics
 clippy.log
 rustfmt.patch
+.flatpak-builder/
+flatpak-build/
+flatpak-repo/
+*.flatpak
+flatpak-smoke-logs/

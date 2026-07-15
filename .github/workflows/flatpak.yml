@@ -1,0 +1,134 @@
+name: Flatpak
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - data/**
+      - packaging/flatpak/**
+      - scripts/smoke-flatpak.sh
+      - src/**
+      - .github/workflows/flatpak.yml
+  push:
+    branches: [master]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - data/**
+      - packaging/flatpak/**
+      - scripts/smoke-flatpak.sh
+      - src/**
+      - .github/workflows/flatpak.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flatpak-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_ID: io.github.beamiter.jterm4
+  CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
+
+jobs:
+  build:
+    name: Bundle and smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream \
+            dbus-x11 \
+            desktop-file-utils \
+            flatpak \
+            flatpak-builder \
+            librsvg2-bin \
+            python3-venv \
+            weston \
+            xvfb
+
+      - name: Verify generated Cargo sources
+        run: |
+          python3 -m venv /tmp/flatpak-cargo-generator
+          /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
+            aiohttp tomlkit pyyaml
+          curl --fail --location \
+            --output /tmp/flatpak-cargo-generator.py \
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
+          /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
+            Cargo.lock -o /tmp/cargo-sources.json
+          diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
+
+      - name: Validate desktop metadata and icons
+        run: |
+          desktop-file-validate data/${APP_ID}.desktop
+          appstreamcli validate --no-net data/${APP_ID}.metainfo.xml
+          rsvg-convert -w 128 -h 128 data/${APP_ID}.svg > /tmp/icon-128.png
+          rsvg-convert -w 256 -h 256 data/${APP_ID}.svg > /tmp/icon-256.png
+          cmp data/${APP_ID}-128.png /tmp/icon-128.png
+          cmp data/${APP_ID}-256.png /tmp/icon-256.png
+
+      - name: Configure Flathub
+        run: |
+          flatpak --user remote-add --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Build Flatpak repository
+        id: flatpak_build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          {
+            flatpak-builder --user --install-deps-from=flathub --force-clean \
+              --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
+              packaging/flatpak/${APP_ID}.yml
+            flatpak build-bundle flatpak-repo ${APP_ID}.flatpak ${APP_ID}
+            sha256sum ${APP_ID}.flatpak | tee ${APP_ID}.flatpak.sha256
+          } 2>&1 | tee flatpak-build.log
+
+      - name: Upload Flatpak build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-build-diagnostics-${{ github.run_id }}
+          path: flatpak-build.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require Flatpak build
+        if: ${{ steps.flatpak_build.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Install local bundle
+        run: |
+          flatpak --user remote-add --if-not-exists --no-gpg-verify \
+            jterm4-ci "file://${PWD}/flatpak-repo"
+          flatpak --user install -y jterm4-ci ${APP_ID}
+          flatpak run ${APP_ID} --version
+          flatpak run ${APP_ID} --doctor
+
+      - name: Smoke-test X11 and Wayland launches
+        run: dbus-run-session -- scripts/smoke-flatpak.sh ${APP_ID}
+
+      - name: Upload Flatpak bundle and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: jterm4-flatpak-${{ github.sha }}
+          path: |
+            io.github.beamiter.jterm4.flatpak
+            io.github.beamiter.jterm4.flatpak.sha256
+            flatpak-build.log
+            flatpak-smoke-logs/
+          if-no-files-found: warn
+          retention-days: 7

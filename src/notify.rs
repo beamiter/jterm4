@@ -12,7 +12,7 @@
 //! D-Bus is broken, the user shouldn't see a stack trace from a feature
 //! that's meant to be unobtrusive.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Post a desktop notification for a command that just finished. `cmd` is
 /// the displayed command (truncated to keep the toast readable);
@@ -36,10 +36,10 @@ pub fn long_block_finished(cmd: &str, exit_code: i32, duration_ms: u64) {
     // a moment of attention.
     let timeout_ms = if exit_code == 0 { "5000" } else { "10000" };
 
-    let _ = Command::new("notify-send")
+    let _ = crate::host::command("notify-send")
         .args([
             "--app-name=jterm4",
-            "--icon=utilities-terminal",
+            "--icon=io.github.beamiter.jterm4",
             "--urgency",
             urgency,
             "--expire-time",
