@@ -84,12 +84,30 @@ jobs:
             https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Build Flatpak repository
+        id: flatpak_build
+        continue-on-error: true
         run: |
-          flatpak-builder --user --install-deps-from=flathub --force-clean \
-            --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
-            packaging/flatpak/${APP_ID}.yml
-          flatpak build-bundle flatpak-repo ${APP_ID}.flatpak ${APP_ID}
-          sha256sum ${APP_ID}.flatpak | tee ${APP_ID}.flatpak.sha256
+          set -o pipefail
+          {
+            flatpak-builder --user --install-deps-from=flathub --force-clean \
+              --disable-rofiles-fuse --repo=flatpak-repo flatpak-build \
+              packaging/flatpak/${APP_ID}.yml
+            flatpak build-bundle flatpak-repo ${APP_ID}.flatpak ${APP_ID}
+            sha256sum ${APP_ID}.flatpak | tee ${APP_ID}.flatpak.sha256
+          } 2>&1 | tee flatpak-build.log
+
+      - name: Upload Flatpak build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-build-diagnostics-${{ github.run_id }}
+          path: flatpak-build.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require Flatpak build
+        if: ${{ steps.flatpak_build.outcome == 'failure' }}
+        run: exit 1
 
       - name: Install local bundle
         run: |
@@ -110,6 +128,7 @@ jobs:
           path: |
             io.github.beamiter.jterm4.flatpak
             io.github.beamiter.jterm4.flatpak.sha256
+            flatpak-build.log
             flatpak-smoke-logs/
           if-no-files-found: warn
           retention-days: 7
