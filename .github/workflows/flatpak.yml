@@ -58,16 +58,43 @@ jobs:
             xvfb
 
       - name: Verify generated Cargo sources
+        id: cargo_sources
+        continue-on-error: true
         run: |
-          python3 -m venv /tmp/flatpak-cargo-generator
-          /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
-            aiohttp tomlkit pyyaml
-          curl --fail --location \
-            --output /tmp/flatpak-cargo-generator.py \
-            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
-          /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
-            Cargo.lock -o /tmp/cargo-sources.json
-          diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
+          set -o pipefail
+          {
+            python3 -m venv /tmp/flatpak-cargo-generator
+            /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
+              aiohttp tomlkit pyyaml
+            curl --fail --location \
+              --output /tmp/flatpak-cargo-generator.py \
+              "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
+            /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
+              Cargo.lock -o /tmp/cargo-sources.json
+            diff -u packaging/flatpak/cargo-sources.json /tmp/cargo-sources.json
+          } 2>&1 | tee cargo-sources-verify.log
+
+      - name: Stage generated Cargo source manifest
+        if: ${{ always() }}
+        run: |
+          if [[ -f /tmp/cargo-sources.json ]]; then
+            cp /tmp/cargo-sources.json generated-cargo-sources.json
+          fi
+
+      - name: Upload Cargo source diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-sources-diagnostics-${{ github.run_id }}
+          path: |
+            cargo-sources-verify.log
+            generated-cargo-sources.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require generated Cargo sources
+        if: ${{ steps.cargo_sources.outcome == 'failure' }}
+        run: exit 1
 
       - name: Validate desktop metadata and icons
         run: |
@@ -102,7 +129,7 @@ jobs:
         with:
           name: flatpak-build-diagnostics-${{ github.run_id }}
           path: flatpak-build.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
 
       - name: Require Flatpak build
@@ -128,6 +155,7 @@ jobs:
           path: |
             io.github.beamiter.jterm4.flatpak
             io.github.beamiter.jterm4.flatpak.sha256
+            cargo-sources-verify.log
             flatpak-build.log
             flatpak-smoke-logs/
           if-no-files-found: warn
