@@ -1,0 +1,140 @@
+name: Apply Linux desktop packaging migration
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - scripts/migrate_linux_desktop_packaging.py
+      - .github/workflows/linux-desktop-packaging-migration.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-desktop-packaging-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_ID: io.github.beamiter.jterm4
+  CARGO_GENERATOR_COMMIT: 737c0085912f9f7dabf9341d4608e2a77a51a73a
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout packaging branch
+        uses: actions/checkout@v7
+        with:
+          ref: agent/linux-desktop-packaging
+
+      - name: Install generation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream \
+            desktop-file-utils \
+            librsvg2-bin \
+            python3-venv \
+            shellcheck
+
+      - name: Install Rust formatter
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply migration
+        run: |
+          python3 scripts/migrate_linux_desktop_packaging.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          desktop = Path("data/io.github.beamiter.jterm4.desktop")
+          desktop.write_text(desktop.read_text().replace(
+              "Categories=System;TerminalEmulator;Development;",
+              "Categories=System;TerminalEmulator;",
+          ))
+
+          metainfo = Path("data/io.github.beamiter.jterm4.metainfo.xml")
+          metainfo.write_text(metainfo.read_text().replace(
+              "<metadata_license>LicenseRef-proprietary</metadata_license>",
+              "<metadata_license>CC0-1.0</metadata_license>",
+          ))
+
+          guide = Path("docs/FLATPAK.md")
+          guide.write_text(guide.read_text().replace(
+              "The AppStream metadata uses `LicenseRef-proprietary` until that decision is made; the",
+              "The AppStream document metadata uses `CC0-1.0`, while the project license remains `LicenseRef-proprietary`; the",
+          ))
+          PY
+
+      - name: Generate Cargo sources and raster icons
+        run: |
+          python3 -m venv /tmp/flatpak-cargo-generator
+          /tmp/flatpak-cargo-generator/bin/pip install --disable-pip-version-check \
+            aiohttp tomlkit pyyaml
+          curl --fail --location \
+            --output /tmp/flatpak-cargo-generator.py \
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py"
+          /tmp/flatpak-cargo-generator/bin/python /tmp/flatpak-cargo-generator.py \
+            Cargo.lock -o packaging/flatpak/cargo-sources.json
+          rsvg-convert -w 128 -h 128 data/${APP_ID}.svg > data/${APP_ID}-128.png
+          rsvg-convert -w 256 -h 256 data/${APP_ID}.svg > data/${APP_ID}-256.png
+
+      - name: Format sources
+        run: cargo fmt --all
+
+      - name: Validate generated packaging files
+        run: |
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+          scripts/install.sh --help >/dev/null
+          scripts/uninstall.sh --help >/dev/null
+          HOME=/tmp/jterm4-home scripts/install.sh \
+            --dry-run --backend cargo --prefix /tmp/jterm4-prefix --no-config >/dev/null
+          HOME=/tmp/jterm4-home scripts/uninstall.sh \
+            --dry-run --prefix /tmp/jterm4-prefix >/dev/null
+          desktop-file-validate data/${APP_ID}.desktop
+          appstreamcli validate --no-net data/${APP_ID}.metainfo.xml
+
+      - name: Remove bootstrap-only and connector-owned workflow files
+        run: |
+          rm scripts/migrate_linux_desktop_packaging.py
+          rm .github/workflows/flatpak.yml
+          git checkout -- .github/workflows/ci.yml
+
+      - name: Normalize generated text files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          changed = subprocess.check_output(
+              ["git", "diff", "--name-only", "--diff-filter=ACM"], text=True
+          ).splitlines()
+          for name in changed:
+              path = Path(name)
+              if not path.is_file():
+                  continue
+              try:
+                  text = path.read_text()
+              except UnicodeDecodeError:
+                  continue
+              normalized = "\n".join(line.rstrip(" \t") for line in text.splitlines()).rstrip("\n") + "\n"
+              if normalized != text:
+                  path.write_text(normalized)
+          PY
+
+      - name: Verify patch cleanliness
+        run: git diff --check
+
+      - name: Commit generated upgrade
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Add reproducible Linux desktop packaging"
+          git push origin HEAD:agent/linux-desktop-packaging
