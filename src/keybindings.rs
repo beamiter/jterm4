@@ -13,6 +13,7 @@ pub(crate) enum Action {
     Paste,
     FontIncrease,
     FontDecrease,
+    FontReset,
     OpacityIncrease,
     OpacityDecrease,
     ToggleSearch,
@@ -88,6 +89,7 @@ impl Action {
             Action::Paste => "Paste",
             Action::FontIncrease => "Font size increase",
             Action::FontDecrease => "Font size decrease",
+            Action::FontReset => "Reset font size",
             Action::OpacityIncrease => "Opacity increase",
             Action::OpacityDecrease => "Opacity decrease",
             Action::ToggleSearch => "Toggle search",
@@ -95,8 +97,8 @@ impl Action {
             Action::ToggleSettings => "Toggle settings panel",
             Action::ReloadConfig => "Reload configuration",
             Action::ToggleSidebar => "Toggle sidebar",
-            Action::SplitHorizontal => "Split horizontal",
-            Action::SplitVertical => "Split vertical",
+            Action::SplitHorizontal => "Split left/right",
+            Action::SplitVertical => "Split top/bottom",
             Action::PrevTab => "Previous tab",
             Action::NextTab => "Next tab",
             Action::ScrollUp => "Scroll up",
@@ -161,6 +163,7 @@ impl Action {
             Action::Paste => Some("paste"),
             Action::FontIncrease => Some("font_increase"),
             Action::FontDecrease => Some("font_decrease"),
+            Action::FontReset => Some("font_reset"),
             Action::OpacityIncrease => Some("opacity_increase"),
             Action::OpacityDecrease => Some("opacity_decrease"),
             Action::ToggleSearch => Some("toggle_search"),
@@ -223,6 +226,7 @@ impl Action {
             Action::Paste,
             Action::FontIncrease,
             Action::FontDecrease,
+            Action::FontReset,
             Action::OpacityIncrease,
             Action::OpacityDecrease,
             Action::ToggleSearch,
@@ -342,6 +346,7 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
 
     let key = match key_str {
         "+" | "plus" => Key::plus,
+        "=" | "equal" => Key::equal,
         "-" | "minus" => Key::minus,
         "PageUp" => Key::Page_Up,
         "PageDown" => Key::Page_Down,
@@ -405,6 +410,7 @@ pub(crate) fn key_combo_to_string(combo: &KeyCombo) -> String {
 
     let key_name = match combo.key {
         Key::plus => "+".to_string(),
+        Key::equal => "=".to_string(),
         Key::minus => "-".to_string(),
         Key::Page_Up => "PageUp".to_string(),
         Key::Page_Down => "PageDown".to_string(),
@@ -462,10 +468,12 @@ impl KeybindingMap {
         bind("Ctrl+Shift+W", Action::ClosePaneOrTab);
         bind("Ctrl+Shift+C", Action::Copy);
         bind("Ctrl+Shift+V", Action::Paste);
-        bind("Ctrl+Shift++", Action::FontIncrease);
-        bind("Ctrl+Shift+J", Action::OpacityDecrease);
-        // Keep jterm1/Warp's I=reinput and K=clear block chords free.
-        bind("Ctrl+Alt+Shift+K", Action::OpacityIncrease);
+        // Keep zoom on the same low-strain row in all jterm variants.
+        bind("Ctrl+equal", Action::FontIncrease);
+        bind("Ctrl+minus", Action::FontDecrease);
+        bind("Ctrl+0", Action::FontReset);
+        bind("Ctrl+Alt+equal", Action::OpacityIncrease);
+        bind("Ctrl+Alt+minus", Action::OpacityDecrease);
         bind("Ctrl+Shift+F", Action::ToggleSearch);
         bind("Ctrl+Shift+P", Action::ToggleCommandPalette);
         bind("Ctrl+Shift+O", Action::ToggleSettings);
@@ -479,30 +487,30 @@ impl KeybindingMap {
         bind("Ctrl+Alt+B", Action::ToggleTabPlacement);
         bind("Ctrl+Shift+E", Action::SplitHorizontal);
         bind("Ctrl+Shift+D", Action::SplitVertical);
-        bind("Ctrl+Shift+PageUp", Action::PrevTab);
-        bind("Ctrl+Shift+PageDown", Action::NextTab);
         bind("Ctrl+Shift+Tab", Action::PrevTab);
         bind("Ctrl+Tab", Action::NextTab);
         bind("Ctrl+Up", Action::ScrollUp);
         bind("Ctrl+Down", Action::ScrollDown);
-        bind("Ctrl+minus", Action::FontDecrease);
         bind("Ctrl+PageUp", Action::PrevTab);
         bind("Ctrl+PageDown", Action::NextTab);
-        // Conventional numbering: Ctrl+1 selects the first tab, Ctrl+9 the
-        // ninth, and Ctrl+0 selects the last tab.
-        for digit in 1..=9u8 {
+        // Browser-style numbering: Ctrl+1..8 select those tabs, Ctrl+9 always
+        // selects the last tab, and Ctrl+0 resets zoom.
+        for digit in 1..=8u8 {
             bind(&format!("Ctrl+{digit}"), Action::QuickSwitchTab(digit - 1));
         }
-        bind("Ctrl+0", Action::QuickSwitchTab(9));
+        bind("Ctrl+9", Action::QuickSwitchTab(9));
         bind("Ctrl+Shift+S", Action::ShowRemotePicker);
-        bind("Alt+Tab", Action::CyclePaneFocusForward);
-        bind("Alt+Shift+Tab", Action::CyclePaneFocusBackward);
 
-        // New pane management keybindings
-        bind("Alt+Shift+Left", Action::ResizePaneLeft);
-        bind("Alt+Shift+Right", Action::ResizePaneRight);
-        bind("Alt+Shift+Up", Action::ResizePaneUp);
-        bind("Alt+Shift+Down", Action::ResizePaneDown);
+        // One spatial layer across every terminal: add Shift for the rarer
+        // resize operation. Ctrl+Alt reaches the app under JWM, unlike Alt-only.
+        bind("Ctrl+Alt+Left", Action::FocusPaneLeft);
+        bind("Ctrl+Alt+Right", Action::FocusPaneRight);
+        bind("Ctrl+Alt+Up", Action::FocusPaneUp);
+        bind("Ctrl+Alt+Down", Action::FocusPaneDown);
+        bind("Ctrl+Alt+Shift+Left", Action::ResizePaneLeft);
+        bind("Ctrl+Alt+Shift+Right", Action::ResizePaneRight);
+        bind("Ctrl+Alt+Shift+Up", Action::ResizePaneUp);
+        bind("Ctrl+Alt+Shift+Down", Action::ResizePaneDown);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
@@ -517,11 +525,6 @@ impl KeybindingMap {
         // Ctrl+Shift+M — "macros" / workflows palette over saved command
         // templates. (Ctrl+Shift+W is ClosePaneOrTab in browser muscle memory.)
         bind("Ctrl+Shift+M", Action::WorkflowsPalette);
-        bind("Alt+Left", Action::FocusPaneLeft);
-        bind("Alt+Right", Action::FocusPaneRight);
-        bind("Ctrl+Alt+Shift+Up", Action::FocusPaneUp);
-        bind("Ctrl+Alt+Shift+Down", Action::FocusPaneDown);
-
         KeybindingMap { bindings }
     }
 
@@ -610,7 +613,7 @@ mod tests {
     //!   `bind!` call gets dropped or the `Action::` variant is renamed)
     //!   and silently becomes unreachable from the UI.
     //! - parse_key_combo / key_combo_to_string drift apart and config
-    //!   round-trip breaks (`Ctrl+Shift++`, digit keys, named keys).
+    //!   round-trip breaks (`Ctrl+=`, digit keys, named keys).
     //!
     //! They do NOT cover the runtime "VTE swallow" question (whether the
     //! live VTE consumes a chord before the block-mode capture phase sees
@@ -629,6 +632,8 @@ mod tests {
         // purpose (chord exhaustion + low frequency of use).
         let palette_only: &[Action] = &[
             Action::CloseTab,
+            Action::CyclePaneFocusForward,
+            Action::CyclePaneFocusBackward,
             Action::CloseSelectedTabs,
             Action::MoveTabLeft,
             Action::MoveTabRight,
@@ -701,10 +706,11 @@ mod tests {
             "Ctrl+Shift+W",
             "Ctrl+Shift+C",
             "Ctrl+Shift+V",
-            "Ctrl+Shift++",
+            "Ctrl+=",
             "Ctrl+Shift+!",
             "Ctrl+Alt+Shift+A",
-            "Ctrl+Alt+Shift+K",
+            "Ctrl+Alt+=",
+            "Ctrl+Alt+-",
             "Ctrl+backslash",
             "Ctrl+minus",
             "Ctrl+Up",
@@ -713,10 +719,12 @@ mod tests {
             "Ctrl+PageDown",
             "Ctrl+Tab",
             "Ctrl+Shift+Tab",
-            "Alt+Tab",
-            "Alt+Shift+Tab",
-            "Alt+Left",
-            "Alt+Right",
+            "Ctrl+Alt+Left",
+            "Ctrl+Alt+Right",
+            "Ctrl+Alt+Up",
+            "Ctrl+Alt+Down",
+            "Ctrl+Alt+Shift+Left",
+            "Ctrl+Alt+Shift+Right",
             "Ctrl+Alt+Shift+Up",
             "Ctrl+Alt+Shift+Down",
             "Ctrl+Alt+B",
@@ -743,10 +751,10 @@ mod tests {
             ("Ctrl+Up", Action::ScrollUp),
             ("Ctrl+Down", Action::ScrollDown),
             // Pane focus (used in block mode to jump between paned block lists).
-            ("Alt+Left", Action::FocusPaneLeft),
-            ("Alt+Right", Action::FocusPaneRight),
-            ("Ctrl+Alt+Shift+Up", Action::FocusPaneUp),
-            ("Ctrl+Alt+Shift+Down", Action::FocusPaneDown),
+            ("Ctrl+Alt+Left", Action::FocusPaneLeft),
+            ("Ctrl+Alt+Right", Action::FocusPaneRight),
+            ("Ctrl+Alt+Up", Action::FocusPaneUp),
+            ("Ctrl+Alt+Down", Action::FocusPaneDown),
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
@@ -785,12 +793,49 @@ mod tests {
         }
     }
 
-    /// Quick-switch digits use user-facing 1-based numbering; Ctrl+0 is the
-    /// conventional shortcut for the last tab.
+    /// Shared ergonomic contract used by jterm1..4. Project-specific actions
+    /// may add chords, but these common actions must never drift again.
     #[test]
-    fn ctrl_digit_quick_switch_tab_bound_for_all_digits() {
+    fn common_default_chord_table() {
         let map = KeybindingMap::from_defaults();
-        for digit in 1u8..=9 {
+        let expectations = [
+            ("Ctrl+Shift+T", Action::NewTab),
+            ("Ctrl+Shift+W", Action::ClosePaneOrTab),
+            ("Ctrl+Shift+C", Action::Copy),
+            ("Ctrl+Shift+V", Action::Paste),
+            ("Ctrl+Shift+F", Action::ToggleSearch),
+            ("Ctrl+Shift+P", Action::ToggleCommandPalette),
+            ("Ctrl+Shift+O", Action::ToggleSettings),
+            ("Ctrl+backslash", Action::ToggleSidebar),
+            ("Ctrl+Shift+E", Action::SplitHorizontal),
+            ("Ctrl+Shift+D", Action::SplitVertical),
+            ("Ctrl+Alt+Left", Action::FocusPaneLeft),
+            ("Ctrl+Alt+Right", Action::FocusPaneRight),
+            ("Ctrl+Alt+Up", Action::FocusPaneUp),
+            ("Ctrl+Alt+Down", Action::FocusPaneDown),
+            ("Ctrl+Alt+Shift+Left", Action::ResizePaneLeft),
+            ("Ctrl+Alt+Shift+Right", Action::ResizePaneRight),
+            ("Ctrl+Alt+Shift+Up", Action::ResizePaneUp),
+            ("Ctrl+Alt+Shift+Down", Action::ResizePaneDown),
+            ("Ctrl+Tab", Action::NextTab),
+            ("Ctrl+Shift+Tab", Action::PrevTab),
+            ("Ctrl+=", Action::FontIncrease),
+            ("Ctrl+-", Action::FontDecrease),
+            ("Ctrl+0", Action::FontReset),
+            ("F12", Action::ToggleDebugDashboard),
+        ];
+        for (chord, expected) in expectations {
+            let combo = parse_key_combo(chord).expect("common chord must parse");
+            assert_eq!(map.lookup(&combo), Some(expected), "{chord}");
+        }
+    }
+
+    /// Quick-switch digits follow browser muscle memory: 1..8 are direct and
+    /// 9 always selects the last tab. Ctrl+0 belongs to font reset.
+    #[test]
+    fn browser_style_ctrl_digit_shortcuts_are_stable() {
+        let map = KeybindingMap::from_defaults();
+        for digit in 1u8..=8 {
             let chord = format!("Ctrl+{digit}");
             let combo = parse_key_combo(&chord).expect("digit chord must parse");
             match map.lookup(&combo) {
@@ -801,8 +846,10 @@ mod tests {
                 ),
             }
         }
+        let nine = parse_key_combo("Ctrl+9").expect("digit chord must parse");
+        assert_eq!(map.lookup(&nine), Some(Action::QuickSwitchTab(9)));
         let zero = parse_key_combo("Ctrl+0").expect("digit chord must parse");
-        assert_eq!(map.lookup(&zero), Some(Action::QuickSwitchTab(9)));
+        assert_eq!(map.lookup(&zero), Some(Action::FontReset));
     }
 
     /// `+` is also the chord separator, so it needs special-casing in
@@ -812,6 +859,14 @@ mod tests {
         let a = parse_key_combo("Ctrl+Shift++").expect("'Ctrl+Shift++' form");
         let b = parse_key_combo("Ctrl+Shift+plus").expect("'Ctrl+Shift+plus' form");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn equal_key_has_config_and_display_aliases() {
+        let symbolic = parse_key_combo("Ctrl+=").expect("'Ctrl+=' form");
+        let named = parse_key_combo("Ctrl+equal").expect("'Ctrl+equal' form");
+        assert_eq!(symbolic, named);
+        assert_eq!(key_combo_to_string(&symbolic), "Ctrl+=");
     }
 
     /// Shift+Tab arrives from GTK as ISO_Left_Tab. normalize_key rewrites
@@ -884,7 +939,7 @@ mod tests {
             ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
             ("Ctrl+Shift+K", Action::ClearBlocks),
             ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
-            ("Ctrl+Alt+Shift+K", Action::OpacityIncrease),
+            ("Ctrl+Alt+=", Action::OpacityIncrease),
         ];
         for (binding, expected) in cases {
             let combo = parse_key_combo(binding).expect("valid built-in binding");

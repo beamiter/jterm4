@@ -38,7 +38,7 @@ seq 1 300
 - 跨块拖选后，内容按界面顺序合并。
 - `Ctrl+Shift+Up/Down` 对齐 active 块顶部/底部。
 - sticky header 点击命令区域跳到块顶部；底部按钮跳到长块底部；最小化/恢复状态正常。
-- `Ctrl+Shift+B` 切换 active 块书签；`Alt+Up/Down` 在书签间跳转。
+- `Ctrl+Shift+B` 切换 active 块书签；`Ctrl+,` / `Ctrl+.` 在书签间跳转。
 - `Alt+Shift+F` 打开 active 或最新块过滤器，关闭后查询内容仍保留。
 
 ## P1 运行中和全屏程序

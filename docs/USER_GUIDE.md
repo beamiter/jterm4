@@ -46,10 +46,10 @@ Block 模式目前不开放分屏。旧实现会先启动 PTY、随后因内部 
 | 关闭当前 Pane 或标签 | `Ctrl+Shift+W` |
 | 下一个标签 | `Ctrl+Tab`、`Ctrl+PageDown` |
 | 上一个标签 | `Ctrl+Shift+Tab`、`Ctrl+PageUp` |
-| 标签 1 到 9 | `Ctrl+1` 到 `Ctrl+9` |
-| 最后一个标签 | `Ctrl+0` |
+| 标签 1 到 8 | `Ctrl+1` 到 `Ctrl+8` |
+| 最后一个标签 | `Ctrl+9` |
 | 过滤标签 | `Ctrl+Shift+L` |
-| 标签栏位置 | `Ctrl+Shift+B` |
+| 标签栏位置 | `Ctrl+Alt+B` |
 
 标签支持拖放排序、双击重命名、固定、标记、复制以及右键菜单。侧栏可在 Tabs 与 Files 之间切换；标签移到顶栏时，过滤动作仍会显示可见的搜索输入框。
 
@@ -61,9 +61,8 @@ Block 模式目前不开放分屏。旧实现会先启动 PTY、随后因内部 
 |---|---|
 | 左右分屏 | `Ctrl+Shift+E` |
 | 上下分屏 | `Ctrl+Shift+D` |
-| 循环焦点 | `Alt+Tab` / `Alt+Shift+Tab` |
-| 方向聚焦 | `Alt+方向键` |
-| 调整大小 | `Alt+Shift+方向键` |
+| 方向聚焦 | `Ctrl+Alt+方向键` |
+| 调整大小 | `Ctrl+Alt+Shift+方向键` |
 | 放大当前 Pane | `Ctrl+Shift+Z` |
 | Pane 移到新标签 | `Ctrl+Shift+!` |
 
@@ -96,7 +95,7 @@ Block 历史选择与 jterm1 保持一致：
 - 选中后用 `↑` / `↓` 移动活动块，`Shift+↑` / `Shift+↓` 扩展范围，`Ctrl+Shift+↑` / `Ctrl+Shift+↓` 对齐活动块顶部或底部。
 - `Enter` 回填活动块命令，`Ctrl+Enter` 回填并执行，`Delete` 删除活动块，`Escape` 清除选择。
 - shell 空闲时，`Home` / `End` 跳到历史两端，`PageUp` / `PageDown` 翻页。
-- `Ctrl+B` 收藏活动块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转；相关动作也可从命令面板调用或在配置中绑定。
+- `Ctrl+Shift+B` 收藏活动块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转；相关动作也可从命令面板调用或在配置中绑定。
 - 复制多选块时按终端顺序合并，块之间保留一个空行；`Alt+Ctrl+Shift+C` 只复制输出。
 
 ## 6. 文件树
@@ -172,7 +171,7 @@ export ANTHROPIC_API_KEY='...'
 jterm4
 ```
 
-`Ctrl+Shift+A` 打开面板；在 Block 模式选中命令块后按 `Ctrl+Shift+Q` 发送命令、退出码、工作目录和截断后的输出。`ai_redact_secrets = true` 默认在发送前遮蔽常见密钥格式。
+`Ctrl+Alt+Shift+A` 打开面板；在 Block 模式选中命令块后按 `Ctrl+Shift+Q` 发送命令、退出码、工作目录和截断后的输出。`ai_redact_secrets = true` 默认在发送前遮蔽常见密钥格式。
 
 AI 请求目前依赖系统 `curl`。运行 `jterm4 --doctor` 可检查其是否可用。不要把终端脱敏当成唯一的秘密保护边界，发送前仍应检查上下文。
 
@@ -199,8 +198,8 @@ toggle_ai_panel = false
 | 重载配置 | `Ctrl+Shift+R` |
 | 显示/隐藏侧栏 | `Ctrl+\` |
 | 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
-| 放大 / 缩小字体 | `Ctrl+Shift++` / `Ctrl+-` |
-| 增加 / 降低透明度 | `Ctrl+Shift+K` / `Ctrl+Shift+J` |
+| 放大 / 缩小 / 复位字体 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
+| 增加 / 降低透明度 | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
 | 调试面板 | `F12` |
 
 ## 11. 状态与历史

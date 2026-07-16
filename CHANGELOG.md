@@ -15,6 +15,9 @@ All notable user-visible and operational changes are recorded here.
 
 ### Changed
 
+- Default shortcuts now share the jterm ergonomic layout: directional Pane
+  focus/resize layers, browser-style tab digits, symmetric zoom/opacity keys,
+  and shell-owned `Ctrl+P` passthrough.
 - Session snapshots and Block history now use owner-only Unix permissions and durable atomic replacement.
 - CI now checks maintained shell scripts and exports complete formatting diagnostics.
 - Temporary round-two source-export workflows and marker files were removed.

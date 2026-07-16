@@ -69,6 +69,10 @@ impl UiState {
                 let new_scale = (self.font_scale.get() - font_step).max(0.1);
                 self.set_font_scale_all(new_scale);
             }
+            Action::FontReset => {
+                log::debug!("Font reset");
+                self.set_font_scale_all(1.0);
+            }
             Action::OpacityIncrease => {
                 log::debug!("Opacity increase");
                 self.window_opacity

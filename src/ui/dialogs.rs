@@ -1335,7 +1335,7 @@ impl UiState {
     /// templates from `~/.config/jterm4/workflows/`. Enter on a row
     /// either writes the command directly (no args) or opens an
     /// args-entry dialog. Same toggle-to-close model as the other
-    /// palettes: re-pressing Ctrl+Shift+W with the palette open closes it.
+    /// palettes: re-pressing Ctrl+Shift+M with the palette open closes it.
     pub(crate) fn show_workflows_palette(&self) {
         let dialog_to_close = self.workflows_palette_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {

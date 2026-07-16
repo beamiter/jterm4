@@ -1,6 +1,7 @@
 //! palette — extracted from block_view (mechanical split, no logic changes)
 //!
-//! Fuzzy-searchable command-history popover (Ctrl+P): pop up a `Popover` over the
+//! Legacy fuzzy-searchable command-history popover. Plain Ctrl+P now remains
+//! available to shell/readline; app history uses Ctrl+Shift+H. Pop up a `Popover` over the
 //! block scroller, take a most-recent-first deduped command list, score each entry
 //! with a subsequence fuzzy match, and on selection clear the live shell line and
 //! type the chosen command (without executing) so the user can edit before Enter.

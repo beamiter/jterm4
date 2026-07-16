@@ -23,6 +23,7 @@ mod css;
 mod export;
 mod find;
 mod history;
+#[allow(dead_code)]
 mod palette;
 mod scroll;
 pub(crate) use alt_screen::*;
@@ -31,6 +32,7 @@ pub(crate) use blocks::*;
 pub(crate) use cross_selection::*;
 pub(crate) use css::*;
 pub(crate) use find::*;
+#[allow(unused_imports)]
 pub(crate) use palette::*;
 pub(crate) use scroll::*;
 
@@ -2207,7 +2209,6 @@ struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
-    active_vte_for_key: Terminal,
     typed_cmd_for_key: Rc<RefCell<String>>,
     finished_blocks_for_key: Rc<RefCell<Vec<FinishedBlock>>>,
     block_data_for_key: Rc<RefCell<VecDeque<BlockData>>>,
@@ -2227,7 +2228,6 @@ impl KeyCtx {
             pty_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
-            active_vte_for_key,
             typed_cmd_for_key,
             finished_blocks_for_key,
             block_data_for_key,
@@ -2451,7 +2451,7 @@ impl KeyCtx {
             // Linux binding). Shows the gutter star + accent stripe.
             // Only consume the key when bookmark logic actually fires — in
             // alt-screen (vim/less) or with no selection, let VTE deliver
-            // Ctrl+B to the running app (e.g. vim's page-up).
+            // Ctrl+Shift+B to the running app.
             if ctrl
                 && shift
                 && !alt
@@ -2540,45 +2540,8 @@ impl KeyCtx {
             // mouse-selects text inside a finished block's TextView, focus
             // sits there and this per-VTE controller never fires.
 
-            // Ctrl+P: fuzzy command-history palette. Build a deduped, most-recent
-            // -first entry list from block_data (which carries exit code + duration
-            // for the failed/slow filters) and pop it up.
-            if ctrl && !shift && !alt && matches!(keyval, Key::p | Key::P) {
-                if !command_recall_available(bstate_for_key.get()) {
-                    return glib::Propagation::Proceed;
-                }
-                let mut seen = std::collections::HashSet::new();
-                let mut entries = Vec::new();
-                {
-                    let block_data = block_data_for_key.borrow();
-                    for b in block_data.iter().rev() {
-                        let c = b.cmd.trim().to_string();
-                        if c.is_empty() {
-                            continue;
-                        }
-                        if seen.insert(c.clone()) {
-                            entries.push(PaletteEntry {
-                                cmd: c,
-                                failed: b.exit_code != 0,
-                                slow: b.duration_ms.map(|d| d >= PALETTE_SLOW_MS).unwrap_or(false),
-                            });
-                        }
-                    }
-                }
-                if entries.is_empty() {
-                    return glib::Propagation::Proceed;
-                }
-                show_command_palette(
-                    &block_scroll_for_key,
-                    entries,
-                    pty_for_key.clone(),
-                    typed_cmd_for_key.clone(),
-                    pty_synced_for_key.clone(),
-                    bracketed_paste_for_key.clone(),
-                    active_vte_for_key.clone(),
-                );
-                return glib::Propagation::Stop;
-            }
+            // Plain Ctrl+P belongs to readline and terminal applications. The
+            // app-level Ctrl+Shift+H action owns command-history recall.
 
             // Everything else: let the VTE translate it (printable keys, editing,
             // control sequences, IME) and emit `commit`.
@@ -2938,7 +2901,7 @@ impl TermView {
             Rc::new(RefCell::new(std::collections::HashSet::new()));
         let selected_block_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let selection_anchor_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
-        // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+B;
+        // Bookmarked block ids (in-memory for the session). Toggled with Ctrl+Shift+B;
         // navigated with Ctrl+,/Ctrl+.. Not persisted (avoids an rkyv schema bump).
         let block_bookmarks: Rc<RefCell<std::collections::HashSet<u64>>> =
             Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -3446,7 +3409,6 @@ impl TermView {
         // ── Keyboard navigation / copy-paste (Capture phase) ──────────────
         {
             let pty_for_key = pty.clone();
-            let active_vte_for_key = active_vte.clone();
             let typed_cmd_for_key = typed_cmd.clone();
             let finished_blocks_for_key = finished_blocks_rc.clone();
             let block_data_for_key = block_data_rc.clone();
@@ -3462,7 +3424,6 @@ impl TermView {
                 pty_for_key,
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
-                active_vte_for_key,
                 typed_cmd_for_key,
                 finished_blocks_for_key,
                 block_data_for_key,
