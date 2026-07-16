@@ -192,7 +192,7 @@ flatpak run io.github.beamiter.jterm4 --doctor
 flatpak run io.github.beamiter.jterm4
 ```
 
-文件树需要宿主文件系统权限。AI 密钥必须通过可信启动器或显式 Flatpak override 提供。完整权限说明见 `docs/FLATPAK.md`。
+文件树需要宿主文件系统权限。AI 密钥可通过可信启动器、显式 Flatpak override 或 sandbox 内可见的 owner-only 独立文件提供。完整权限说明见 `docs/FLATPAK.md`。
 
 ## 10. SSH 远程会话
 
@@ -214,7 +214,7 @@ multiplex = true
 
 ## 11. AI 与 Agent 安全边界
 
-AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol；密钥只从环境读取，不写入 TOML：
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先，也可配置独立的 owner-only 密钥文件：
 
 ```bash
 export ANTHROPIC_API_KEY='...'
@@ -222,7 +222,24 @@ export ANTHROPIC_API_KEY='...'
 jterm4
 ```
 
-相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可检查 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
+不便向桌面启动器传递环境变量时，可创建独立文件：
+
+```bash
+mkdir -p ~/.config/jterm4
+install -m 600 /dev/null ~/.config/jterm4/ai.key
+read -rsp 'AI API Key: ' JTERM4_KEY; printf '\n'
+printf '%s\n' "$JTERM4_KEY" > ~/.config/jterm4/ai.key
+unset JTERM4_KEY
+chmod 600 ~/.config/jterm4/ai.key
+```
+
+并在 `config.toml` 中设置：
+
+```toml
+ai_api_key_file = "~/.config/jterm4/ai.key"
+```
+
+文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
 自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 在当前 active Block pane 打开原生 **Shell Agent**；它在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 

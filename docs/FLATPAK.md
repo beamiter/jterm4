@@ -87,8 +87,10 @@ host paths nor terminal/configuration contents. Review its files before sharing.
 Flatpak applications do not automatically inherit arbitrary host environment
 variables. To use AI, provide `JTERM4_AI_API_KEY` or the selected provider's
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_KEY` through a trusted
-launcher or an explicit Flatpak override. Treat such overrides as secret
-configuration; API keys are intentionally not accepted in `config.toml`.
+launcher or an explicit Flatpak override. Alternatively, set
+`ai_api_key_file` to an owner-only file visible inside the sandbox (normally
+under the app's Flatpak config directory). Only its path is stored in
+`config.toml`; API key contents remain in the separate `0600` file.
 
 AI `curl` requests use the host-command bridge. Notebook `shell`/unlabelled cells
 use the configured shell argv (including its host wrapper when present), while an

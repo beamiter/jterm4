@@ -145,6 +145,7 @@ impl AiPanel {
         let convo_view = TextView::with_buffer(&convo_buffer);
         convo_view.set_editable(false);
         convo_view.set_cursor_visible(false);
+        convo_view.set_focusable(true);
         convo_view.set_wrap_mode(WrapMode::WordChar);
         convo_view.set_monospace(false);
         convo_view.set_top_margin(6);
@@ -176,6 +177,7 @@ impl AiPanel {
         input_view.set_right_margin(6);
         input_view.set_accepts_tab(false);
         let input_scroll = ScrolledWindow::builder()
+            .hexpand(true)
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
             .min_content_height(60)
@@ -260,6 +262,27 @@ impl AiPanel {
         }
 
         panel
+    }
+
+    /// Copy a mouse/keyboard selection from the read-only transcript.
+    ///
+    /// The application owns Ctrl+Shift+C at the window capture phase for
+    /// terminal copying, so TextView never receives that shortcut itself.
+    /// Give a focused transcript selection priority before falling back to
+    /// the active terminal.
+    pub(crate) fn copy_transcript_selection(&self) -> bool {
+        if !self.convo_view.has_focus() {
+            return false;
+        }
+        let Some((start, end)) = self.convo_buffer.selection_bounds() else {
+            return false;
+        };
+        let text = self.convo_buffer.text(&start, &end, false);
+        if text.is_empty() {
+            return false;
+        }
+        self.convo_view.clipboard().set_text(&text);
+        true
     }
 
     /// Append a labelled message to the visible transcript and scroll to end.

@@ -251,6 +251,9 @@ pub struct Config {
     pub(crate) ai_provider: String,
     /// Provider API root. Endpoint suffixes are added by the AI client.
     pub(crate) ai_base_url: String,
+    /// Optional owner-only file used when no AI API key environment variable
+    /// is present. The path is persisted; the credential itself is not.
+    pub(crate) ai_api_key_file: Option<String>,
     /// Show the right-side AI chat panel. Toggled via Ctrl+Shift+A and
     /// persisted across sessions.
     pub(crate) ai_panel_visible: bool,
@@ -340,6 +343,7 @@ impl Config {
             agent_max_turns: 20,
             ai_provider: "anthropic".to_string(),
             ai_base_url: "https://api.anthropic.com".to_string(),
+            ai_api_key_file: None,
             ai_panel_visible: false,
             ai_panel_width: 360,
             ai_model: "claude-sonnet-4-6".to_string(),
@@ -626,6 +630,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "agent_max_turns",
     "ai_provider",
     "ai_base_url",
+    "ai_api_key_file",
     "ai_panel_visible",
     "ai_panel_width",
     "ai_model",
@@ -663,6 +668,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "block_history_path",
         "ai_provider",
         "ai_base_url",
+        "ai_api_key_file",
         "ai_model",
     ];
     let integers = [
@@ -833,6 +839,19 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 Error,
                 "ai_base_url",
                 "expected an absolute http(s) URL without whitespace",
+            );
+        }
+    }
+    if let Some(path) = table.get("ai_api_key_file").and_then(toml::Value::as_str) {
+        let path = path.trim();
+        if path.is_empty() {
+            config_issue(&mut issues, Error, "ai_api_key_file", "must not be empty");
+        } else if !(path.starts_with('/') || path == "~" || path.starts_with("~/")) {
+            config_issue(
+                &mut issues,
+                Error,
+                "ai_api_key_file",
+                "expected an absolute path or a path beginning with ~/",
             );
         }
     }
@@ -1054,6 +1073,7 @@ struct FileConfig {
     agent_max_turns: Option<u32>,
     ai_provider: Option<String>,
     ai_base_url: Option<String>,
+    ai_api_key_file: Option<String>,
     ai_panel_visible: Option<bool>,
     ai_panel_width: Option<u32>,
     ai_model: Option<String>,
@@ -1236,6 +1256,10 @@ fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision
             .map(str::to_string),
         ai_base_url: table
             .get("ai_base_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ai_api_key_file: table
+            .get("ai_api_key_file")
             .and_then(|v| v.as_str())
             .map(str::to_string),
         ai_panel_visible: table.get("ai_panel_visible").and_then(|v| v.as_bool()),
@@ -1508,6 +1532,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or_else(|| default_ai_base_url.to_string())
         .trim_end_matches('/')
         .to_string();
+    let ai_api_key_file = env_string("JTERM4_AI_API_KEY_FILE")
+        .or(fc.ai_api_key_file)
+        .filter(|path| !path.trim().is_empty());
 
     let config = Config {
         window_opacity,
@@ -1549,6 +1576,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         agent_max_turns,
         ai_provider,
         ai_base_url,
+        ai_api_key_file,
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
         ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
         ai_model,
@@ -1903,20 +1931,20 @@ unknown_action = "F8"
     #[test]
     fn ai_and_agent_config_is_semantically_validated() {
         let valid = validate_config_contents(
-            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_api_key_file = '~/.config/jterm4/ai.key'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
         )
         .unwrap();
         assert!(valid.is_empty(), "{valid:?}");
 
         let invalid = validate_config_contents(
-            "agent_max_turns = 0\nai_provider = 'mystery'\nai_base_url = 'file:///tmp/model'\nai_model = ''\nai_max_tokens = 999999\n",
+            "agent_max_turns = 0\nai_provider = 'mystery'\nai_base_url = 'file:///tmp/model'\nai_api_key_file = 'relative.key'\nai_model = ''\nai_max_tokens = 999999\n",
         )
         .unwrap();
         assert!(invalid.iter().any(|issue| {
             issue.path == "agent_max_turns" && issue.level == ConfigIssueLevel::Warning
         }));
         assert!(invalid.iter().any(|issue| issue.path == "ai_max_tokens"));
-        for key in ["ai_provider", "ai_base_url", "ai_model"] {
+        for key in ["ai_provider", "ai_base_url", "ai_api_key_file", "ai_model"] {
             assert!(invalid
                 .iter()
                 .any(|issue| issue.path == key && issue.is_error()));
@@ -1941,6 +1969,7 @@ unknown_action = "F8"
         config.command_history_path = Some("/tmp/history".into());
         config.block_history_path = Some("/tmp/blocks".into());
         config.ai_enabled = true;
+        config.ai_api_key_file = Some("/tmp/ai-key".into());
         config.agent_enabled = true;
         config.ai_panel_visible = true;
         config.notify_long_blocks = true;
@@ -1966,6 +1995,7 @@ unknown_action = "F8"
         assert!(config.command_history_path.is_none());
         assert!(config.block_history_path.is_none());
         assert!(!config.ai_enabled);
+        assert!(config.ai_api_key_file.is_none());
         assert!(!config.agent_enabled);
         assert!(!config.ai_panel_visible);
         assert!(!config.notify_long_blocks);

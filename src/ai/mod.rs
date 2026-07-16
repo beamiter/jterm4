@@ -6,7 +6,9 @@
 //! function in this module executes or submits a generated command.
 
 use serde_json::{json, Value};
-use std::io::Write;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
 
@@ -14,6 +16,7 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const CURL_STATUS_MARKER: &str = "\n__JTERM4_STATUS__:";
 const MAX_ERROR_BODY_BYTES: usize = 2 * 1024;
 const MAX_GENERATED_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_API_KEY_FILE_BYTES: u64 = 16 * 1024;
 const API_KEY_ENV_NAMES: [&str; 4] = [
     "JTERM4_AI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -131,6 +134,7 @@ pub enum AiError {
     MissingProviderApiKey {
         provider: Provider,
     },
+    CredentialFile(String),
     Disabled,
     InvalidConfiguration(String),
     InvalidCommand(String),
@@ -151,9 +155,10 @@ impl std::fmt::Display for AiError {
             ),
             Self::MissingProviderApiKey { provider } => write!(
                 f,
-                "{} API key is not set (use JTERM4_AI_API_KEY or the provider-specific variable)",
+                "{} API key is not set (use an environment variable or ai_api_key_file)",
                 provider.display_name()
             ),
+            Self::CredentialFile(message) => write!(f, "AI API key file: {message}"),
             Self::Disabled => write!(f, "AI features are disabled by configuration"),
             Self::InvalidConfiguration(message) => write!(f, "invalid AI configuration: {message}"),
             Self::InvalidCommand(message) => write!(
@@ -169,8 +174,8 @@ impl std::fmt::Display for AiError {
 
 impl std::error::Error for AiError {}
 
-/// Fully resolved settings for one provider. API keys are loaded only from
-/// the environment and are never part of Config or config persistence.
+/// Fully resolved settings for one provider. API key contents are never part
+/// of Config or config persistence; only an optional credential-file path is.
 #[derive(Debug, Clone)]
 pub struct AiClient {
     pub provider: Provider,
@@ -213,9 +218,17 @@ impl AiClient {
             return Err(AiError::Disabled);
         }
         let provider = Provider::from_str(&config.ai_provider)?;
+        let api_key = match provider.provider_api_key() {
+            Some(key) => Some(key),
+            None => config
+                .ai_api_key_file
+                .as_deref()
+                .map(read_api_key_file)
+                .transpose()?,
+        };
         Self::new(
             provider,
-            provider.provider_api_key(),
+            api_key,
             config.ai_model.clone(),
             config.ai_base_url.clone(),
             config.ai_max_tokens,
@@ -239,14 +252,14 @@ impl AiClient {
         let max_tokens = nonempty_env("JTERM4_AI_MAX_TOKENS")
             .and_then(|value| value.parse().ok())
             .unwrap_or(1024);
-        Self::new(
-            provider,
-            provider.provider_api_key(),
-            model,
-            base_url,
-            max_tokens,
-            true,
-        )
+        let api_key = match provider.provider_api_key() {
+            Some(key) => Some(key),
+            None => nonempty_env("JTERM4_AI_API_KEY_FILE")
+                .as_deref()
+                .map(read_api_key_file)
+                .transpose()?,
+        };
+        Self::new(provider, api_key, model, base_url, max_tokens, true)
     }
 
     pub fn display_name(&self) -> String {
@@ -423,6 +436,101 @@ fn nonempty_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn expand_api_key_path(raw: &str) -> Result<PathBuf, AiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(AiError::CredentialFile("path is empty".into()));
+    }
+    if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AiError::CredentialFile("HOME is unavailable for ~/ path".into()))?;
+        let mut path = PathBuf::from(home);
+        if let Some(rest) = raw.strip_prefix("~/") {
+            path.push(rest);
+        }
+        return Ok(path);
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(AiError::CredentialFile(
+            "path must be absolute or begin with ~/".into(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn read_api_key_file(raw_path: &str) -> Result<String, AiError> {
+    let path = expand_api_key_path(raw_path)?;
+    let file = fs::File::open(&path).map_err(|error| {
+        AiError::CredentialFile(format!("cannot open {}: {error}", path.display()))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        AiError::CredentialFile(format!("cannot inspect {}: {error}", path.display()))
+    })?;
+    if !metadata.is_file() {
+        return Err(AiError::CredentialFile(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_API_KEY_FILE_BYTES {
+        return Err(AiError::CredentialFile(format!(
+            "{} exceeds {} bytes",
+            path.display(),
+            MAX_API_KEY_FILE_BYTES
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode() & 0o777;
+        // SAFETY: geteuid has no preconditions and only returns process state.
+        let effective_uid = unsafe { nix::libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(AiError::CredentialFile(format!(
+                "{} is not owned by the current user",
+                path.display()
+            )));
+        }
+        if mode & 0o077 != 0 {
+            return Err(AiError::CredentialFile(format!(
+                "{} permissions are {:03o}; run chmod 600 {}",
+                path.display(),
+                mode,
+                path.display()
+            )));
+        }
+    }
+    let mut contents = String::new();
+    file.take(MAX_API_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| {
+            AiError::CredentialFile(format!("cannot read {}: {error}", path.display()))
+        })?;
+    if contents.len() as u64 > MAX_API_KEY_FILE_BYTES {
+        return Err(AiError::CredentialFile(format!(
+            "{} exceeds {} bytes",
+            path.display(),
+            MAX_API_KEY_FILE_BYTES
+        )));
+    }
+    let key = contents.trim();
+    if key.is_empty() {
+        return Err(AiError::CredentialFile(format!(
+            "{} is empty",
+            path.display()
+        )));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(AiError::CredentialFile(format!(
+            "{} contains control characters",
+            path.display()
+        )));
+    }
+    Ok(key.to_string())
 }
 
 fn curl_json_post(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, AiError> {
@@ -969,5 +1077,29 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_file_requires_private_permissions_and_trims_one_line() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "jterm4-ai-key-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        fs::write(&path, "sk-test-secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_api_key_file(path.to_str().unwrap()).unwrap(),
+            "sk-test-secret"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_api_key_file(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(error, AiError::CredentialFile(_)));
+        assert!(error.to_string().contains("chmod 600"));
+        fs::remove_file(path).unwrap();
     }
 }

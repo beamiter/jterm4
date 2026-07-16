@@ -67,13 +67,16 @@ notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
 show_repo_strip = true
 
-# AI / Agent（密钥只从环境变量读取，不会写入此文件） -------------------------
+# AI / Agent（密钥内容不会写入此文件） -------------------------------------
 
 # provider: anthropic | openai-compatible | ollama
 # Anthropic: export ANTHROPIC_API_KEY=...
 # OpenAI-compatible: export OPENAI_API_KEY=...（无鉴权的本地服务可不设置）
-# 通用覆盖：JTERM4_AI_API_KEY、JTERM4_AI_PROVIDER、JTERM4_AI_MODEL、
-#           JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS
+# 可选独立密钥文件（必须为当前用户所有，权限不超过 0600）：
+# ai_api_key_file = "~/.config/jterm4/ai.key"
+# 环境 Key 优先于文件。路径可由 JTERM4_AI_API_KEY_FILE 覆盖。
+# 通用覆盖：JTERM4_AI_API_KEY、JTERM4_AI_API_KEY_FILE、JTERM4_AI_PROVIDER、
+#           JTERM4_AI_MODEL、JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS
 ai_enabled = true
 agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
 agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准

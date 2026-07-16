@@ -706,6 +706,11 @@ pub fn run() -> glib::ExitCode {
                         // mouse-selecting text inside a finished block,
                         // focus lives on that TextView and the per-VTE
                         // block-mode handler never fires.
+                        // A focused selection in the read-only AI transcript
+                        // takes priority over terminal/block selections.
+                        if ui_clone.ai_panel.copy_transcript_selection() {
+                            return true.into();
+                        }
                         // copy_to_clipboard handles Warp block-selection,
                         // VTE selection, TextBuffer selection, and PRIMARY
                         // fallback in priority order. Pass Alt for the

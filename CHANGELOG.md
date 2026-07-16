@@ -44,7 +44,7 @@ All notable user-visible and operational changes are recorded here.
 ### Security
 
 - Persisted commands, output, working directories, and session metadata are restricted to `0700` directories and `0600` files on Unix.
-- AI credentials remain environment-only; safe mode disables AI/Agent, executable notebooks, history, remote hosts, restoration, and persistence.
+- AI credential contents remain outside `config.toml`: environment variables take priority, with an optional owner-only `ai_api_key_file` fallback; safe mode disables AI/Agent, executable notebooks, history, remote hosts, restoration, and persistence.
 - AI/Agent command proposals never submit or execute a command without an explicit user action.
 - Agent approval is refused while the bound Block prompt is busy or already contains input; malformed model output never degrades into a runnable proposal.
 - History, workflow, file-tree and AI review insertions reject line breaks and terminal control characters before writing to a PTY.

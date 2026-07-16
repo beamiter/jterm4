@@ -7,7 +7,7 @@ use gtk4::pango::FontDescription;
 use gtk4::{Adjustment, Label, ListBox, Orientation, Scale, ScrolledWindow};
 use gtk4::{EventControllerKey, GestureClick, SearchEntry};
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use vte4::Format;
 use vte4::Terminal;
@@ -1258,7 +1258,7 @@ impl UiState {
         let ai_group = adw::PreferencesGroup::new();
         ai_group.set_title("AI & Agent");
         ai_group.set_description(Some(
-            "API keys are read from the environment and are never saved in config.toml",
+            "API key contents come from the environment or an owner-only file and are never saved in config.toml",
         ));
         let ai_enabled_row = adw::SwitchRow::builder()
             .title("Enable AI Features")
@@ -1481,8 +1481,16 @@ impl UiState {
             ui.persist_config();
         });
 
+        // `Editable::set_text()` may emit `changed` for the intermediate empty
+        // value while it replaces the old contents.  Provider changes update
+        // these two rows programmatically, so suppress their ordinary edit
+        // handlers until the matching Config fields have been replaced as one
+        // coherent set.  Otherwise the intermediate empty model is validated
+        // and produces a spurious "Settings were not saved" error.
+        let syncing_ai_defaults = Rc::new(Cell::new(false));
         let model_for_provider = model_row.clone();
         let base_for_provider = base_url_row.clone();
+        let syncing_for_provider = syncing_ai_defaults.clone();
         let ui = self.clone();
         provider_row.connect_selected_notify(move |row| {
             let provider = match row.selected() {
@@ -1490,6 +1498,7 @@ impl UiState {
                 2 => crate::ai::Provider::Ollama,
                 _ => crate::ai::Provider::Anthropic,
             };
+            syncing_for_provider.set(true);
             model_for_provider.set_text(provider.default_model());
             base_for_provider.set_text(provider.default_base_url());
             let mut config = ui.config.borrow_mut();
@@ -1497,17 +1506,26 @@ impl UiState {
             config.ai_model = provider.default_model().to_string();
             config.ai_base_url = provider.default_base_url().to_string();
             drop(config);
+            syncing_for_provider.set(false);
             ui.persist_config();
         });
 
+        let syncing_for_model = syncing_ai_defaults.clone();
         let ui = self.clone();
         model_row.connect_changed(move |row| {
+            if syncing_for_model.get() {
+                return;
+            }
             ui.config.borrow_mut().ai_model = row.text().to_string();
             ui.persist_config();
         });
 
+        let syncing_for_base = syncing_ai_defaults;
         let ui = self.clone();
         base_url_row.connect_changed(move |row| {
+            if syncing_for_base.get() {
+                return;
+            }
             ui.config.borrow_mut().ai_base_url = row.text().to_string();
             ui.persist_config();
         });

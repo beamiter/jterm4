@@ -443,6 +443,11 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ai_base_url".into(),
         toml::Value::String(config.ai_base_url.clone()),
     );
+    if let Some(path) = &config.ai_api_key_file {
+        table.insert("ai_api_key_file".into(), toml::Value::String(path.clone()));
+    } else {
+        table.remove("ai_api_key_file");
+    }
     table.insert(
         "ai_panel_visible".into(),
         toml::Value::Boolean(config.ai_panel_visible),
@@ -880,6 +885,7 @@ mod tests {
         config.agent_max_turns = 17;
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
+        config.ai_api_key_file = Some("~/.config/jterm4/ai.key".into());
         config.ai_model = "qwen2.5-coder:7b".into();
         config.ai_max_tokens = 2048;
         save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();
@@ -899,7 +905,11 @@ mod tests {
             table.get("ai_base_url").and_then(toml::Value::as_str),
             Some("http://localhost:11434")
         );
-        assert!(!contents.to_ascii_lowercase().contains("api_key"));
+        assert_eq!(
+            table.get("ai_api_key_file").and_then(toml::Value::as_str),
+            Some("~/.config/jterm4/ai.key")
+        );
+        assert!(!contents.contains("sk-test-secret"));
         fs::remove_dir_all(directory).unwrap();
     }
 
