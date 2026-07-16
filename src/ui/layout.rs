@@ -76,7 +76,7 @@ impl UiState {
         if persist {
             self.sidebar_view.set(view);
             self.config.borrow_mut().sidebar_view = view;
-            crate::config::save_config(&self.config.borrow());
+            self.persist_config();
         }
     }
 
@@ -98,6 +98,6 @@ impl UiState {
         self.tab_placement.set(next);
         self.config.borrow_mut().tab_placement = next;
         self.apply_tab_placement();
-        crate::config::save_config(&self.config.borrow());
+        self.persist_config();
     }
 }

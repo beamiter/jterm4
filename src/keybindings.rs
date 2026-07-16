@@ -67,6 +67,8 @@ pub(crate) enum Action {
     /// Send the currently selected finished block (cmd + output + exit) to the
     /// AI panel as a fresh "explain this" question.
     AskAiAboutSelectedBlock,
+    /// Open the approval-gated multi-turn shell Agent for the active Block pane.
+    OpenAgent,
     /// Open a fuzzy palette over this tab's finished-block command history.
     /// Enter pastes the selected command into the live input cell.
     HistoryPalette,
@@ -77,6 +79,8 @@ pub(crate) enum Action {
     /// opens an arg-entry dialog that substitutes placeholders and writes
     /// the resolved command into the live PTY (no auto-Enter).
     WorkflowsPalette,
+    /// Open the bundled executable quick-start notebook.
+    OpenWelcome,
 }
 
 impl Action {
@@ -148,9 +152,11 @@ impl Action {
             Action::ToggleDebugDashboard => "Toggle debug dashboard",
             Action::ToggleAiPanel => "Toggle AI panel",
             Action::AskAiAboutSelectedBlock => "Ask AI about selected block",
+            Action::OpenAgent => "Open shell Agent",
             Action::HistoryPalette => "Command history palette",
             Action::CrossBlockSearch => "Search across blocks (ripgrep)",
             Action::WorkflowsPalette => "Workflows palette",
+            Action::OpenWelcome => "Open welcome & quick start notebook",
         }
     }
 
@@ -211,9 +217,11 @@ impl Action {
             Action::ToggleDebugDashboard => Some("toggle_debug_dashboard"),
             Action::ToggleAiPanel => Some("toggle_ai_panel"),
             Action::AskAiAboutSelectedBlock => Some("ask_ai_about_selected_block"),
+            Action::OpenAgent => Some("open_agent"),
             Action::HistoryPalette => Some("history_palette"),
             Action::CrossBlockSearch => Some("cross_block_search"),
             Action::WorkflowsPalette => Some("workflows_palette"),
+            Action::OpenWelcome => None,
         }
     }
 
@@ -273,9 +281,11 @@ impl Action {
             Action::ToggleDebugDashboard,
             Action::ToggleAiPanel,
             Action::AskAiAboutSelectedBlock,
+            Action::OpenAgent,
             Action::HistoryPalette,
             Action::CrossBlockSearch,
             Action::WorkflowsPalette,
+            Action::OpenWelcome,
         ]
     }
 }
@@ -319,14 +329,15 @@ pub(crate) fn normalize_key(key: Key) -> Key {
 
 pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
     let mut modifiers = ModifierType::empty();
-    let parts: Vec<&str> = s.split('+').collect();
-    if parts.is_empty() {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return Err("Empty key combo".to_string());
     }
+    let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
 
     // The last part is the key, but "+" itself is special:
     // "Ctrl+Shift++" means Ctrl+Shift and key is "+"
-    let (mod_parts, key_str) = if s.ends_with("++") && parts.len() >= 3 {
+    let (mod_parts, key_str) = if trimmed.ends_with("++") && parts.len() >= 3 {
         (&parts[..parts.len() - 2], "+")
     } else if parts.last() == Some(&"") && parts.len() >= 2 {
         // "Ctrl++" case
@@ -345,25 +356,29 @@ pub(crate) fn parse_key_combo(s: &str) -> Result<KeyCombo, String> {
     }
 
     let key = match key_str {
-        "+" | "plus" => Key::plus,
-        "=" | "equal" => Key::equal,
-        "-" | "minus" => Key::minus,
-        "PageUp" => Key::Page_Up,
-        "PageDown" => Key::Page_Down,
-        "Tab" => Key::Tab,
-        "Escape" | "Esc" => Key::Escape,
-        "Return" | "Enter" => Key::Return,
-        "Up" => Key::Up,
-        "Down" => Key::Down,
-        "Left" => Key::Left,
-        "Right" => Key::Right,
-        "!" | "exclam" => Key::exclam,
-        "Space" => Key::space,
-        "Backspace" => Key::BackSpace,
-        "Delete" => Key::Delete,
-        "Home" => Key::Home,
-        "End" => Key::End,
-        "Insert" => Key::Insert,
+        "+" => Key::plus,
+        "=" => Key::equal,
+        "-" => Key::minus,
+        k if k.eq_ignore_ascii_case("plus") => Key::plus,
+        k if k.eq_ignore_ascii_case("equal") => Key::equal,
+        k if k.eq_ignore_ascii_case("minus") => Key::minus,
+        k if k.eq_ignore_ascii_case("PageUp") => Key::Page_Up,
+        k if k.eq_ignore_ascii_case("PageDown") => Key::Page_Down,
+        k if k.eq_ignore_ascii_case("Tab") => Key::Tab,
+        k if k.eq_ignore_ascii_case("Escape") || k.eq_ignore_ascii_case("Esc") => Key::Escape,
+        k if k.eq_ignore_ascii_case("Return") || k.eq_ignore_ascii_case("Enter") => Key::Return,
+        k if k.eq_ignore_ascii_case("Up") => Key::Up,
+        k if k.eq_ignore_ascii_case("Down") => Key::Down,
+        k if k.eq_ignore_ascii_case("Left") => Key::Left,
+        k if k.eq_ignore_ascii_case("Right") => Key::Right,
+        "!" => Key::exclam,
+        k if k.eq_ignore_ascii_case("exclam") => Key::exclam,
+        k if k.eq_ignore_ascii_case("Space") => Key::space,
+        k if k.eq_ignore_ascii_case("Backspace") => Key::BackSpace,
+        k if k.eq_ignore_ascii_case("Delete") => Key::Delete,
+        k if k.eq_ignore_ascii_case("Home") => Key::Home,
+        k if k.eq_ignore_ascii_case("End") => Key::End,
+        k if k.eq_ignore_ascii_case("Insert") => Key::Insert,
         s if s.len() == 1 => {
             let c = s.chars().next().unwrap();
             if c.is_ascii_digit() {
@@ -480,6 +495,8 @@ impl KeybindingMap {
         bind("Ctrl+Shift+R", Action::ReloadConfig);
         bind("Ctrl+backslash", Action::ToggleSidebar);
         bind("Ctrl+Shift+L", Action::FilterTabs);
+        bind("Ctrl+Shift+X", Action::FilterFailedBlocks);
+        bind("Ctrl+Shift+N", Action::ClearBlockFilter);
         bind("Ctrl+Shift+A", Action::SelectAllBlocks);
         bind("Ctrl+Shift+I", Action::ReinputSelectedCommands);
         bind("Ctrl+Shift+K", Action::ClearBlocks);
@@ -516,6 +533,7 @@ impl KeybindingMap {
         bind("F12", Action::ToggleDebugDashboard);
         bind("Ctrl+Alt+Shift+A", Action::ToggleAiPanel);
         bind("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock);
+        bind("Ctrl+Alt+G", Action::OpenAgent);
         // Ctrl+R is consumed by bash readline in the live VTE, so the chord
         // for our block-history palette is Ctrl+Shift+H ("history").
         bind("Ctrl+Shift+H", Action::HistoryPalette);
@@ -542,13 +560,11 @@ impl KeybindingMap {
                 log::warn!("Unknown keybinding action: {config_key}");
                 continue;
             };
-            // Remove old bindings for this action
-            self.bindings.retain(|_, a| *a != action);
-
             // `false`, an empty string, "none", and "disabled" intentionally
             // leave the action unbound. This makes it possible to resolve a
             // desktop/window-manager conflict without inventing a dummy chord.
             if value.as_bool() == Some(false) {
+                self.bindings.retain(|_, a| *a != action);
                 continue;
             }
             let Some(key_str) = value.as_str() else {
@@ -559,23 +575,33 @@ impl KeybindingMap {
                 || key_str.eq_ignore_ascii_case("none")
                 || key_str.eq_ignore_ascii_case("disabled")
             {
+                self.bindings.retain(|_, a| *a != action);
                 continue;
             }
 
-            // Parse and add new binding
-            match parse_key_combo(key_str) {
-                Ok(combo) => {
-                    if let Some(displaced) = self.bindings.insert(combo, action) {
-                        log::warn!(
-                            "Keybinding '{key_str}' for {config_key} replaces {}",
-                            displaced.name()
-                        );
-                    }
-                }
+            let combo = match parse_key_combo(key_str) {
+                Ok(combo) => combo,
                 Err(e) => {
+                    // A typo must not silently make the action unreachable.
                     log::warn!("Invalid keybinding '{key_str}' for {config_key}: {e}");
+                    continue;
+                }
+            };
+            if let Some(existing) = self.bindings.get(&combo).copied() {
+                if existing != action {
+                    // Keep both existing defaults instead of stealing another
+                    // action's chord and leaving that action unreachable.
+                    log::warn!(
+                        "Keybinding '{key_str}' for {config_key} conflicts with '{}'",
+                        existing.name()
+                    );
+                    continue;
                 }
             }
+
+            // Mutate only after parsing and conflict validation succeeded.
+            self.bindings.retain(|_, a| *a != action);
+            self.bindings.insert(combo, action);
         }
     }
 
@@ -640,10 +666,9 @@ mod tests {
             Action::DuplicateTab,
             Action::ToggleTabMarked,
             Action::ToggleTabPinned,
-            Action::FilterFailedBlocks,
+            Action::OpenWelcome,
             Action::FilterSlowBlocks,
             Action::FilterPinnedBlocks,
-            Action::ClearBlockFilter,
             Action::JumpToPrevPinned,
             Action::JumpToNextPinned,
         ];
@@ -767,6 +792,8 @@ mod tests {
             ("Ctrl+backslash", Action::ToggleSidebar),
             // Tab filter palette.
             ("Ctrl+Shift+L", Action::FilterTabs),
+            ("Ctrl+Shift+X", Action::FilterFailedBlocks),
+            ("Ctrl+Shift+N", Action::ClearBlockFilter),
             // jterm1/Warp block actions.
             ("Ctrl+Shift+A", Action::SelectAllBlocks),
             ("Ctrl+Shift+I", Action::ReinputSelectedCommands),
@@ -774,6 +801,7 @@ mod tests {
             // AI sidebar keeps a non-conflicting chord.
             ("Ctrl+Alt+Shift+A", Action::ToggleAiPanel),
             ("Ctrl+Shift+Q", Action::AskAiAboutSelectedBlock),
+            ("Ctrl+Alt+G", Action::OpenAgent),
             // Block-history palette (Ctrl+R is bash readline, so we use Ctrl+Shift+H).
             ("Ctrl+Shift+H", Action::HistoryPalette),
             // Cross-block ripgrep palette.
@@ -920,6 +948,40 @@ mod tests {
             parse_key_combo("control+shift+t").unwrap(),
             parse_key_combo("Ctrl+Shift+T").unwrap()
         );
+    }
+
+    #[test]
+    fn parser_trims_whitespace_and_accepts_case_insensitive_named_keys() {
+        assert_eq!(
+            parse_key_combo("  control + shift + pageup  ").unwrap(),
+            parse_key_combo("Ctrl+Shift+PageUp").unwrap()
+        );
+        assert_eq!(
+            parse_key_combo("ctrl+BACKSPACE").unwrap(),
+            parse_key_combo("Ctrl+Backspace").unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_override_keeps_default_binding() {
+        let mut map = KeybindingMap::from_defaults();
+        let original = parse_key_combo("Ctrl+Shift+T").unwrap();
+        let table = "new_tab = 'Ctrl+NoSuchModifier+T'"
+            .parse::<toml::Table>()
+            .unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&original), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn conflicting_override_keeps_both_defaults() {
+        let mut map = KeybindingMap::from_defaults();
+        let new_tab = parse_key_combo("Ctrl+Shift+T").unwrap();
+        let paste = parse_key_combo("Ctrl+Shift+V").unwrap();
+        let table = "new_tab = 'Ctrl+Shift+V'".parse::<toml::Table>().unwrap();
+        map.apply_user_overrides(&table);
+        assert_eq!(map.lookup(&new_tab), Some(Action::NewTab));
+        assert_eq!(map.lookup(&paste), Some(Action::Paste));
     }
 
     #[test]

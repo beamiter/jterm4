@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  release:
+    name: Build and publish Linux bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            pkg-config libgtk-4-dev libadwaita-1-dev \
+            libvte-2.91-gtk4-dev libpcre2-dev xvfb
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches Cargo version
+        run: |
+          version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+          test "${GITHUB_REF_NAME}" = "v${version}" || {
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${version}." >&2
+            exit 1
+          }
+
+      - name: Run release gates
+        run: |
+          cargo test --all-features --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Build and verify bundle
+        run: |
+          cargo build --release --all-features --locked
+          bash scripts/package-release.sh target/release/jterm4
+          (cd target/dist && sha256sum --check *.sha256)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          assets=(target/dist/*)
+          (( ${#assets[@]} > 0 )) || { echo "No release assets produced." >&2; exit 1; }
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+              --verify-tag --generate-notes \
+              --title "jterm4 ${GITHUB_REF_NAME#v}"
+          fi
+

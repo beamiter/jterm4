@@ -2,6 +2,7 @@ use gtk4::glib;
 use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
+use std::borrow::Cow;
 use std::ffi::CString;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -21,6 +22,12 @@ pub struct OwnedPty {
     /// therefore backpressures that worker rather than GTK's main thread.
     input_tx: mpsc::Sender<Vec<u8>>,
     pid: Pid,
+    /// Tracks explicit bracketed-paste frames whose start, body, and end are
+    /// delivered through separate `write_bytes` calls.
+    outgoing_bracketed_paste: AtomicBool,
+    /// Mirrors the shell's DECSET/DECRST 2004 state observed on PTY output so
+    /// multiline insertion can be protected at the central input boundary.
+    shell_bracketed_paste: Arc<AtomicBool>,
 }
 
 // Raw GLib FFI for g_unix_fd_add_full (not exposed by glib-rs 0.22)
@@ -47,6 +54,86 @@ const PTY_READ_CHUNK_BYTES: usize = 32 * 1024;
 /// Keep a continuously-ready PTY from monopolizing GTK's main loop. The first
 /// chunk is dispatched immediately; queued follow-ups are paced at this rate.
 const PTY_DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
+
+/// Observe DECSET/DECRST 2004 in output whose escape sequence may be split
+/// across adjacent PTY read chunks.  Only a short suffix is retained.
+fn observe_bracketed_paste_mode(current: bool, tail: &mut Vec<u8>, data: &[u8]) -> bool {
+    let mut combined = Vec::with_capacity(tail.len() + data.len());
+    combined.extend_from_slice(tail);
+    combined.extend_from_slice(data);
+
+    let mut enabled = current;
+    let mut index = 0usize;
+    while index < combined.len() {
+        let rest = &combined[index..];
+        if rest.starts_with(BRACKETED_PASTE_ENABLE) {
+            enabled = true;
+            index += BRACKETED_PASTE_ENABLE.len();
+        } else if rest.starts_with(BRACKETED_PASTE_DISABLE) {
+            enabled = false;
+            index += BRACKETED_PASTE_DISABLE.len();
+        } else {
+            index += 1;
+        }
+    }
+
+    let bridge_len = BRACKETED_PASTE_ENABLE
+        .len()
+        .max(BRACKETED_PASTE_DISABLE.len())
+        .saturating_sub(1);
+    let keep_from = combined.len().saturating_sub(bridge_len);
+    tail.clear();
+    tail.extend_from_slice(&combined[keep_from..]);
+    enabled
+}
+
+/// Protect insertion-only input from becoming several unintended submissions.
+///
+/// Explicit submissions (a payload ending in CR) and explicitly framed paste
+/// data pass through unchanged.  Otherwise multiline input is bracketed when
+/// the shell advertises DECSET 2004, and safely reduced to the first logical
+/// line when it does not.  Single-line typing is never rewritten.
+fn sanitize_input_chunk(
+    data: &[u8],
+    paste_active: bool,
+    shell_supports_bracketed_paste: bool,
+) -> (Cow<'_, [u8]>, bool) {
+    let starts_paste = data.starts_with(BRACKETED_PASTE_START);
+    let ends_paste = data.ends_with(BRACKETED_PASTE_END);
+    let protected_by_paste = paste_active || starts_paste;
+    let next_paste_active = if ends_paste {
+        false
+    } else if starts_paste {
+        true
+    } else {
+        paste_active
+    };
+
+    if protected_by_paste || data.ends_with(b"\r") {
+        return (Cow::Borrowed(data), next_paste_active);
+    }
+
+    let Some(first_break) = data.iter().position(|&byte| byte == b'\r' || byte == b'\n') else {
+        return (Cow::Borrowed(data), next_paste_active);
+    };
+
+    if shell_supports_bracketed_paste {
+        let mut wrapped = Vec::with_capacity(
+            BRACKETED_PASTE_START.len() + data.len() + BRACKETED_PASTE_END.len(),
+        );
+        wrapped.extend_from_slice(BRACKETED_PASTE_START);
+        wrapped.extend_from_slice(data);
+        wrapped.extend_from_slice(BRACKETED_PASTE_END);
+        return (Cow::Owned(wrapped), next_paste_active);
+    }
+
+    (Cow::Owned(data[..first_break].to_vec()), next_paste_active)
+}
 
 struct FdWatchData<F: FnMut() -> bool> {
     callback: F,
@@ -209,6 +296,8 @@ impl OwnedPty {
                     master: std::sync::Arc::new(std::sync::Mutex::new(Some(master))),
                     input_tx,
                     pid: child,
+                    outgoing_bracketed_paste: AtomicBool::new(false),
+                    shell_bracketed_paste: Arc::new(AtomicBool::new(false)),
                 })
             }
             Err(error) => Err(io::Error::other(error)),
@@ -219,11 +308,30 @@ impl OwnedPty {
         self.pid.as_raw()
     }
 
+    /// Raw master-side fd, or -1 if the PTY has already been closed.
+    ///
+    /// The descriptor remains owned by this `OwnedPty`; callers only borrow the
+    /// integer long enough for non-mutating probes such as `tcgetpgrp(3)`.
+    pub fn master_fd_raw(&self) -> i32 {
+        self.master
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(AsRawFd::as_raw_fd))
+            .unwrap_or(-1)
+    }
+
     pub fn write_bytes(&self, data: &[u8]) {
-        if data.is_empty() {
+        let paste_active = self.outgoing_bracketed_paste.load(Ordering::Relaxed);
+        let shell_supports_bracketed_paste = self.shell_bracketed_paste.load(Ordering::Relaxed);
+        let (safe_data, next_paste_active) =
+            sanitize_input_chunk(data, paste_active, shell_supports_bracketed_paste);
+        self.outgoing_bracketed_paste
+            .store(next_paste_active, Ordering::Relaxed);
+
+        if safe_data.is_empty() {
             return;
         }
-        if let Err(error) = self.input_tx.send(data.to_vec()) {
+        if let Err(error) = self.input_tx.send(safe_data.into_owned()) {
             log::warn!(
                 "PTY input queue is closed; discarded {} byte(s)",
                 error.0.len()
@@ -284,9 +392,17 @@ impl OwnedPty {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let eventfd_for_thread = Arc::clone(&eventfd);
         let wake_pending_for_thread = Arc::clone(&wake_pending);
-        spawn_reader_thread(reader_fd, child_pid, tx, "jterm4-pty-reader", move || {
-            notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
-        });
+        let shell_bracketed_paste = Arc::clone(&self.shell_bracketed_paste);
+        spawn_reader_thread(
+            reader_fd,
+            child_pid,
+            tx,
+            "jterm4-pty-reader",
+            shell_bracketed_paste,
+            move || {
+                notify_eventfd_once(&eventfd_for_thread, &wake_pending_for_thread);
+            },
+        );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
 
@@ -344,7 +460,14 @@ impl OwnedPty {
         F: FnMut(Vec<u8>) + 'static,
         E: FnOnce(i32) + 'static,
     {
-        spawn_reader_thread(reader_fd, child_pid, tx, "jterm4-pty-reader-poll", || {});
+        spawn_reader_thread(
+            reader_fd,
+            child_pid,
+            tx,
+            "jterm4-pty-reader-poll",
+            Arc::clone(&self.shell_bracketed_paste),
+            || {},
+        );
 
         let on_exit = std::cell::Cell::new(Some(on_exit));
         let rx = std::cell::RefCell::new(rx);
@@ -373,6 +496,7 @@ fn spawn_reader_thread(
     child_pid: Pid,
     tx: mpsc::SyncSender<PtyMsg>,
     thread_name: &'static str,
+    shell_bracketed_paste: Arc<AtomicBool>,
     notify: impl Fn() + Send + 'static,
 ) {
     std::thread::Builder::new()
@@ -381,6 +505,7 @@ fn spawn_reader_thread(
             let mut file = std::fs::File::from(reader_fd);
             let fd = file.as_raw_fd();
             let mut buf = [0u8; PTY_READ_CHUNK_BYTES];
+            let mut mode_tail = Vec::with_capacity(BRACKETED_PASTE_ENABLE.len().saturating_sub(1));
             loop {
                 match file.read(&mut buf) {
                     Ok(0) => break,
@@ -390,6 +515,12 @@ fn spawn_reader_thread(
                         let mut combined = Vec::with_capacity(PTY_READ_CHUNK_BYTES);
                         combined.extend_from_slice(&buf[..n]);
                         coalesce_pending(fd, &mut file, &mut buf, &mut combined);
+                        let mode = observe_bracketed_paste_mode(
+                            shell_bracketed_paste.load(Ordering::Relaxed),
+                            &mut mode_tail,
+                            &combined,
+                        );
+                        shell_bracketed_paste.store(mode, Ordering::Relaxed);
                         if tx.send(PtyMsg::Data(combined)).is_err() {
                             return;
                         }
@@ -538,5 +669,71 @@ mod tests {
         };
         assert_eq!(read as usize, std::mem::size_of::<u64>());
         assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn unframed_multiline_insert_falls_back_without_shell_support() {
+        let (safe, active) = sanitize_input_chunk(b"echo first\necho second", false, false);
+        assert_eq!(safe.as_ref(), b"echo first");
+        assert!(!active);
+
+        let (safe, _) = sanitize_input_chunk(b"echo first\r\necho second", false, false);
+        assert_eq!(safe.as_ref(), b"echo first");
+    }
+
+    #[test]
+    fn shell_supported_multiline_insert_is_automatically_bracketed() {
+        let input = b"echo first\necho second";
+        let (safe, active) = sanitize_input_chunk(input, false, true);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(BRACKETED_PASTE_START);
+        expected.extend_from_slice(input);
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(safe.as_ref(), expected.as_slice());
+        assert!(!active);
+    }
+
+    #[test]
+    fn explicit_submission_preserves_multiline_bytes() {
+        let submitted = b"if true; then\necho ok\nfi\r";
+        let (safe, active) = sanitize_input_chunk(submitted, false, false);
+        assert_eq!(safe.as_ref(), submitted);
+        assert!(!active);
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_body_across_writes() {
+        let (start, active) = sanitize_input_chunk(BRACKETED_PASTE_START, false, false);
+        assert_eq!(start.as_ref(), BRACKETED_PASTE_START);
+        assert!(active);
+
+        let body = b"echo first\necho second";
+        let (safe_body, active) = sanitize_input_chunk(body, active, false);
+        assert_eq!(safe_body.as_ref(), body);
+        assert!(active);
+
+        let (end, active) = sanitize_input_chunk(BRACKETED_PASTE_END, active, false);
+        assert_eq!(end.as_ref(), BRACKETED_PASTE_END);
+        assert!(!active);
+    }
+
+    #[test]
+    fn ordinary_single_line_input_is_unchanged() {
+        let input = b"git status";
+        let (safe, active) = sanitize_input_chunk(input, false, false);
+        assert_eq!(safe.as_ref(), input);
+        assert!(!active);
+    }
+
+    #[test]
+    fn observes_split_bracketed_paste_mode_sequences() {
+        let mut tail = Vec::new();
+        let enabled = observe_bracketed_paste_mode(false, &mut tail, b"prompt\x1b[?20");
+        assert!(!enabled);
+        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"04h");
+        assert!(enabled);
+
+        let enabled = observe_bracketed_paste_mode(enabled, &mut tail, b"\x1b[?2004l");
+        assert!(!enabled);
     }
 }

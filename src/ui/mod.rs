@@ -11,11 +11,14 @@ use crate::config::{Config, SidebarView, TabPlacement, Theme};
 use crate::keybindings::KeybindingMap;
 
 mod actions;
+mod agent_panel;
 mod ai_panel;
+mod command_palette;
 mod config_apply;
 mod dialogs;
 mod file_tree;
 mod layout;
+mod notebooks;
 mod pane_leaf;
 mod pane_node;
 mod pane_tree_edit;
@@ -50,6 +53,10 @@ pub(crate) enum ConnStatus {
 /// auto-reconnect. Keyed by tab_num in `UiState::tab_connections`.
 #[derive(Clone)]
 pub(crate) struct TabConnection {
+    /// Stable identity for this concrete connection attempt. The map key may
+    /// change when its pane moves to another tab while a reconnect timer is
+    /// pending, but this value moves with the record.
+    pub(crate) identity: u32,
     /// The host this tab connects to — used to rebuild the same argv (and thus
     /// the same remote `--session` id) on reconnect.
     pub(crate) host: crate::config::RemoteHost,
@@ -102,6 +109,10 @@ pub(crate) struct UiState {
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    pub(crate) agent_dialog: Rc<RefCell<Option<adw::Dialog>>>,
+    /// Suppresses a storm of identical persistence alerts while a continuous
+    /// setting (opacity/font size) emits multiple change notifications.
+    pub(crate) config_save_error_visible: Rc<Cell<bool>>,
     pub(crate) keybinding_map: Rc<RefCell<KeybindingMap>>,
     pub(crate) zoom_state: Rc<RefCell<Option<ZoomState>>>,
     pub(crate) scrollbar_css: CssProvider,

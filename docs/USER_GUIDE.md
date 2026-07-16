@@ -1,131 +1,202 @@
 # jterm4 用户指南
 
-## 1. 启动与诊断
+## 1. 启动、诊断与恢复
 
-直接启动：
+jterm4 默认启动 Block 后端并恢复最近一个可领取的窗口快照：
 
 ```bash
 jterm4
+jterm4 ~/project
+jterm4 --working-directory ~/project
+jterm4 --mode vte --no-restore
+jterm4 --execute bash -lc 'cargo test'
 ```
 
-常用的无界面命令：
+`--execute` 后的参数原样作为 argv，不经过额外 shell 拆词。显式 cwd、`--execute`、`--no-restore` 和 `--safe-mode` 都不会意外领取普通恢复快照；execute/safe-mode 窗口也不发布会话快照。单独使用 `--mode` 只覆盖本窗口后端，仍可恢复窗口布局。
+
+以下命令在 GTK 初始化前完成，可用于 SSH、TTY 和 CI：
 
 ```bash
 jterm4 --help
 jterm4 --version
 jterm4 --doctor
-jterm4 --print-config-path
+jterm4 --doctor --json
+jterm4 --config-path
+jterm4 --init-config
 jterm4 --check-config
+jterm4 --check-config --json
+jterm4 --restore-config-backup
+jterm4 --print-default-config
 ```
 
-这些命令在 GTK 初始化前完成，因此可在 SSH、TTY 和 CI 中运行。`--doctor` 还会报告 ready / active 会话快照数量。日志可用 `JTERM4_LOG=debug`，或使用 `RUST_LOG='warn,jterm4=debug,jterm4::state=trace'` 按模块设置；每行包含相对时间、级别和 target。使用其他配置文件：
+`--doctor` 报告配置语义与权限、有效轮换备份、配置写锁、显示/input 环境、可选工具、AI provider/密钥存在性、workflow 与欢迎 Notebook 发现结果、远程 SSH 就绪度以及 ready/active 快照数量，但不输出快照中的目录、标签或命令，也不会探测任何网络 endpoint。使用独立配置：
 
 ```bash
 jterm4 --config ~/configs/work.toml
 jterm4 --check-config ~/configs/work.toml
 ```
 
-## 2. 终端模式
+安装版还提供隐私保护的支持归档工具：
 
-在 `~/.config/jterm4/config.toml` 中选择：
-
-```toml
-terminal_mode = "vte"
+```bash
+jterm4-support-bundle ~/Desktop
 ```
 
-- `vte` 是传统终端，适合 TUI、分屏和通用 shell 工作。
-- `block` 把每条命令保存为独立块，提供退出状态、耗时、筛选、跨块搜索、历史回调和 AI 上下文。
+它通过脱敏诊断模式收集权限/大小元数据、聚合计数、非敏感系统特征和选定环境变量是否存在，不打包配置正文、历史、会话、终端输出、剪贴板、API key、SSH 目标、主机名或本地路径，也不会发起网络请求。归档权限为 `0600`；发送给他人前仍应检查每个文件。
 
-Block 模式目前不开放分屏。旧实现会先启动 PTY、随后因内部 VTE 不是 Pane 根组件而无法挂载；当前版本会在启动进程之前明确提示。需要分屏时请切换为 VTE 模式。
+`jterm4 --safe-mode` 完全跳过用户配置及 `JTERM4_*` 外观/行为覆盖，使用内置 VTE 主题和默认快捷键；同时禁用配置重载、恢复、配置/会话持久化、历史、仓库探测、远程主机、通知、AI 和可执行 Notebook。它适合确认故障来自用户配置还是图形/终端环境，不能与 `--mode` 或 `--execute` 同时使用；即使同时给出 `--config`，该文件也不会被读取。
 
-## 3. 标签页
+## 2. Shell 集成
+
+Block 后端可在没有集成脚本时工作，但加载脚本后能通过 OSC 133/7 精确获取 prompt/command 边界、退出码和 cwd。无需查找安装路径：
+
+```bash
+# ~/.bashrc
+[[ $TERM_PROGRAM == jterm4 ]] && source <(jterm4 --shell-integration bash)
+
+# ~/.zshrc
+[[ $TERM_PROGRAM == jterm4 ]] && source <(jterm4 --shell-integration zsh)
+```
+
+fish 和 PowerShell 对应 `fish`、`pwsh`。原生安装还会把四种脚本放到 `${prefix}/share/jterm4/shell-integration/`。其他终端会忽略这些 OSC 序列。
+
+Flatpak 的交互 shell 运行在宿主机，宿主 rc 不应直接引用沙箱内的
+`/app/share`。bash/zsh 可在对应 rc 中使用
+`source <(flatpak run io.github.beamiter.jterm4 --shell-integration bash)`；fish
+使用 `flatpak run io.github.beamiter.jterm4 --shell-integration fish | source`。
+两种后端都会在读取 rc 前注入 `TERM_PROGRAM=jterm4`，因此可继续用该变量做条件保护。
+
+## 3. 终端模式与 Pane
+
+默认配置是：
+
+```toml
+terminal_mode = "block"
+```
+
+- `block` 把命令保存为独立块，提供退出状态、耗时、筛选、跨块搜索、历史回填和 AI 上下文。
+- `vte` 是传统终端，适合要求完整滚屏语义的 TUI 或兼容性排查。
+
+两个后端共享输入路由、字体/主题、cwd、进程检查和关闭清理。从 Block pane 发起分屏时，原 Block 会留在 pane tree 中，新 sibling 使用 VTE；VTE sibling 可继续嵌套分屏。这避免隐藏 PTY，同时保留 Block 工作区里的分屏能力。
 
 | 操作 | 快捷键 |
 |---|---|
-| 新建标签 | `Ctrl+Shift+T` |
-| 关闭当前 Pane 或标签 | `Ctrl+Shift+W` |
-| 下一个标签 | `Ctrl+Tab`、`Ctrl+PageDown` |
-| 上一个标签 | `Ctrl+Shift+Tab`、`Ctrl+PageUp` |
-| 标签 1 到 8 | `Ctrl+1` 到 `Ctrl+8` |
-| 最后一个标签 | `Ctrl+9` |
-| 过滤标签 | `Ctrl+Shift+L` |
-| 标签栏位置 | `Ctrl+Alt+B` |
-
-标签支持拖放排序、双击重命名、固定、标记、复制以及右键菜单。侧栏可在 Tabs 与 Files 之间切换；标签位于顶栏且配置未记录用户选择时，侧栏默认关闭。侧栏开关状态会持久化，过滤动作仍会按需打开侧栏并显示搜索输入框。
-
-每个 jterm4 窗口维护独立的活动快照。正常关闭后，快照才会发布给未来窗口；同时运行的窗口不会读取或覆盖彼此状态。多个窗口关闭后，后续启动会逐个原子领取最近的快照。异常退出留下的活动快照会在确认原进程已结束后自动回收，旧版 `tabs.state` 也会在首次启动时无损迁移。`jterm4 --doctor` 只报告 ready / active 数量，不暴露路径或标签内容。
-
-## 4. VTE 分屏
-
-| 操作 | 快捷键 |
-|---|---|
-| 左右分屏 | `Ctrl+Shift+E` |
-| 上下分屏 | `Ctrl+Shift+D` |
+| 左右 / 上下分屏 | `Ctrl+Shift+E` / `Ctrl+Shift+D` |
 | 方向聚焦 | `Ctrl+Alt+方向键` |
 | 调整大小 | `Ctrl+Alt+Shift+方向键` |
 | 放大当前 Pane | `Ctrl+Shift+Z` |
 | Pane 移到新标签 | `Ctrl+Shift+!` |
+| 关闭当前 Pane 或标签 | `Ctrl+Shift+W` |
 
-分屏状态序列化仍属于实验功能。重要工作流不要只依赖自动恢复；启动命令和远程会话也应保留自己的持久化机制。
+关闭 pane、标签、多个选中标签或窗口时，jterm4 会扫描所有后端的真实 PTY 和前台进程；存在运行中任务时先给出统一确认。缩放的 pane 会先恢复 pane tree 再关闭，避免漏掉隐藏 sibling。
 
-## 5. 搜索与 Block 工具
+分屏布局恢复仍建议与命令自身的持久化方案配合使用，尤其是 SSH/TUI 长任务。
 
-`Ctrl+Shift+F` 打开当前标签搜索：
+## 4. 标签页与窗口恢复
 
-- 普通文本执行不区分大小写的搜索。
-- `/expression/` 使用正则表达式。
-- `Enter` 下一个结果，`Shift+Enter` 上一个，`Escape` 关闭。
-- 清空输入会立即清除 VTE 和 Block 高亮。
-- 搜索状态切换标签时，焦点保留在搜索框并对新标签重新应用查询。
+| 操作 | 快捷键 |
+|---|---|
+| 新建标签 | `Ctrl+Shift+T` |
+| 下一个 / 上一个标签 | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| 标签 1 到 8 / 最后一个 | `Ctrl+1`…`Ctrl+8` / `Ctrl+9` |
+| 过滤标签 | `Ctrl+Shift+L` |
+| 标签栏位置 | `Ctrl+Alt+B` |
 
-Block 模式额外提供：
+标签支持拖放排序、双击重命名、固定、标记、复制和右键菜单。侧栏在 Tabs 与 Files 之间切换；开关、宽度和视图会持久化。
 
-| 功能 | 快捷键 |
+每个进程维护独立 active 快照。正常关闭后才原子发布为 ready；并发窗口不会读取或覆盖彼此 active 状态。后续启动逐个领取最近快照，确认 owner PID 已结束后才回收崩溃遗留的 active 快照，最多保留 32 个 ready 快照。旧版 `tabs.state` 会在首次启动时迁移。
+
+## 5. 搜索与 Block 操作
+
+`Ctrl+Shift+F` 打开当前标签搜索：普通文本不区分大小写，`/expression/` 使用正则；Enter/Shift+Enter 前后跳转，Escape 关闭。清空输入立即清除 VTE 和 Block 高亮。
+
+| Block 功能 | 快捷键 |
 |---|---|
 | 命令历史面板 | `Ctrl+Shift+H` |
 | 跨块行搜索 | `Ctrl+Shift+G` |
-| 工作流模板 | `Ctrl+Shift+M` |
+| 跳到首个失败块 / 最早块 | `Ctrl+Shift+X` / `Ctrl+Shift+N` |
+| workflow | `Ctrl+Shift+M` |
 | AI 分析选中块 | `Ctrl+Shift+Q` |
+| Shell Agent | `Ctrl+Alt+G` |
+| 全选 / 回填 / 清空 | `Ctrl+Shift+A` / `Ctrl+Shift+I` / `Ctrl+Shift+K` |
 
-右键块可复制命令、复制输出、重新运行或导出。命令回调只会在 shell 正停留在提示符时写入，避免误发给正在运行的 TUI。
+选择语义与 jterm1 对齐：
 
-Block 历史选择与 jterm1 保持一致：
+- `Ctrl+Up` 从最新块进入选择；普通 `Up/Down` 移动 active edge，`Shift+Up/Down` 扩展范围。
+- `Enter` 或 `Ctrl+Shift+I` 按终端顺序回填所有选中命令，不自动执行；`Escape` 清除选择。
+- `Ctrl+Shift+B` 收藏 active 块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转。
+- 多选右键可批量复制命令、输出、完整块或回填命令；复制按界面顺序合并。
+- 长块提供顶部/底部导航与 sticky header，后台异步输出使用独立 Block 样式。
 
-- 单击块头进入选择；`Shift+单击` 选择连续范围，`Ctrl+Shift+单击` 切换单个块。
-- 选中后用 `↑` / `↓` 移动活动块，`Shift+↑` / `Shift+↓` 扩展范围，`Ctrl+Shift+↑` / `Ctrl+Shift+↓` 对齐活动块顶部或底部。
-- `Enter` 回填活动块命令，`Ctrl+Enter` 回填并执行，`Delete` 删除活动块，`Escape` 清除选择。
-- shell 空闲时，`Home` / `End` 跳到历史两端，`PageUp` / `PageDown` 翻页。
-- `Ctrl+Shift+B` 收藏活动块，`Ctrl+,` / `Ctrl+.` 在收藏块之间跳转；相关动作也可从命令面板调用或在配置中绑定。
-- 复制多选块时按终端顺序合并，块之间保留一个空行；`Alt+Ctrl+Shift+C` 只复制输出。
+命令运行中或 alt-screen TUI 活跃时，Enter 和应用所需按键继续发送给前台进程，不会误触发旧块回填。
 
-## 6. 文件树
+## 6. 统一命令面板、历史与 workflow
 
-侧栏 Files 页以当前标签目录为根：
+`Ctrl+Shift+P` 打开的面板统一模糊搜索四类来源：
 
-- 双击目录展开或折叠。
-- 双击文件会把经过 shell 引号保护的路径插入当前输入行，不自动执行。
-- “向上”按钮进入父目录，“主页”按钮回到当前终端工作目录。
+| 前缀 | 来源 | 接受后的行为 |
+|---|---|---|
+| `>` | 应用动作与当前快捷键 | 执行动作 |
+| `@` | JSONL 命令历史 | 写入编辑行，不提交 |
+| `:` | YAML/TOML workflow | 填参数后写入编辑行，不提交 |
+| `?` | 自然语言命令请求 | 交给 AI 生成候选，先审阅 |
 
-Block 模式的路径插入走其自管 PTY 输入通道；VTE 模式走 VTE child 输入。
+JSONL 历史默认位于 `${XDG_STATE_HOME:-~/.local/state}/jterm4/history.jsonl`，只保存 command、cwd、exit code 和完成时间，不保存终端输出。文件权限为 `0600`，重复命令按最新记录展示，损坏或超限记录会跳过，文件会按上限压缩。
 
-## 7. Flatpak 与桌面安装
+用户 workflow 放在 `~/.config/jterm4/workflows/`，支持 `.toml`、`.yaml`、`.yml`；也可用 `JTERM4_WORKFLOW_DIR` 增加以路径列表表示的目录。用户定义优先于已安装示例，同名项不会被示例覆盖。
 
-Flatpak 应用 ID 为 `io.github.beamiter.jterm4`。打包版本会通过
-`flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免用户
-误以为终端命令运行在真实系统、实际却被限制在应用沙箱。该设计也意味着
-jterm4 Flatpak 不是命令隔离边界。
+安装包附带 feature branch、大文件查找、交互式 rebase、SSH 本地端口转发、Docker 日志跟随和端口进程终止示例。所有示例都只生成可编辑的单行命令；选中后不会自动执行，其中会结束进程或建立长连接的模板仍须由用户逐字审阅。
+
+TOML 示例：
+
+```toml
+name = "Deploy"
+description = "Deploy a branch"
+command = "deploy --branch {branch} --env {env}"
+tags = ["release"]
+
+[[args]]
+name = "branch"
+default = "main"
+
+[[args]]
+name = "env"
+default = "staging"
+```
+
+YAML 可使用共享格式的 `{{name}}` placeholder。未提供的必填参数不会静默执行，生成内容始终只进入当前 pane 的编辑行。为保证“只插入、不提交”，history、workflow、文件路径和 AI 候选只接受不含 CR、LF、NUL 或其他终端控制字符的单行文本；不安全条目会被拒绝并提示，而不会写入 PTY。
+
+## 7. 可执行 Notebook
+
+`.jtnb.md` 是普通 Markdown，其中 bash/sh/zsh/fish/pwsh/powershell/shell 或无标签 fence 可执行。双击文件树中的 Notebook 打开；内置 quick start 可在命令面板搜索 **Open welcome & quick start notebook**。
+
+- 每个 cell 可单独 Run/Stop，也可 Run All/Stop All。
+- stdout 与 stderr 分开显示，并保留 exit status；单 cell 合计输出有 256 KiB 上限。
+- 显式 shell fence 使用对应解释器；`shell` 和无标签 fence 使用 jterm4 的配置 shell argv。
+- 非 shell fence 只展示，不执行。
+- cell 在独立进程组运行，停止、Stop All 或关闭对话框会清理完整进程组。
+- 命令不会注入当前终端，也不会绕过 Notebook 自己的运行按钮；安全模式禁用执行。
+
+安装资产位于 `${prefix}/share/jterm4/notebooks/`；Flatpak 中是 `/app/share/jterm4/notebooks/`。
+
+## 8. 文件树
+
+侧栏 Files 页以当前标签 cwd 为根：双击目录展开/折叠；双击普通文件把 shell 引号保护后的路径插入编辑行，不自动执行；双击 `.jtnb.md` 打开 Notebook。向上按钮进入父目录，主页按钮回到当前终端 cwd。Block 走自管 PTY 输入，VTE 走 VTE child input。
+
+## 9. Flatpak 与桌面安装
+
+Flatpak 应用 ID 是 `io.github.beamiter.jterm4`。打包版本通过 `flatpak-spawn --host` 启动宿主 Shell、SSH、Git、curl 和通知工具，避免命令误跑在一次性应用沙箱；因此 jterm4 Flatpak 本身不是命令隔离边界。
 
 ```bash
 flatpak run io.github.beamiter.jterm4 --doctor
 flatpak run io.github.beamiter.jterm4
 ```
 
-文件树需要宿主文件系统权限；AI 密钥必须通过可信启动器或显式 Flatpak 环境
-覆盖提供。完整权限说明和构建流程见 `docs/FLATPAK.md`。
+文件树需要宿主文件系统权限。AI 密钥必须通过可信启动器或显式 Flatpak override 提供。完整权限说明见 `docs/FLATPAK.md`。
 
-## 8. SSH 远程会话
+## 10. SSH 远程会话
 
-jterm4 不会预置任何个人主机。在配置中显式添加：
+jterm4 不预置主机。在配置中显式添加：
 
 ```toml
 [[remote_hosts]]
@@ -139,45 +210,40 @@ login_shell = true
 multiplex = true
 ```
 
-按 `Ctrl+Shift+S` 打开主机选择器。连接复用通过 OpenSSH ControlMaster 完成，异常断开会按上限退避重连；用户正常退出不会重连。
+`Ctrl+Shift+S` 打开主机选择器。连接复用由 OpenSSH ControlMaster 完成，异常断开按上限退避重连；用户正常退出不会重连。
 
-## 9. 工作流模板
+## 11. AI 与 Agent 安全边界
 
-将一个或多个 TOML 文件放到 `~/.config/jterm4/workflows/`：
-
-```toml
-name = "Deploy"
-description = "Deploy a branch"
-command = "deploy --branch {branch} --env {env}"
-
-[[args]]
-name = "branch"
-description = "Git branch"
-default = "main"
-
-[[args]]
-name = "env"
-default = "staging"
-```
-
-`Ctrl+Shift+M` 选择模板并填写参数。生成的命令只写入编辑行，不会自动按 Enter。
-
-## 10. AI 面板
-
-启动前设置密钥：
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol；密钥只从环境读取，不写入 TOML：
 
 ```bash
 export ANTHROPIC_API_KEY='...'
+# 或 OPENAI_API_KEY / OLLAMA_API_KEY / 通用 JTERM4_AI_API_KEY
 jterm4
 ```
 
-`Ctrl+Alt+Shift+A` 打开面板；在 Block 模式选中命令块后按 `Ctrl+Shift+Q` 发送命令、退出码、工作目录和截断后的输出。`ai_redact_secrets = true` 默认在发送前遮蔽常见密钥格式。
+相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可检查 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
-AI 请求目前依赖系统 `curl`。运行 `jterm4 --doctor` 可检查其是否可用。不要把终端脱敏当成唯一的秘密保护边界，发送前仍应检查上下文。
+自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 在当前 active Block pane 打开原生 **Shell Agent**；它在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
-## 11. 配置与快捷键
+一次 Agent 会话的安全流程是：
 
-完整字段见仓库根目录的 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 可手动重载。语法或语义错误的热重载会被拒绝，当前有效配置保持不变。
+1. 输入任务后，模型回复必须是严格 JSON `say`、`run` 或 `done`；夹杂 prose、未知字段、错误类型、过期 proposal 或非法控制字符都会失败关闭，不能退化为可运行命令。
+2. `run` 显示单独 proposal 卡片和可编辑命令。识别到顶层 `rm -rf`、`mkfs`、下载后 pipe 到 shell 等模式时显示醒目的危险提示。
+3. 每张卡片只能 **Reject** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；批准执行的是用户最后编辑后的精确文本。
+4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
+5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
+6. **Cancel Agent** 或关闭窗口会取消会话并作废待处理模型回复；`agent_max_turns` 达到上限后停止继续请求。已经由用户批准并启动的普通终端命令不会被取消按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
+
+`agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
+
+`ai_redact_secrets = true` 默认遮蔽常见密钥格式，但脱敏不是秘密保护边界；发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
+
+## 12. 配置保存与快捷键
+
+完整字段见 `config.toml.example`。保存后自动热重载，`Ctrl+Shift+R` 手动重载。语法或语义错误不会替换当前有效配置。
+
+应用内设置保存还会：获取进程级 advisory lock、检查加载时 revision、拒绝并发编辑冲突、用 owner-only 临时文件 `fsync` 后原子替换，并轮换 `.bak` / `.bak.1` 两份经过验证的备份。恢复前的当前文件另存为 `.before-restore`。冲突、验证拒绝、锁超时和 I/O 错误会在窗口中明确提示；内存中的临时改动仍有效，但磁盘不会被覆盖。发生冲突时先重载配置再重新应用改动；必要时运行 `jterm4 --restore-config-backup`。safe mode 中的设置只影响当前窗口，也会明确提示不会保存。
 
 覆盖或解除快捷键：
 
@@ -187,44 +253,35 @@ show_remote_picker = "F8"
 toggle_ai_panel = false
 ```
 
-修饰键名称不区分大小写，`Ctrl` 与 `Control` 等价。若两个 action 使用同一组合，配置检查器会报告冲突。
+修饰键名称不区分大小写，`Ctrl` 与 `Control` 等价。若两个 action 使用同一组合，配置检查器会报告冲突。`Ctrl+R` / `Ctrl+P` 留给 shell/readline。
 
-视觉与常用动作：
+## 13. 状态与历史位置
 
-| 操作 | 快捷键 |
-|---|---|
-| 命令面板 | `Ctrl+Shift+P` |
-| 设置 | `Ctrl+Shift+O` |
-| 重载配置 | `Ctrl+Shift+R` |
-| 显示/隐藏侧栏 | `Ctrl+\` |
-| 复制 / 粘贴 | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
-| 放大 / 缩小 / 复位字体 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` |
-| 增加 / 降低透明度 | `Ctrl+Alt+=` / `Ctrl+Alt+-` |
-| 调试面板 | `F12` |
+- 配置：`~/.config/jterm4/config.toml` 及 `.bak` / `.bak.1`。
+- 窗口快照：`~/.config/jterm4/windows/window-*.active|state`。
+- JSONL 命令历史：`${XDG_STATE_HOME:-~/.local/state}/jterm4/history.jsonl`，可用配置覆盖。
+- 可选 Block 全量历史：由 `block_history_path` 指定，可能包含输出。
+- 用户 workflow：`~/.config/jterm4/workflows/*.{toml,yaml,yml}`。
+- 已安装示例与 Notebook：`${prefix}/share/jterm4/`。
 
-## 11. 状态与历史
+配置、快照与历史包含敏感工作信息，备份或分享前应主动检查。
 
-- 标签快照：`~/.config/jterm4/tabs.state`
-- 可选 Block 历史：由 `block_history_path` 指定
-- 工作流：`~/.config/jterm4/workflows/*.toml`
-
-状态与历史保存使用同目录临时文件和原子替换。Block 历史路径支持开头的 `~/` 并自动创建父目录。
-
-## 12. 故障排查
-
-先运行：
+## 14. 故障排查
 
 ```bash
 jterm4 --doctor
 jterm4 --check-config
-JTERM4_LOG=debug jterm4
+JTERM4_LOG=debug jterm4 --no-restore
+jterm4 --safe-mode
+jterm4-support-bundle .
 ```
 
-常见检查：
-
-- GUI 无法启动：确认 `DISPLAY` 或 `WAYLAND_DISPLAY`，以及 GTK/VTE 动态库。
+- GUI 无法启动：确认 `DISPLAY` 或 `WAYLAND_DISPLAY` 以及 GTK/VTE 动态库。
 - 中文输入无预编辑：检查 `GTK_IM_MODULE`、`XMODIFIERS` 和 fcitx5/ibus GTK4 模块。
-- AI 不可用：检查 `ANTHROPIC_API_KEY` 与 `curl`。
-- 长命令无通知：检查 `notify-send` 与桌面通知服务。
-- SSH 无目标：添加 `[[remote_hosts]]`，再按 `Ctrl+Shift+S`。
-- 配置修改没生效：先运行 `--check-config`；错误配置不会替换当前有效配置。
+- Block 缺少准确 exit/cwd：加载对应 shell integration。
+- AI 不可用：检查 `ai_enabled`、provider 对应密钥、base URL 和 `curl`。
+- 欢迎 Notebook 找不到：重新安装资产，或设置 `JTERM4_ASSET_DIR=/path/to/share/jterm4`。
+- workflow 示例找不到：检查 `${prefix}/share/jterm4/workflows`；非默认 prefix 可设置 `JTERM4_WORKFLOW_DIR`。
+- 长命令无通知：检查 `notify_long_blocks`、阈值、`notify-send` 和通知服务。
+- SSH 无目标：添加 `[[remote_hosts]]` 后按 `Ctrl+Shift+S`。
+- 配置修改没生效：先运行 `--check-config`；并发冲突需要重载后再保存。

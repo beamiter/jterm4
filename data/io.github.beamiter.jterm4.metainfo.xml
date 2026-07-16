@@ -7,14 +7,14 @@
   <summary>Session-aware GTK4 terminal with structured command blocks</summary>
   <description>
     <p>
-      jterm4 combines a traditional VTE terminal with an optional Block mode
-      that keeps commands, output, exit status, duration, and working directory
-      as searchable structured history.
+      jterm4 defaults to a structured Block terminal that keeps commands,
+      output, exit status, duration, and working directory as searchable
+      history, while retaining a traditional VTE backend for compatibility.
     </p>
     <ul>
-      <li>VTE tabs and split panes with session restoration</li>
-      <li>Structured command blocks, search, filtering, bookmarks, and recall</li>
-      <li>SSH workflows, an asynchronous file tree, and optional AI assistance</li>
+      <li>Tabs and split panes with safe close checks and session restoration</li>
+      <li>Structured command blocks, unified search, history, workflows, and executable notebooks</li>
+      <li>SSH sessions, an asynchronous file tree, and optional multi-provider AI assistance</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.beamiter.jterm4.desktop</launchable>

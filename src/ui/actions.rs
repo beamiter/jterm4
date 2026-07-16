@@ -91,7 +91,7 @@ impl UiState {
             }
             Action::ToggleCommandPalette => {
                 log::debug!("Toggle command palette");
-                self.toggle_command_palette();
+                self.toggle_unified_command_palette();
             }
             Action::ToggleSettings => {
                 log::debug!("Toggle settings panel");
@@ -287,6 +287,7 @@ impl UiState {
                 log::debug!("Ask AI about selected block");
                 self.ask_ai_about_selected_block();
             }
+            Action::OpenAgent => self.toggle_agent_panel(),
             Action::HistoryPalette => {
                 log::debug!("Show history palette");
                 self.show_history_palette();
@@ -299,6 +300,7 @@ impl UiState {
                 log::debug!("Show workflows palette");
                 self.show_workflows_palette();
             }
+            Action::OpenWelcome => self.open_welcome_notebook(),
         }
     }
 
@@ -306,6 +308,10 @@ impl UiState {
     /// `config.ai_panel_visible` so the panel state survives restart.
     pub(crate) fn toggle_ai_panel(&self) {
         let next = !self.ai_panel_visible.get();
+        if next && !self.config.borrow().ai_enabled {
+            self.show_ai_error("AI features are disabled in Settings or safe mode.");
+            return;
+        }
         self.ai_panel_visible.set(next);
         if next {
             self.ai_paned.set_end_child(Some(&self.ai_panel.root));
@@ -320,7 +326,7 @@ impl UiState {
             self.ai_paned.set_end_child(None::<&gtk4::Widget>);
         }
         self.config.borrow_mut().ai_panel_visible = next;
-        crate::config::save_config(&self.config.borrow());
+        self.persist_config();
     }
 
     /// Grab the selected block's context (cmd + output + cwd + exit) from
@@ -328,6 +334,10 @@ impl UiState {
     /// first if it's hidden; no-ops cleanly when nothing's selected or the
     /// active tab is VTE-mode.
     pub(crate) fn ask_ai_about_selected_block(&self) {
+        if !self.config.borrow().ai_enabled {
+            self.show_ai_error("AI features are disabled in Settings or safe mode.");
+            return;
+        }
         let Some(term_view) = self.current_term_view() else {
             log::debug!("AI: no active block-mode tab");
             return;
@@ -340,6 +350,13 @@ impl UiState {
             self.toggle_ai_panel();
         }
         self.ai_panel.ask_about_block(ctx);
+    }
+
+    pub(crate) fn show_ai_error(&self, message: &str) {
+        let dialog = adw::AlertDialog::new(Some("AI unavailable"), Some(message));
+        dialog.add_response("ok", "OK");
+        dialog.set_default_response(Some("ok"));
+        dialog.present(Some(&self.window));
     }
 
     pub(crate) fn focus_current_terminal(&self) {
@@ -384,7 +401,8 @@ impl UiState {
         self.notebook
             .current_page()
             .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
-            .and_then(|widget| PaneLeaf::from_widget(&widget))
+            .and_then(|widget| PaneNode::from_widget(&widget))
+            .and_then(|node| node.active_leaf())
     }
 
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {

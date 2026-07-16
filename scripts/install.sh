@@ -177,9 +177,36 @@ require_command install
 STAGED_BIN_DIR="${DESTDIR}${BIN_DIR}"
 run install -d -m 0755 "${STAGED_BIN_DIR}"
 run install -m 0755 "${BINARY}" "${STAGED_BIN_DIR}/jterm4"
+run install -m 0755 \
+    "${REPO_ROOT}/scripts/support-bundle.sh" \
+    "${STAGED_BIN_DIR}/jterm4-support-bundle"
+
+SHARE_DIR="${DESTDIR}${PREFIX}/share"
+ASSET_DIR="${SHARE_DIR}/jterm4"
+run install -d -m 0755 \
+    "${ASSET_DIR}/shell-integration" \
+    "${ASSET_DIR}/workflows" \
+    "${ASSET_DIR}/notebooks"
+run install -m 0644 \
+    "${REPO_ROOT}/scripts/shell-integration/README.md" \
+    "${REPO_ROOT}/scripts/shell-integration/jterm4.bash" \
+    "${REPO_ROOT}/scripts/shell-integration/jterm4.zsh" \
+    "${REPO_ROOT}/scripts/shell-integration/jterm4.fish" \
+    "${REPO_ROOT}/scripts/shell-integration/jterm4.ps1" \
+    "${ASSET_DIR}/shell-integration/"
+run install -m 0644 \
+    "${REPO_ROOT}/scripts/workflows/git-feature.yaml" \
+    "${REPO_ROOT}/scripts/workflows/find-large-files.yaml" \
+    "${REPO_ROOT}/scripts/workflows/git-rebase-interactive.yaml" \
+    "${REPO_ROOT}/scripts/workflows/ssh-tunnel.yaml" \
+    "${REPO_ROOT}/scripts/workflows/docker-tail-logs.yaml" \
+    "${REPO_ROOT}/scripts/workflows/kill-port.yaml" \
+    "${ASSET_DIR}/workflows/"
+run install -m 0644 \
+    "${REPO_ROOT}/scripts/notebooks/welcome.jtnb.md" \
+    "${ASSET_DIR}/notebooks/welcome.jtnb.md"
 
 if ((INSTALL_DESKTOP == 1)); then
-    SHARE_DIR="${DESTDIR}${PREFIX}/share"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.desktop" \
         "${SHARE_DIR}/applications/${APP_ID}.desktop"
     run install -Dm0644 "${REPO_ROOT}/data/${APP_ID}.metainfo.xml" \
@@ -206,6 +233,8 @@ if ((INSTALL_CONFIG == 1)); then
 fi
 
 printf 'Installed jterm4 to %s\n' "${BIN_DIR}/jterm4"
+printf 'Installed support tool to %s\n' "${BIN_DIR}/jterm4-support-bundle"
+printf 'Installed runtime assets under %s/share/jterm4\n' "${PREFIX}"
 if ((INSTALL_DESKTOP == 1)); then
     printf 'Installed desktop integration under %s/share\n' "${PREFIX}"
 fi

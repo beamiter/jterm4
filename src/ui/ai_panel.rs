@@ -1,4 +1,4 @@
-//! ai_panel — right-side chat sidebar backed by the Anthropic Messages API.
+//! ai_panel — provider-neutral right-side chat sidebar.
 //!
 //! Layout: vertical column = [header row | conversation scroll | status label |
 //! input row]. The input is a multi-line TextView so users can paste shell
@@ -23,20 +23,81 @@ use gtk4::{
 use crate::ai::{self, BlockContext, Role, Turn};
 use crate::config::Config;
 
+/// Provider-facing transcript plus a monotonically increasing request token.
+/// Clearing a conversation invalidates the active token, so a response that
+/// was already in flight can never repopulate the cleared transcript or append
+/// an assistant turn without its matching user turn.
+#[derive(Default)]
+struct ConversationState {
+    history: Vec<Turn>,
+    epoch: u64,
+    active_epoch: Option<u64>,
+}
+
+impl ConversationState {
+    fn is_busy(&self) -> bool {
+        self.active_epoch.is_some()
+    }
+
+    fn begin(&mut self, user_text: String) -> (u64, Vec<Turn>) {
+        self.epoch = self.epoch.wrapping_add(1);
+        let epoch = self.epoch;
+        self.history.push(Turn {
+            role: Role::User,
+            text: user_text,
+        });
+        self.active_epoch = Some(epoch);
+        (epoch, self.history.clone())
+    }
+
+    fn clear(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.active_epoch = None;
+        self.history.clear();
+    }
+
+    fn complete_success(&mut self, epoch: u64, text: String) -> bool {
+        if self.active_epoch != Some(epoch) {
+            return false;
+        }
+        self.active_epoch = None;
+        self.history.push(Turn {
+            role: Role::Assistant,
+            text,
+        });
+        true
+    }
+
+    fn complete_error(&mut self, epoch: u64) -> bool {
+        if self.active_epoch != Some(epoch) {
+            return false;
+        }
+        self.active_epoch = None;
+        if self
+            .history
+            .last()
+            .is_some_and(|turn| turn.role == Role::User)
+        {
+            self.history.pop();
+        }
+        true
+    }
+}
+
 /// All widgets + state the AI panel needs to drive itself.
 #[derive(Clone)]
 pub(crate) struct AiPanel {
     /// Root box returned from `build`. Add this as the end child of the
     /// outer Paned in main.rs.
     pub(crate) root: GBox,
-    history: Rc<RefCell<Vec<Turn>>>,
+    conversation: Rc<RefCell<ConversationState>>,
     convo_buffer: TextBuffer,
     convo_view: TextView,
     convo_scroll: ScrolledWindow,
     input_buffer: TextBuffer,
     send_btn: Button,
     status_label: Label,
-    busy: Rc<std::cell::Cell<bool>>,
+    block_context: Rc<RefCell<Option<BlockContext>>>,
     config: Rc<std::cell::RefCell<Config>>,
 }
 
@@ -149,14 +210,14 @@ impl AiPanel {
 
         let panel = AiPanel {
             root,
-            history: Rc::new(RefCell::new(Vec::new())),
+            conversation: Rc::new(RefCell::new(ConversationState::default())),
             convo_buffer: convo_buffer.clone(),
             convo_view,
             convo_scroll: convo_scroll.clone(),
             input_buffer: input_buffer.clone(),
             send_btn: send_btn.clone(),
             status_label: status_label.clone(),
-            busy: Rc::new(std::cell::Cell::new(false)),
+            block_context: Rc::new(RefCell::new(None)),
             config,
         };
 
@@ -164,9 +225,11 @@ impl AiPanel {
         {
             let p = panel.clone();
             clear_btn.connect_clicked(move |_| {
-                p.history.borrow_mut().clear();
+                p.conversation.borrow_mut().clear();
+                *p.block_context.borrow_mut() = None;
                 p.convo_buffer.set_text("");
                 p.status_label.set_text("");
+                p.send_btn.set_sensitive(true);
             });
         }
 
@@ -235,7 +298,7 @@ impl AiPanel {
     /// and fire a request. No-op if both sources are empty or a request is
     /// already in flight.
     fn send_from_input(&self, override_text: Option<String>) {
-        if self.busy.get() {
+        if self.conversation.borrow().is_busy() {
             return;
         }
         let text = override_text.unwrap_or_else(|| {
@@ -256,7 +319,7 @@ impl AiPanel {
     /// action `AskAiAboutSelectedBlock`). Posts the question, attaches the
     /// block as system context.
     pub(crate) fn ask_about_block(&self, ctx: BlockContext) {
-        if self.busy.get() {
+        if self.conversation.borrow().is_busy() {
             // Don't queue — quietly drop the second click. The status label
             // already says "Thinking…", which is signal enough.
             return;
@@ -267,6 +330,28 @@ impl AiPanel {
             "This command failed. Diagnose the error and suggest a fix."
         };
         self.send_with_context(prompt.to_string(), Some(ctx));
+    }
+
+    pub(crate) fn command_generation_started(&self, request: &str) {
+        self.append_visible("You", "role-user", &format!("Generate command: {request}"));
+        self.status_label
+            .set_text("Generating a reviewable command…");
+    }
+
+    pub(crate) fn command_generation_review_required(&self, command: &str) {
+        self.status_label
+            .set_text("Review the generated command before inserting it.");
+        self.append_visible("Assistant", "role-asst", command);
+    }
+
+    pub(crate) fn command_generation_inserted(&self) {
+        self.status_label
+            .set_text("Inserted in the terminal for review; it was not run.");
+    }
+
+    pub(crate) fn command_generation_failed(&self, error: &str) {
+        self.status_label.set_text(error);
+        self.append_visible("Assistant", "role-err", error);
     }
 
     /// Core send path. Appends to the visible transcript + the API history,
@@ -291,6 +376,15 @@ impl AiPanel {
             }
         };
 
+        // A selected block seeds the conversation's system context. Retain it
+        // for follow-up turns until Clear, otherwise the second question would
+        // send the role history but silently lose the command/output being
+        // discussed.
+        if let Some(context) = ctx.as_ref() {
+            *self.block_context.borrow_mut() = Some(context.clone());
+        }
+        let effective_context = ctx.clone().or_else(|| self.block_context.borrow().clone());
+
         // Show what we sent.
         let visible_user = match &ctx {
             Some(c) => format!("{user_text}\n[context: `{}`, exit {}]", c.cmd, c.exit_code),
@@ -299,21 +393,17 @@ impl AiPanel {
         self.append_visible("You", "role-user", &visible_user);
         // History always holds the raw user message — the block context goes
         // into the system prompt, not the user turn.
-        self.history.borrow_mut().push(Turn {
-            role: Role::User,
-            text: user_text,
-        });
+        let (request_epoch, history) = self.conversation.borrow_mut().begin(user_text);
+        let client = ai::AiClient::from_config(&self.config.borrow());
+        let provider_label = client
+            .as_ref()
+            .map(ai::AiClient::display_name)
+            .unwrap_or_else(|_| "AI unavailable".to_string());
+        let system = ai::build_system_prompt(effective_context.as_ref());
 
-        let history = self.history.borrow().clone();
-        let (model, max_tokens) = {
-            let c = self.config.borrow();
-            (c.ai_model.clone(), c.ai_max_tokens)
-        };
-        let system = ai::build_system_prompt(ctx.as_ref());
-
-        self.busy.set(true);
         self.send_btn.set_sensitive(false);
-        self.status_label.set_text(&format!("Thinking… ({model})"));
+        self.status_label
+            .set_text(&format!("Thinking… ({provider_label})"));
 
         // mpsc + polling timeout matches the pattern in pty.rs:346 (gtk-rs 0.11
         // dropped MainContext::channel; the codebase polls a std::sync::mpsc
@@ -321,46 +411,85 @@ impl AiPanel {
         // latency and far cheaper than an API call's hundreds-of-ms cost.
         let (tx, rx) = std::sync::mpsc::channel::<Result<String, ai::AiError>>();
         std::thread::spawn(move || {
-            let res = ai::send_blocking(&model, max_tokens, system.as_deref(), &history);
+            let res =
+                client.and_then(|client| client.send_turns_blocking(system.as_deref(), &history));
             let _ = tx.send(res);
         });
 
         let p = self.clone();
         let rx_cell = std::cell::RefCell::new(rx);
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            match rx_cell.borrow().try_recv() {
-                Ok(res) => {
-                    p.busy.set(false);
-                    p.send_btn.set_sensitive(true);
-                    match res {
-                        Ok(text) => {
-                            p.status_label.set_text("");
-                            p.append_visible("Assistant", "role-asst", &text);
-                            p.history.borrow_mut().push(Turn {
-                                role: Role::Assistant,
-                                text,
-                            });
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || match rx_cell
+            .borrow()
+            .try_recv()
+        {
+            Ok(res) => {
+                match res {
+                    Ok(text) => {
+                        if !p
+                            .conversation
+                            .borrow_mut()
+                            .complete_success(request_epoch, text.clone())
+                        {
+                            return glib::ControlFlow::Break;
                         }
-                        Err(e) => {
-                            let msg = format!("Error: {e}");
-                            p.status_label.set_text(&msg);
-                            p.append_visible("Assistant", "role-err", &msg);
-                            // Drop the trailing user message from history so the
-                            // next retry doesn't double-count it. The visible
-                            // transcript keeps it so the user can see what failed.
-                            p.history.borrow_mut().pop();
-                        }
+                        p.send_btn.set_sensitive(true);
+                        p.status_label.set_text("");
+                        p.append_visible("Assistant", "role-asst", &text);
                     }
-                    glib::ControlFlow::Break
+                    Err(e) => {
+                        if !p.conversation.borrow_mut().complete_error(request_epoch) {
+                            return glib::ControlFlow::Break;
+                        }
+                        p.send_btn.set_sensitive(true);
+                        let msg = format!("Error: {e}");
+                        p.status_label.set_text(&msg);
+                        p.append_visible("Assistant", "role-err", &msg);
+                    }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    p.busy.set(false);
-                    p.send_btn.set_sensitive(true);
-                    p.status_label.set_text("Error: worker thread disconnected");
-                    glib::ControlFlow::Break
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if !p.conversation.borrow_mut().complete_error(request_epoch) {
+                    return glib::ControlFlow::Break;
                 }
+                p.send_btn.set_sensitive(true);
+                p.status_label.set_text("Error: worker thread disconnected");
+                glib::ControlFlow::Break
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_invalidates_in_flight_reply_and_prevents_assistant_only_history() {
+        let mut state = ConversationState::default();
+        let (epoch, sent) = state.begin("first".into());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].role, Role::User);
+
+        state.clear();
+        assert!(!state.complete_success(epoch, "stale".into()));
+        assert!(state.history.is_empty());
+        assert!(!state.is_busy());
+    }
+
+    #[test]
+    fn success_alternates_roles_and_error_rolls_back_only_its_user_turn() {
+        let mut state = ConversationState::default();
+        let (first, _) = state.begin("one".into());
+        assert!(state.complete_success(first, "answer one".into()));
+        let (second, sent) = state.begin("two".into());
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].role, Role::User);
+        assert_eq!(sent[1].role, Role::Assistant);
+        assert_eq!(sent[2].role, Role::User);
+        assert!(state.complete_error(second));
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[1].role, Role::Assistant);
     }
 }

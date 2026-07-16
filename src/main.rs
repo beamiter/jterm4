@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::config::{choose_shell_argv, config_file_path, load_config};
+use crate::config::{choose_shell_argv, config_file_path, load_config, load_safe_config};
 use crate::keybindings::{normalize_key, Action, KeyCombo};
 use crate::logging::init_logging;
 use crate::state::{
@@ -21,6 +21,10 @@ use crate::state::{
 };
 use crate::terminal::terminal_working_directory;
 use crate::ui::{self, UiState};
+
+/// GApplication receives only a program name. All real launch arguments are
+/// consumed by `cli::handle_early_args` before GTK is initialized.
+const GTK_APPLICATION_ARGV: [&str; 1] = ["jterm4"];
 
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())
@@ -155,6 +159,7 @@ pub fn run() -> glib::ExitCode {
     if let Some(code) = crate::cli::handle_early_args() {
         return code;
     }
+    let launch_options = crate::cli::launch_options().clone();
     init_logging();
     init_input_method_env();
 
@@ -165,11 +170,20 @@ pub fn run() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    app.connect_activate(|app| {
-        let (config, themes, keybinding_map) = load_config();
+    app.connect_activate(move |app| {
+        let launch = launch_options.clone();
+        let (config, themes, keybinding_map) = if launch.safe_mode {
+            load_safe_config()
+        } else {
+            load_config()
+        };
 
         // Cache shell selection once to avoid extra process probes per new tab.
-        let shell_argv = Rc::new(RefCell::new(choose_shell_argv(config.shell.as_deref())));
+        let shell_argv = Rc::new(RefCell::new(if launch.safe_mode {
+            vec!["sh".to_string()]
+        } else {
+            choose_shell_argv(config.shell.as_deref())
+        }));
 
         let window_opacity = Rc::new(Cell::new(config.window_opacity));
         let config = Rc::new(RefCell::new(config));
@@ -501,6 +515,8 @@ pub fn run() -> glib::ExitCode {
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
+            agent_dialog: Rc::new(RefCell::new(None)),
+            config_save_error_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
             scrollbar_css: CssProvider::new(),
@@ -576,13 +592,33 @@ pub fn run() -> glib::ExitCode {
             ui_for_add.add_new_tab(working_directory, None, None, startup);
         });
 
-        // Atomically claim one ready window snapshot. Other running instances
-        // keep separate active files, so concurrent windows cannot overwrite or
-        // restore one another's state.
-        let (saved_current, saved_tabs) = load_tabs_state();
+        let requested_cwd = launch
+            .working_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let restore_session = !launch.safe_mode
+            && !launch.no_restore
+            && launch.working_directory.is_none()
+            && launch.execute.is_none();
+        // One-shot `--execute` windows and safe mode must not overwrite the
+        // user's interactive workspace. `--no-restore` still starts a new
+        // persistable workspace, matching jterm1.
+        let session_persistence = launch.execute.is_none() && !launch.safe_mode;
+
+        // Atomically claim one ready window snapshot only when this launch did
+        // not explicitly request a fresh cwd/command/workspace.
+        let (saved_current, saved_tabs) = if restore_session {
+            load_tabs_state()
+        } else {
+            (None, Vec::new())
+        };
         if saved_tabs.is_empty() {
-            let startup = ui.config.borrow().startup_commands.clone();
-            ui.add_new_tab(None, None, None, startup);
+            if let Some(argv) = launch.execute.clone() {
+                ui.add_new_tab_with_argv(requested_cwd, argv);
+            } else {
+                let startup = ui.config.borrow().startup_commands.clone();
+                ui.add_new_tab(requested_cwd, None, None, startup);
+            }
         } else {
             for (name, layout) in saved_tabs {
                 ui.restore_pane_layout(layout, name);
@@ -596,30 +632,32 @@ pub fn run() -> glib::ExitCode {
             }
         }
 
-        // Auto-save tabs state when tabs are added or removed.
-        // Use idle_add to defer saving until after the page is fully initialized.
-        let session_ids_for_page_added = ui.session_ids.clone();
-        let notebook_clone_for_added = notebook.clone();
-        notebook.connect_page_added(move |_notebook, _child, _page_num| {
-            let nb = notebook_clone_for_added.clone();
-            let sids = session_ids_for_page_added.clone();
-            glib::idle_add_local_once(move || {
-                save_tabs_state(&nb, &sids.borrow());
+        if session_persistence {
+            // Auto-save tabs state when tabs are added or removed. Defer until
+            // the page's typed pane controller is fully attached.
+            let session_ids_for_page_added = ui.session_ids.clone();
+            let notebook_clone_for_added = notebook.clone();
+            notebook.connect_page_added(move |_notebook, _child, _page_num| {
+                let nb = notebook_clone_for_added.clone();
+                let sids = session_ids_for_page_added.clone();
+                glib::idle_add_local_once(move || {
+                    save_tabs_state(&nb, &sids.borrow());
+                });
             });
-        });
 
-        let session_ids_for_page_removed = ui.session_ids.clone();
-        let notebook_clone_for_removed = notebook.clone();
-        notebook.connect_page_removed(move |_notebook, _child, _page_num| {
-            let nb = notebook_clone_for_removed.clone();
-            let sids = session_ids_for_page_removed.clone();
-            glib::idle_add_local_once(move || {
-                save_tabs_state(&nb, &sids.borrow());
+            let session_ids_for_page_removed = ui.session_ids.clone();
+            let notebook_clone_for_removed = notebook.clone();
+            notebook.connect_page_removed(move |_notebook, _child, _page_num| {
+                let nb = notebook_clone_for_removed.clone();
+                let sids = session_ids_for_page_removed.clone();
+                glib::idle_add_local_once(move || {
+                    save_tabs_state(&nb, &sids.borrow());
+                });
             });
-        });
 
-        // Save initial state after tabs are restored
-        save_tabs_state(&notebook, &ui.session_ids.borrow());
+            // Save initial state after tabs are restored.
+            save_tabs_state(&notebook, &ui.session_ids.borrow());
+        }
 
         // Setup key controller on window level with Capture phase
         // This allows us to intercept shortcuts before the terminal processes them
@@ -868,7 +906,46 @@ pub fn run() -> glib::ExitCode {
         let config_for_close = ui.config.clone();
         let sidebar_for_close = sidebar.clone();
         let paned_for_close = content_box.clone();
-        window.connect_close_request(move |_| {
+        let zoom_for_close = ui.zoom_state.clone();
+        let close_allowed = Rc::new(Cell::new(false));
+        let close_confirmation_open = Rc::new(Cell::new(false));
+        window.connect_close_request(move |window| {
+            if !close_allowed.get() {
+                // A zoomed split keeps the sibling tree outside the Notebook.
+                // Restore it before scanning/saving so no hidden pane escapes
+                // confirmation or teardown. Cancellation simply leaves the tab
+                // safely unzoomed.
+                if let Some(state) = zoom_for_close.borrow_mut().take() {
+                    let _ = ui::restore_zoomed_leaf(&notebook_for_close_request, &state.swap);
+                }
+                if close_confirmation_open.get() {
+                    return true.into();
+                }
+                if let Some(processes) =
+                    UiState::running_process_summary_for_notebook(&notebook_for_close_request)
+                {
+                    close_confirmation_open.set(true);
+                    let window_for_confirmation = window.clone();
+                    let allowed_for_confirmation = close_allowed.clone();
+                    let open_for_confirmation = close_confirmation_open.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let confirmed = UiState::confirm_close_with_processes(
+                            &window_for_confirmation,
+                            "Close window with running processes?",
+                            "Close Window",
+                            &processes,
+                        )
+                        .await;
+                        open_for_confirmation.set(false);
+                        if confirmed {
+                            allowed_for_confirmation.set(true);
+                            window_for_confirmation.close();
+                        }
+                    });
+                    return true.into();
+                }
+            }
+
             // Persist the current sidebar geometry/state before teardown.
             let width = paned_for_close.position().max(120) as u32;
             {
@@ -876,9 +953,11 @@ pub fn run() -> glib::ExitCode {
                 config.sidebar_width = width;
                 config.sidebar_visible = sidebar_for_close.is_visible();
             }
-            crate::config::save_config(&config_for_close.borrow());
+            let _ = crate::config::save_config(&config_for_close.borrow());
 
-            save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
+            if session_persistence {
+                save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
+            }
             kill_all_terminal_children(&notebook_for_close_request);
 
             // Explicitly clear all pages to break reference cycles and allow TermView cleanup.
@@ -888,7 +967,9 @@ pub fn run() -> glib::ExitCode {
             }
             // Make the final snapshot visible only after this window is fully
             // quiesced. Any queued auto-save callbacks become no-ops.
-            finalize_tabs_state();
+            if session_persistence {
+                finalize_tabs_state();
+            }
 
             // Directly quit the application
             app_for_close.quit();
@@ -907,14 +988,14 @@ pub fn run() -> glib::ExitCode {
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();
 
-        // Config file hot reload: watch config.toml for external changes
-        let config_path = config_file_path();
-        if let Some(parent_dir) = config_path.parent() {
-            // Ensure config dir exists for the monitor
-            let _ = fs::create_dir_all(parent_dir);
-        }
-        let config_file = gio::File::for_path(&config_path);
-        match config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>) {
+        // Safe mode deliberately ignores later config-file changes.
+        if !launch.safe_mode {
+            let config_path = config_file_path();
+            if let Some(parent_dir) = config_path.parent() {
+                let _ = fs::create_dir_all(parent_dir);
+            }
+            let config_file = gio::File::for_path(&config_path);
+            match config_file.monitor_file(gio::FileMonitorFlags::NONE, None::<&Cancellable>) {
             Ok(monitor) => {
                 let ui_for_reload = ui.clone();
                 // Debounce: editors may write multiple events in rapid succession.
@@ -937,11 +1018,30 @@ pub fn run() -> glib::ExitCode {
                 // Keep monitor alive by storing it on the window
                 unsafe { window.set_data("config-monitor", monitor); }
             }
-            Err(err) => {
-                log::warn!("Failed to watch config file: {err}");
+                Err(err) => {
+                    log::warn!("Failed to watch config file: {err}");
+                }
             }
         }
     });
 
-    app.run()
+    // All user-facing options were parsed and consumed by `handle_early_args`
+    // before GTK initialisation.  Passing the process argv to GApplication a
+    // second time makes it reject jterm4-specific launch options such as
+    // `--no-restore`, `--safe-mode`, `--mode`, `-d`, and `-e`.  Give GTK only a
+    // stable program name; the validated values are already captured above in
+    // `launch_options`.
+    app.run_with_args(&GTK_APPLICATION_ARGV)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn gtk_receives_only_the_sanitized_program_name() {
+        // Keep this assertion beside the GApplication boundary.  Launch
+        // options belong exclusively to cli::handle_early_args and must never
+        // be forwarded for a second parse.
+        assert_eq!(super::GTK_APPLICATION_ARGV, ["jterm4"]);
+        assert_eq!(super::GTK_APPLICATION_ARGV.len(), 1);
+    }
 }

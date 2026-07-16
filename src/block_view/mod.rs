@@ -2722,11 +2722,14 @@ impl TermView {
         // keep colored git output, keep the interactive pager even for a short
         // `git log`, and let less use alt-screen so transient pager content
         // stays ephemeral. Respect an explicit user-provided LESS.
-        let mut env_extra: Vec<(&str, &str)> = if std::env::var_os("LESS").is_none() {
-            vec![("LESS", "R")]
-        } else {
-            Vec::new()
-        };
+        // Advertise the terminal before the interactive rc file is read. This
+        // makes the documented `[[ $TERM_PROGRAM == jterm4 ]] && source ...`
+        // gate work for native PTYs and, through `OwnedPty::spawn`, for the
+        // Flatpak host bridge as well.
+        let mut env_extra: Vec<(&str, &str)> = vec![("TERM_PROGRAM", "jterm4")];
+        if std::env::var_os("LESS").is_none() {
+            env_extra.push(("LESS", "R"));
+        }
         let session_id_owned = session_id.map(|s| s.to_string());
         if let Some(ref sid) = session_id_owned {
             if is_rsh {
@@ -3746,7 +3749,21 @@ impl TermView {
 
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
+        if self.bstate.get() == BlockState::AwaitingCommand
+            && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+        {
+            self.typed_cmd
+                .borrow_mut()
+                .push_str(&String::from_utf8_lossy(data));
+        }
         self.pty.write_bytes(data);
+    }
+
+    /// Agent commands may only be submitted into a clean, idle shell editor.
+    pub fn can_accept_agent_command(&self) -> bool {
+        self.bstate.get() == BlockState::AwaitingCommand
+            && !self.fullscreen.get()
+            && self.typed_cmd.borrow().trim().is_empty()
     }
 
     /// Resize the PTY.
@@ -3761,6 +3778,13 @@ impl TermView {
 
     pub fn pid_i32(&self) -> i32 {
         self.pty.pid_i32()
+    }
+
+    /// Borrow the real master-side PTY descriptor for foreground-process
+    /// probing.  Block mode does not attach its custom PTY to VTE's `pty()`
+    /// property, so callers must use this descriptor instead.
+    pub fn pty_fd_i32(&self) -> i32 {
+        self.pty.master_fd_raw()
     }
 
     pub fn vte(&self) -> &Terminal {

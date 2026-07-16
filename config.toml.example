@@ -5,9 +5,9 @@
 
 # 基础 -----------------------------------------------------------------------
 
-# "vte"：传统终端，支持分屏；"block"：结构化命令块视图。
-# Block 分屏目前会被安全拒绝，避免产生不可见的孤儿进程。
-terminal_mode = "vte"
+# "block"：结构化命令块视图（默认）；"vte"：传统兼容终端。
+# 两种模式均支持分屏；Block 旁的新 pane 使用轻量 VTE，与 jterm1 一致。
+terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000
 font = "SauceCodePro Nerd Font Mono 14"
@@ -46,6 +46,12 @@ block_compact = false
 block_history_compress = true
 preserve_live_scrollback = false
 
+# 轻量命令历史只保存命令、cwd、退出码和完成时间，不保存终端输出。
+command_history_enabled = true
+# 默认：$XDG_STATE_HOME/jterm4/history.jsonl
+# command_history_path = "/home/you/.local/state/jterm4/history.jsonl"
+command_history_max_entries = 10000 # 100 .. 1000000
+
 # 终端协议与安全 -------------------------------------------------------------
 
 mouse_reporting_enabled = true
@@ -61,12 +67,23 @@ notify_long_blocks = true
 notify_long_block_threshold_ms = 10000
 show_repo_strip = true
 
-# AI 面板（需要在启动 jterm4 前设置 ANTHROPIC_API_KEY） ----------------------
+# AI / Agent（密钥只从环境变量读取，不会写入此文件） -------------------------
+
+# provider: anthropic | openai-compatible | ollama
+# Anthropic: export ANTHROPIC_API_KEY=...
+# OpenAI-compatible: export OPENAI_API_KEY=...（无鉴权的本地服务可不设置）
+# 通用覆盖：JTERM4_AI_API_KEY、JTERM4_AI_PROVIDER、JTERM4_AI_MODEL、
+#           JTERM4_AI_BASE_URL、JTERM4_AI_MAX_TOKENS
+ai_enabled = true
+agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
+agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准
+ai_provider = "anthropic"
+ai_base_url = "https://api.anthropic.com"
 
 ai_panel_visible = false
 ai_panel_width = 360           # 240 .. 1200
 ai_model = "claude-sonnet-4-6"
-ai_max_tokens = 1024           # 64 .. 8192
+ai_max_tokens = 1024           # 64 .. 32768
 ai_redact_secrets = true
 
 # 自定义颜色（可选；取消注释后覆盖主题对应颜色） ----------------------------
@@ -108,6 +125,7 @@ ai_redact_secrets = true
 # resize_pane_up = "Ctrl+Alt+Shift+Up"
 # resize_pane_down = "Ctrl+Alt+Shift+Down"
 # toggle_ai_panel = "Ctrl+Alt+Shift+A"
+# open_agent = "Ctrl+Alt+G"
 
 # SSH 远程主机（可重复；默认不会注入任何个人地址） --------------------------
 

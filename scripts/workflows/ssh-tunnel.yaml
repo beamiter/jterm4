@@ -1,0 +1,17 @@
+name: "SSH local port forward"
+description: "Forward a local port to a remote host and port through an SSH bastion"
+command: "ssh -N -L {{local_port}}:{{remote_host}}:{{remote_port}} {{bastion}}"
+tags: [ssh, network]
+args:
+  - name: local_port
+    description: "Local port to bind"
+    default: "8080"
+  - name: remote_host
+    description: "Target host as seen from the bastion"
+    default: "127.0.0.1"
+  - name: remote_port
+    description: "Target port"
+    default: "80"
+  - name: bastion
+    description: "SSH user@host of the jump box"
+    default: "user@example.com"

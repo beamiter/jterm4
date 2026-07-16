@@ -1,6 +1,5 @@
 //! zoom — UiState methods extracted from ui (mechanical split, no logic changes)
-use adw::prelude::*;
-use libadwaita as adw;
+use gtk4::prelude::WidgetExt;
 
 use super::*;
 use crate::terminal::terminal_working_directory;
@@ -71,7 +70,6 @@ impl UiState {
         let Some(leaf) = node.active_leaf() else {
             return;
         };
-
         let working_directory = terminal_working_directory(leaf.terminal());
         let leaf_root = leaf.root_widget();
         let Some(sibling) = detach_leaf_and_promote(&self.notebook, &leaf_root) else {

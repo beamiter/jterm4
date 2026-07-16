@@ -45,6 +45,12 @@ block_history_path = "~/.local/share/jterm4/block-history.bin"
 block_history_compress = true
 ```
 
+独立的命令面板历史是轻量 JSONL 索引，只保存 command、cwd、exit code 和完成时间：单条最多 1 MiB、文件超过 32 MiB 会触发压缩，并按 `command_history_max_entries` 保留近期记录。它不复制 Block 输出，因此即使关闭全量 Block 历史也能提供 `@` 搜索。
+
+### Notebook 输出
+
+每个 Notebook cell 的 stdout/stderr 合计最多保留 256 KiB。输出在 worker 中读取并定期送回 GTK；Stop/Stop All 使用进程组取消，避免只终止外层 shell 而留下孙进程。Notebook 不是无限日志查看器，长输出应重定向到文件。
+
 ### Git 状态探测
 
 Git 分支、dirty、ahead/behind 通过单个 `git status --porcelain=v2 --branch` 获取。进程级 worker 会合并同一路径的并发请求并缓存最近结果；GTK 主线程最多等待 12ms，慢查询继续在后台执行。Git 子进程仍有 500ms 硬超时，超时会 kill 并 wait，避免僵尸进程。
@@ -115,7 +121,7 @@ show_repo_strip = false
 
 - Block 完成记录使用多个 VTE widget 和多份输出表示，尚未实现 model-backed renderer recycling。
 - 自管 PTY reader 已有约 256KiB 的队列上限和 8ms 积压调度间隔；仍需用 soak test 校验多 PTY 同时输出时的吞吐、公平性和输入延迟。
-- 文件树和历史加载仍有主线程 I/O。
+- 文件树枚举已移到 worker；命令面板打开时仍同步读取有大小上限的 JSONL 历史，极慢网络状态目录可能造成短暂停顿。
 - `TermView` 的状态由较多 `Rc<RefCell<_>>` 回调共享，难以做纯 reducer 基准。
 
 后续性能工作应先建立 parser microbenchmark、PTY soak test、固定虚拟显示的 GUI smoke benchmark，再以 byte budget 和 frame time 为验收指标。

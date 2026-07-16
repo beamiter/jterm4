@@ -163,24 +163,73 @@ impl UiState {
     }
 
     pub(crate) fn close_selected_tabs(&self) {
-        let selected = self.selected_tabs.borrow();
+        let selected = self.selected_tabs.borrow().clone();
         if selected.is_empty() {
             return;
         }
 
-        for tab_name in selected.iter() {
-            // Find the widget by name and close it
-            for i in 0..self.notebook.n_pages() {
-                if let Some(page_widget) = self.notebook.nth_page(Some(i)) {
-                    if page_widget.widget_name().as_str() == tab_name {
-                        self.remove_tab_by_widget(&page_widget);
-                        break;
-                    }
+        let mut running = Vec::new();
+        for tab_name in &selected {
+            for page in 0..self.notebook.n_pages() {
+                let Some(page_widget) = self.notebook.nth_page(Some(page)) else {
+                    continue;
+                };
+                if page_widget.widget_name().as_str() != tab_name {
+                    continue;
                 }
+                let label = crate::state::tab_label_text(&self.notebook, &page_widget)
+                    .unwrap_or_else(|| format!("Tab {}", page + 1));
+                for process in Self::running_processes_in_widget(&page_widget) {
+                    running.push(format!("{label} — {process}"));
+                }
+                break;
             }
         }
-        drop(selected);
-        self.selected_tabs.borrow_mut().clear();
+
+        let close_selected = {
+            let ui = self.clone();
+            move || {
+                // Resolve names again: tabs may have exited while a confirmation
+                // dialog was open. Removing by the original stale widget could
+                // otherwise tear down bookkeeping for an already-closed page.
+                for tab_name in &selected {
+                    let page_widget = (0..ui.notebook.n_pages()).find_map(|page| {
+                        let widget = ui.notebook.nth_page(Some(page))?;
+                        (widget.widget_name().as_str() == tab_name).then_some(widget)
+                    });
+                    if let Some(widget) = page_widget {
+                        ui.remove_tab_by_widget_internal(&widget);
+                    }
+                }
+                ui.clear_tab_selection();
+            }
+        };
+
+        if running.is_empty() {
+            close_selected();
+            return;
+        }
+
+        const MAX_SHOWN: usize = 8;
+        let hidden = running.len().saturating_sub(MAX_SHOWN);
+        running.truncate(MAX_SHOWN);
+        if hidden > 0 {
+            running.push(format!("…and {hidden} more"));
+        }
+        let process_info = running.join("\n");
+        let window = self.window.clone();
+        glib::MainContext::default().spawn_local(async move {
+            if Self::confirm_close_with_processes(
+                &window,
+                "Close selected tabs with running processes?",
+                "Close Tabs",
+                &process_info,
+            )
+            .await
+            {
+                close_selected();
+            }
+        });
     }
 
     pub(crate) fn move_tab_left(&self) {
@@ -248,6 +297,38 @@ impl UiState {
         }
     }
 
+    /// Stable-partition pages so pinned tabs lead, matching jterm1 while
+    /// preserving the relative order within the pinned and unpinned groups.
+    /// Keep the same page active across the GTK reorder operation.
+    pub(crate) fn reorder_pinned_first(&self) {
+        let active = self
+            .notebook
+            .current_page()
+            .and_then(|index| self.notebook.nth_page(Some(index)));
+        let mut pages = Vec::new();
+        for index in 0..self.notebook.n_pages() {
+            if let Some(page) = self.notebook.nth_page(Some(index)) {
+                pages.push(page);
+            }
+        }
+        pages.sort_by_key(|page| {
+            let pinned = unsafe {
+                page.data::<bool>("pinned")
+                    .is_some_and(|value| *value.as_ref())
+            };
+            !pinned
+        });
+        for (index, page) in pages.iter().enumerate() {
+            self.notebook.reorder_child(page, Some(index as u32));
+        }
+        self.reorder_tab_strip_buttons();
+        let active_page = active
+            .as_ref()
+            .and_then(|page| self.notebook.page_num(page));
+        self.notebook.set_current_page(active_page);
+        self.sync_tab_strip_active(active_page);
+    }
+
     pub(crate) fn toggle_current_tab_marked(&self) {
         if let Some(page) = self.notebook.current_page() {
             let mut idx = 0u32;
@@ -278,8 +359,7 @@ impl UiState {
     /// Toggle the "pinned" state of the current tab, mirroring the context-menu
     /// "Pin Tab" item: flips the strip button's css class + `pinned` data, the
     /// pin icon's visibility, and the notebook page's `pinned` data (read by
-    /// session save). Unlike jterm1 this does not reorder — jterm4's pinning is
-    /// a visual flag persisted across restarts, not a sort key.
+    /// session save), then stable-partitions pinned tabs to the front.
     pub(crate) fn toggle_current_tab_pinned(&self) {
         let Some(page) = self.notebook.current_page() else {
             return;
@@ -300,17 +380,32 @@ impl UiState {
                         unsafe {
                             btn.set_data::<bool>("pinned", pinned);
                         }
-                        unsafe {
-                            wrapper.set_data::<bool>("pinned", pinned);
-                        }
+                        Self::set_tab_page_pinned(&wrapper, pinned);
                         if let Some(icon) = find_pin_icon(&btn) {
                             icon.set_visible(pinned);
                         }
+                        self.reorder_pinned_first();
                     }
                     break;
                 }
                 idx += 1;
                 child = c.next_sibling();
+            }
+        }
+    }
+
+    /// Persist tab pinning on both the notebook page and every concrete pane
+    /// leaf. Session serialization walks split trees leaf-by-leaf, so keeping
+    /// only the `Paned` root marked would lose the flag after a restart.
+    pub(crate) fn set_tab_page_pinned(page: &gtk4::Widget, pinned: bool) {
+        unsafe {
+            page.set_data::<bool>("pinned", pinned);
+        }
+        if let Some(node) = PaneNode::from_widget(page) {
+            for leaf in node.leaves() {
+                unsafe {
+                    leaf.root_widget().set_data::<bool>("pinned", pinned);
+                }
             }
         }
     }
@@ -386,6 +481,17 @@ impl UiState {
                 super::ConnStatus::Disconnected => dot.add_css_class("tab-disconnected"),
             }
             dot.set_visible(true);
+        }
+    }
+
+    /// Remove the remote-only affordance after a remote leaf disappears from a
+    /// split while a local sibling keeps the tab alive.
+    pub(crate) fn clear_tab_conn_status(&self, tab_num: u32) {
+        if let Some(dot) = self.find_conn_dot(tab_num) {
+            dot.remove_css_class("tab-connecting");
+            dot.remove_css_class("tab-connected");
+            dot.remove_css_class("tab-disconnected");
+            dot.set_visible(false);
         }
     }
 

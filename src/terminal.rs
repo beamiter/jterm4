@@ -10,6 +10,7 @@ use gtk4::GestureClick;
 use gtk4::{glib, Entry, Label, Orientation, Paned};
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use vte4::{CursorBlinkMode, CursorShape, PtyFlags, Terminal};
 use vte4::{TerminalExt, TerminalExtManual};
@@ -66,6 +67,10 @@ pub(crate) fn create_terminal(config: &Config) -> Terminal {
         .build();
 
     terminal.set_mouse_autohide(true);
+    // Match the canonical xterm/VTE erase sequences explicitly instead of
+    // inheriting distro- or profile-dependent defaults.
+    terminal.set_backspace_binding(vte4::EraseBinding::AsciiDelete);
+    terminal.set_delete_binding(vte4::EraseBinding::DeleteSequence);
 
     apply_terminal_theme(&terminal, config);
 
@@ -295,6 +300,14 @@ impl VteTerminalView {
                 .unwrap_or(0)
         }
     }
+
+    /// Borrow the VTE-managed master-side PTY descriptor for process probes.
+    pub fn pty_fd_i32(&self) -> i32 {
+        self.terminal
+            .pty()
+            .map(|pty| pty.fd().as_raw_fd())
+            .unwrap_or(-1)
+    }
 }
 
 /// Wrap a terminal in an hbox with a scrollbar on the right side.
@@ -363,13 +376,16 @@ pub(crate) fn spawn_shell(
     }
     let home = std::env::var("HOME").ok();
     let requested_working_directory = working_directory.or(home.as_deref());
-    let argv_vec = crate::host::wrap_argv(&argv_vec, requested_working_directory, &[]);
+    // `TERM_PROGRAM` must reach both a native child and a shell launched by
+    // `flatpak-spawn --host`; the latter needs it encoded in the wrapper argv.
+    let host_environment = [("TERM_PROGRAM", "jterm4")];
+    let argv_vec =
+        crate::host::wrap_argv(&argv_vec, requested_working_directory, &host_environment);
     let argv: Vec<&str> = argv_vec.iter().map(|s| s.as_str()).collect();
 
-    // Use empty envv to inherit all environment variables from parent process.
-    // In Flatpak mode, cwd and host environment forwarding are encoded in the
-    // flatpak-spawn argv above instead of being applied to the sandbox helper.
-    let envv: &[&str] = &[];
+    // VTE inherits the rest of the environment. The explicit value covers a
+    // native child; Flatpak host forwarding is encoded in argv above.
+    let envv: &[&str] = &["TERM_PROGRAM=jterm4"];
     let spawn_flags = SpawnFlags::SEARCH_PATH;
     let cancellable: Option<&Cancellable> = None;
     let spawn_working_directory = if crate::host::is_flatpak() {

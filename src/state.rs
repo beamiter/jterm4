@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
 use vte4::TerminalExt;
 
-use crate::block_view::TermView;
-use crate::terminal::{collect_terminals, find_first_terminal, terminal_working_directory};
+use crate::terminal::{find_first_terminal, terminal_working_directory};
+use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
 const READY_STATE_EXTENSION: &str = "state";
@@ -291,33 +291,40 @@ pub(crate) fn serialize_pane_layout(
     } else {
         // Leaf terminal
         let terminal = find_first_terminal(widget).expect("Leaf must contain terminal");
-        let dir = unsafe {
-            widget
-                .data::<std::rc::Rc<TermView>>("term-view")
-                .map(|tv| tv.as_ref().cwd())
-                .filter(|s| !s.is_empty())
-        }
-        .unwrap_or_else(|| {
-            terminal_working_directory(&terminal)
-                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
-        });
+        let pane_leaf = PaneLeaf::from_widget(widget);
+        let dir = pane_leaf
+            .as_ref()
+            .and_then(PaneLeaf::block_view)
+            .map(|view| view.cwd())
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| terminal_working_directory(&terminal))
+            .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
-        // Extract tab number from widget name "tab-N" and lookup session_id
+        // Prefer the identity attached to this exact leaf. The tab-number map
+        // remains a compatibility fallback for older/top-level pages.
         let widget_name = widget.widget_name();
-        let sid = if let Some(tab_str) = widget_name.to_string().strip_prefix("tab-") {
-            if let Ok(tab_num) = tab_str.parse::<u32>() {
-                session_ids
-                    .get(&tab_num)
-                    .cloned()
-                    .unwrap_or_else(generate_session_id)
-            } else {
-                generate_session_id()
-            }
-        } else {
-            generate_session_id()
-        };
+        let sid = pane_leaf
+            .as_ref()
+            .and_then(PaneLeaf::session_id)
+            .unwrap_or_else(|| {
+                if let Some(tab_str) = widget_name.to_string().strip_prefix("tab-") {
+                    if let Ok(tab_num) = tab_str.parse::<u32>() {
+                        session_ids
+                            .get(&tab_num)
+                            .cloned()
+                            .unwrap_or_else(generate_session_id)
+                    } else {
+                        generate_session_id()
+                    }
+                } else {
+                    generate_session_id()
+                }
+            });
 
-        let cmds = get_restorable_commands(&terminal);
+        let cmds = pane_leaf
+            .as_ref()
+            .and_then(PaneLeaf::restorable_command)
+            .or_else(|| get_restorable_commands(&terminal));
 
         // Check if this tab is pinned
         let pinned = unsafe { widget.data::<bool>("pinned").map(|p| *p.as_ref()) };
@@ -635,17 +642,12 @@ pub(crate) fn terminate_terminal_process(pid: i32) {
 }
 
 pub(crate) fn kill_widget_child_processes(widget: &gtk4::Widget) -> bool {
-    let term_view = unsafe {
-        widget
-            .data::<std::rc::Rc<TermView>>("term-view")
-            .map(|ptr| ptr.as_ref().clone())
-    };
-
-    if let Some(term_view) = term_view {
-        term_view.kill();
+    if let Some(node) = PaneNode::from_widget(widget) {
+        for leaf in node.leaves() {
+            leaf.kill();
+        }
         return true;
     }
-
     false
 }
 
@@ -667,14 +669,7 @@ pub(crate) fn kill_terminal_child(terminal: &Terminal) {
 pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     for i in 0..notebook.n_pages() {
         if let Some(page_widget) = notebook.nth_page(Some(i)) {
-            if kill_widget_child_processes(&page_widget) {
-                continue;
-            }
-            let mut terms = Vec::new();
-            collect_terminals(&page_widget, &mut terms);
-            for term in &terms {
-                kill_terminal_child(term);
-            }
+            let _ = kill_widget_child_processes(&page_widget);
         }
     }
 }
@@ -753,18 +748,23 @@ pub(crate) fn match_restorable_command(args: &[String]) -> Option<String> {
     }
 }
 
-/// Detect restorable interactive commands running in a terminal by inspecting the
-/// foreground process group and walking up the process tree to the shell.
-pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
-    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
-
-    // Find the foreground process group via the PTY fd.
-    let pty = terminal.pty()?;
-    let raw_fd = pty.fd().as_raw_fd();
-    let fg_pgid = unsafe { tcgetpgrp(raw_fd) };
-    if fg_pgid <= 0 || fg_pgid == shell_pid {
-        return None; // shell itself is foreground — nothing to restore
+/// Foreground process group for a PTY, excluding the pane's ordinary shell.
+fn foreground_pgid(pty_fd: i32, shell_pid: i32) -> Option<i32> {
+    if pty_fd < 0 || shell_pid <= 0 {
+        return None;
     }
+    let fg_pgid = unsafe { tcgetpgrp(pty_fd) };
+    if fg_pgid <= 0 || fg_pgid == shell_pid {
+        return None;
+    }
+    Some(fg_pgid)
+}
+
+/// Detect a restorable interactive command by inspecting a real PTY master fd
+/// and walking from its foreground process group back toward the pane shell.
+/// This backend-neutral entry point is used by both VTE and Block panes.
+pub(crate) fn restorable_command_for_pty(pty_fd: i32, shell_pid: i32) -> Option<String> {
+    let fg_pgid = foreground_pgid(pty_fd, shell_pid)?;
 
     // Walk from the foreground process up to the shell, checking each level.
     // This handles cases like: rsh -> nix develop -> bash (fg)
@@ -786,26 +786,30 @@ pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
     None
 }
 
-/// Get the name of the foreground process in a terminal, or None if the shell itself is foreground.
+/// Name of the foreground process on a PTY, or `None` while the normal shell
+/// owns the foreground process group.
+pub(crate) fn foreground_process_name_for_pty(pty_fd: i32, shell_pid: i32) -> Option<String> {
+    let fg_pgid = foreground_pgid(pty_fd, shell_pid)?;
+    let args = read_proc_cmdline(fg_pgid)?;
+    Path::new(args.first()?)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Conventional-VTE compatibility wrapper. Block panes must use their
+/// `PaneLeaf` probe because their custom PTY is intentionally not VTE-owned.
+pub(crate) fn get_restorable_commands(terminal: &Terminal) -> Option<String> {
+    let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
+    let pty_fd = terminal.pty()?.fd().as_raw_fd();
+    restorable_command_for_pty(pty_fd, shell_pid)
+}
+
+/// Conventional-VTE compatibility wrapper for tooltip callers.
 pub(crate) fn get_foreground_process_name(terminal: &Terminal) -> Option<String> {
     let shell_pid: i32 = unsafe { *terminal.data::<i32>("child-pid")?.as_ref() };
-
-    let pty = terminal.pty()?;
-    let raw_fd = pty.fd().as_raw_fd();
-    let fg_pgid = unsafe { tcgetpgrp(raw_fd) };
-    if fg_pgid <= 0 || fg_pgid == shell_pid {
-        return None;
-    }
-
-    if let Some(args) = read_proc_cmdline(fg_pgid) {
-        if !args.is_empty() {
-            return Path::new(&args[0])
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|s| s.to_string());
-        }
-    }
-    None
+    let pty_fd = terminal.pty()?.fd().as_raw_fd();
+    foreground_process_name_for_pty(pty_fd, shell_pid)
 }
 
 pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, String>) {

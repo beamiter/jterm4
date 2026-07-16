@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
-use vte4::TerminalExt;
 
 use super::*;
 use crate::terminal::terminal_working_directory;
@@ -367,16 +366,15 @@ impl UiState {
                 return;
             }
 
+            if crate::notebook::is_notebook_path(&entry.path) {
+                ui.open_notebook(&entry.path);
+                return;
+            }
+
             let file_path = entry.path.to_string_lossy();
             let snippet = format!("{} ", shell_quote(file_path.as_ref()));
-            if let Some(term_view) = ui.current_term_view() {
-                // Block mode owns its PTY instead of attaching it to the display
-                // VTE, so route through the shared TermView input path.
-                term_view.write_input(snippet.as_bytes());
-                term_view.grab_focus();
-            } else if let Some(term) = ui.current_terminal() {
-                term.feed_child(snippet.as_bytes());
-                term.grab_focus();
+            if let Some(pane) = ui.current_pane_leaf() {
+                ui.insert_review_text(&pane, &snippet);
             }
         });
     }

@@ -1,0 +1,11 @@
+name: "Docker: tail container logs"
+description: "Stream logs from a running container, including a bounded recent tail"
+command: "docker logs -f --tail {{tail}} {{container}}"
+tags: [docker, logs]
+args:
+  - name: container
+    description: "Container name or id"
+    default: ""
+  - name: tail
+    description: "Recent line count to show before streaming"
+    default: "100"

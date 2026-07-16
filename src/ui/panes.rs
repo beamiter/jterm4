@@ -1,7 +1,6 @@
 //! panes — UiState methods extracted from ui (mechanical split, no logic changes)
-use adw::prelude::*;
+use gtk4::prelude::*;
 use gtk4::{Orientation, Paned};
-use libadwaita as adw;
 use std::rc::Rc;
 
 use super::*;
@@ -45,23 +44,30 @@ impl UiState {
             ui_for_exit.handle_terminal_exited(&terminal_for_exit.clone().upcast::<gtk4::Widget>());
         });
 
-        if let Some(name) = tab_widget_name {
-            let ui_for_bell = self.clone();
-            let bell_name = name.clone();
-            view.connect_bell(move || {
-                log::debug!("Bell signal received (split)");
-                ui_for_bell.mark_tab_bell(&bell_name);
-            });
-
-            let ui_for_activity = self.clone();
-            view.connect_activity(move || {
-                ui_for_activity.mark_tab_activity(&name);
-            });
-        }
-
         let leaf = PaneLeaf::Vte(view);
         let root = leaf.root_widget();
         leaf.attach_to(&root);
+        leaf.set_session_id(&sid);
+        leaf.set_remote(false);
+        if tab_widget_name.is_some() {
+            let ui_for_bell = self.clone();
+            let leaf_for_bell = leaf.clone();
+            if let PaneLeaf::Vte(view) = &leaf {
+                view.connect_bell(move || {
+                    log::debug!("Bell signal received (split)");
+                    ui_for_bell.mark_tab_bell(&leaf_for_bell.root_widget().widget_name());
+                });
+            }
+
+            let ui_for_activity = self.clone();
+            let leaf_for_activity = leaf.clone();
+            if let PaneLeaf::Vte(view) = &leaf {
+                view.connect_activity(move || {
+                    ui_for_activity
+                        .mark_tab_activity(&leaf_for_activity.root_widget().widget_name());
+                });
+            }
+        }
         leaf
     }
 
@@ -75,23 +81,6 @@ impl UiState {
         let Some(page_node) = PaneNode::from_widget(&page_widget) else {
             return;
         };
-
-        // A Block leaf owns a structured history surface around its live VTE.
-        // Refuse before creating a second PTY until split construction itself
-        // creates typed Block leaves. Existing VTE split trees remain supported.
-        if page_node.contains_block() {
-            let dialog = adw::AlertDialog::new(
-                Some("Split panes require VTE mode"),
-                Some(
-                    "Block mode keeps command history in a structured view and cannot yet be split safely. Change terminal_mode to \"vte\" for split panes.",
-                ),
-            );
-            dialog.add_response("ok", "OK");
-            dialog.set_default_response(Some("ok"));
-            dialog.present(Some(&self.window));
-            log::warn!("Blocked an unsupported block-mode split before spawning a PTY");
-            return;
-        }
 
         let Some(current_leaf) = page_node.active_leaf() else {
             return;

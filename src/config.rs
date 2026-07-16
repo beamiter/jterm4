@@ -219,6 +219,11 @@ pub struct Config {
     #[allow(dead_code)]
     pub(crate) max_collapsed_output_lines: u32,
     pub(crate) virtual_scroll_margin: u32,
+    /// Lightweight JSONL command index. Unlike block snapshots this stores no
+    /// terminal output, only command metadata used by history/palette UIs.
+    pub(crate) command_history_enabled: bool,
+    pub(crate) command_history_path: Option<String>,
+    pub(crate) command_history_max_entries: u32,
     pub(crate) block_history_path: Option<String>,
     pub(crate) block_history_compress: bool,
     /// Use jterm1/Warp-style denser block spacing.
@@ -235,13 +240,24 @@ pub struct Config {
     /// Disabled by default because finished blocks already own that history;
     /// enabling it deliberately presents both the VTE and structured views.
     pub(crate) preserve_live_scrollback: bool,
-    /// Show the right-side AI chat panel (Anthropic Messages API). Toggled
-    /// via Ctrl+Shift+A; persisted across sessions.
+    /// Master switch for every network-backed AI feature.
+    pub(crate) ai_enabled: bool,
+    /// Agent mode can be disabled independently while leaving chat and
+    /// natural-language command generation available.
+    pub(crate) agent_enabled: bool,
+    /// Maximum number of model replies in one Agent session.
+    pub(crate) agent_max_turns: u32,
+    /// Provider wire protocol: anthropic, openai-compatible, or ollama.
+    pub(crate) ai_provider: String,
+    /// Provider API root. Endpoint suffixes are added by the AI client.
+    pub(crate) ai_base_url: String,
+    /// Show the right-side AI chat panel. Toggled via Ctrl+Shift+A and
+    /// persisted across sessions.
     pub(crate) ai_panel_visible: bool,
     /// Width in pixels of the AI panel when visible (right Paned position is
     /// computed from window width minus this).
     pub(crate) ai_panel_width: u32,
-    /// Anthropic model id (default `claude-sonnet-4-6`).
+    /// Provider-specific model id.
     pub(crate) ai_model: String,
     /// Per-request max output tokens.
     pub(crate) ai_max_tokens: u32,
@@ -265,6 +281,77 @@ pub struct Config {
     /// repo's branch, dirty marker, and ahead/behind counts. Hides itself
     /// when cwd isn't inside a git repository.
     pub(crate) show_repo_strip: bool,
+    /// Exact disk revision this loaded configuration is allowed to replace.
+    /// Clones from one window share the revision and advance it only after a
+    /// durable save; independently loaded windows retain their own revisions.
+    pub(crate) persistence_revision:
+        std::sync::Arc<std::sync::Mutex<Option<crate::config_store::ConfigRevision>>>,
+}
+
+impl Config {
+    /// Replace the complete configuration with an isolated, built-in VTE
+    /// profile. This deliberately ignores both the user's file and JTERM4_*
+    /// appearance/behavior overrides, making safe mode useful for diagnosis.
+    #[cfg(test)]
+    pub(crate) fn apply_safe_mode(&mut self) {
+        *self = Self::safe_defaults();
+    }
+
+    fn safe_defaults() -> Self {
+        let themes = builtin_themes();
+        let theme = &themes[0];
+        Self {
+            window_opacity: 0.95,
+            terminal_scrollback_lines: 5_000,
+            font_desc: "SauceCodePro Nerd Font Mono 14".to_string(),
+            default_font_scale: 1.0,
+            theme_name: theme.name.clone(),
+            foreground: theme.foreground,
+            background: theme.background,
+            cursor: theme.cursor,
+            cursor_foreground: theme.cursor_foreground,
+            palette: theme.palette,
+            shell: None,
+            startup_commands: None,
+            terminal_mode: TerminalMode::Vte,
+            tab_placement: TabPlacement::Sidebar,
+            sidebar_view: SidebarView::Tabs,
+            sidebar_visible: true,
+            sidebar_width: 220,
+            max_visible_blocks: 200,
+            lazy_load_threshold: 1_000,
+            truncation_threshold_lines: 50_000,
+            finished_block_viewport_rows: 24,
+            max_collapsed_output_lines: 25,
+            virtual_scroll_margin: 1,
+            command_history_enabled: false,
+            command_history_path: None,
+            command_history_max_entries: 10_000,
+            block_history_path: None,
+            block_history_compress: true,
+            block_compact: false,
+            remote_hosts: Vec::new(),
+            mouse_reporting_enabled: true,
+            scroll_reporting_enabled: true,
+            focus_reporting_enabled: true,
+            preserve_live_scrollback: false,
+            ai_enabled: false,
+            agent_enabled: false,
+            agent_max_turns: 20,
+            ai_provider: "anthropic".to_string(),
+            ai_base_url: "https://api.anthropic.com".to_string(),
+            ai_panel_visible: false,
+            ai_panel_width: 360,
+            ai_model: "claude-sonnet-4-6".to_string(),
+            ai_max_tokens: 1_024,
+            ai_redact_secrets: true,
+            allow_remote_clipboard_write: false,
+            notify_long_blocks: false,
+            notify_long_block_threshold_ms: 10_000,
+            show_repo_strip: false,
+            persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +493,15 @@ fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
@@ -423,6 +519,43 @@ pub(crate) fn config_file_path() -> PathBuf {
         return PathBuf::from(path);
     }
     glib::user_config_dir().join("jterm4").join("config.toml")
+}
+
+pub(crate) fn default_command_history_path() -> String {
+    xdg_state_home()
+        .join("jterm4")
+        .join("history.jsonl")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// GLib only exposes `g_get_user_state_dir()` behind a newer API feature than
+/// jterm4 currently requires, so implement the XDG Base Directory rule
+/// directly: an absolute `$XDG_STATE_HOME`, otherwise `$HOME/.local/state`.
+fn xdg_state_home() -> PathBuf {
+    xdg_state_home_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &glib::home_dir(),
+    )
+}
+
+fn xdg_state_home_from(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    fallback_home: &Path,
+) -> PathBuf {
+    if let Some(path) = xdg_state_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return path;
+    }
+    home.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback_home.to_path_buf())
+        .join(".local/state")
 }
 
 /// Severity reported by the headless config checker and startup diagnostics.
@@ -477,6 +610,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "finished_block_viewport_rows",
     "max_collapsed_output_lines",
     "virtual_scroll_margin",
+    "command_history_enabled",
+    "command_history_path",
+    "command_history_max_entries",
     "block_history_path",
     "block_history_compress",
     "block_compact",
@@ -485,6 +621,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "scroll_reporting_enabled",
     "focus_reporting_enabled",
     "preserve_live_scrollback",
+    "ai_enabled",
+    "agent_enabled",
+    "agent_max_turns",
+    "ai_provider",
+    "ai_base_url",
     "ai_panel_visible",
     "ai_panel_width",
     "ai_model",
@@ -518,7 +659,10 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "terminal_mode",
         "tab_placement",
         "sidebar_view",
+        "command_history_path",
         "block_history_path",
+        "ai_provider",
+        "ai_base_url",
         "ai_model",
     ];
     let integers = [
@@ -530,6 +674,8 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "finished_block_viewport_rows",
         "max_collapsed_output_lines",
         "virtual_scroll_margin",
+        "command_history_max_entries",
+        "agent_max_turns",
         "ai_panel_width",
         "ai_max_tokens",
         "notify_long_block_threshold_ms",
@@ -537,11 +683,14 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
     let booleans = [
         "block_history_compress",
         "block_compact",
+        "command_history_enabled",
         "mouse_reporting_enabled",
         "scroll_reporting_enabled",
         "focus_reporting_enabled",
         "preserve_live_scrollback",
         "sidebar_visible",
+        "ai_enabled",
+        "agent_enabled",
         "ai_panel_visible",
         "ai_redact_secrets",
         "allow_remote_clipboard_write",
@@ -632,8 +781,10 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
     warn_int_range(&mut issues, "finished_block_viewport_rows", 3, 5_000);
     warn_int_range(&mut issues, "max_collapsed_output_lines", 1, 1_000_000);
     warn_int_range(&mut issues, "virtual_scroll_margin", 0, 10_000);
+    warn_int_range(&mut issues, "command_history_max_entries", 100, 1_000_000);
+    warn_int_range(&mut issues, "agent_max_turns", 1, 100);
     warn_int_range(&mut issues, "ai_panel_width", 240, 1200);
-    warn_int_range(&mut issues, "ai_max_tokens", 64, 8192);
+    warn_int_range(&mut issues, "ai_max_tokens", 64, 32_768);
     warn_int_range(&mut issues, "notify_long_block_threshold_ms", 0, i64::MAX);
 
     if let Some(mode) = table.get("terminal_mode").and_then(toml::Value::as_str) {
@@ -643,6 +794,45 @@ fn validate_config_table(table: &toml::Table) -> Vec<ConfigIssue> {
                 Error,
                 "terminal_mode",
                 "expected 'block' or 'vte'",
+            );
+        }
+    }
+    if let Some(provider) = table.get("ai_provider").and_then(toml::Value::as_str) {
+        if !matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "anthropic"
+                | "claude"
+                | "openai"
+                | "openai-compatible"
+                | "openai_compatible"
+                | "ollama"
+        ) {
+            config_issue(
+                &mut issues,
+                Error,
+                "ai_provider",
+                "expected 'anthropic', 'openai-compatible', or 'ollama'",
+            );
+        }
+    }
+    if let Some(model) = table.get("ai_model").and_then(toml::Value::as_str) {
+        if model.trim().is_empty() {
+            config_issue(&mut issues, Error, "ai_model", "must not be empty");
+        }
+    }
+    if let Some(url) = table.get("ai_base_url").and_then(toml::Value::as_str) {
+        let url = url.trim();
+        let valid = (url.starts_with("http://") || url.starts_with("https://"))
+            && url
+                .split_once("://")
+                .is_some_and(|(_, authority)| !authority.is_empty())
+            && !url.chars().any(char::is_whitespace);
+        if !valid {
+            config_issue(
+                &mut issues,
+                Error,
+                "ai_base_url",
+                "expected an absolute http(s) URL without whitespace",
             );
         }
     }
@@ -848,6 +1038,9 @@ struct FileConfig {
     finished_block_viewport_rows: Option<u32>,
     max_collapsed_output_lines: Option<u32>,
     virtual_scroll_margin: Option<u32>,
+    command_history_enabled: Option<bool>,
+    command_history_path: Option<String>,
+    command_history_max_entries: Option<u32>,
     block_history_path: Option<String>,
     block_history_compress: Option<bool>,
     block_compact: Option<bool>,
@@ -856,6 +1049,11 @@ struct FileConfig {
     scroll_reporting_enabled: Option<bool>,
     focus_reporting_enabled: Option<bool>,
     preserve_live_scrollback: Option<bool>,
+    ai_enabled: Option<bool>,
+    agent_enabled: Option<bool>,
+    agent_max_turns: Option<u32>,
+    ai_provider: Option<String>,
+    ai_base_url: Option<String>,
     ai_panel_visible: Option<bool>,
     ai_panel_width: Option<u32>,
     ai_model: Option<String>,
@@ -881,20 +1079,50 @@ fn table_u64(table: &toml::Table, key: &str) -> Option<u64> {
         .and_then(|value| u64::try_from(value).ok())
 }
 
-fn load_file_config() -> FileConfig {
+fn load_file_config() -> (FileConfig, Option<crate::config_store::ConfigRevision>) {
     let path = config_file_path();
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return FileConfig {
-            remote_hosts: default_remote_hosts(),
-            ..Default::default()
-        };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                FileConfig {
+                    remote_hosts: default_remote_hosts(),
+                    ..Default::default()
+                },
+                Some(crate::config_store::ConfigRevision::missing()),
+            );
+        }
+        Err(error) => {
+            log::warn!("Failed to read config file {}: {error}", path.display());
+            return (
+                FileConfig {
+                    remote_hosts: default_remote_hosts(),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+    };
+    let revision = crate::config_store::ConfigRevision::from_bytes(&bytes);
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        log::warn!("Config file {} is not valid UTF-8", path.display());
+        return (
+            FileConfig {
+                remote_hosts: default_remote_hosts(),
+                ..Default::default()
+            },
+            Some(revision),
+        );
     };
     let Ok(table) = contents.parse::<toml::Table>() else {
         log::warn!("Failed to parse config file {}", path.display());
-        return FileConfig {
-            remote_hosts: default_remote_hosts(),
-            ..Default::default()
-        };
+        return (
+            FileConfig {
+                remote_hosts: default_remote_hosts(),
+                ..Default::default()
+            },
+            Some(revision),
+        );
     };
     for issue in validate_config_table(&table) {
         match issue.level {
@@ -913,7 +1141,7 @@ fn load_file_config() -> FileConfig {
         default_remote_hosts()
     };
 
-    FileConfig {
+    let file_config = FileConfig {
         opacity: table.get("opacity").and_then(|v| v.as_float()),
         scrollback: table_u32(&table, "scrollback"),
         font: table
@@ -970,6 +1198,14 @@ fn load_file_config() -> FileConfig {
         finished_block_viewport_rows: table_u32(&table, "finished_block_viewport_rows"),
         max_collapsed_output_lines: table_u32(&table, "max_collapsed_output_lines"),
         virtual_scroll_margin: table_u32(&table, "virtual_scroll_margin"),
+        command_history_enabled: table
+            .get("command_history_enabled")
+            .and_then(|v| v.as_bool()),
+        command_history_path: table
+            .get("command_history_path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        command_history_max_entries: table_u32(&table, "command_history_max_entries"),
         block_history_path: table
             .get("block_history_path")
             .and_then(|v| v.as_str())
@@ -991,6 +1227,17 @@ fn load_file_config() -> FileConfig {
         preserve_live_scrollback: table
             .get("preserve_live_scrollback")
             .and_then(|v| v.as_bool()),
+        ai_enabled: table.get("ai_enabled").and_then(|v| v.as_bool()),
+        agent_enabled: table.get("agent_enabled").and_then(|v| v.as_bool()),
+        agent_max_turns: table_u32(&table, "agent_max_turns"),
+        ai_provider: table
+            .get("ai_provider")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ai_base_url: table
+            .get("ai_base_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         ai_panel_visible: table.get("ai_panel_visible").and_then(|v| v.as_bool()),
         ai_panel_width: table_u32(&table, "ai_panel_width"),
         ai_model: table
@@ -1005,7 +1252,8 @@ fn load_file_config() -> FileConfig {
         notify_long_blocks: table.get("notify_long_blocks").and_then(|v| v.as_bool()),
         notify_long_block_threshold_ms: table_u64(&table, "notify_long_block_threshold_ms"),
         show_repo_strip: table.get("show_repo_strip").and_then(|v| v.as_bool()),
-    }
+    };
+    (file_config, Some(revision))
 }
 
 /// Parse `[[remote_hosts]]` array-of-tables. Entries missing a `host` are skipped.
@@ -1065,7 +1313,7 @@ fn parse_remote_hosts(table: &toml::Table) -> Vec<RemoteHost> {
 
 /// Serialize a `RemoteHost` back into a TOML table that `parse_remote_hosts`
 /// round-trips. Optional fields are only emitted when present.
-fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
+pub(crate) fn remote_host_to_toml(h: &RemoteHost) -> toml::Value {
     let mut t = toml::Table::new();
     t.insert("name".into(), toml::Value::String(h.name.clone()));
     t.insert("host".into(), toml::Value::String(h.host.clone()));
@@ -1103,7 +1351,7 @@ fn default_remote_hosts() -> Vec<RemoteHost> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
-    let fc = load_file_config();
+    let (fc, persistence_revision) = load_file_config();
     let themes = builtin_themes();
 
     // Resolve active theme
@@ -1178,6 +1426,16 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .or(fc.virtual_scroll_margin)
         .unwrap_or(1)
         .min(10_000);
+    let command_history_enabled = fc.command_history_enabled.unwrap_or(true);
+    let command_history_path = command_history_enabled.then(|| {
+        env_string("JTERM4_COMMAND_HISTORY_PATH")
+            .or(fc.command_history_path)
+            .unwrap_or_else(default_command_history_path)
+    });
+    let command_history_max_entries = fc
+        .command_history_max_entries
+        .unwrap_or(10_000)
+        .clamp(100, 1_000_000);
     let block_history_path = std::env::var("JTERM4_HISTORY_PATH")
         .ok()
         .or(fc.block_history_path);
@@ -1191,16 +1449,17 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     .unwrap_or(false);
     let shell = std::env::var("JTERM4_SHELL").ok().or(fc.shell);
 
-    // Parse terminal mode (default: vte)
+    // Block-first like jterm1; VTE remains available for compatibility and
+    // safe mode.
     let terminal_mode_str = env_string("JTERM4_MODE")
         .or(fc.terminal_mode)
-        .unwrap_or_else(|| "vte".to_string());
+        .unwrap_or_else(|| "block".to_string());
     let terminal_mode = match terminal_mode_str.to_ascii_lowercase().as_str() {
         "block" => TerminalMode::Block,
         "vte" => TerminalMode::Vte,
         other => {
-            log::warn!("Unknown terminal_mode '{other}', using vte");
-            TerminalMode::Vte
+            log::warn!("Unknown terminal_mode '{other}', using block");
+            TerminalMode::Block
         }
     };
 
@@ -1210,6 +1469,45 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
             .unwrap_or_else(|| "sidebar".to_string()),
     );
     let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
+
+    let ai_enabled = env_bool("JTERM4_AI_ENABLED")
+        .or(fc.ai_enabled)
+        .unwrap_or(true);
+    let agent_enabled = env_bool("JTERM4_AGENT_ENABLED")
+        .or(fc.agent_enabled)
+        .unwrap_or(true);
+    let agent_max_turns = env_u32("JTERM4_AGENT_MAX_TURNS")
+        .or(fc.agent_max_turns)
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let requested_provider = env_string("JTERM4_AI_PROVIDER")
+        .or(fc.ai_provider)
+        .unwrap_or_else(|| "anthropic".to_string());
+    let ai_provider = match requested_provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => "anthropic",
+        "openai" | "openai-compatible" | "openai_compatible" => "openai-compatible",
+        "ollama" => "ollama",
+        other => {
+            log::warn!("Unknown ai_provider '{other}', using anthropic");
+            "anthropic"
+        }
+    }
+    .to_string();
+    let (default_ai_model, default_ai_base_url) = match ai_provider.as_str() {
+        "openai-compatible" => ("gpt-4o-mini", "https://api.openai.com/v1"),
+        "ollama" => ("codellama:7b", "http://localhost:11434"),
+        _ => ("claude-sonnet-4-6", "https://api.anthropic.com"),
+    };
+    let ai_model = env_string("JTERM4_AI_MODEL")
+        .or(fc.ai_model)
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| default_ai_model.to_string());
+    let ai_base_url = env_string("JTERM4_AI_BASE_URL")
+        .or(fc.ai_base_url)
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| default_ai_base_url.to_string())
+        .trim_end_matches('/')
+        .to_string();
 
     let config = Config {
         window_opacity,
@@ -1235,6 +1533,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         finished_block_viewport_rows,
         max_collapsed_output_lines,
         virtual_scroll_margin,
+        command_history_enabled,
+        command_history_path,
+        command_history_max_entries,
         block_history_path,
         block_history_compress,
         block_compact,
@@ -1243,20 +1544,26 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         scroll_reporting_enabled: fc.scroll_reporting_enabled.unwrap_or(true),
         focus_reporting_enabled: fc.focus_reporting_enabled.unwrap_or(true),
         preserve_live_scrollback: fc.preserve_live_scrollback.unwrap_or(false),
+        ai_enabled,
+        agent_enabled,
+        agent_max_turns,
+        ai_provider,
+        ai_base_url,
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
         ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
-        ai_model: env_string("JTERM4_AI_MODEL")
-            .or(fc.ai_model)
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+        ai_model,
         ai_max_tokens: env_u32("JTERM4_AI_MAX_TOKENS")
             .or(fc.ai_max_tokens)
             .unwrap_or(1024)
-            .clamp(64, 8192),
-        ai_redact_secrets: fc.ai_redact_secrets.unwrap_or(true),
+            .clamp(64, 32_768),
+        ai_redact_secrets: env_bool("JTERM4_AI_REDACT_SECRETS")
+            .or(fc.ai_redact_secrets)
+            .unwrap_or(true),
         allow_remote_clipboard_write: fc.allow_remote_clipboard_write.unwrap_or(false),
         notify_long_blocks: fc.notify_long_blocks.unwrap_or(true),
         notify_long_block_threshold_ms: fc.notify_long_block_threshold_ms.unwrap_or(10_000),
         show_repo_strip: fc.show_repo_strip.unwrap_or(true),
+        persistence_revision: std::sync::Arc::new(std::sync::Mutex::new(persistence_revision)),
     };
 
     let mut keybinding_map = KeybindingMap::from_defaults();
@@ -1265,6 +1572,17 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
     }
 
     (config, themes, keybinding_map)
+}
+
+/// Load no external configuration at all. Unlike applying a partial override
+/// after `load_config`, this cannot block on or inherit a user-selected config
+/// path, and it also resets custom keybindings.
+pub(crate) fn load_safe_config() -> (Config, Vec<Theme>, KeybindingMap) {
+    (
+        Config::safe_defaults(),
+        builtin_themes(),
+        KeybindingMap::from_defaults(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,150 +1598,21 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
-pub(crate) fn save_config(config: &Config) {
-    let path = config_file_path();
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            log::warn!("Failed to create config dir {}: {err}", parent.display());
-            return;
-        }
+pub(crate) fn save_config(config: &Config) -> Result<(), crate::config_store::ConfigWriteError> {
+    if safe_mode_persistence_disabled(std::env::var_os("JTERM4_SAFE_MODE").as_deref()) {
+        log::debug!("Skipping configuration save in safe mode");
+        return Ok(());
     }
+    crate::config_store::save_config(config)
+        .map(|_| ())
+        .inspect_err(|error| log::warn!("Failed to save configuration: {error}"))
+}
 
-    // Read existing config to preserve user-authored sections (e.g. [keybindings])
-    let mut table = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.parse::<toml::Table>().ok())
-        .unwrap_or_default();
-
-    table.insert("opacity".into(), toml::Value::Float(config.window_opacity));
-    table.insert(
-        "scrollback".into(),
-        toml::Value::Integer(config.terminal_scrollback_lines as i64),
-    );
-    table.insert("font".into(), toml::Value::String(config.font_desc.clone()));
-    table.insert(
-        "font_scale".into(),
-        toml::Value::Float(config.default_font_scale),
-    );
-    table.insert(
-        "theme".into(),
-        toml::Value::String(config.theme_name.clone()),
-    );
-    table.insert(
-        "terminal_mode".into(),
-        toml::Value::String(
-            match config.terminal_mode {
-                TerminalMode::Block => "block",
-                TerminalMode::Vte => "vte",
-            }
-            .to_string(),
-        ),
-    );
-    table.insert(
-        "tab_placement".into(),
-        toml::Value::String(config.tab_placement.as_str().to_string()),
-    );
-    table.insert(
-        "sidebar_view".into(),
-        toml::Value::String(config.sidebar_view.as_str().to_string()),
-    );
-    table.insert(
-        "sidebar_visible".into(),
-        toml::Value::Boolean(config.sidebar_visible),
-    );
-    table.insert(
-        "sidebar_width".into(),
-        toml::Value::Integer(config.sidebar_width as i64),
-    );
-    table.insert(
-        "ai_panel_visible".into(),
-        toml::Value::Boolean(config.ai_panel_visible),
-    );
-    table.insert(
-        "ai_panel_width".into(),
-        toml::Value::Integer(config.ai_panel_width as i64),
-    );
-    table.insert(
-        "ai_model".into(),
-        toml::Value::String(config.ai_model.clone()),
-    );
-    table.insert(
-        "ai_max_tokens".into(),
-        toml::Value::Integer(config.ai_max_tokens as i64),
-    );
-    table.insert(
-        "ai_redact_secrets".into(),
-        toml::Value::Boolean(config.ai_redact_secrets),
-    );
-    table.insert(
-        "allow_remote_clipboard_write".into(),
-        toml::Value::Boolean(config.allow_remote_clipboard_write),
-    );
-    table.insert(
-        "notify_long_blocks".into(),
-        toml::Value::Boolean(config.notify_long_blocks),
-    );
-    table.insert(
-        "notify_long_block_threshold_ms".into(),
-        toml::Value::Integer(config.notify_long_block_threshold_ms as i64),
-    );
-    table.insert(
-        "finished_block_viewport_rows".into(),
-        toml::Value::Integer(config.finished_block_viewport_rows as i64),
-    );
-    table.insert(
-        "block_compact".into(),
-        toml::Value::Boolean(config.block_compact),
-    );
-    table.insert(
-        "show_repo_strip".into(),
-        toml::Value::Boolean(config.show_repo_strip),
-    );
-
-    let mut colors = toml::Table::new();
-    colors.insert(
-        "foreground".into(),
-        toml::Value::String(rgba_to_hex(&config.foreground)),
-    );
-    colors.insert(
-        "background".into(),
-        toml::Value::String(rgba_to_hex(&config.background)),
-    );
-    colors.insert(
-        "cursor".into(),
-        toml::Value::String(rgba_to_hex(&config.cursor)),
-    );
-    colors.insert(
-        "cursor_foreground".into(),
-        toml::Value::String(rgba_to_hex(&config.cursor_foreground)),
-    );
-    table.insert("colors".into(), toml::Value::Table(colors));
-
-    // Preserve explicitly loaded hosts on the first save. Fresh installs use an
-    // empty list, so this never injects personal network targets. Once the
-    // section exists it is user-authored and is left untouched.
-    if !table.contains_key("remote_hosts") && !config.remote_hosts.is_empty() {
-        let hosts: Vec<toml::Value> = config
-            .remote_hosts
-            .iter()
-            .map(remote_host_to_toml)
-            .collect();
-        table.insert("remote_hosts".into(), toml::Value::Array(hosts));
-    }
-
-    let content = table.to_string();
-    let tmp_path = path.with_extension("toml.tmp");
-    if let Err(err) = fs::write(&tmp_path, &content) {
-        log::warn!("Failed to write config {}: {err}", tmp_path.display());
-        return;
-    }
-    if let Err(err) = fs::rename(&tmp_path, &path) {
-        let _ = fs::remove_file(&path);
-        if let Err(err2) = fs::rename(&tmp_path, &path) {
-            log::warn!("Failed to move config into place: {err} / {err2}");
-            let _ = fs::remove_file(&tmp_path);
-        }
-    }
+fn safe_mode_persistence_disabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.to_string_lossy();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,6 +1860,131 @@ unknown_action = "F8"
     #[test]
     fn fresh_install_has_no_personal_remote_targets() {
         assert!(default_remote_hosts().is_empty());
+    }
+
+    #[test]
+    fn command_history_config_is_validated_and_uses_xdg_state_semantics() {
+        let issues = validate_config_contents(
+            "command_history_enabled = true\ncommand_history_path = '/tmp/history.jsonl'\ncommand_history_max_entries = 99\n",
+        )
+        .unwrap();
+        assert!(issues.iter().all(|issue| !issue.is_error()), "{issues:?}");
+        assert!(issues.iter().any(|issue| {
+            issue.path == "command_history_max_entries" && issue.level == ConfigIssueLevel::Warning
+        }));
+
+        let wrong_types = validate_config_contents(
+            "command_history_enabled = 'yes'\ncommand_history_path = false\ncommand_history_max_entries = 'many'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_types.iter().filter(|issue| issue.is_error()).count(),
+            3
+        );
+
+        assert_eq!(
+            xdg_state_home_from(
+                Some(std::ffi::OsStr::new("/var/state")),
+                Some(std::ffi::OsStr::new("/home/test")),
+                Path::new("/fallback")
+            ),
+            PathBuf::from("/var/state")
+        );
+        assert_eq!(
+            xdg_state_home_from(
+                Some(std::ffi::OsStr::new("relative-state")),
+                Some(std::ffi::OsStr::new("/home/test")),
+                Path::new("/fallback")
+            ),
+            PathBuf::from("/home/test/.local/state")
+        );
+    }
+
+    #[test]
+    fn ai_and_agent_config_is_semantically_validated() {
+        let valid = validate_config_contents(
+            "ai_enabled = true\nagent_enabled = true\nagent_max_turns = 20\nai_provider = 'openai-compatible'\nai_base_url = 'http://localhost:8000/v1'\nai_model = 'local-model'\nai_max_tokens = 4096\nai_redact_secrets = true\n",
+        )
+        .unwrap();
+        assert!(valid.is_empty(), "{valid:?}");
+
+        let invalid = validate_config_contents(
+            "agent_max_turns = 0\nai_provider = 'mystery'\nai_base_url = 'file:///tmp/model'\nai_model = ''\nai_max_tokens = 999999\n",
+        )
+        .unwrap();
+        assert!(invalid.iter().any(|issue| {
+            issue.path == "agent_max_turns" && issue.level == ConfigIssueLevel::Warning
+        }));
+        assert!(invalid.iter().any(|issue| issue.path == "ai_max_tokens"));
+        for key in ["ai_provider", "ai_base_url", "ai_model"] {
+            assert!(invalid
+                .iter()
+                .any(|issue| issue.path == key && issue.is_error()));
+        }
+    }
+
+    #[test]
+    fn safe_mode_removes_external_and_persistent_state() {
+        let (mut config, _, _) = load_config();
+        config.window_opacity = 0.2;
+        config.terminal_scrollback_lines = 42;
+        config.font_desc = "User Font 30".into();
+        config.default_font_scale = 3.0;
+        config.tab_placement = TabPlacement::TopBar;
+        config.sidebar_view = SidebarView::Files;
+        config.sidebar_visible = false;
+        config.mouse_reporting_enabled = false;
+        config.show_repo_strip = true;
+        config.shell = Some("/custom/shell".into());
+        config.startup_commands = Some("touch /tmp/should-not-run".into());
+        config.command_history_enabled = true;
+        config.command_history_path = Some("/tmp/history".into());
+        config.block_history_path = Some("/tmp/blocks".into());
+        config.ai_enabled = true;
+        config.agent_enabled = true;
+        config.ai_panel_visible = true;
+        config.notify_long_blocks = true;
+        config.allow_remote_clipboard_write = true;
+        config.remote_hosts.push(host());
+
+        config.apply_safe_mode();
+
+        assert!(matches!(config.terminal_mode, TerminalMode::Vte));
+        assert_eq!(config.window_opacity, 0.95);
+        assert_eq!(config.terminal_scrollback_lines, 5_000);
+        assert_eq!(config.font_desc, "SauceCodePro Nerd Font Mono 14");
+        assert_eq!(config.default_font_scale, 1.0);
+        assert_eq!(config.theme_name, "default");
+        assert_eq!(config.tab_placement, TabPlacement::Sidebar);
+        assert_eq!(config.sidebar_view, SidebarView::Tabs);
+        assert!(config.sidebar_visible);
+        assert!(config.mouse_reporting_enabled);
+        assert!(!config.show_repo_strip);
+        assert!(config.shell.is_none());
+        assert!(config.startup_commands.is_none());
+        assert!(!config.command_history_enabled);
+        assert!(config.command_history_path.is_none());
+        assert!(config.block_history_path.is_none());
+        assert!(!config.ai_enabled);
+        assert!(!config.agent_enabled);
+        assert!(!config.ai_panel_visible);
+        assert!(!config.notify_long_blocks);
+        assert!(!config.allow_remote_clipboard_write);
+        assert!(config.remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn safe_mode_environment_disables_configuration_writes() {
+        assert!(safe_mode_persistence_disabled(Some(std::ffi::OsStr::new(
+            "1"
+        ))));
+        assert!(safe_mode_persistence_disabled(Some(std::ffi::OsStr::new(
+            "TRUE"
+        ))));
+        assert!(!safe_mode_persistence_disabled(None));
+        assert!(!safe_mode_persistence_disabled(Some(std::ffi::OsStr::new(
+            "0"
+        ))));
     }
 
     #[test]

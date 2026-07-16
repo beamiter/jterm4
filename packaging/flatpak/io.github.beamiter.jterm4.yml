@@ -15,6 +15,8 @@ finish-args:
   - --device=dri
   - --filesystem=host
   - --talk-name=org.freedesktop.Flatpak
+  - --env=JTERM4_ASSET_DIR=/app/share/jterm4
+  - --env=JTERM4_WORKFLOW_DIR=/app/share/jterm4/workflows
 
 cleanup:
   - /bin/vte-2.91-gtk4
@@ -84,11 +86,24 @@ modules:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo build --offline --release --all-features --locked
       - install -Dm0755 target/release/jterm4 ${FLATPAK_DEST}/bin/jterm4
+      - install -Dm0755 scripts/support-bundle.sh ${FLATPAK_DEST}/bin/jterm4-support-bundle
       - install -Dm0644 data/io.github.beamiter.jterm4.desktop ${FLATPAK_DEST}/share/applications/io.github.beamiter.jterm4.desktop
       - install -Dm0644 data/io.github.beamiter.jterm4.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.beamiter.jterm4.metainfo.xml
       - install -Dm0644 data/io.github.beamiter.jterm4.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm4.svg
       - install -Dm0644 data/io.github.beamiter.jterm4-128.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.beamiter.jterm4.png
       - install -Dm0644 data/io.github.beamiter.jterm4-256.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.beamiter.jterm4.png
+      - install -Dm0644 scripts/shell-integration/README.md ${FLATPAK_DEST}/share/jterm4/shell-integration/README.md
+      - install -Dm0644 scripts/shell-integration/jterm4.bash ${FLATPAK_DEST}/share/jterm4/shell-integration/jterm4.bash
+      - install -Dm0644 scripts/shell-integration/jterm4.zsh ${FLATPAK_DEST}/share/jterm4/shell-integration/jterm4.zsh
+      - install -Dm0644 scripts/shell-integration/jterm4.fish ${FLATPAK_DEST}/share/jterm4/shell-integration/jterm4.fish
+      - install -Dm0644 scripts/shell-integration/jterm4.ps1 ${FLATPAK_DEST}/share/jterm4/shell-integration/jterm4.ps1
+      - install -Dm0644 scripts/workflows/git-feature.yaml ${FLATPAK_DEST}/share/jterm4/workflows/git-feature.yaml
+      - install -Dm0644 scripts/workflows/find-large-files.yaml ${FLATPAK_DEST}/share/jterm4/workflows/find-large-files.yaml
+      - install -Dm0644 scripts/workflows/git-rebase-interactive.yaml ${FLATPAK_DEST}/share/jterm4/workflows/git-rebase-interactive.yaml
+      - install -Dm0644 scripts/workflows/ssh-tunnel.yaml ${FLATPAK_DEST}/share/jterm4/workflows/ssh-tunnel.yaml
+      - install -Dm0644 scripts/workflows/docker-tail-logs.yaml ${FLATPAK_DEST}/share/jterm4/workflows/docker-tail-logs.yaml
+      - install -Dm0644 scripts/workflows/kill-port.yaml ${FLATPAK_DEST}/share/jterm4/workflows/kill-port.yaml
+      - install -Dm0644 scripts/notebooks/welcome.jtnb.md ${FLATPAK_DEST}/share/jterm4/notebooks/welcome.jtnb.md
     sources:
       - type: dir
         path: ../..

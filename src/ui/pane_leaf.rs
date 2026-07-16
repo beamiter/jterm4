@@ -15,6 +15,8 @@ use crate::block_view::TermView;
 use crate::terminal::{focus_terminal_deferred, VteTerminalView};
 
 const PANE_LEAF_DATA_KEY: &str = "terminal-view-type";
+const PANE_SESSION_ID_DATA_KEY: &str = "terminal-session-id";
+const PANE_REMOTE_DATA_KEY: &str = "terminal-remote-pane";
 
 #[derive(Clone)]
 pub(crate) enum PaneLeaf {
@@ -50,6 +52,28 @@ impl PaneLeaf {
         }
     }
 
+    /// Insert bytes into the pane's live input surface without submitting a
+    /// trailing newline. Palettes and workflows use this review-first path for
+    /// both terminal backends.
+    pub(crate) fn write_input(&self, data: &[u8]) {
+        match self {
+            Self::Block(view) => view.write_input(data),
+            Self::Vte(view) => view.write_input(data),
+        }
+    }
+
+    /// Insert one command for review without submitting it. Unlike the generic
+    /// input path, this rejects all terminal control characters so a history,
+    /// workflow, file name, or model response cannot smuggle Enter into the PTY.
+    pub(crate) fn write_review_input(
+        &self,
+        text: &str,
+    ) -> Result<(), crate::review_input::ReviewInputError> {
+        let text = crate::review_input::validate(text)?;
+        self.write_input(text.as_bytes());
+        Ok(())
+    }
+
     pub(crate) fn block_view(&self) -> Option<Rc<TermView>> {
         match self {
             Self::Block(view) => Some(view.clone()),
@@ -59,6 +83,72 @@ impl PaneLeaf {
 
     pub(crate) fn is_block(&self) -> bool {
         matches!(self, Self::Block(_))
+    }
+
+    /// `(pty master fd, shell pid)` used for foreground-process inspection.
+    /// Block mode owns an `OwnedPty`, while conventional mode lets VTE own it;
+    /// keeping that distinction here prevents feature code from accidentally
+    /// asking the Block live VTE for a PTY it does not own.
+    pub(crate) fn process_probe(&self) -> (i32, i32) {
+        match self {
+            Self::Block(view) => (view.pty_fd_i32(), view.pid_i32()),
+            Self::Vte(view) => (view.pty_fd_i32(), view.pid_i32()),
+        }
+    }
+
+    /// Persist the per-pane session identity on the actual leaf root. Split
+    /// descendants cannot all be represented by the tab-number keyed map.
+    pub(crate) fn set_session_id(&self, session_id: &str) {
+        unsafe {
+            self.root_widget()
+                .set_data::<String>(PANE_SESSION_ID_DATA_KEY, session_id.to_owned());
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> Option<String> {
+        unsafe {
+            self.root_widget()
+                .data::<String>(PANE_SESSION_ID_DATA_KEY)
+                .map(|value| value.as_ref().clone())
+        }
+    }
+
+    /// Mark the process hosted by this exact leaf as a remote connection.
+    ///
+    /// A tab may later be split, at which point tab-level connection metadata is
+    /// no longer enough to tell the remote primary from a local sibling. Keeping
+    /// the bit on the leaf lets structural operations avoid moving a controller
+    /// whose reconnect callbacks are intentionally bound to its original tab.
+    pub(crate) fn set_remote(&self, remote: bool) {
+        unsafe {
+            self.root_widget()
+                .set_data::<bool>(PANE_REMOTE_DATA_KEY, remote);
+        }
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        unsafe {
+            self.root_widget()
+                .data::<bool>(PANE_REMOTE_DATA_KEY)
+                .is_some_and(|value| *value.as_ref())
+        }
+    }
+
+    pub(crate) fn restorable_command(&self) -> Option<String> {
+        let (pty_fd, shell_pid) = self.process_probe();
+        crate::state::restorable_command_for_pty(pty_fd, shell_pid)
+    }
+
+    pub(crate) fn foreground_process_name(&self) -> Option<String> {
+        let (pty_fd, shell_pid) = self.process_probe();
+        crate::state::foreground_process_name_for_pty(pty_fd, shell_pid)
+    }
+
+    /// Terminate this leaf's shell and its process group through the
+    /// backend-neutral process teardown path.
+    pub(crate) fn kill(&self) {
+        let (_, shell_pid) = self.process_probe();
+        crate::state::terminate_terminal_process(shell_pid);
     }
 
     /// Store the typed controller on its GTK leaf root. Keeping the unsafe GTK

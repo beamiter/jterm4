@@ -2,50 +2,56 @@
 
 ## Process entry and headless commands
 
-`src/bin/jterm4.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, config validation, path printing, and `--doctor` before GTK initialization, so diagnostics remain usable over SSH and in CI. A normal launch then enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
+`src/bin/jterm4.rs` is intentionally tiny and delegates to the library application. `src/cli.rs` handles help, version, human/JSON config validation and diagnostics, config initialization/backup recovery, shell-integration output, and launch overrides before GTK initialization. Headless operations therefore remain usable over SSH and in CI. A normal launch enters `src/main.rs`, which builds the libadwaita application and the shared `UiState`.
 
 ## Terminal models
 
 jterm4 has two explicit terminal models:
 
-- **VTE mode** attaches a GTK VTE widget directly to a PTY and supports native split panes.
-- **Block mode** owns its PTY and reader lifecycle in `TermView`, parses shell integration markers, and renders commands and output as searchable finished blocks plus one live terminal.
+- **VTE mode** attaches a GTK VTE widget directly to a PTY and supports conventional split panes.
+- **Block mode**, the default, owns its PTY and reader lifecycle in `TermView`, parses shell integration markers, and renders commands and output as searchable finished blocks plus one live terminal.
 
-These modes share configuration, theming, input routing, process cleanup, and session metadata, but they do not pretend to have identical ownership. Block-mode pane splits remain disabled until every pane can own an independent `TermView` and PTY without creating hidden processes.
+`PaneLeaf` is the backend-neutral ownership boundary. It exposes the visible root, live input surface, PTY/shell process probe, cwd/restorable command, focus, and teardown without discovering an arbitrary nested VTE widget. Splitting a Block leaf retains that Block controller and creates a conventional VTE sibling; nested VTE splits use the same pane tree. Close paths scan every leaf, restore zoomed trees before mutation, confirm foreground work, and terminate the corresponding process group.
 
 ## UI composition
 
 `UiState` coordinates tabs, panes, sidebars, search, configuration reloads, and actions. The file sidebar uses GTK4's supported model-view stack: `gio::ListStore`, `TreeListModel`, `ListView`, and `TreeExpander`. Directory scans run on named worker threads; generation checks prevent stale results from repopulating a changed root.
 
+The unified palette keeps fuzzy ranking in a pure data layer and combines actions, metadata-only JSONL command history, YAML/TOML workflows, and the review-first natural-language command entry. Prefixes select one source without creating separate search implementations.
+
+The native Shell Agent dialog captures one active Block `TermView` as its target. A pure bounded state machine accepts only strict JSON `say`, `run`, or `done` actions; unknown fields, prose, stale proposal IDs, invalid transitions, and malformed commands fail closed. The GTK layer renders editable proposal cards and is the only layer allowed to turn an explicit **Approve & Run** click into PTY input. It refuses approval unless the pinned prompt is idle and empty, then correlates the resulting finished block before feeding its bounded observation back into the next turn.
+
 ## Asynchronous boundaries
 
-GTK widgets are only mutated on the main context. PTY reads, directory enumeration, Git metadata, notifications, and remote work happen outside the UI thread and return bounded results. Callbacks that outlive a tab are explicitly removed or guarded by weak references/generations.
+GTK widgets are only mutated on the main context. PTY reads, directory enumeration, Git metadata, notifications, AI/Agent transport, Notebook cells, and remote work happen outside the UI thread and return bounded results. Agent cancellation invalidates the outstanding model request and session; it does not silently authorize or reinterpret a late reply. Notebook cells run in isolated process groups, stream stdout/stderr through bounded UI updates, and are cancelled as a group. Callbacks that outlive a tab are explicitly removed or guarded by weak references/generations.
 
 ## Persistence
 
 Each process owns one active window snapshot. A snapshot becomes available to a future process only after graceful shutdown, using an atomic rename from `.active` to `.state`. Launches atomically claim one ready snapshot, stale active snapshots are recovered after their owner PID exits, and legacy `tabs.state` is migrated without allowing two processes to restore it. Ready snapshots are retained with a bounded count.
 
-Session snapshots and Block history use owner-only Unix permissions. File contents are written to a sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes.
+Session snapshots and Block history use owner-only Unix permissions. File contents are written to a sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes. The separate JSONL command index deliberately stores no output and enforces record/file bounds.
 
+## Native and Flatpak execution boundary
 
-    ## Native and Flatpak execution boundary
+Native builds execute shells and helper tools directly. Flatpak builds keep the
+GTK process sandboxed but route interactive shells, SSH, Git metadata, curl, and
+notifications through a single `host` module backed by
+`flatpak-spawn --host --watch-bus`. Cwd and selected environment values are
+encoded as argv options before process creation, so VTE and Block PTYs share the
+same explicit host boundary and cleanup rules. The stable application ID is
+`io.github.beamiter.jterm4`.
 
-    Native builds execute shells and helper tools directly. Flatpak builds keep the
-    GTK process sandboxed but route interactive shells, SSH, Git metadata, curl, and
-    notifications through a single `host` module backed by
-    `flatpak-spawn --host --watch-bus`. Cwd and selected environment values are
-    encoded as argv options before process creation, so VTE and Block PTYs share the
-    same explicit host boundary and cleanup rules. The stable application ID is
-    `io.github.beamiter.jterm4`.
+The Flatpak is intentionally granted host filesystem and command access because a
+terminal emulator is not a command sandbox. That authority is documented and
+validated rather than hidden behind a package that only works inside its own
+container. Runtime assets live under `/app/share/jterm4`; explicit environment
+paths make them discoverable without copying examples into user data.
 
-    The Flatpak is intentionally granted host filesystem and command access because a
-    terminal emulator is not a command sandbox. That authority is documented and
-    validated rather than hidden behind a package that only works inside its own
-    container.
+## Configuration and observability
 
-    ## Configuration and observability
+Configuration is parsed and semantically validated before replacing the active runtime value. Writes take an advisory lock, compare the exact loaded revision, preserve two valid rotating backups, and use private durable atomic replacement. Conflicts and invalid TOML cannot overwrite a newer disk revision, and UI-originated failures are surfaced without discarding the active in-memory value. File monitoring provides hot reload while manual reload remains available. Safe mode bypasses the external config path and environment overrides entirely, creates the built-in VTE profile plus default keymap, and rejects manual reload.
 
-Configuration is parsed and validated before replacing the active runtime value. File monitoring provides hot reload while manual reload remains available. The lightweight logger supports plain levels and target-specific `RUST_LOG` directives; each line includes relative time, severity, and target. `--doctor` reports configuration status, display/input environment, optional tools, shell choice, and ready/active snapshot counts without exposing snapshot contents.
+The lightweight logger supports plain levels and target-specific `RUST_LOG` directives; each line includes relative time, severity, and target. `--doctor` reports configuration validation/permissions/backups/lock state, display/input environment, optional tools, shell choice, AI provider readiness, workflow/Notebook discovery, remote readiness, and ready/active snapshot counts without network probes or snapshot contents; `--json` makes diagnostics machine-readable. The support-bundle wrapper enables a path/value-redacted diagnostic mode and adds only non-content file metadata and non-sensitive system characteristics.
 
 ## Quality gates
 
@@ -58,4 +64,6 @@ CI runs rustfmt, tests, strict Clippy, Rustdoc with warnings denied, a release b
 3. Concurrent processes never claim or overwrite the same ready session snapshot.
 4. Persisted terminal data is bounded, atomically replaced, and owner-only.
 5. Invalid configuration never replaces the last valid runtime configuration.
-6. New features must preserve both VTE and Block input routing or explicitly document a mode limitation.
+6. Generated commands are never submitted to a PTY without an explicit user action.
+7. Agent approval requires the exact pinned Block prompt to be idle and empty; every completed result is correlated to the approved proposal.
+8. New features must preserve both VTE and Block input routing or explicitly document a mode limitation.

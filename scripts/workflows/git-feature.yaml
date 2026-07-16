@@ -1,0 +1,11 @@
+name: Create feature branch
+description: Create and switch to a named feature branch
+command: "git switch -c {{prefix}}/{{name}}"
+tags: [git, branch]
+args:
+  - name: prefix
+    description: Branch namespace
+    default: feature
+  - name: name
+    description: Short branch name
+    default: my-change

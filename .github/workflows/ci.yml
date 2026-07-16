@@ -67,8 +67,10 @@ jobs:
 
       - name: Check installer and smoke scripts
         run: |
-          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
-          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh
+          bash -n scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh \
+            scripts/support-bundle.sh scripts/package-release.sh packaging/install-release.sh
+          shellcheck scripts/install.sh scripts/uninstall.sh scripts/smoke-flatpak.sh \
+            scripts/support-bundle.sh scripts/package-release.sh packaging/install-release.sh
           scripts/install.sh --help >/dev/null
           scripts/uninstall.sh --help >/dev/null
 
@@ -203,3 +205,32 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --all-features --locked
+
+      - name: Build and verify relocatable release bundle
+        run: |
+          bash scripts/package-release.sh target/release/jterm4
+          (cd target/dist && sha256sum --check *.sha256)
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: jterm4-${{ github.sha }}
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  nix:
+    name: Nix package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Evaluate and build flake checks
+        run: nix flake check --no-write-lock-file --print-build-logs

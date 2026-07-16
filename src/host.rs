@@ -144,4 +144,14 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn flatpak_shell_identity_reaches_the_host_child() {
+        let argv = vec!["bash".to_string(), "-l".to_string()];
+        let wrapped = wrap_argv_for(true, &argv, None, &[("TERM_PROGRAM", "jterm4")]);
+        assert!(wrapped
+            .iter()
+            .any(|argument| argument == "--env=TERM_PROGRAM=jterm4"));
+        assert_eq!(&wrapped[wrapped.len() - 2..], ["bash", "-l"]);
+    }
 }

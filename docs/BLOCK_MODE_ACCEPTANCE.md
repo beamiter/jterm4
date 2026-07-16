@@ -6,6 +6,7 @@
 
 ```bash
 cargo build
+source <(target/debug/jterm4 --shell-integration bash)
 RUST_LOG=jterm4=debug target/debug/jterm4 --mode block --no-restore
 ```
 
@@ -53,6 +54,16 @@ read -r value; printf 'value=%s\n' "$value"
 - 在 `vim`、`less`、`top` 等 alt-screen 程序中，Block-only 快捷键不能操作隐藏块。
 - 退出 alt-screen 后，选择、过滤、书签、复制和回填继续正常。
 
+## P1 分屏、进程检查与关闭
+
+- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见，新建 VTE sibling，没有隐藏或孤儿 PTY。
+- 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常。
+- 对普通 sibling、原始 primary 和 remote pane 分别执行 **Move pane to new tab**，重复移动后旧/新 tab 的 close、Pin、tooltip、进程状态和 session id 仍指向各自可见 pane。
+- 让 remote 异常退出并进入重连倒计时：直接移动 dead pane 后重连应跟随新 tab；倒计时期间新建 split 或 zoom 时只移除 dead remote leaf，不能关闭或 kill 仍存活的 local sibling；手动关闭 dead leaf 也应取消 timer 并立即 collapse。
+- Block 和 VTE 分别运行 `sleep 60`，关闭单 pane、整个标签、批量标签和窗口时都出现前台任务确认。
+- zoom 到任意 pane 后关闭标签，确认隐藏 sibling 也被扫描并终止，pane tree 没有残留进程。
+- 空闲 shell 关闭时不误报；关闭含前台任务的窗口后，相关 shell/child process group 均退出。
+
 ## P1 长会话与虚拟滚动
 
 准备至少 250 个独立块后检查：
@@ -65,6 +76,20 @@ read -r value; printf 'value=%s\n' "$value"
 ## 设置面板
 
 - Settings 中的 **Compact Block Spacing** 与 `block_compact` 配置一致。
-- 该选项只影响新建 Block pane，切换时不应破坏当前 pane 的 VTE 和虚拟滚动状态。
+- Settings 中切换 backend 只影响后续新建 tab；安全模式下 backend 控件不可修改。
+- Compact Block Spacing 与相关 Block 配置热更新到当前所有嵌套 Block pane，不能破坏 live VTE、选择或虚拟滚动状态。
+
+## 配套工作流
+
+- 执行若干成功/失败命令后，`Ctrl+Shift+P` 的 `@` 历史只显示 command/cwd/status，不包含输出；接受只回填不执行。
+- `:` 能模糊匹配安装的 YAML 示例和用户 TOML/YAML workflow，参数替换后只写入编辑行。
+- 在文件树双击 `.jtnb.md`，逐 cell 与 Run All 均能运行；Stop/Stop All/关闭对话框会终止完整 cell process group。
+- `?` 生成的命令必须先展示供审阅，不能自行向 PTY 写入换行。
+- 在 active Block pane 按 `Ctrl+Alt+G` 打开 Shell Agent；VTE pane、safe mode、`ai_enabled = false` 或 `agent_enabled = false` 都必须拒绝打开。
+- 要求 Agent 完成一个两步任务：每个严格 JSON proposal 都显示为可编辑卡片；修改后 **Approve & Run** 执行修改值，Reject 会把拒绝写入上下文并请求替代方案。
+- 对 `rm -rf /`、`mkfs` 或 download-pipe-to-shell 类型 proposal 显示醒目危险提示，但仍不得自动执行。
+- prompt 正在运行命令或已有未提交输入时点击批准，必须拒绝且不改动输入；清空并空闲后才允许再次批准。
+- 批准命令完成后，Agent transcript 显示 exit code/输出并自动进入下一轮；不相关 Block 完成事件不能被误关联。
+- **Cancel Agent**、关闭对话框和达到 `agent_max_turns` 后停止模型回合；取消时的迟到回复不能形成 proposal。已明确批准且已经启动的终端命令仍按普通 Block 任务管理。
 
 问题记录建议包含桌面环境、X11/Wayland、shell 及版本、是否加载 shell integration、复现步骤和 `RUST_LOG=jterm4=debug` 日志。

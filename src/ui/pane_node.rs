@@ -38,13 +38,6 @@ impl PaneNode {
         matches!(self, Self::Split { .. })
     }
 
-    pub(crate) fn contains_block(&self) -> bool {
-        match self {
-            Self::Leaf(controller) => controller.is_block(),
-            Self::Split { start, end } => start.contains_block() || end.contains_block(),
-        }
-    }
-
     pub(crate) fn leaves(&self) -> Vec<PaneLeaf> {
         let mut leaves = Vec::new();
         self.collect_leaves(&mut leaves);

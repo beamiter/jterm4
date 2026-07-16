@@ -30,6 +30,8 @@
 //! that collides with shell variable expansion (a perfectly valid
 //! workflow template containing `${HOME}` would silently get mangled).
 
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,11 @@ pub struct Workflow {
     pub name: String,
     pub description: String,
     pub command: String,
+    /// Optional search/category labels used by the unified command palette.
+    pub tags: Vec<String>,
+    /// Optional shell hint retained for compatibility with shared workflow
+    /// libraries. Commands are still inserted for review, not auto-executed.
+    pub shell: Option<String>,
     pub args: Vec<WorkflowArg>,
     /// Absolute path the workflow was loaded from. Used so the palette
     /// can offer "open file" / "reveal in folder" actions later.
@@ -63,7 +70,60 @@ pub fn workflows_dir() -> PathBuf {
     base.join("jterm4").join("workflows")
 }
 
-/// Read all `*.toml` files from `dir` and parse each as a Workflow.
+/// Workflow search path in precedence order. User-authored workflows win over
+/// additional, installed and source-tree examples with the same name.
+pub fn workflow_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![workflows_dir()];
+    if let Some(extra) = std::env::var_os("JTERM4_WORKFLOW_DIR") {
+        dirs.extend(std::env::split_paths(&extra));
+    }
+    dirs.push(gtk4::glib::user_data_dir().join("jterm4").join("workflows"));
+    dirs.extend(
+        gtk4::glib::system_data_dirs()
+            .into_iter()
+            .map(|dir| dir.join("jterm4").join("workflows")),
+    );
+    dirs.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("workflows"),
+    );
+    let mut unique = Vec::new();
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// Locate the installed or source-tree quick-start notebook.
+pub fn welcome_notebook_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(asset_dir) = std::env::var_os("JTERM4_ASSET_DIR") {
+        candidates.push(PathBuf::from(asset_dir).join("notebooks/welcome.jtnb.md"));
+    }
+    candidates.push(
+        gtk4::glib::user_data_dir()
+            .join("jterm4")
+            .join("notebooks")
+            .join("welcome.jtnb.md"),
+    );
+    candidates.extend(
+        gtk4::glib::system_data_dirs()
+            .into_iter()
+            .map(|dir| dir.join("jterm4").join("notebooks").join("welcome.jtnb.md")),
+    );
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("notebooks")
+            .join("welcome.jtnb.md"),
+    );
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Read all TOML or YAML workflow files from `dir` and parse each as a Workflow.
 /// Files that fail to parse are silently skipped — a malformed template
 /// shouldn't kill the palette for every other one. Returns workflows
 /// sorted by name for stable palette order.
@@ -74,13 +134,22 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "toml" | "yaml" | "yml") {
             continue;
         }
         let Ok(contents) = fs::read_to_string(&path) else {
             continue;
         };
-        if let Some(wf) = parse_workflow(&contents, &path) {
+        let workflow = match extension.as_str() {
+            "yaml" | "yml" => parse_yaml_workflow(&contents, &path),
+            _ => parse_workflow(&contents, &path),
+        };
+        if let Some(wf) = workflow {
             out.push(wf);
         }
     }
@@ -88,20 +157,122 @@ pub fn load_all_from(dir: &Path) -> Vec<Workflow> {
     out
 }
 
-/// Convenience: load all workflows from the default directory.
+/// Load all configured sources, deduplicating by name. Earlier directories
+/// have higher precedence so installed examples never shadow user files.
 pub fn load_all() -> Vec<Workflow> {
-    load_all_from(&workflows_dir())
+    let mut out = Vec::new();
+    let mut names = HashSet::new();
+    for dir in workflow_dirs() {
+        for workflow in load_all_from(&dir) {
+            if names.insert(workflow.name.clone()) {
+                out.push(workflow);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlWorkflow {
+    name: String,
+    #[serde(default)]
+    description: String,
+    command: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    args: Vec<YamlWorkflowArg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct YamlWorkflowArg {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+fn command_is_reviewable(command: &str, source_path: &Path) -> bool {
+    match crate::review_input::validate(command) {
+        Ok(_) => true,
+        Err(error) => {
+            log::warn!(
+                "workflows: skipping {}: command is unsafe for review-only insertion: {error}",
+                source_path.display()
+            );
+            false
+        }
+    }
+}
+
+fn parse_yaml_workflow(source: &str, source_path: &Path) -> Option<Workflow> {
+    let raw: YamlWorkflow = match serde_yaml::from_str(source) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log::warn!("workflows: skipping {}: {err}", source_path.display());
+            return None;
+        }
+    };
+    if raw.name.trim().is_empty() || raw.command.trim().is_empty() {
+        log::warn!(
+            "workflows: skipping {}: name and command must not be empty",
+            source_path.display()
+        );
+        return None;
+    }
+    if !command_is_reviewable(&raw.command, source_path) {
+        return None;
+    }
+    Some(Workflow {
+        name: raw.name,
+        description: raw.description,
+        command: raw.command,
+        tags: raw.tags,
+        shell: raw.shell,
+        args: raw
+            .args
+            .into_iter()
+            .filter(|arg| !arg.name.trim().is_empty())
+            .map(|arg| WorkflowArg {
+                name: arg.name,
+                description: arg.description,
+                default: arg.default.unwrap_or_default(),
+            })
+            .collect(),
+        source_path: source_path.to_path_buf(),
+    })
 }
 
 fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
     let table: toml::Table = toml::from_str(toml_src).ok()?;
     let name = table.get("name")?.as_str()?.to_string();
     let command = table.get("command")?.as_str()?.to_string();
+    if name.trim().is_empty() || !command_is_reviewable(&command, source_path) {
+        return None;
+    }
     let description = table
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let tags = table
+        .get("tags")
+        .and_then(toml::Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let shell = table
+        .get("shell")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string);
 
     let mut args = Vec::new();
     if let Some(raw_args) = table.get("args").and_then(|v| v.as_array()) {
@@ -135,6 +306,8 @@ fn parse_workflow(toml_src: &str, source_path: &Path) -> Option<Workflow> {
         name,
         description,
         command,
+        tags,
+        shell,
         args,
         source_path: source_path.to_path_buf(),
     })
@@ -152,8 +325,20 @@ pub fn substitute(template: &str, bindings: &[(String, String)]) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'{' {
-            // Escaped literal `{{`
+            // Shared YAML workflows use mustache-style `{{name}}`. Preserve
+            // the historical literal-brace escape when no such binding exists.
             if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                if let Some(close_rel) =
+                    bytes[i + 2..].windows(2).position(|window| window == b"}}")
+                {
+                    let close = i + 2 + close_rel;
+                    let name = &template[i + 2..close];
+                    if let Some((_, value)) = bindings.iter().find(|(key, _)| key == name) {
+                        out.push_str(value);
+                        i = close + 2;
+                        continue;
+                    }
+                }
                 out.push('{');
                 i += 2;
                 continue;
@@ -206,6 +391,8 @@ mod tests {
         assert_eq!(wf.name, "Echo");
         assert_eq!(wf.command, "echo hi");
         assert_eq!(wf.description, "");
+        assert!(wf.tags.is_empty());
+        assert!(wf.shell.is_none());
         assert!(wf.args.is_empty());
     }
 
@@ -231,6 +418,48 @@ mod tests {
     fn parse_missing_required_fields_returns_none() {
         let src = r#"description = "no name or command""#;
         assert!(parse_workflow(src, Path::new("/tmp/x.toml")).is_none());
+    }
+
+    #[test]
+    fn parses_shared_yaml_workflow_metadata() {
+        let src = r#"
+name: Deploy
+description: Deploy a service
+command: "deploy {{service}}"
+tags: [ops, deploy]
+shell: bash
+args:
+  - name: service
+    description: Service name
+    default: api
+"#;
+        let wf = parse_yaml_workflow(src, Path::new("/tmp/deploy.yaml")).unwrap();
+        assert_eq!(wf.tags, vec!["ops", "deploy"]);
+        assert_eq!(wf.shell.as_deref(), Some("bash"));
+        assert_eq!(wf.args[0].default, "api");
+        assert_eq!(
+            substitute(&wf.command, &[("service".into(), "web".into())]),
+            "deploy web"
+        );
+    }
+
+    #[test]
+    fn rejects_multiline_or_control_character_commands() {
+        assert!(parse_yaml_workflow(
+            "name: Unsafe\ncommand: |\n  echo one\n  echo two\n",
+            Path::new("/tmp/unsafe.yaml")
+        )
+        .is_none());
+        assert!(parse_workflow(
+            "name = 'Unsafe'\ncommand = \"echo one\\necho two\"\n",
+            Path::new("/tmp/unsafe.toml")
+        )
+        .is_none());
+        assert!(parse_workflow(
+            "name = 'Unsafe'\ncommand = \"echo \\u001b[31mred\"\n",
+            Path::new("/tmp/escape.toml")
+        )
+        .is_none());
     }
 
     #[test]
@@ -286,6 +515,11 @@ mod tests {
             &dir.path().join("b.toml"),
             "name = \"B\"\ncommand = \"echo b\"\n",
         );
+        // good YAML
+        write_file(
+            &dir.path().join("c.yaml"),
+            "name: C\ncommand: echo c\ntags: [example]\n",
+        );
         // wrong extension
         write_file(&dir.path().join("c.txt"), "not a workflow");
         // malformed toml
@@ -294,15 +528,35 @@ mod tests {
         write_file(&dir.path().join("e.toml"), "description = \"oops\"");
 
         let wfs = load_all_from(dir.path());
-        assert_eq!(wfs.len(), 2);
+        assert_eq!(wfs.len(), 3);
         assert_eq!(wfs[0].name, "A");
         assert_eq!(wfs[1].name, "B");
+        assert_eq!(wfs[2].name, "C");
     }
 
     #[test]
     fn load_all_from_missing_dir_returns_empty() {
         let wfs = load_all_from(Path::new("/nonexistent/jterm4/workflows/never"));
         assert!(wfs.is_empty());
+    }
+
+    #[test]
+    fn every_bundled_workflow_is_parseable_and_review_only() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("workflows");
+        let candidate_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter(|entry| workflow_file_for_test(&entry.path()))
+            .count();
+        let workflows = load_all_from(&dir);
+        assert_eq!(workflows.len(), candidate_count);
+        assert!(workflows.len() >= 6);
+        assert!(workflows
+            .iter()
+            .all(|workflow| crate::review_input::validate(&workflow.command).is_ok()));
     }
 
     // ----- test helpers (no external `tempfile` dep) -----
@@ -330,5 +584,16 @@ mod tests {
     fn write_file(p: &Path, contents: &str) {
         let mut f = fs::File::create(p).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
+    }
+
+    fn workflow_file_for_test(path: &Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "toml" | "yaml" | "yml"
+                )
+            })
     }
 }

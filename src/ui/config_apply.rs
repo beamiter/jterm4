@@ -15,6 +15,59 @@ use crate::config::{
 use crate::terminal::collect_terminals;
 
 impl UiState {
+    fn show_config_error(&self, title: &str, message: &str) {
+        if self.config_save_error_visible.replace(true) {
+            return;
+        }
+        let dialog = adw::AlertDialog::new(Some(title), Some(message));
+        dialog.add_response("ok", "OK");
+        dialog.set_default_response(Some("ok"));
+        dialog.set_close_response("ok");
+        let visible = self.config_save_error_visible.clone();
+        dialog.connect_response(None, move |_, _| visible.set(false));
+        dialog.present(Some(&self.window));
+    }
+
+    /// Persist a UI-originated configuration change and make conflicts,
+    /// validation refusal, lock timeouts and I/O failures visible to the user.
+    pub(crate) fn persist_config(&self) {
+        if std::env::var_os("JTERM4_SAFE_MODE").is_some() {
+            self.show_config_error(
+                "Temporary safe-mode setting",
+                "This change applies only to the current window and will not be saved.",
+            );
+            return;
+        }
+        let result = crate::config::save_config(&self.config.borrow());
+        let Err(error) = result else {
+            return;
+        };
+        self.show_config_error(
+            "Settings were not saved",
+            &format!(
+                "{error}\n\nThe in-memory setting is still active. Reload the configuration (Ctrl+Shift+R) before trying again if the file changed elsewhere."
+            ),
+        );
+    }
+
+    /// Push the current behavioral configuration into every live Block pane,
+    /// including panes nested under splits.
+    pub(crate) fn sync_block_configs(&self) {
+        for page in 0..self.notebook.n_pages() {
+            let Some(widget) = self.notebook.nth_page(Some(page)) else {
+                continue;
+            };
+            let Some(node) = PaneNode::from_widget(&widget) else {
+                continue;
+            };
+            for leaf in node.leaves() {
+                if let Some(view) = leaf.block_view() {
+                    view.reload_config(&self.config.borrow());
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_font_scale_all(&self, new_scale: f64) {
         self.font_scale.set(new_scale);
         for i in 0..self.notebook.n_pages() {
@@ -133,6 +186,16 @@ impl UiState {
 
     /// Reload configuration from disk and apply changes.
     pub(crate) fn reload_config(&self) {
+        if std::env::var_os("JTERM4_SAFE_MODE").is_some() {
+            let dialog = adw::AlertDialog::new(
+                Some("Configuration reload disabled"),
+                Some("Safe mode keeps the built-in VTE profile isolated from user configuration."),
+            );
+            dialog.add_response("ok", "OK");
+            dialog.set_default_response(Some("ok"));
+            dialog.present(Some(&self.window));
+            return;
+        }
         let path = config_file_path();
         if path.exists() {
             let validation = std::fs::read_to_string(&path)
@@ -142,13 +205,32 @@ impl UiState {
                 });
             match validation {
                 Ok(issues) if issues.iter().any(|issue| issue.is_error()) => {
+                    let details = issues
+                        .iter()
+                        .filter(|issue| issue.is_error())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     for issue in issues {
                         log::error!("Config reload rejected: {issue}");
                     }
+                    self.show_config_error(
+                        "Configuration reload rejected",
+                        &format!(
+                            "The current settings remain active. Fix these errors first:\n\n{details}"
+                        ),
+                    );
                     return;
                 }
                 Err(err) => {
                     log::error!("Config reload rejected for {}: {err}", path.display());
+                    self.show_config_error(
+                        "Configuration reload rejected",
+                        &format!(
+                            "The current settings remain active. {}: {err}",
+                            path.display()
+                        ),
+                    );
                     return;
                 }
                 _ => {}
@@ -169,14 +251,7 @@ impl UiState {
 
         // TermView owns a shared clone used by long-lived callbacks. Refresh it
         // as well so behavior changes do not require reopening block tabs.
-        for page in 0..self.notebook.n_pages() {
-            if let Some(widget) = self.notebook.nth_page(Some(page)) {
-                if let Some(term_view) = unsafe { widget.data::<Rc<TermView>>("term-view") } {
-                    let term_view = unsafe { term_view.as_ref() };
-                    term_view.reload_config(&self.config.borrow());
-                }
-            }
-        }
+        self.sync_block_configs();
 
         // Apply all visual changes
         self.window_opacity.set(opacity);

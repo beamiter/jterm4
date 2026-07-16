@@ -14,19 +14,20 @@ use vte4::Terminal;
 use vte4::TerminalExt;
 
 use super::*;
-use crate::config::save_config;
 use crate::keybindings::Action;
 use crate::terminal::open_uri;
 
 impl UiState {
-    pub(crate) async fn confirm_close_tab_with_process(
+    pub(crate) async fn confirm_close_with_processes(
         window: &adw::ApplicationWindow,
+        heading: &str,
+        close_label: &str,
         process_info: &str,
     ) -> bool {
         let dialog = adw::MessageDialog::builder()
-            .heading("Close tab with running process?")
+            .heading(heading)
             .body(format!(
-                "This tab has a running process:\n\n{}\n\nClosing will terminate it.",
+                "The following foreground process(es) are still running:\n\n{}\n\nClosing will terminate them.",
                 process_info
             ))
             .transient_for(window)
@@ -34,12 +35,25 @@ impl UiState {
             .build();
 
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("close", "Close Tab");
+        dialog.add_response("close", close_label);
         dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
 
         dialog.choose_future().await == "close"
+    }
+
+    pub(crate) async fn confirm_close_tab_with_process(
+        window: &adw::ApplicationWindow,
+        process_info: &str,
+    ) -> bool {
+        Self::confirm_close_with_processes(
+            window,
+            "Close tab with running process?",
+            "Close Tab",
+            process_info,
+        )
+        .await
     }
 
     pub(crate) fn toggle_sidebar(&self) {
@@ -51,7 +65,7 @@ impl UiState {
         self.sidebar.set_visible(visible);
         if persist {
             self.config.borrow_mut().sidebar_visible = visible;
-            save_config(&self.config.borrow());
+            self.persist_config();
         }
     }
 
@@ -442,11 +456,8 @@ impl UiState {
         filter_entry.grab_focus();
     }
 
-    /// Fuzzy palette over the active block-mode tab's finished-command
-    /// history. Enter pastes the selected command into the live VTE (with
-    /// honor for whatever bracketed-paste/readline state the shell sits in).
-    /// Toggle: a second invocation closes an open palette. No-op when the
-    /// active tab is VTE-mode or has no finished blocks yet.
+    /// Palette over the active Block tab plus the lightweight cross-session
+    /// history index. Enter inserts into either backend without auto-running.
     pub(crate) fn show_history_palette(&self) {
         let dialog_to_close = self.history_palette_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {
@@ -454,11 +465,33 @@ impl UiState {
             return;
         }
 
-        let Some(term_view) = self.current_term_view() else {
-            log::debug!("[history] no active block-mode tab");
+        let Some(pane) = self.current_pane_leaf() else {
+            log::debug!("[history] no active terminal pane");
             return;
         };
-        let history: Rc<Vec<String>> = Rc::new(term_view.command_history());
+        let mut history = pane
+            .block_view()
+            .map(|view| view.command_history())
+            .unwrap_or_default();
+        let mut seen: std::collections::HashSet<String> = history.iter().cloned().collect();
+        {
+            let config = self.config.borrow();
+            if config.command_history_enabled {
+                if let Some(path) = config.command_history_path.as_deref() {
+                    for record in crate::command_history::read_recent(
+                        std::path::Path::new(path),
+                        config.command_history_max_entries as usize,
+                    )
+                    .unwrap_or_default()
+                    {
+                        if seen.insert(record.command.clone()) {
+                            history.push(record.command);
+                        }
+                    }
+                }
+            }
+        }
+        let history: Rc<Vec<String>> = Rc::new(history);
         if history.is_empty() {
             log::debug!("[history] no finished commands to show");
             return;
@@ -543,11 +576,11 @@ impl UiState {
         // matches how bash's reverse-i-search behaves.
         let paste = {
             let history = history.clone();
-            let term_view = term_view.clone();
+            let pane = pane.clone();
+            let ui = self.clone();
             move |idx: usize| {
                 if let Some(cmd) = history.get(idx) {
-                    term_view.grab_focus();
-                    term_view.write_input(cmd.as_bytes());
+                    ui.insert_review_text(&pane, cmd);
                 }
             }
         };
@@ -905,22 +938,120 @@ impl UiState {
         content.set_margin_top(12);
         content.set_margin_bottom(12);
 
-        // Populate `content` from the current block-mode view's debug snapshot.
+        // Populate application/session diagnostics plus the active Block
+        // backend's PTY/viewport snapshot. The app-level sections remain useful
+        // in conventional VTE mode instead of presenting an empty dashboard.
         let ui_for_populate = self.clone();
         let populate = Rc::new(move |content: &gtk4::Box| {
             while let Some(child) = content.first_child() {
                 content.remove(&child);
             }
-            let Some(term_view) = ui_for_populate.current_term_view() else {
-                let label = Label::new(Some("Debug dashboard is only available in block mode."));
-                label.add_css_class("dim-label");
-                label.set_wrap(true);
-                content.append(&label);
-                return;
+            let tab_count = ui_for_populate.notebook.n_pages();
+            let total_panes: usize = (0..tab_count)
+                .filter_map(|index| ui_for_populate.notebook.nth_page(Some(index)))
+                .map(|page| {
+                    PaneNode::from_widget(&page)
+                        .map(|node| node.leaves().len())
+                        .unwrap_or(1)
+                })
+                .sum();
+            let active_page = ui_for_populate.notebook.current_page();
+            let active_widget =
+                active_page.and_then(|index| ui_for_populate.notebook.nth_page(Some(index)));
+            let active_title = active_widget
+                .as_ref()
+                .and_then(|page| crate::state::tab_label_text(&ui_for_populate.notebook, page))
+                .unwrap_or_default();
+            let active_panes = active_widget
+                .as_ref()
+                .and_then(PaneNode::from_widget)
+                .map(|node| node.leaves().len())
+                .unwrap_or(0);
+            let config = ui_for_populate.config.borrow();
+            let mut sections = vec![
+                (
+                    "Session".to_string(),
+                    vec![
+                        ("Tabs".to_string(), tab_count.to_string()),
+                        ("Total panes".to_string(), total_panes.to_string()),
+                        ("Active tab".to_string(), active_title),
+                        ("Panes in active tab".to_string(), active_panes.to_string()),
+                        (
+                            "Zoomed".to_string(),
+                            ui_for_populate.zoom_state.borrow().is_some().to_string(),
+                        ),
+                    ],
+                ),
+                (
+                    "Appearance".to_string(),
+                    vec![
+                        ("Theme".to_string(), config.theme_name.clone()),
+                        ("Font".to_string(), config.font_desc.clone()),
+                        (
+                            "Font scale".to_string(),
+                            format!("{:.3}", ui_for_populate.font_scale.get()),
+                        ),
+                        (
+                            "Opacity".to_string(),
+                            format!("{:.2}", ui_for_populate.window_opacity.get()),
+                        ),
+                        (
+                            "Terminal mode".to_string(),
+                            match &config.terminal_mode {
+                                crate::config::TerminalMode::Block => "block",
+                                crate::config::TerminalMode::Vte => "vte",
+                            }
+                            .to_string(),
+                        ),
+                        (
+                            "Scrollback".to_string(),
+                            config.terminal_scrollback_lines.to_string(),
+                        ),
+                    ],
+                ),
+                (
+                    "Config".to_string(),
+                    vec![
+                        (
+                            "Keybindings".to_string(),
+                            ui_for_populate
+                                .keybinding_map
+                                .borrow()
+                                .bindings
+                                .len()
+                                .to_string(),
+                        ),
+                        (
+                            "Remote hosts".to_string(),
+                            config.remote_hosts.len().to_string(),
+                        ),
+                        (
+                            "Startup commands".to_string(),
+                            config.startup_commands.clone().unwrap_or_default(),
+                        ),
+                    ],
+                ),
+            ];
+            drop(config);
+            if let Some(term_view) = ui_for_populate.current_term_view() {
+                sections.extend(
+                    term_view
+                        .debug_info()
+                        .into_iter()
+                        .map(|(section, rows)| (format!("Block · {section}"), rows)),
+                );
+            } else {
+                sections.push((
+                    "Backend".to_string(),
+                    vec![(
+                        "Block diagnostics".to_string(),
+                        "not available for a VTE pane".to_string(),
+                    )],
+                ));
             };
-            for (section, rows) in term_view.debug_info() {
+            for (section, rows) in sections {
                 let group = adw::PreferencesGroup::new();
-                group.set_title(section);
+                group.set_title(&section);
                 for (key, value) in rows {
                     let row = adw::ActionRow::builder().title(key.as_str()).build();
                     let value_label = Label::new(Some(&value));
@@ -989,6 +1120,7 @@ impl UiState {
 
         let page = adw::PreferencesPage::new();
         let group = adw::PreferencesGroup::new();
+        group.set_title("Appearance");
 
         let config = self.config.borrow();
 
@@ -1082,7 +1214,124 @@ impl UiState {
             .build();
         group.add(&block_compact_row);
 
+        let terminal_group = adw::PreferencesGroup::new();
+        terminal_group.set_title("Terminal & Blocks");
+        let terminal_mode_model = gtk4::StringList::new(&["Block", "VTE compatibility"]);
+        let terminal_mode_row = adw::ComboRow::builder()
+            .title("Terminal Backend")
+            .subtitle("Applies to new local tabs; splits beside Block use VTE")
+            .model(&terminal_mode_model)
+            .selected(match config.terminal_mode {
+                crate::config::TerminalMode::Block => 0,
+                crate::config::TerminalMode::Vte => 1,
+            })
+            .build();
+        let safe_mode = std::env::var_os("JTERM4_SAFE_MODE").is_some();
+        terminal_mode_row.set_sensitive(!safe_mode);
+        terminal_group.add(&terminal_mode_row);
+
+        let command_history_row = adw::SwitchRow::builder()
+            .title("Command History Index")
+            .subtitle("Store commands, cwd and status; never terminal output")
+            .active(config.command_history_enabled)
+            .build();
+        command_history_row.set_sensitive(!safe_mode);
+        terminal_group.add(&command_history_row);
+
+        let privacy_group = adw::PreferencesGroup::new();
+        privacy_group.set_title("Features & Privacy");
+        let notifications_row = adw::SwitchRow::builder()
+            .title("Long-command Notifications")
+            .active(config.notify_long_blocks)
+            .build();
+        notifications_row.set_sensitive(!safe_mode);
+        privacy_group.add(&notifications_row);
+
+        let remote_clipboard_row = adw::SwitchRow::builder()
+            .title("Allow OSC 52 Clipboard Writes")
+            .subtitle("Enable only for trusted local and remote programs")
+            .active(config.allow_remote_clipboard_write)
+            .build();
+        remote_clipboard_row.set_sensitive(!safe_mode);
+        privacy_group.add(&remote_clipboard_row);
+
+        let ai_group = adw::PreferencesGroup::new();
+        ai_group.set_title("AI & Agent");
+        ai_group.set_description(Some(
+            "API keys are read from the environment and are never saved in config.toml",
+        ));
+        let ai_enabled_row = adw::SwitchRow::builder()
+            .title("Enable AI Features")
+            .active(config.ai_enabled)
+            .build();
+        ai_enabled_row.set_sensitive(!safe_mode);
+        ai_group.add(&ai_enabled_row);
+
+        let agent_enabled_row = adw::SwitchRow::builder()
+            .title("Enable Approval-gated Agent")
+            .subtitle("Every proposed command remains editable and requires approval")
+            .active(config.agent_enabled)
+            .build();
+        agent_enabled_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&agent_enabled_row);
+
+        let provider_model = gtk4::StringList::new(&["Anthropic", "OpenAI-compatible", "Ollama"]);
+        let provider_row = adw::ComboRow::builder()
+            .title("Provider")
+            .model(&provider_model)
+            .selected(match config.ai_provider.as_str() {
+                "openai-compatible" => 1,
+                "ollama" => 2,
+                _ => 0,
+            })
+            .build();
+        provider_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&provider_row);
+
+        let model_row = adw::EntryRow::new();
+        model_row.set_title("Model");
+        model_row.set_text(&config.ai_model);
+        model_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&model_row);
+
+        let base_url_row = adw::EntryRow::new();
+        base_url_row.set_title("Base URL");
+        base_url_row.set_text(&config.ai_base_url);
+        base_url_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&base_url_row);
+
+        let max_tokens_adj = Adjustment::new(
+            config.ai_max_tokens as f64,
+            64.0,
+            32_768.0,
+            64.0,
+            512.0,
+            0.0,
+        );
+        let max_tokens_row = adw::SpinRow::new(Some(&max_tokens_adj), 64.0, 0);
+        max_tokens_row.set_title("Maximum Response Tokens");
+        max_tokens_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&max_tokens_row);
+
+        let agent_turns_adj =
+            Adjustment::new(config.agent_max_turns as f64, 1.0, 100.0, 1.0, 5.0, 0.0);
+        let agent_turns_row = adw::SpinRow::new(Some(&agent_turns_adj), 1.0, 0);
+        agent_turns_row.set_title("Agent Turn Limit");
+        agent_turns_row.set_sensitive(!safe_mode && config.ai_enabled && config.agent_enabled);
+        ai_group.add(&agent_turns_row);
+
+        let redact_row = adw::SwitchRow::builder()
+            .title("Redact Common Secrets")
+            .subtitle("Apply before terminal context is sent to a provider")
+            .active(config.ai_redact_secrets)
+            .build();
+        redact_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&redact_row);
+
         page.add(&group);
+        page.add(&terminal_group);
+        page.add(&privacy_group);
+        page.add(&ai_group);
         dialog.add(&page);
 
         drop(config);
@@ -1094,7 +1343,7 @@ impl UiState {
             let idx = row.selected() as usize;
             if let Some(theme) = themes.get(idx) {
                 ui.apply_theme(theme);
-                save_config(&ui.config.borrow());
+                ui.persist_config();
             }
         });
 
@@ -1109,7 +1358,7 @@ impl UiState {
                 let new_desc = format!("{} {}", family, size);
                 ui.config.borrow_mut().font_desc = new_desc;
                 ui.apply_font_all();
-                save_config(&ui.config.borrow());
+                ui.persist_config();
             }
         });
 
@@ -1127,7 +1376,7 @@ impl UiState {
             let new_desc = format!("{} {}", family, size);
             ui.config.borrow_mut().font_desc = new_desc;
             ui.apply_font_all();
-            save_config(&ui.config.borrow());
+            ui.persist_config();
         });
 
         // --- Signal: Font Scale ---
@@ -1136,7 +1385,7 @@ impl UiState {
             let new_scale = row.value();
             ui.set_font_scale_all(new_scale);
             ui.config.borrow_mut().default_font_scale = new_scale;
-            save_config(&ui.config.borrow());
+            ui.persist_config();
         });
 
         // --- Signal: Opacity ---
@@ -1146,7 +1395,7 @@ impl UiState {
             ui.window_opacity.set(val);
             ui.window.set_opacity(val);
             ui.config.borrow_mut().window_opacity = val;
-            save_config(&ui.config.borrow());
+            ui.persist_config();
         });
 
         // --- Signal: Scrollback ---
@@ -1155,13 +1404,130 @@ impl UiState {
             let val = row.value() as u32;
             ui.config.borrow_mut().terminal_scrollback_lines = val;
             ui.apply_scrollback_all();
-            save_config(&ui.config.borrow());
+            ui.persist_config();
         });
 
         let ui = self.clone();
         block_compact_row.connect_active_notify(move |row| {
             ui.config.borrow_mut().block_compact = row.is_active();
-            save_config(&ui.config.borrow());
+            ui.sync_block_configs();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        terminal_mode_row.connect_selected_notify(move |row| {
+            ui.config.borrow_mut().terminal_mode = if row.selected() == 0 {
+                crate::config::TerminalMode::Block
+            } else {
+                crate::config::TerminalMode::Vte
+            };
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        command_history_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            let mut config = ui.config.borrow_mut();
+            config.command_history_enabled = enabled;
+            if enabled && config.command_history_path.is_none() {
+                config.command_history_path = Some(crate::config::default_command_history_path());
+            }
+            drop(config);
+            ui.sync_block_configs();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        notifications_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().notify_long_blocks = row.is_active();
+            ui.sync_block_configs();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        remote_clipboard_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().allow_remote_clipboard_write = row.is_active();
+            ui.sync_block_configs();
+            ui.persist_config();
+        });
+
+        let dependent_rows: Vec<gtk4::Widget> = vec![
+            agent_enabled_row.clone().upcast(),
+            provider_row.clone().upcast(),
+            model_row.clone().upcast(),
+            base_url_row.clone().upcast(),
+            max_tokens_row.clone().upcast(),
+            redact_row.clone().upcast(),
+        ];
+        let agent_turns_for_ai = agent_turns_row.clone();
+        let agent_enabled_for_ai = agent_enabled_row.clone();
+        let ui = self.clone();
+        ai_enabled_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            ui.config.borrow_mut().ai_enabled = enabled;
+            for dependent in &dependent_rows {
+                dependent.set_sensitive(enabled);
+            }
+            agent_turns_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
+            ui.persist_config();
+        });
+
+        let turns_for_agent = agent_turns_row.clone();
+        let ui = self.clone();
+        agent_enabled_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            ui.config.borrow_mut().agent_enabled = enabled;
+            turns_for_agent.set_sensitive(enabled);
+            ui.persist_config();
+        });
+
+        let model_for_provider = model_row.clone();
+        let base_for_provider = base_url_row.clone();
+        let ui = self.clone();
+        provider_row.connect_selected_notify(move |row| {
+            let provider = match row.selected() {
+                1 => crate::ai::Provider::OpenAiCompatible,
+                2 => crate::ai::Provider::Ollama,
+                _ => crate::ai::Provider::Anthropic,
+            };
+            model_for_provider.set_text(provider.default_model());
+            base_for_provider.set_text(provider.default_base_url());
+            let mut config = ui.config.borrow_mut();
+            config.ai_provider = provider.as_config_value().to_string();
+            config.ai_model = provider.default_model().to_string();
+            config.ai_base_url = provider.default_base_url().to_string();
+            drop(config);
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        model_row.connect_changed(move |row| {
+            ui.config.borrow_mut().ai_model = row.text().to_string();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        base_url_row.connect_changed(move |row| {
+            ui.config.borrow_mut().ai_base_url = row.text().to_string();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        max_tokens_row.connect_value_notify(move |row| {
+            ui.config.borrow_mut().ai_max_tokens = row.value() as u32;
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        agent_turns_row.connect_value_notify(move |row| {
+            ui.config.borrow_mut().agent_max_turns = row.value() as u32;
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        redact_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().ai_redact_secrets = row.is_active();
+            ui.persist_config();
         });
 
         // Key controller: Ctrl+Shift+O to close
@@ -1352,8 +1718,8 @@ impl UiState {
             return;
         }
 
-        let Some(term_view) = self.current_term_view() else {
-            log::debug!("[workflows] no active block-mode tab");
+        let Some(pane) = self.current_pane_leaf() else {
+            log::debug!("[workflows] no active terminal pane");
             return;
         };
 
@@ -1368,7 +1734,7 @@ impl UiState {
             let dialog = adw::MessageDialog::builder()
                 .heading("No workflows yet")
                 .body(format!(
-                    "Add `*.toml` workflow files to:\n\n{}",
+                    "Add `*.toml`, `*.yaml`, or `*.yml` workflow files to:\n\n{}",
                     crate::workflows::workflows_dir().display()
                 ))
                 .build();
@@ -1400,7 +1766,16 @@ impl UiState {
         let haystacks: Rc<Vec<String>> = Rc::new(
             workflows
                 .iter()
-                .map(|w| format!("{} {} {}", w.name, w.description, w.command).to_lowercase())
+                .map(|w| {
+                    format!(
+                        "{} {} {} {}",
+                        w.name,
+                        w.description,
+                        w.command,
+                        w.tags.join(" ")
+                    )
+                    .to_lowercase()
+                })
                 .collect(),
         );
 
@@ -1464,16 +1839,15 @@ impl UiState {
         // cheap relative to the dialog work that follows.
         let workflows_for_pick = workflows.clone();
         let ui_self = self.clone();
-        let term_view_for_pick = term_view.clone();
+        let pane_for_pick = pane.clone();
         let pick = Rc::new(move |idx: usize| {
             let Some(wf) = workflows_for_pick.get(idx).cloned() else {
                 return;
             };
             if wf.args.is_empty() {
-                term_view_for_pick.grab_focus();
-                term_view_for_pick.write_input(wf.command.as_bytes());
+                ui_self.insert_review_text(&pane_for_pick, &wf.command);
             } else {
-                ui_self.show_workflow_args_dialog(wf, term_view_for_pick.clone());
+                ui_self.show_workflow_args_dialog(wf, pane_for_pick.clone());
             }
         });
 
@@ -1557,13 +1931,13 @@ impl UiState {
     }
 
     /// Modal arg-entry dialog for a workflow. One Entry per arg, default
-    /// pre-filled; "Run" substitutes and writes the resolved command into
+    /// pre-filled; "Insert command" substitutes and writes the resolved command into
     /// the live PTY (without a trailing newline — user reviews and hits
     /// Enter). Cancel/Escape exits without touching the terminal.
     pub(crate) fn show_workflow_args_dialog(
         &self,
         wf: crate::workflows::Workflow,
-        term_view: Rc<crate::block_view::TermView>,
+        pane: crate::ui::PaneLeaf,
     ) {
         let dialog = adw::Dialog::builder()
             .title(format!("Workflow: {}", wf.name))
@@ -1621,7 +1995,7 @@ impl UiState {
             entries.borrow_mut().push((arg.name.clone(), entry));
         }
 
-        let run_btn = gtk4::Button::with_label("Run");
+        let run_btn = gtk4::Button::with_label("Insert command");
         run_btn.add_css_class("suggested-action");
         run_btn.set_halign(gtk4::Align::End);
         run_btn.set_margin_top(8);
@@ -1633,7 +2007,8 @@ impl UiState {
         dialog.set_child(Some(&toolbar_view));
 
         let entries_for_run = entries.clone();
-        let term_view_for_run = term_view.clone();
+        let pane_for_run = pane.clone();
+        let ui_for_run = self.clone();
         let dialog_for_run = dialog.clone();
         let template = wf.command.clone();
         run_btn.connect_clicked(move |_| {
@@ -1644,12 +2019,11 @@ impl UiState {
                 .collect();
             let resolved = crate::workflows::substitute(&template, &bindings);
             dialog_for_run.force_close();
-            term_view_for_run.grab_focus();
-            term_view_for_run.write_input(resolved.as_bytes());
+            ui_for_run.insert_review_text(&pane_for_run, &resolved);
         });
 
-        // Escape closes; Ctrl+Enter from any field triggers Run for
-        // keyboard-only operation.
+        // Escape closes; Ctrl+Enter from any field inserts the command for
+        // keyboard-only operation. It deliberately never sends Enter to PTY.
         let key_controller = EventControllerKey::new();
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let dialog_for_key = dialog.clone();

@@ -26,10 +26,32 @@ The manifest requests:
 - `--filesystem=host` so the file tree and reported working directories can show
   host projects. Flatpak still excludes several system paths from this shortcut.
 - `--talk-name=org.freedesktop.Flatpak` for `flatpak-spawn --host`.
-- SSH agent and network access for remote sessions and the optional AI panel.
+- SSH agent and network access for remote sessions and the optional AI/Agent UI.
 
 OSC 52 clipboard writes remain disabled by jterm4 unless the user explicitly
 enables them. AI-bound terminal text is still redacted by default.
+
+The package installs shell integration, example workflows, and the welcome
+notebook below `/app/share/jterm4`. `JTERM4_ASSET_DIR` and
+`JTERM4_WORKFLOW_DIR` are fixed to those read-only package paths so built-in
+content is available without copying it into the user's writable data area.
+User workflows in the per-app config directory continue to take precedence.
+
+The interactive terminal itself runs on the host. Its rc file therefore cannot
+reliably source `/app/share/...` directly, because `/app` belongs to the Flatpak
+mount namespace. Load the embedded script through the installed application ID
+instead. For bash, add this to the host `~/.bashrc`:
+
+```bash
+if [[ $TERM_PROGRAM == jterm4 ]]; then
+    source <(flatpak run io.github.beamiter.jterm4 --shell-integration bash)
+fi
+```
+
+Use `zsh` in the command for `~/.zshrc`. Fish can use
+`flatpak run io.github.beamiter.jterm4 --shell-integration fish | source` inside
+the equivalent `TERM_PROGRAM` guard. The child environment is set before the rc
+file is read, for both Block and VTE backends.
 
 ## Build
 
@@ -55,13 +77,24 @@ and Block modes under headless X11 and Wayland sessions.
 ```bash
 flatpak --user install ./io.github.beamiter.jterm4.flatpak
 flatpak run io.github.beamiter.jterm4 --doctor
+flatpak run --command=jterm4-support-bundle io.github.beamiter.jterm4 "$PWD"
 flatpak run io.github.beamiter.jterm4
 ```
 
+The support archive command performs no network requests and records neither
+host paths nor terminal/configuration contents. Review its files before sharing.
+
 Flatpak applications do not automatically inherit arbitrary host environment
-variables. To use the AI panel, provide `ANTHROPIC_API_KEY` to the app through a
-trusted launcher or an explicit Flatpak override. Treat such overrides as secret
-configuration.
+variables. To use AI, provide `JTERM4_AI_API_KEY` or the selected provider's
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_KEY` through a trusted
+launcher or an explicit Flatpak override. Treat such overrides as secret
+configuration; API keys are intentionally not accepted in `config.toml`.
+
+AI `curl` requests use the host-command bridge. Notebook `shell`/unlabelled cells
+use the configured shell argv (including its host wrapper when present), while an
+explicit interpreter fence selects that interpreter by name. Executable notebooks
+must therefore be treated as trusted code, not as sandboxed snippets; review a
+`.jtnb.md` file before pressing Run or Run All.
 
 ## Known boundary
 
