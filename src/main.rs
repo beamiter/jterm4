@@ -780,29 +780,47 @@ pub fn run() -> glib::ExitCode {
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
         let notebook_for_switch = notebook.clone();
+        // Invalidates deferred focus work from earlier pages during a rapid
+        // Ctrl+PageUp/PageDown sequence.
+        let tab_focus_generation = Rc::new(Cell::new(0u64));
         notebook.connect_switch_page(move |_, widget, page_num| {
+            let generation = tab_focus_generation.get().wrapping_add(1);
+            tab_focus_generation.set(generation);
             if ui_for_switch.search_bar.is_search_mode() {
                 ui_for_switch.search_apply();
                 ui_for_switch.search_entry.grab_focus();
             } else {
-                ui_for_switch.focus_terminal_in_page(widget);
+                ui_for_switch.focus_terminal_in_page_now(widget);
             }
             // `switch-page` runs before GTK has completed map/allocation and a
             // held Ctrl+PageUp can queue several switches in one event burst.
-            // Reclaim focus on the next frame, but only if this is still the
-            // selected page; otherwise an older tab's deferred callback can
-            // steal focus from the final tab in the cycle.
+            // Retry across a few frames until the live VTE is mapped and accepts
+            // focus. Every retry is scoped to both the selected page and this
+            // switch generation, so stale callbacks cannot focus an older tab.
             let notebook_for_focus = notebook_for_switch.clone();
             let target_widget = widget.clone();
             let ui_for_focus = ui_for_switch.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-                if notebook_for_focus.current_page() == Some(page_num) {
-                    if ui_for_focus.search_bar.is_search_mode() {
-                        ui_for_focus.search_apply();
-                        ui_for_focus.search_entry.grab_focus();
-                    } else {
-                        ui_for_focus.focus_terminal_in_page(&target_widget);
-                    }
+            let focus_generation = tab_focus_generation.clone();
+            let attempts = Rc::new(Cell::new(0u8));
+            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                if focus_generation.get() != generation
+                    || notebook_for_focus.current_page() != Some(page_num)
+                {
+                    return glib::ControlFlow::Break;
+                }
+
+                if ui_for_focus.search_bar.is_search_mode() {
+                    ui_for_focus.search_apply();
+                    ui_for_focus.search_entry.grab_focus();
+                    return glib::ControlFlow::Break;
+                }
+
+                attempts.set(attempts.get() + 1);
+                let focused = ui_for_focus.focus_terminal_in_page_now(&target_widget);
+                if focused || attempts.get() >= 4 {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
                 }
             });
             // Clear activity/bell indicators for the tab being switched to

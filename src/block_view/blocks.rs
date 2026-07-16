@@ -367,7 +367,17 @@ fn output_visual_row_count(text: &str, cols: i64) -> i64 {
     use unicode_width::UnicodeWidthChar;
 
     let cols = cols.max(1) as usize;
-    let text = output_display_text(text);
+    // Count what the terminal leaves on screen, not the byte stream used to
+    // produce it. Programs such as apt repeatedly repaint a progress row with
+    // CR + EL and wrap ordinary text in SGR/OSC sequences. Counting those
+    // control bytes (and every overwritten progress update) can turn a short
+    // result into a false "long output" block. Long blocks are fitted to the
+    // pane height, so that misclassification shows up as a large blank tail.
+    // `strip_ansi` applies the horizontal cursor/erase semantics as well as
+    // removing escape sequences, which makes this estimate match the VTE
+    // snapshot closely enough for the short/long decision.
+    let rendered = strip_ansi(text);
+    let text = output_display_text(&rendered);
     if text.is_empty() {
         return 1;
     }
@@ -1731,6 +1741,17 @@ mod tests {
     fn visual_row_count_includes_terminal_wrapping() {
         assert_eq!(super::output_visual_row_count("123456789\nabc", 4), 4);
         assert_eq!(super::output_visual_row_count("界界界", 4), 2);
+    }
+
+    #[test]
+    fn visual_row_count_ignores_ansi_and_overwritten_progress_rows() {
+        let apt_like = concat!(
+            "\r0% [Working]",
+            "\r\x1b[K\x1b[32mHit:1 repo\x1b[0m\r\n",
+            "\r50% [Working]",
+            "\r\x1b[KDone\r\n",
+        );
+        assert_eq!(super::output_visual_row_count(apt_like, 20), 2);
     }
 
     #[test]

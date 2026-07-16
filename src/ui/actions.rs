@@ -357,6 +357,21 @@ impl UiState {
         }
     }
 
+    /// Try to focus the page's live input surface synchronously.
+    ///
+    /// Tab switching owns its own page-scoped retry loop, so it must not use
+    /// `PaneLeaf::grab_focus`: that helper schedules an unscoped idle retry
+    /// which can outlive the switch and steal focus back to an older page when
+    /// Ctrl+PageUp/PageDown is pressed repeatedly.
+    pub(crate) fn focus_terminal_in_page_now(&self, widget: &gtk4::Widget) -> bool {
+        let Some(terminal) = PaneNode::from_widget(widget).and_then(|node| node.active_terminal())
+        else {
+            return false;
+        };
+        terminal.grab_focus();
+        terminal.has_focus()
+    }
+
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
         self.notebook
             .current_page()
