@@ -45,6 +45,10 @@ impl TabPlacement {
     }
 }
 
+fn resolve_sidebar_visibility(explicit: Option<bool>, placement: TabPlacement) -> bool {
+    explicit.unwrap_or(placement == TabPlacement::Sidebar)
+}
+
 /// Which single view the sidebar shows (tab list vs file tree).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarView {
@@ -199,6 +203,10 @@ pub struct Config {
     pub(crate) tab_placement: TabPlacement,
     /// Which single view the sidebar shows (tab list vs file tree).
     pub(crate) sidebar_view: SidebarView,
+    /// Whether the left sidebar is visible. When absent from an older config,
+    /// startup derives the default from tab placement: open for sidebar tabs,
+    /// closed for top-bar tabs.
+    pub(crate) sidebar_visible: bool,
     /// Sidebar width in pixels (resizable divider position).
     pub(crate) sidebar_width: u32,
     // Block view optimizations
@@ -461,6 +469,7 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "terminal_mode",
     "tab_placement",
     "sidebar_view",
+    "sidebar_visible",
     "sidebar_width",
     "max_visible_blocks",
     "lazy_load_threshold",
@@ -532,6 +541,7 @@ fn validate_value_types(table: &toml::Table, issues: &mut Vec<ConfigIssue>) {
         "scroll_reporting_enabled",
         "focus_reporting_enabled",
         "preserve_live_scrollback",
+        "sidebar_visible",
         "ai_panel_visible",
         "ai_redact_secrets",
         "allow_remote_clipboard_write",
@@ -829,6 +839,7 @@ struct FileConfig {
     terminal_mode: Option<String>,
     tab_placement: Option<String>,
     sidebar_view: Option<String>,
+    sidebar_visible: Option<bool>,
     sidebar_width: Option<u32>,
     // Block view optimizations
     max_visible_blocks: Option<u32>,
@@ -951,6 +962,7 @@ fn load_file_config() -> FileConfig {
             .get("sidebar_view")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        sidebar_visible: table.get("sidebar_visible").and_then(|v| v.as_bool()),
         sidebar_width: table_u32(&table, "sidebar_width"),
         max_visible_blocks: table_u32(&table, "max_visible_blocks"),
         lazy_load_threshold: table_u32(&table, "lazy_load_threshold"),
@@ -1192,6 +1204,13 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         }
     };
 
+    let tab_placement = TabPlacement::parse(
+        &env_string("JTERM4_TAB_PLACEMENT")
+            .or(fc.tab_placement)
+            .unwrap_or_else(|| "sidebar".to_string()),
+    );
+    let sidebar_visible = resolve_sidebar_visibility(fc.sidebar_visible, tab_placement);
+
     let config = Config {
         window_opacity,
         terminal_scrollback_lines,
@@ -1206,12 +1225,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         shell,
         startup_commands: fc.startup_commands,
         terminal_mode,
-        tab_placement: TabPlacement::parse(
-            &env_string("JTERM4_TAB_PLACEMENT")
-                .or(fc.tab_placement)
-                .unwrap_or_else(|| "sidebar".to_string()),
-        ),
+        tab_placement,
         sidebar_view: SidebarView::parse(&fc.sidebar_view.unwrap_or_else(|| "tabs".to_string())),
+        sidebar_visible,
         sidebar_width: fc.sidebar_width.unwrap_or(220).clamp(120, 800),
         max_visible_blocks,
         lazy_load_threshold,
@@ -1310,6 +1326,10 @@ pub(crate) fn save_config(config: &Config) {
     table.insert(
         "sidebar_view".into(),
         toml::Value::String(config.sidebar_view.as_str().to_string()),
+    );
+    table.insert(
+        "sidebar_visible".into(),
+        toml::Value::Boolean(config.sidebar_visible),
     );
     table.insert(
         "sidebar_width".into(),
@@ -1651,5 +1671,22 @@ unknown_action = "F8"
     #[test]
     fn fresh_install_has_no_personal_remote_targets() {
         assert!(default_remote_hosts().is_empty());
+    }
+
+    #[test]
+    fn sidebar_visibility_default_follows_tab_placement() {
+        assert!(resolve_sidebar_visibility(None, TabPlacement::Sidebar));
+        assert!(!resolve_sidebar_visibility(None, TabPlacement::TopBar));
+        assert!(resolve_sidebar_visibility(Some(true), TabPlacement::TopBar));
+        assert!(!resolve_sidebar_visibility(
+            Some(false),
+            TabPlacement::Sidebar
+        ));
+
+        let issues = validate_config_contents(
+            "tab_placement = \"top\"\nsidebar_visible = false\nsidebar_width = 220\n",
+        )
+        .unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
     }
 }

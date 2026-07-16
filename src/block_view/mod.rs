@@ -3123,22 +3123,38 @@ impl TermView {
             let unread = unread_count.clone();
             let scroll = block_scroll.clone();
             let holder = active.borrow().widget().clone();
+            let programmatic_scroll = programmatic_scroll.clone();
             let check_pending = Rc::new(Cell::new(false));
+            let pending_programmatic_only = Rc::new(Cell::new(true));
             block_scroll
                 .vadjustment()
                 .connect_value_changed(move |_adj| {
+                    // `set_value()` emits this synchronously, while the geometry
+                    // check below deliberately runs on idle. Preserve the source
+                    // now: otherwise the programmatic flag has been cleared by
+                    // the time the idle runs and a follow-bottom pin is mistaken
+                    // for the user scrolling into history.
+                    let caused_by_programmatic_scroll = programmatic_scroll.get();
                     if check_pending.get() {
+                        if !caused_by_programmatic_scroll {
+                            pending_programmatic_only.set(false);
+                        }
                         return;
                     }
                     check_pending.set(true);
+                    pending_programmatic_only.set(caused_by_programmatic_scroll);
                     let user_scrolled = user_scrolled.clone();
                     let fab = fab.clone();
                     let unread = unread.clone();
                     let scroll = scroll.clone();
                     let holder = holder.clone();
                     let check_pending = check_pending.clone();
+                    let pending_programmatic_only = pending_programmatic_only.clone();
                     glib::idle_add_local_once(move || {
                         check_pending.set(false);
+                        if pending_programmatic_only.replace(true) {
+                            return;
+                        }
                         let vp_h = scroll.height() as f64;
                         let at_bottom = holder
                             .compute_bounds(&scroll)

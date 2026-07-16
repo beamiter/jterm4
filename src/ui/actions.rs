@@ -107,7 +107,7 @@ impl UiState {
             }
             Action::FilterTabs => {
                 log::debug!("Filter tabs");
-                self.sidebar.set_visible(true);
+                self.set_sidebar_visible(true, true);
                 // The search entry lives on the Tabs sidebar page even when
                 // tabs themselves are placed in the top bar. Show that page so
                 // the focused entry is never invisible.

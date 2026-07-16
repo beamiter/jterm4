@@ -418,6 +418,10 @@ pub fn run() -> glib::ExitCode {
 
         sidebar.append(&sidebar_switcher);
         sidebar.append(&sidebar_stack);
+        // Older configs have no explicit visibility key. `load_config` derives
+        // their initial state from tab placement, matching jterm1: top-bar tabs
+        // start with the optional file sidebar closed.
+        sidebar.set_visible(config.borrow().sidebar_visible);
 
         // Content area: resizable sidebar | notebook (draggable divider).
         let right_col = gtk4::Box::new(Orientation::Vertical, 0);
@@ -862,11 +866,16 @@ pub fn run() -> glib::ExitCode {
         let session_ids_for_close = ui.session_ids.clone();
         let app_for_close = app.clone();
         let config_for_close = ui.config.clone();
+        let sidebar_for_close = sidebar.clone();
         let paned_for_close = content_box.clone();
         window.connect_close_request(move |_| {
-            // Persist the current sidebar width before teardown.
+            // Persist the current sidebar geometry/state before teardown.
             let width = paned_for_close.position().max(120) as u32;
-            config_for_close.borrow_mut().sidebar_width = width;
+            {
+                let mut config = config_for_close.borrow_mut();
+                config.sidebar_width = width;
+                config.sidebar_visible = sidebar_for_close.is_visible();
+            }
             crate::config::save_config(&config_for_close.borrow());
 
             save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());

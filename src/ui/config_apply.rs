@@ -159,6 +159,7 @@ impl UiState {
         let font_scale = new_config.default_font_scale;
         let tab_placement = new_config.tab_placement;
         let sidebar_view = new_config.sidebar_view;
+        let sidebar_visible = new_config.sidebar_visible;
         let ai_visible = new_config.ai_panel_visible;
 
         // New panes/tabs immediately use a changed shell; all other config is
@@ -188,6 +189,7 @@ impl UiState {
         self.tab_placement.set(tab_placement);
         self.sidebar_view.set(sidebar_view);
         self.apply_tab_placement();
+        self.set_sidebar_visible(sidebar_visible, false);
 
         self.ai_panel_visible.set(ai_visible);
         if ai_visible {

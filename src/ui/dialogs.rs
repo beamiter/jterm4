@@ -43,7 +43,16 @@ impl UiState {
     }
 
     pub(crate) fn toggle_sidebar(&self) {
-        self.sidebar.set_visible(!self.sidebar.is_visible());
+        self.set_sidebar_visible(!self.sidebar.is_visible(), true);
+    }
+
+    /// Apply sidebar visibility and optionally persist the user's choice.
+    pub(crate) fn set_sidebar_visible(&self, visible: bool, persist: bool) {
+        self.sidebar.set_visible(visible);
+        if persist {
+            self.config.borrow_mut().sidebar_visible = visible;
+            save_config(&self.config.borrow());
+        }
     }
 
     pub(crate) fn toggle_command_palette(&self) {
