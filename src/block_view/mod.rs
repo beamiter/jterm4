@@ -246,6 +246,10 @@ fn history_edge_navigation_available(state: BlockState, editor_dirty: bool) -> b
         )
 }
 
+fn should_buffer_background_output(idle_input_dirty: bool, pty_synced: bool) -> bool {
+    !idle_input_dirty && !pty_synced
+}
+
 /// Collect selected commands in terminal order, skipping background-only blocks.
 fn selected_command_text<'a, I>(blocks: I, selected: &HashSet<u64>) -> String
 where
@@ -1239,7 +1243,10 @@ impl ReaderCtx {
                                     // arrives before the user begins editing. Once input
                                     // is dirty, PTY echo/completion is indistinguishable
                                     // from a background process and remains inline.
-                                    if !idle_input_dirty_rc.get() {
+                                    if should_buffer_background_output(
+                                        idle_input_dirty_rc.get(),
+                                        pty_synced_rc.get(),
+                                    ) {
                                         let mut pending = background_output_rc.borrow_mut();
                                         pending.extend_from_slice(bytes);
                                         if pending.len() > MAX_RAW_OUTPUT_BYTES {
@@ -4553,9 +4560,9 @@ mod tests {
         build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
         history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
         record_external_input, scroll_delta_to_reveal, selected_command_text, selected_id_range,
-        strip_ansi, strip_ansi_with_clear_detect, take_background_output,
-        truncate_plain_output_for_height, visible_indices_for_viewport, BlockData, BlockState,
-        ViewportState,
+        should_buffer_background_output, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, truncate_plain_output_for_height, visible_indices_for_viewport,
+        BlockData, BlockState, ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -4579,6 +4586,13 @@ mod tests {
         );
         assert!(pending.borrow().is_empty());
         assert!(take_background_output(&pending).is_none());
+    }
+
+    #[test]
+    fn programmatic_editor_sync_keeps_async_output_inline() {
+        assert!(should_buffer_background_output(false, false));
+        assert!(!should_buffer_background_output(true, false));
+        assert!(!should_buffer_background_output(false, true));
     }
 
     #[test]
