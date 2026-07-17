@@ -1,16 +1,17 @@
 name: Apply block mode UX fix
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix/block-mode-tab-focus-long-output
+      - master
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, 'run block mode UX fix')
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/block-mode-tab-focus-long-output'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
