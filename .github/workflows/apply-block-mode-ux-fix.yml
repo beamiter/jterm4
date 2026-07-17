@@ -1,0 +1,52 @@
+name: Apply block mode UX fix
+
+on:
+  push:
+    branches:
+      - fix/block-mode-tab-focus-long-output
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, 'run block mode UX fix')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/block-mode-tab-focus-long-output
+
+      - name: Install GTK and VTE development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev \
+            pkg-config
+
+      - name: Apply focused source changes
+        run: python3 .github/scripts/apply_block_mode_ux_fix.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Remove one-shot patch machinery
+        run: |
+          rm .github/scripts/apply_block_mode_ux_fix.py
+          rm .github/workflows/apply-block-mode-ux-fix.yml
+
+      - name: Commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: stabilize block tab focus and long output viewport"
+          git push origin HEAD:fix/block-mode-tab-focus-long-output
