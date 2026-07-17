@@ -41,6 +41,7 @@ jobs:
       - name: Remove one-shot patch machinery
         run: |
           rm .github/scripts/apply_block_mode_ux_fix.py
+          rm .github/scripts/.apply-block-ux-trigger
           rm .github/workflows/apply-block-mode-ux-fix.yml
 
       - name: Commit verified fix
