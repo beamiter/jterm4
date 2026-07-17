@@ -1,0 +1,56 @@
+name: Apply block capture and sidebar contrast fix
+
+on:
+  push:
+    branches:
+      - fix/block-command-capture-sidebar-contrast
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, 'run block capture contrast fix')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/block-command-capture-sidebar-contrast
+
+      - name: Install GTK and VTE development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev \
+            pkg-config
+
+      - name: Apply focused source changes
+        run: python3 .github/scripts/apply_block_capture_contrast_fix.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Remove one-shot patch machinery
+        run: |
+          rm .github/scripts/apply_block_capture_contrast_fix.py
+          rm -f .github/scripts/.apply-block-capture-contrast-trigger*
+          rm .github/workflows/apply-block-capture-contrast-fix.yml
+
+      - name: Commit verified fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: preserve block commands and improve sidebar contrast"
+          git push origin HEAD:fix/block-command-capture-sidebar-contrast
