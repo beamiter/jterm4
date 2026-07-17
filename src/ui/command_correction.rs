@@ -69,14 +69,22 @@ struct CommandCorrection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FailureKind {
-    AptPackageNotFound { package: String },
-    CommandNotFound { executable: String },
+    AptPackageNotFound {
+        package: String,
+    },
+    CommandNotFound {
+        executable: String,
+    },
     ExplicitSuggestion {
         offending: String,
         suggested: String,
     },
-    UnknownSubcommand { token: Option<String> },
-    UnknownOption { token: Option<String> },
+    UnknownSubcommand {
+        token: Option<String>,
+    },
+    UnknownOption {
+        token: Option<String>,
+    },
 }
 
 impl FailureKind {
@@ -321,14 +329,7 @@ fn resolve_correction_blocking(
         return Ok(None);
     };
     let system = correction_system_prompt();
-    let user = correction_user_prompt(
-        original_command,
-        exit_code,
-        output,
-        cwd,
-        failure,
-        remote,
-    );
+    let user = correction_user_prompt(original_command, exit_code, output, cwd, failure, remote);
     let reply = client
         .send_turns_blocking(
             Some(system),
@@ -391,9 +392,7 @@ fn resolve_apt_package(original_command: &str, package: &str) -> Option<CommandC
 
     Some(CommandCorrection {
         command,
-        message: format!(
-            "APT contains `{replacement}`, while the failed package was `{package}`."
-        ),
+        message: format!("APT contains `{replacement}`, while the failed package was `{package}`."),
         evidence: CorrectionEvidence::AptIndex,
     })
 }
@@ -435,6 +434,13 @@ fn list_path_commands() -> Vec<String> {
                 return commands;
             }
         }
+    }
+
+    // In Flatpak, the process PATH describes the sandbox rather than the host
+    // where terminal commands run. If the host bash probe was unavailable, do
+    // not present sandbox executables as verified host candidates.
+    if crate::host::is_flatpak() {
+        return Vec::new();
     }
 
     let Some(path) = std::env::var_os("PATH") else {
@@ -548,8 +554,8 @@ fn edit_distance(left: &str, right: &str) -> usize {
     for (index, row) in matrix.iter_mut().enumerate() {
         row[0] = index;
     }
-    for index in 0..=right.len() {
-        matrix[0][index] = index;
+    for (index, value) in matrix[0].iter_mut().enumerate() {
+        *value = index;
     }
 
     for left_index in 1..=left.len() {
@@ -583,10 +589,12 @@ fn show_correction_dialog(
 ) {
     let danger = crate::agent::is_dangerous(&correction.command);
     let direct_run = correction.evidence.is_verified() && danger.is_none();
-    let title = if correction.evidence.is_verified() {
-        "Verified command correction"
-    } else {
-        "AI found a possible correction"
+    let title = match correction.evidence {
+        CorrectionEvidence::AptIndex | CorrectionEvidence::ExecutablePath => {
+            "Verified command correction"
+        }
+        CorrectionEvidence::TargetOutput => "The command suggested a correction",
+        CorrectionEvidence::AiUnverified => "AI found a possible correction",
     };
     let mut body = format!(
         "{}\n\n{}\n\nOriginal command:\n{}\n\nTarget directory:\n{}",
@@ -602,6 +610,10 @@ fn show_correction_dialog(
     } else if correction.evidence.is_verified() {
         body.push_str(
             "\n\nThe exact verified candidate may be inserted or run. Editing it removes that verification.",
+        );
+    } else if correction.evidence == CorrectionEvidence::TargetOutput {
+        body.push_str(
+            "\n\nThis tool-provided proposal is not independently verified and can only be inserted for review.",
         );
     } else {
         body.push_str(
@@ -948,10 +960,7 @@ fn extract_tool_suggestion(output: &str) -> Option<String> {
             } else {
                 lower.find("你是不是想")? + "你是不是想".len()
             };
-            let suffix = line[marker..]
-                .trim()
-                .trim_start_matches(':')
-                .trim();
+            let suffix = line[marker..].trim().trim_start_matches(':').trim();
             if !suffix.is_empty() && !matches!(suffix.to_ascii_lowercase().as_str(), "is" | "is:") {
                 if let Some(value) = clean_error_token(suffix) {
                     return Some(value);
@@ -1017,12 +1026,15 @@ fn clean_error_token(value: &str) -> Option<String> {
                     '\'' | '"' | '`' | ':' | ';' | ',' | '.' | '?' | '(' | ')' | '[' | ']'
                 )
         });
-    let value = value.split_whitespace().next()?.trim_matches(|character: char| {
-        matches!(
-            character,
-            '\'' | '"' | '`' | ':' | ';' | ',' | '.' | '?' | '(' | ')' | '[' | ']'
-        )
-    });
+    let value = value
+        .split_whitespace()
+        .next()?
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '\'' | '"' | '`' | ':' | ';' | ',' | '.' | '?' | '(' | ')' | '[' | ']'
+            )
+        });
     (!value.is_empty()).then(|| value.to_string())
 }
 
@@ -1042,7 +1054,12 @@ fn first_executable(command: &str) -> Option<String> {
         .filter(|word| !word.is_empty())
         .filter(|word| !word.contains('='))
         .filter(|word| !word.starts_with('-'))
-        .find(|word| !matches!(*word, "sudo" | "doas" | "env" | "command" | "nohup" | "time"))
+        .find(|word| {
+            !matches!(
+                *word,
+                "sudo" | "doas" | "env" | "command" | "nohup" | "time"
+            )
+        })
         .map(str::to_string)
 }
 
@@ -1051,10 +1068,7 @@ fn closest_command_word(command: &str, suggested: &str) -> Option<String> {
         .filter(|word| !word.is_empty() && !word.starts_with('-'))
         .filter(|word| !matches!(*word, "sudo" | "doas" | "env" | "command"))
         .min_by_key(|word| {
-            edit_distance(
-                &word.to_ascii_lowercase(),
-                &suggested.to_ascii_lowercase(),
-            )
+            edit_distance(&word.to_ascii_lowercase(), &suggested.to_ascii_lowercase())
         })
         .map(str::to_string)
 }
@@ -1064,23 +1078,28 @@ fn replace_shell_word(command: &str, old: &str, new: &str) -> Option<String> {
         return None;
     }
 
-    for (start, _) in command.match_indices(old) {
+    let mut matches = command.match_indices(old).filter_map(|(start, _)| {
         let end = start + old.len();
         let previous = command[..start].chars().next_back();
         let next = command[end..].chars().next();
-        if previous.is_some_and(is_shell_word_character)
-            || next.is_some_and(is_shell_word_character)
-        {
-            continue;
-        }
-
-        let mut replacement = String::with_capacity(command.len() + new.len());
-        replacement.push_str(&command[..start]);
-        replacement.push_str(new);
-        replacement.push_str(&command[end..]);
-        return Some(replacement);
+        (!previous.is_some_and(is_shell_word_character)
+            && !next.is_some_and(is_shell_word_character))
+        .then_some(start)
+    });
+    let start = matches.next()?;
+    // When the same token appears more than once, guessing which occurrence
+    // failed can silently change an unrelated argument. Leave that case to the
+    // editable AI fallback instead of claiming a deterministic correction.
+    if matches.next().is_some() {
+        return None;
     }
-    None
+
+    let end = start + old.len();
+    let mut replacement = String::with_capacity(command.len() + new.len());
+    replacement.push_str(&command[..start]);
+    replacement.push_str(new);
+    replacement.push_str(&command[end..]);
+    Some(replacement)
 }
 
 fn is_shell_word_character(character: char) -> bool {
@@ -1156,17 +1175,17 @@ fn adds_new_control_syntax(original: &str, candidate: &str) -> bool {
     }
     let original_lower = original.to_ascii_lowercase();
     let candidate_lower = candidate.to_ascii_lowercase();
-    ["| sh", "|sh", "| bash", "|bash"].iter().any(|pipe| {
-        candidate_lower.contains(pipe) && !original_lower.contains(pipe)
-    })
+    ["| sh", "|sh", "| bash", "|bash"]
+        .iter()
+        .any(|pipe| candidate_lower.contains(pipe) && !original_lower.contains(pipe))
 }
 
 fn adds_remote_execution(original: &str, candidate: &str) -> bool {
     let original_words = normalized_words(original);
     let candidate_words = normalized_words(candidate);
-    ["ssh", "scp", "sftp"].iter().any(|word| {
-        candidate_words.contains(*word) && !original_words.contains(*word)
-    })
+    ["ssh", "scp", "sftp"]
+        .iter()
+        .any(|word| candidate_words.contains(*word) && !original_words.contains(*word))
 }
 
 fn normalized_words(command: &str) -> HashSet<&str> {
@@ -1281,8 +1300,7 @@ mod tests {
                 suggested: "status".into()
             }
         );
-        let correction =
-            resolve_verified_correction("git statsu", &failure, true).unwrap();
+        let correction = resolve_verified_correction("git statsu", &failure, true).unwrap();
         assert_eq!(correction.command, "git status");
         assert_eq!(correction.evidence, CorrectionEvidence::TargetOutput);
     }
@@ -1294,6 +1312,7 @@ mod tests {
             Some("sudo apt-get install -y 'ffmpeg'")
         );
         assert!(replace_shell_word("/opt/fmpg/bin/run", "fmpg", "ffmpeg").is_none());
+        assert!(replace_shell_word("printf fmpg; apt install fmpg", "fmpg", "ffmpeg").is_none());
     }
 
     #[test]
@@ -1308,9 +1327,7 @@ mod tests {
 
         let ranked = rank_names(
             "gti",
-            ["git", "gio", "gtk4-demo"]
-                .into_iter()
-                .map(str::to_string),
+            ["git", "gio", "gtk4-demo"].into_iter().map(str::to_string),
         );
         assert_eq!(ranked.first().map(String::as_str), Some("git"));
     }
