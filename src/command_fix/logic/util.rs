@@ -18,11 +18,7 @@ pub(super) fn edit_distance(left: &str, right: &str) -> usize {
         let left_index = left_offset + 1;
         for (right_offset, right_character) in right.iter().enumerate() {
             let right_index = right_offset + 1;
-            let cost = if left_character == right_character {
-                0
-            } else {
-                1
-            };
+            let cost = usize::from(left_character != right_character);
             let mut value = (distance[left_index - 1][right_index] + 1)
                 .min(distance[left_index][right_index - 1] + 1)
                 .min(distance[left_index - 1][right_index - 1] + cost);
@@ -66,7 +62,7 @@ fn word_character(character: char) -> bool {
         || matches!(character, '_' | '-' | '+' | '.' | '/' | ':' | '@' | '%')
 }
 
-pub(super) fn safe_candidate(original: &str, candidate: &str) -> bool {
+pub(crate) fn safe_candidate(original: &str, candidate: &str) -> bool {
     if candidate.len() > MAX_COMMAND_BYTES
         || candidate.trim() == original.trim()
         || crate::review_input::validate(candidate).is_err()
@@ -108,36 +104,6 @@ fn adds_remote_execution(original: &str, candidate: &str) -> bool {
     let original = words(original);
     let candidate = words(candidate);
     candidate.contains("ssh") && !original.contains("ssh")
-}
-
-pub(super) fn bounded(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let half = max_bytes / 2;
-    let mut head = half;
-    while head > 0 && !text.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = text.len().saturating_sub(half);
-    while tail < text.len() && !text.is_char_boundary(tail) {
-        tail += 1;
-    }
-    format!(
-        "{}\n\n… output elided …\n\n{}",
-        &text[..head],
-        &text[tail..]
-    )
-}
-
-pub(super) fn truncate(message: &str, max_chars: usize) -> String {
-    let mut chars = message.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
 }
 
 #[cfg(test)]
