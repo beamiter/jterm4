@@ -35,6 +35,8 @@ cleanup:
 modules:
   - name: fast_float
     buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_INSTALL_LIBDIR=lib
     sources:
       - type: git
         url: https://github.com/fastfloat/fast_float.git
@@ -47,6 +49,8 @@ modules:
 
   - name: simdutf
     buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_INSTALL_LIBDIR=lib
     sources:
       - type: git
         url: https://github.com/simdutf/simdutf.git
@@ -61,6 +65,7 @@ modules:
     buildsystem: meson
     config-opts:
       - --buildtype=release
+      - --libdir=lib
       - -Dgtk3=false
       - -Dgtk4=true
       - -Dglade=false
