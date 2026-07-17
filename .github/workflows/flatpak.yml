@@ -54,6 +54,7 @@ jobs:
             flatpak \
             flatpak-builder \
             librsvg2-bin \
+            librsvg2-common \
             python3-venv \
             weston \
             xvfb
