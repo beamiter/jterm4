@@ -28,6 +28,9 @@ jobs:
             libpcre2-dev \
             pkg-config
 
+      - name: Repair prior Block test import
+        run: python3 .github/scripts/fix_block_test_import.py
+
       - name: Apply focused source changes
         run: python3 .github/scripts/apply_block_capture_contrast_fix.py
 
@@ -42,6 +45,7 @@ jobs:
 
       - name: Remove one-shot patch machinery
         run: |
+          rm .github/scripts/fix_block_test_import.py
           rm .github/scripts/apply_block_capture_contrast_fix.py
           rm -f .github/scripts/.apply-block-capture-contrast-trigger*
           rm .github/workflows/apply-block-capture-contrast-fix.yml
