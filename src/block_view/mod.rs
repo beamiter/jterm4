@@ -3946,6 +3946,47 @@ impl TermView {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
 
+    /// Reveal the live input when its tab becomes active. A single bottom
+    /// adjustment is too early during `switch-page`: mapping and virtualized block
+    /// visibility can change `upper` for several idle turns. Re-pin until the
+    /// geometry is stable, while marking every write as programmatic so it cannot
+    /// accidentally engage history scroll-lock.
+    pub(crate) fn reveal_live_input(&self) {
+        self.user_scrolled_up.set(false);
+        self.unread_count.set(0);
+        set_jump_fab_label(&self.jump_fab, 0);
+        self.jump_fab.set_visible(false);
+        self.block_list.queue_allocate();
+
+        let scroll = self.block_scroll.clone();
+        let user_scrolled = self.user_scrolled_up.clone();
+        let programmatic = self.programmatic_scroll.clone();
+        let attempts = Rc::new(Cell::new(0u8));
+        let stable_turns = Rc::new(Cell::new(0u8));
+        glib::idle_add_local(move || {
+            attempts.set(attempts.get().saturating_add(1));
+            user_scrolled.set(false);
+
+            let adj = scroll.vadjustment();
+            let target = (adj.upper() - adj.page_size()).max(adj.lower());
+            programmatic.set(true);
+            adj.set_value(target);
+            programmatic.set(false);
+
+            if (adj.value() - target).abs() < 1.0 {
+                stable_turns.set(stable_turns.get().saturating_add(1));
+            } else {
+                stable_turns.set(0);
+            }
+
+            if stable_turns.get() >= 2 || attempts.get() >= 12 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
     pub fn scroll_lines(&self, lines: i32) {
         // Ctrl+Up enters jterm1/Warp-style block selection at the newest block.
         {

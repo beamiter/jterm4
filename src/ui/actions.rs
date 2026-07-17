@@ -445,6 +445,15 @@ impl UiState {
         }
     }
 
+    /// Return the page's exact Block controller, when the active leaf uses
+    /// block mode. This mirrors `terminal_in_page` so tab activation never has to
+    /// discover the live surface by walking through read-only snapshot VTEs.
+    pub(crate) fn term_view_in_page(&self, widget: &gtk4::Widget) -> Option<Rc<TermView>> {
+        PaneNode::from_widget(widget)
+            .and_then(|node| node.active_leaf())
+            .and_then(|leaf| leaf.block_view())
+    }
+
     /// Return the page's exact live input surface.
     ///
     /// Block pages contain read-only VTE snapshots in addition to the active
