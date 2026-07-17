@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - fix/block-mode-selection-input-history
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, 'run block mode UX round2')
+    if: github.actor != 'github-actions[bot]' && (github.event_name == 'pull_request' || contains(github.event.head_commit.message, 'run block mode UX round2'))
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
