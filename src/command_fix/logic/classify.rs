@@ -1,7 +1,7 @@
 use super::util::edit_distance;
 use super::{Context, Failure};
 
-pub(super) fn classify(context: &Context) -> Option<Failure> {
+pub(crate) fn classify(context: &Context) -> Option<Failure> {
     if let Some(package) = line_suffix(&context.output, "unable to locate package") {
         return Some(Failure::AptPackageNotFound(package));
     }
@@ -61,10 +61,10 @@ fn command_not_found(output: &str) -> Option<String> {
                 return Some(token);
             }
         }
-        if lower.contains("unknown command:") {
-            if let Some(token) = line_suffix(line, "unknown command:") {
-                return Some(token);
-            }
+        if lower.contains("unknown command:")
+            && let Some(token) = line_suffix(line, "unknown command:")
+        {
+            return Some(token);
         }
         if let Some(index) = lower.rfind(": not found") {
             let prefix = &line[..index];
@@ -115,10 +115,11 @@ fn tool_suggestion(output: &str) -> Option<String> {
             return Some(token);
         }
         let suffix = line[marker_end..].trim().trim_start_matches(':').trim();
-        if !suffix.is_empty() && !matches!(suffix.to_ascii_lowercase().as_str(), "is" | "is:") {
-            if let Some(token) = clean_token(suffix) {
-                return Some(token);
-            }
+        if !suffix.is_empty()
+            && !matches!(suffix.to_ascii_lowercase().as_str(), "is" | "is:")
+            && let Some(token) = clean_token(suffix)
+        {
+            return Some(token);
         }
         if let Some(token) = lines
             .iter()
@@ -209,8 +210,6 @@ mod tests {
     fn context(command: &str, output: &str) -> Context {
         Context {
             command: command.to_string(),
-            cwd: "/tmp".to_string(),
-            exit_code: 1,
             output: output.to_string(),
             remote: false,
         }
