@@ -1,227 +1,209 @@
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
+use crate::ai::AiClient;
 
-use super::util::{edit_distance, replace_word, safe_candidate};
-use super::{Candidate, Context, Evidence, Failure};
+use super::model;
+use super::util::{
+    rank_names, replace_closest_token, replace_exact_token, safe_word, validate_candidate,
+};
+use super::{Candidate, Context, Evidence, Failure, SuggestionResult, MAX_CANDIDATES};
 
-const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_CANDIDATES: usize = 3;
-
-pub(super) fn local_suggestions(context: &Context, failure: &Failure) -> Vec<Candidate> {
-    match failure {
-        Failure::AptPackageNotFound(package) if !context.remote => {
-            apt_candidates(&context.command, package)
+pub(super) fn suggest_blocking(
+    context: &Context,
+    failure: &Failure,
+    ai_client: Option<&AiClient>,
+) -> SuggestionResult {
+    let mut candidates = local_candidates(context, failure);
+    if candidates.is_empty() {
+        if let Some(client) = ai_client {
+            candidates = model::suggest_blocking(client, context, failure);
         }
-        Failure::CommandNotFound(executable) if !context.remote => {
-            path_candidates(&context.command, executable)
-        }
-        Failure::ToolSuggestion { old, new } => replace_word(&context.command, old, new)
-            .filter(|command| safe_candidate(&context.command, command))
-            .map(|command| {
-                vec![Candidate {
-                    command,
-                    reason: format!(
-                        "The failing tool suggested replacing `{old}` with `{new}`."
-                    ),
-                    evidence: Evidence::TargetOutput,
-                }]
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    }
+
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        validate_candidate(&context.command, &candidate.command)
+            && seen.insert(candidate.command.clone())
+    });
+    candidates.truncate(MAX_CANDIDATES);
+
+    if candidates.is_empty() {
+        SuggestionResult::None
+    } else {
+        SuggestionResult::Candidates(candidates)
     }
 }
 
-fn apt_candidates(original: &str, package: &str) -> Vec<Candidate> {
-    if !crate::host::command_available("apt-cache") {
+fn local_candidates(context: &Context, failure: &Failure) -> Vec<Candidate> {
+    match failure {
+        Failure::ToolSuggestion { suggestion } => tool_suggestion(context, suggestion),
+        Failure::AptPackageNotFound { package } if !context.remote => {
+            apt_package_candidates(context, package)
+        }
+        Failure::CommandNotFound { executable } if !context.remote => {
+            path_command_candidates(context, executable)
+        }
+        Failure::AptPackageNotFound { .. }
+        | Failure::CommandNotFound { .. }
+        | Failure::UnknownSubcommand { .. }
+        | Failure::UnknownOption { .. } => Vec::new(),
+    }
+}
+
+fn tool_suggestion(context: &Context, suggestion: &str) -> Vec<Candidate> {
+    if !safe_word(suggestion) {
         return Vec::new();
     }
-    let Some(output) = capture("apt-cache", &["pkgnames"]) else {
+    let Some(command) = replace_closest_token(&context.command, suggestion) else {
         return Vec::new();
     };
-    rank(
-        package,
-        output
-            .lines()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string),
-    )
-    .into_iter()
-    .filter_map(|replacement| {
-        let command = replace_word(original, package, &replacement)?;
-        safe_candidate(original, &command).then_some(Candidate {
-            command,
-            reason: format!(
-                "APT contains `{replacement}`, while the failed package was `{package}`."
-            ),
-            evidence: Evidence::AptIndex,
-        })
-    })
-    .take(MAX_CANDIDATES)
-    .collect()
+    vec![Candidate {
+        command,
+        reason: "The failed tool printed this likely correction.".to_string(),
+        evidence: Evidence::ToolOutput,
+    }]
 }
 
-fn path_candidates(original: &str, executable: &str) -> Vec<Candidate> {
-    rank(executable, path_commands())
+fn apt_package_candidates(context: &Context, package: &str) -> Vec<Candidate> {
+    let Some(names) = apt_package_names() else {
+        return Vec::new();
+    };
+    rank_names(package, names.lines())
         .into_iter()
-        .filter(|name| crate::host::command_available(name))
-        .filter_map(|replacement| {
-            let command = replace_word(original, executable, &replacement)?;
-            safe_candidate(original, &command).then_some(Candidate {
+        .filter_map(|candidate_package| {
+            let command = replace_exact_token(&context.command, package, &candidate_package)?;
+            Some(Candidate {
                 command,
                 reason: format!(
-                    "Executable `{replacement}` exists in this host's PATH and closely matches `{executable}`."
+                    "The package name {package:?} is close to the package {candidate_package:?}."
                 ),
-                evidence: Evidence::Path,
+                evidence: Evidence::PackageIndex {
+                    package: candidate_package,
+                },
             })
         })
-        .take(MAX_CANDIDATES)
         .collect()
 }
 
-fn capture(program: &str, args: &[&str]) -> Option<String> {
-    let output = crate::host::command(program)
-        .args(args)
+fn apt_package_names() -> Option<String> {
+    let output = crate::host::command("apt-cache")
+        .arg("pkgnames")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    if !output.status.success() {
+    if !output.status.success() || output.stdout.len() > 16 * 1024 * 1024 {
         return None;
     }
-    let end = output.stdout.len().min(MAX_PROBE_BYTES);
-    Some(String::from_utf8_lossy(&output.stdout[..end]).into_owned())
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn path_commands() -> Vec<String> {
-    if crate::host::command_available("bash") {
-        if let Some(output) = capture(
-            "bash",
-            &[
-                "--noprofile",
-                "--norc",
-                "-lc",
-                "compgen -c | LC_ALL=C sort -u",
-            ],
-        ) {
-            let names: Vec<String> = output
-                .lines()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-            if !names.is_empty() {
-                return names;
-            }
-        }
-    }
+fn path_command_candidates(context: &Context, executable: &str) -> Vec<Candidate> {
+    let commands = target_command_names().unwrap_or_else(native_path_command_names);
+    rank_names(executable, commands.iter().map(String::as_str))
+        .into_iter()
+        .filter_map(|candidate_executable| {
+            let command = replace_exact_token(
+                &context.command,
+                executable,
+                &candidate_executable,
+            )?;
+            Some(Candidate {
+                command,
+                reason: format!(
+                    "The command {executable:?} is close to the available command {candidate_executable:?}."
+                ),
+                evidence: Evidence::PathCommand {
+                    executable: candidate_executable,
+                },
+            })
+        })
+        .collect()
+}
 
+fn target_command_names() -> Option<Vec<String>> {
+    let output = crate::host::command("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-lc",
+            "compgen -c | LC_ALL=C sort -u",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|name| safe_word(name))
+            .take(100_000)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn native_path_command_names() -> Vec<String> {
+    let mut names = HashSet::new();
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };
-    let mut names = HashSet::new();
     for directory in std::env::split_paths(&path) {
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
+        for entry in entries.flatten().take(20_000) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
+            if safe_word(name) {
+                names.insert(name.to_string());
             }
         }
     }
     names.into_iter().collect()
 }
 
-struct Ranked {
-    name: String,
-    distance: usize,
-    fuzzy: i64,
-    length_delta: usize,
-}
-
-fn rank(needle: &str, names: impl IntoIterator<Item = String>) -> Vec<String> {
-    let needle = needle.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let max_distance = if needle.chars().count() <= 7 { 2 } else { 3 };
-    let first = needle.chars().next();
-    let matcher = SkimMatcherV2::default();
-    let mut seen = HashSet::new();
-    let mut ranked = Vec::new();
-
-    for name in names {
-        let name = name.trim();
-        if name.is_empty() || name.eq_ignore_ascii_case(needle.as_str()) {
-            continue;
-        }
-        let lower = name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) {
-            continue;
-        }
-        let distance = edit_distance(&needle, &lower);
-        if distance > max_distance || (first != lower.chars().next() && distance > 1) {
-            continue;
-        }
-        ranked.push(Ranked {
-            name: name.to_string(),
-            distance,
-            fuzzy: matcher.fuzzy_match(&lower, &needle).unwrap_or(i64::MIN / 4),
-            length_delta: lower.chars().count().abs_diff(needle.chars().count()),
-        });
-    }
-
-    ranked.sort_by(|left, right| {
-        left.distance
-            .cmp(&right.distance)
-            .then_with(|| right.fuzzy.cmp(&left.fuzzy))
-            .then_with(|| left.length_delta.cmp(&right.length_delta))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    ranked
-        .into_iter()
-        .take(MAX_CANDIDATES * 4)
-        .map(|item| item.name)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn context(command: &str) -> Context {
+        Context {
+            command: command.to_string(),
+            cwd: "/tmp".to_string(),
+            exit_code: 1,
+            output: "failure".to_string(),
+            remote: false,
+        }
+    }
+
     #[test]
-    fn ranking_handles_expected_typos() {
-        assert_eq!(
-            rank(
-                "fmpg",
-                ["fping", "ffmpeg", "imagemagick"]
-                    .into_iter()
-                    .map(str::to_string),
-            )
-            .first()
-            .map(String::as_str),
-            Some("ffmpeg")
-        );
-        assert_eq!(
-            rank(
-                "gti",
-                ["git", "gio", "gtk4-demo"]
-                    .into_iter()
-                    .map(str::to_string),
-            )
-            .first()
-            .map(String::as_str),
-            Some("git")
-        );
+    fn tool_hint_changes_only_the_closest_token() {
+        let suggestions = tool_suggestion(&context("git statsu"), "status");
+        assert_eq!(suggestions[0].command, "git status");
+        assert_eq!(suggestions[0].evidence, Evidence::ToolOutput);
+    }
+
+    #[test]
+    fn remote_failures_do_not_use_local_package_or_path_state() {
+        let mut context = context("apt install fmpg");
+        context.remote = true;
+        assert!(local_candidates(
+            &context,
+            &Failure::AptPackageNotFound {
+                package: "fmpg".to_string()
+            }
+        )
+        .is_empty());
     }
 }
