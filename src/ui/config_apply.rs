@@ -117,6 +117,7 @@ impl UiState {
     }
 
     pub(crate) fn apply_dynamic_css(&self) {
+        self.install_command_correction_monitor();
         let config = self.config.borrow();
         let bg = &config.background;
         let fg = &config.foreground;

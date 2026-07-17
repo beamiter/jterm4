@@ -50,12 +50,28 @@ jobs:
             appstream \
             dbus-x11 \
             desktop-file-utils \
+            elfutils \
             flatpak \
             flatpak-builder \
             librsvg2-bin \
+            librsvg2-common \
             python3-venv \
             weston \
             xvfb
+
+      - name: Enable full AppStream compose diagnostics
+        run: |
+          mkdir -p "${RUNNER_TEMP}/jterm4-ci-bin"
+          cat > "${RUNNER_TEMP}/jterm4-ci-bin/appstreamcli" <<'EOF'
+          #!/bin/sh
+          if [ "${1:-}" = "compose" ]; then
+            shift
+            exec /usr/bin/appstreamcli compose --print-report=full "$@"
+          fi
+          exec /usr/bin/appstreamcli "$@"
+          EOF
+          chmod 0755 "${RUNNER_TEMP}/jterm4-ci-bin/appstreamcli"
+          echo "${RUNNER_TEMP}/jterm4-ci-bin" >> "${GITHUB_PATH}"
 
       - name: Verify generated Cargo sources
         id: cargo_sources
