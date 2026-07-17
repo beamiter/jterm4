@@ -1,0 +1,55 @@
+name: Apply block mode UX final polish
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/block-mode-selection-input-history
+
+      - name: Install GTK and VTE development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev
+
+      - name: Apply final Block-mode polish
+        run: python3 .github/scripts/apply_block_mode_ux_final_polish.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Remove one-shot patch machinery
+        run: |
+          rm .github/scripts/apply_block_mode_ux_final_polish.py
+          rm .github/workflows/apply-block-mode-ux-final-polish.yml
+
+      - name: Commit verified final polish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: align Block paste and selection state"
+          git push origin HEAD:fix/block-mode-selection-input-history
