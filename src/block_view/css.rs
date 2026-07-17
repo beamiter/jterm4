@@ -22,19 +22,25 @@ pub(crate) fn rgba_to_hex(c: &RGBA) -> String {
     )
 }
 
-pub(crate) fn shorten_path(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let display = if !home.is_empty() && path.starts_with(&home) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.to_string()
+fn shorten_path_with_home(path: &str, home: Option<&std::path::Path>) -> String {
+    let path_obj = std::path::Path::new(path);
+    let display = match home.and_then(|home| path_obj.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.to_string_lossy()),
+        None => path.to_string(),
     };
-    let parts: Vec<&str> = display.split('/').filter(|s| !s.is_empty()).collect();
+
+    let parts: Vec<&str> = display.split('/').filter(|part| !part.is_empty()).collect();
     if parts.len() <= 3 {
         display
     } else {
         format!("…/{}", parts[parts.len() - 2..].join("/"))
     }
+}
+
+pub(crate) fn shorten_path(path: &str) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    shorten_path_with_home(path, home.as_deref())
 }
 
 /// Cheap git-branch lookup for the context chip: walk up from `cwd` to find a
@@ -597,4 +603,35 @@ pub(crate) fn install_block_css(config: &Config) {
         );
         *prev = Some(provider);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shorten_path_with_home;
+    use std::path::Path;
+
+    #[test]
+    fn shorten_path_uses_component_aware_home_prefix() {
+        let home = Path::new("/home/alice");
+        assert_eq!(shorten_path_with_home("/home/alice", Some(home)), "~");
+        assert_eq!(
+            shorten_path_with_home("/home/alice/projects/demo", Some(home)),
+            "~/projects/demo"
+        );
+        assert_eq!(
+            shorten_path_with_home("/home/alice2/project", Some(home)),
+            "/home/alice2/project"
+        );
+    }
+
+    #[test]
+    fn shorten_path_keeps_only_the_last_two_components_when_long() {
+        assert_eq!(
+            shorten_path_with_home(
+                "/home/alice/workspace/team/project",
+                Some(Path::new("/home/alice")),
+            ),
+            "…/team/project"
+        );
+    }
 }
