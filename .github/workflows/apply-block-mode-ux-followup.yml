@@ -1,0 +1,54 @@
+name: Apply block mode UX follow-up
+
+on:
+  pull_request:
+    branches:
+      - master
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/block-mode-tab-focus-long-output'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/block-mode-tab-focus-long-output
+
+      - name: Install GTK and VTE development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev \
+            pkg-config
+
+      - name: Apply focused follow-up
+        run: python3 .github/scripts/apply_block_mode_ux_followup.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Remove one-shot patch machinery
+        run: |
+          rm .github/scripts/apply_block_mode_ux_followup.py
+          rm .github/scripts/.apply-block-ux-followup-trigger
+          rm .github/workflows/apply-block-mode-ux-followup.yml
+
+      - name: Commit verified follow-up
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: harden block viewport scrolling"
+          git push origin HEAD:fix/block-mode-tab-focus-long-output
