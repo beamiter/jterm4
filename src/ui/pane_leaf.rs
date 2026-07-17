@@ -158,6 +158,9 @@ impl PaneLeaf {
         unsafe {
             widget.set_data::<Self>(PANE_LEAF_DATA_KEY, self.clone());
         }
+        if let Self::Block(view) = self {
+            crate::command_fix::attach_to_block(view);
+        }
     }
 
     /// Recover a directly attached pane leaf from a GTK root widget.
