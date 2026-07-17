@@ -1,0 +1,80 @@
+name: Command correction mechanical repair
+
+on:
+  push:
+    branches:
+      - agent/smart-command-correction
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/smart-command-correction
+          fetch-depth: 0
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev \
+            pkg-config
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Apply machine-applicable repairs
+        id: repair
+        shell: bash
+        run: |
+          set +e
+          cargo fix --all-targets --all-features --locked --allow-dirty --allow-staged --broken-code > /tmp/cargo-fix.log 2>&1
+          fix_status=$?
+          cargo clippy --fix --all-targets --all-features --locked --allow-dirty --allow-staged > /tmp/clippy-fix.log 2>&1
+          clippy_fix_status=$?
+          cargo fmt --all > /tmp/rustfmt.log 2>&1
+          fmt_status=$?
+          cargo check --all-targets --all-features --locked > /tmp/check.log 2>&1
+          check_status=$?
+          cargo clippy --all-targets --all-features --locked -- -D warnings > /tmp/clippy.log 2>&1
+          clippy_status=$?
+          cargo test --all-features --locked > /tmp/test.log 2>&1
+          test_status=$?
+          {
+            echo "cargo fix: $fix_status"
+            echo "clippy fix: $clippy_fix_status"
+            echo "rustfmt: $fmt_status"
+            echo "cargo check: $check_status"
+            echo "clippy: $clippy_status"
+            echo "tests: $test_status"
+          } > /tmp/status.txt
+          cat /tmp/status.txt
+          cat /tmp/check.log
+          cat /tmp/clippy.log
+          cat /tmp/test.log
+          exit 0
+
+      - name: Commit mechanical source changes and remove this workflow
+        shell: bash
+        run: |
+          git pull --rebase origin agent/smart-command-correction
+          git rm -f .github/workflows/command-fix-mechanical-repair.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "apply mechanical Rust repairs"
+          git push origin HEAD:agent/smart-command-correction
