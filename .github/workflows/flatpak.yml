@@ -153,12 +153,32 @@ jobs:
         run: exit 1
 
       - name: Install local bundle
+        id: flatpak_install
+        continue-on-error: true
         run: |
-          flatpak --user remote-add --if-not-exists --no-gpg-verify \
-            jterm4-ci "file://${PWD}/flatpak-repo"
-          flatpak --user install -y jterm4-ci ${APP_ID}
-          flatpak run ${APP_ID} --version
-          flatpak run ${APP_ID} --doctor
+          set -o pipefail
+          {
+            flatpak --user remote-add --if-not-exists --no-gpg-verify \
+              jterm4-ci "file://${PWD}/flatpak-repo"
+            flatpak --user install -y jterm4-ci ${APP_ID}
+            flatpak run ${APP_ID} --version
+            # The Flatpak host bridge uses flatpak-spawn over the session bus.
+            # Run headless diagnostics inside a bus even when no display exists.
+            dbus-run-session -- flatpak run ${APP_ID} --doctor
+          } 2>&1 | tee flatpak-install.log
+
+      - name: Upload Flatpak install diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-install-diagnostics-${{ github.run_id }}
+          path: flatpak-install.log
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Require local bundle install
+        if: ${{ steps.flatpak_install.outcome == 'failure' }}
+        run: exit 1
 
       - name: Smoke-test X11 and Wayland launches
         run: dbus-run-session -- scripts/smoke-flatpak.sh ${APP_ID}
@@ -173,6 +193,7 @@ jobs:
             io.github.beamiter.jterm4.flatpak.sha256
             cargo-sources-verify.log
             flatpak-build.log
+            flatpak-install.log
             flatpak-smoke-logs/
           if-no-files-found: warn
           retention-days: 7
