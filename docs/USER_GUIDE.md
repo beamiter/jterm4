@@ -243,7 +243,11 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 
 面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。
 
-每个窗口快照还保存最多 100 个完整成功聊天 turn，以及当时实际发给 provider 的选中 Block 上下文（开启 `ai_redact_secrets` 时为脱敏版本）。**New chat** 会立即清除这一窗口的持久化对话；在途请求、错误回合和命令生成审阅事件不会伪装成已完成回答恢复。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode`、`--no-restore` 和显式新工作区不会读取旧对话。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
+**New chat** 会创建并立即选中一个新会话，旧会话不会被清除。打开 **Chats** 会话库可搜索和选择所有保留的 chat；首条问题会生成自动标题，也可 Rename。Archive 将 chat 移入归档列表而不删除内容，Unarchive 可恢复；Delete 会先要求确认，再永久移除该 chat。切换 chat 时，未发送 draft、该 chat 实际发给 provider 的选中 Block context 以及当前选中的 chat 都会跟随窗口快照持久化。
+
+每个窗口最多保存 50 条 chat metadata，每个 chat 最多恢复 100 个完整 turn；active 与 archived chat 都计入集合上限。所有 chat 共用一个 8 MiB 紧凑 JSON 总预算，而不是每个 chat 各有 8 MiB。超过全局预算时会优先裁剪最旧内容、保留 chat 条目，并在受影响会话显示 `truncated`，提示更早内容已不在快照中。工作区的 20 MiB Pane/Tab 上限之外另有 64 KiB 专用于完整 chat metadata；空间紧张时会继续裁剪 payload，而不会静默省略整个 Chats 库。旧版单会话 schema v1 会在读取时自动迁移为 v2 Chats 集合。
+
+后台请求绑定其发起时的稳定 chat ID：切换到其他 chat 不会改变回复目的地，也可让不同 chat 的请求各自完成；如果原 chat 已 Delete，迟到回复会直接丢弃，不能重新创建或污染当前 chat。在途用户 turn、错误回合和命令生成审阅事件不会伪装成已完成回答恢复；待完成或失败的问题会回到可重试 draft，发送期间键入的下一条 draft 也会保留，Ask selected Block 不会清掉已有草稿，关窗会先刷新防抖中的最新内容。开启 `ai_redact_secrets` 时，持久化脱敏覆盖 active、non-active、archived chat，包括标题、turn、draft 和 Block context，而不只处理当前可见对话。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode` 不读取也不发布会话库，`--no-restore` 和显式新工作区仍不领取旧快照，其中 `--no-restore` 继续按既有语义建立新的可持久化工作区。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
 
 自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 在当前 active Block pane 打开原生 **Shell Agent**；它在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
@@ -258,7 +262,7 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
 
-`ai_redact_secrets = true` 默认遮蔽常见密钥格式，但脱敏不是秘密保护边界；发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
+`ai_redact_secrets = true` 默认遮蔽常见密钥格式，并在持久化前重新处理所有 active、non-active、archived chat 及其 draft/context；但脱敏不是秘密保护边界，发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
 
 ## 12. 配置保存与快捷键
 

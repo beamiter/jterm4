@@ -143,7 +143,7 @@ impl UiState {
         if !self.ai_panel_visible.get() {
             self.toggle_ai_panel();
         }
-        self.ai_panel.command_generation_started(&request);
+        let generation_chat_id = self.ai_panel.command_generation_started(&request);
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -161,13 +161,15 @@ impl UiState {
                         .is_some_and(|view| !view.can_accept_agent_command())
                     {
                         let message = "The target Block prompt is busy or now contains input; the generated command was not inserted.";
-                        ui.ai_panel.command_generation_failed(message);
+                        ui.ai_panel
+                            .command_generation_failed(generation_chat_id, message);
                         ui.show_ai_error(message);
                         return gtk4::glib::ControlFlow::Break;
                     }
 
                     let danger = crate::agent::is_dangerous(&command);
-                    ui.ai_panel.command_generation_review_required(&command);
+                    ui.ai_panel
+                        .command_generation_review_required(generation_chat_id, &command);
                     let title = if danger.is_some() {
                         "Review potentially destructive command"
                     } else {
@@ -200,7 +202,10 @@ impl UiState {
                         if response != "insert" {
                             ui_for_response
                                 .ai_panel
-                                .command_generation_failed("Command insertion cancelled.");
+                                .command_generation_failed(
+                                    generation_chat_id,
+                                    "Command insertion cancelled.",
+                                );
                             return;
                         }
                         if pane
@@ -208,14 +213,19 @@ impl UiState {
                             .is_some_and(|view| !view.can_accept_agent_command())
                         {
                             let message = "The target Block prompt is busy or now contains input; the generated command was not inserted.";
-                            ui_for_response.ai_panel.command_generation_failed(message);
+                            ui_for_response
+                                .ai_panel
+                                .command_generation_failed(generation_chat_id, message);
                             ui_for_response.show_ai_error(message);
                             return;
                         }
                         if ui_for_response.insert_review_text(&pane, &command_for_insert) {
-                            ui_for_response.ai_panel.command_generation_inserted();
+                            ui_for_response
+                                .ai_panel
+                                .command_generation_inserted(generation_chat_id);
                         } else {
                             ui_for_response.ai_panel.command_generation_failed(
+                                generation_chat_id,
                                 "The generated command contained unsafe terminal control characters.",
                             );
                         }
@@ -225,14 +235,16 @@ impl UiState {
                 }
                 Ok(Err(error)) => {
                     let message = format!("Command generation failed: {error}");
-                    ui.ai_panel.command_generation_failed(&message);
+                    ui.ai_panel
+                        .command_generation_failed(generation_chat_id, &message);
                     ui.show_ai_error(&message);
                     gtk4::glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     let message = "Command generation worker disconnected.";
-                    ui.ai_panel.command_generation_failed(message);
+                    ui.ai_panel
+                        .command_generation_failed(generation_chat_id, message);
                     ui.show_ai_error(message);
                     gtk4::glib::ControlFlow::Break
                 }

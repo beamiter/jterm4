@@ -151,6 +151,37 @@ impl UiState {
              }}
              .ai-panel-title {{ color: rgb({fr},{fg_g},{fb}); font-weight: 700; }}
              .ai-panel-subtitle {{ color: rgba({fr},{fg_g},{fb},0.60); font-size: 0.86em; }}
+             .ai-chat-header-button {{ min-width: 30px; min-height: 30px; padding: 4px; }}
+             .ai-chat-library {{ background-color: rgb({br},{bg_g},{bb}); }}
+             .ai-chat-library-toolbar {{
+                 padding: 10px;
+                 border-bottom: 1px solid rgba({fr},{fg_g},{fb},0.12);
+             }}
+             .ai-chat-search {{ color: rgb({fr},{fg_g},{fb}); }}
+             .ai-chat-search text {{
+                 color: rgb({fr},{fg_g},{fb});
+                 caret-color: rgb({fr},{fg_g},{fb});
+             }}
+             .ai-chat-list {{
+                 margin: 8px;
+                 background-color: transparent;
+             }}
+             .ai-chat-row {{
+                 color: rgb({fr},{fg_g},{fb});
+                 border-radius: 8px;
+                 margin: 2px 0;
+             }}
+             .ai-chat-row:hover {{ background-color: rgba({fr},{fg_g},{fb},0.08); }}
+             .ai-chat-row.active {{ background-color: rgba({fr},{fg_g},{fb},0.14); }}
+             .ai-chat-row.archived {{ color: rgba({fr},{fg_g},{fb},0.62); }}
+             .ai-chat-row.unread {{ font-weight: 700; }}
+             .ai-chat-section {{
+                 color: rgba({fr},{fg_g},{fb},0.56);
+                 font-size: 0.82em;
+                 font-weight: 700;
+                 padding: 8px 8px 4px 8px;
+             }}
+             .ai-chat-empty {{ color: rgba({fr},{fg_g},{fb},0.56); padding: 28px; }}
              .ai-transcript, .ai-transcript text {{
                  background-color: rgb({br},{bg_g},{bb});
                  color: rgb({fr},{fg_g},{fb});

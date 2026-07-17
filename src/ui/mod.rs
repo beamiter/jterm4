@@ -12,6 +12,7 @@ use crate::keybindings::KeybindingMap;
 
 mod actions;
 mod agent_panel;
+mod ai_chat_store;
 mod ai_panel;
 mod command_palette;
 mod config_apply;

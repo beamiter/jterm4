@@ -693,26 +693,33 @@ pub fn run() -> glib::ExitCode {
             // the page's typed pane controller is fully attached.
             let session_ids_for_page_added = ui.session_ids.clone();
             let notebook_clone_for_added = notebook.clone();
+            let ai_panel_for_page_added = ui.ai_panel.clone();
             notebook.connect_page_added(move |_notebook, _child, _page_num| {
                 let nb = notebook_clone_for_added.clone();
                 let sids = session_ids_for_page_added.clone();
+                let ai_panel = ai_panel_for_page_added.clone();
                 glib::idle_add_local_once(move || {
                     save_tabs_state(&nb, &sids.borrow());
+                    ai_panel.sync_persisted_truncation();
                 });
             });
 
             let session_ids_for_page_removed = ui.session_ids.clone();
             let notebook_clone_for_removed = notebook.clone();
+            let ai_panel_for_page_removed = ui.ai_panel.clone();
             notebook.connect_page_removed(move |_notebook, _child, _page_num| {
                 let nb = notebook_clone_for_removed.clone();
                 let sids = session_ids_for_page_removed.clone();
+                let ai_panel = ai_panel_for_page_removed.clone();
                 glib::idle_add_local_once(move || {
                     save_tabs_state(&nb, &sids.borrow());
+                    ai_panel.sync_persisted_truncation();
                 });
             });
 
             // Save initial state after tabs are restored.
             save_tabs_state(&notebook, &ui.session_ids.borrow());
+            ui.ai_panel.sync_persisted_truncation();
         }
 
         // Setup key controller on window level with Capture phase
@@ -726,7 +733,7 @@ pub fn run() -> glib::ExitCode {
             // Composer Enter semantics must win over optional user-defined
             // global bindings. The focused TextView controller also gives IME
             // candidate confirmation first refusal.
-            if ui_clone.ai_panel.input_has_focus()
+            if ui_clone.ai_panel.handles_enter_key()
                 && matches!(keyval, Key::Return | Key::KP_Enter)
             {
                 return false.into();
@@ -981,6 +988,7 @@ pub fn run() -> glib::ExitCode {
         let ai_paned_for_close = ai_paned.clone();
         let ai_panel_visible_for_close = ui.ai_panel_visible.clone();
         let ai_panel_width_restoring_for_close = ui.ai_panel_width_restoring.clone();
+        let ai_panel_for_close = ui.ai_panel.clone();
         let zoom_for_close = ui.zoom_state.clone();
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
@@ -1038,6 +1046,10 @@ pub fn run() -> glib::ExitCode {
             let _ = crate::config::save_config(&config_for_close.borrow());
 
             if session_persistence {
+                // Do not let the composer's draft debounce outlive the final
+                // window snapshot. This also persists an in-flight question as
+                // a recoverable draft rather than a fake completed turn.
+                ai_panel_for_close.flush_persisted_conversation();
                 save_tabs_state(&notebook_for_close_request, &session_ids_for_close.borrow());
             }
             kill_all_terminal_children(&notebook_for_close_request);

@@ -1,27 +1,30 @@
-//! ai_panel — provider-neutral right-side chat sidebar.
+//! Provider-neutral multi-chat sidebar.
 //!
-//! Layout: vertical column = [header row | conversation scroll | status label |
-//! input row]. The input is a multi-line TextView so users can paste shell
-//! errors without losing newlines. Enter and Ctrl+Enter send; Shift+Enter
-//! inserts a newline. Input-method events are offered to TextView before the
-//! send shortcut so confirming an IME candidate never submits the message.
-//!
-//! Networking runs on a worker `std::thread`; a bounded main-loop timer polls
-//! its channel for the response or error. While a request is in flight the
-//! send button is desensitised and the status row shows provider activity.
+//! GTK keeps one transcript and composer alive while `ChatStore` owns a
+//! bounded collection of chats. Enter and Ctrl+Enter send, Shift+Enter inserts
+//! a newline, and IME candidate confirmation gets first refusal. Requests are
+//! completed against `(chat_id, epoch)`, so switching chats never redirects a
+//! background reply into the visible conversation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use adw::prelude::*;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Box as GBox, Button, EventControllerKey, Label, Orientation, Overlay, ScrolledWindow, Spinner,
-    TextBuffer, TextTag, TextView, WrapMode,
+    Box as GBox, Button, Entry, EventControllerKey, Image, Label, ListBox, ListBoxRow, MenuButton,
+    Orientation, Overlay, Popover, ScrolledWindow, SearchEntry, Spinner, Stack, TextBuffer,
+    TextTag, TextView, WrapMode,
 };
+use libadwaita as adw;
 
-use crate::ai::{self, BlockContext, Role, Turn};
+use super::ai_chat_store::{ChatStatus, ChatStore, ChatStoreError, ChatSummary, RequestToken};
+use crate::ai::{self, BlockContext, Role};
 use crate::config::Config;
+
+const CHAT_PAGE: &str = "chat";
+const CHAT_LIBRARY_PAGE: &str = "library";
 
 type PersistenceCallback = Rc<dyn Fn()>;
 
@@ -54,109 +57,23 @@ fn classify_composer_key(
     }
 }
 
-fn conversation_snapshot_for_persistence(
-    history: &[Turn],
-    block_context: Option<&BlockContext>,
-    redact: bool,
-) -> Option<ai::ConversationSnapshot> {
-    let mut history = history.to_vec();
-    let mut block_context = block_context.cloned();
-
-    // A user may enable redaction after restoring a conversation that was
-    // originally saved with the opt-out setting. Scrub a persistence-only
-    // copy so the next snapshot upgrades every retained field without
-    // rewriting the visible transcript or provider history mid-conversation.
-    if redact {
-        for turn in &mut history {
-            turn.text = crate::redact::redact_secrets(&turn.text);
-        }
-        if let Some(context) = block_context.as_mut() {
-            context.cmd = crate::redact::redact_secrets(&context.cmd);
-            context.output = crate::redact::redact_secrets(&context.output);
-            context.cwd = context
-                .cwd
-                .take()
-                .map(|cwd| crate::redact::redact_secrets(&cwd));
-        }
-    }
-
-    ai::ConversationSnapshot::from_completed_history(&history, block_context.as_ref())
-}
-
-/// Provider-facing transcript plus a monotonically increasing request token.
-/// Clearing a conversation invalidates the active token, so a response that
-/// was already in flight can never repopulate the cleared transcript or append
-/// an assistant turn without its matching user turn.
-#[derive(Default)]
-struct ConversationState {
-    history: Vec<Turn>,
-    epoch: u64,
-    active_epoch: Option<u64>,
-}
-
-impl ConversationState {
-    fn is_busy(&self) -> bool {
-        self.active_epoch.is_some()
-    }
-
-    fn begin(&mut self, user_text: String) -> (u64, Vec<Turn>) {
-        self.epoch = self.epoch.wrapping_add(1);
-        let epoch = self.epoch;
-        self.history.push(Turn {
-            role: Role::User,
-            text: user_text,
-        });
-        self.active_epoch = Some(epoch);
-        (epoch, self.history.clone())
-    }
-
-    fn clear(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        self.active_epoch = None;
-        self.history.clear();
-    }
-
-    fn restore(&mut self, history: Vec<Turn>) {
-        self.epoch = self.epoch.wrapping_add(1);
-        self.active_epoch = None;
-        self.history = history;
-    }
-
-    fn complete_success(&mut self, epoch: u64, text: String) -> bool {
-        if self.active_epoch != Some(epoch) {
-            return false;
-        }
-        self.active_epoch = None;
-        self.history.push(Turn {
-            role: Role::Assistant,
-            text,
-        });
-        true
-    }
-
-    fn complete_error(&mut self, epoch: u64) -> bool {
-        if self.active_epoch != Some(epoch) {
-            return false;
-        }
-        self.active_epoch = None;
-        if self
-            .history
-            .last()
-            .is_some_and(|turn| turn.role == Role::User)
-        {
-            self.history.pop();
-        }
-        true
-    }
-}
-
-/// All widgets + state the AI panel needs to drive itself.
 #[derive(Clone)]
 pub(crate) struct AiPanel {
-    /// Root box returned from `build`. Add this as the end child of the
-    /// outer Paned in main.rs.
     pub(crate) root: GBox,
-    conversation: Rc<RefCell<ConversationState>>,
+    store: Rc<RefCell<ChatStore>>,
+    content_stack: Stack,
+    library_btn: Button,
+    new_chat_btn: Button,
+    chat_title: Label,
+    header_meta: Label,
+    actions_popover: Popover,
+    rename_chat_btn: Button,
+    archive_chat_btn: Button,
+    delete_chat_btn: Button,
+    close_btn: Button,
+    chat_search: SearchEntry,
+    chat_list: ListBox,
+    chat_row_ids: Rc<RefCell<Vec<Option<u64>>>>,
     convo_buffer: TextBuffer,
     convo_view: TextView,
     convo_scroll: ScrolledWindow,
@@ -168,69 +85,89 @@ pub(crate) struct AiPanel {
     status_row: GBox,
     status_spinner: Spinner,
     status_label: Label,
-    header_meta: Label,
-    close_btn: Button,
-    block_context: Rc<RefCell<Option<BlockContext>>>,
     persistence_callback: Rc<RefCell<Option<PersistenceCallback>>>,
-    config: Rc<std::cell::RefCell<Config>>,
+    draft_persist_epoch: Rc<Cell<u64>>,
+    config: Rc<RefCell<Config>>,
 }
 
 impl AiPanel {
-    /// Build the panel widget tree. The returned root is hidden / shown by
-    /// `UiState::toggle_ai_panel` — visibility is not owned here.
-    pub(crate) fn build(config: Rc<std::cell::RefCell<Config>>) -> Self {
+    pub(crate) fn build(config: Rc<RefCell<Config>>) -> Self {
         let header = GBox::new(Orientation::Horizontal, 6);
         header.add_css_class("ai-panel-header");
-        let title = Label::new(Some("AI Assistant"));
-        title.set_halign(gtk4::Align::Start);
-        title.add_css_class("ai-panel-title");
+
+        let library_btn = Button::with_label("Chats");
+        library_btn.set_tooltip_text(Some("Browse saved and archived chats"));
+        library_btn.set_focus_on_click(false);
+        library_btn.add_css_class("flat");
+        library_btn.add_css_class("ai-chat-header-button");
+
+        let chat_title = Label::new(Some("New chat"));
+        chat_title.set_halign(gtk4::Align::Start);
+        chat_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        chat_title.add_css_class("ai-panel-title");
         let header_meta = Label::new(None);
         header_meta.set_halign(gtk4::Align::Start);
         header_meta.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         header_meta.add_css_class("ai-panel-subtitle");
         let header_text = GBox::new(Orientation::Vertical, 0);
-        header_text.append(&title);
+        header_text.append(&chat_title);
         header_text.append(&header_meta);
         header_text.set_hexpand(true);
-        let clear_btn = Button::with_label("New chat");
-        clear_btn.set_tooltip_text(Some(
-            "Start a new chat; an in-flight response will be ignored",
-        ));
-        clear_btn.set_focus_on_click(false);
-        clear_btn.add_css_class("flat");
+
+        let new_chat_btn = Button::with_label("New chat");
+        new_chat_btn.set_tooltip_text(Some("Create a new chat and keep existing chats"));
+        new_chat_btn.set_focus_on_click(false);
+        new_chat_btn.add_css_class("flat");
+        new_chat_btn.add_css_class("ai-chat-header-button");
+
+        let rename_chat_btn = menu_button("Rename");
+        let archive_chat_btn = menu_button("Archive");
+        let delete_chat_btn = menu_button("Delete");
+        delete_chat_btn.add_css_class("destructive-action");
+        let actions_box = GBox::new(Orientation::Vertical, 0);
+        actions_box.add_css_class("menu");
+        actions_box.append(&rename_chat_btn);
+        actions_box.append(&archive_chat_btn);
+        actions_box.append(&delete_chat_btn);
+        let actions_popover = Popover::new();
+        actions_popover.set_has_arrow(false);
+        actions_popover.set_child(Some(&actions_box));
+        let actions_btn = MenuButton::new();
+        actions_btn.set_icon_name("view-more-symbolic");
+        actions_btn.set_tooltip_text(Some("Chat actions"));
+        actions_btn.set_popover(Some(&actions_popover));
+        actions_btn.add_css_class("flat");
+        actions_btn.add_css_class("ai-chat-header-button");
+
         let close_btn = Button::from_icon_name("window-close-symbolic");
         close_btn.set_tooltip_text(Some("Close AI panel"));
         close_btn.set_focus_on_click(false);
         close_btn.add_css_class("flat");
+        close_btn.add_css_class("ai-chat-header-button");
+
+        header.append(&library_btn);
         header.append(&header_text);
-        header.append(&clear_btn);
+        header.append(&new_chat_btn);
+        header.append(&actions_btn);
         header.append(&close_btn);
 
-        // Conversation transcript remains a single selectable TextView so a
-        // copied range can span multiple messages. Role labels carry the
-        // semantic distinction without relying on theme-specific hard-coded
-        // blue/green body colors.
         let convo_buffer = TextBuffer::new(None);
         let tag_table = convo_buffer.tag_table();
-        // 700 = Pango bold; using the integer avoids depending on
-        // pango::Weight's ABI conversion.
-        let user_tag = TextTag::builder().name("role-user").weight(700).build();
-        let asst_tag = TextTag::builder().name("role-asst").weight(700).build();
-        let err_tag = TextTag::builder()
-            .name("role-err")
-            .foreground("#e01b24")
-            .weight(700)
-            .build();
-        tag_table.add(&user_tag);
-        tag_table.add(&asst_tag);
-        tag_table.add(&err_tag);
+        tag_table.add(&TextTag::builder().name("role-user").weight(700).build());
+        tag_table.add(&TextTag::builder().name("role-asst").weight(700).build());
+        tag_table.add(
+            &TextTag::builder()
+                .name("role-err")
+                .foreground("#e01b24")
+                .weight(700)
+                .build(),
+        );
 
         let convo_view = TextView::with_buffer(&convo_buffer);
         convo_view.set_editable(false);
         convo_view.set_cursor_visible(false);
         convo_view.set_focusable(true);
         convo_view.set_wrap_mode(WrapMode::WordChar);
-        convo_view.set_monospace(false);
         convo_view.set_top_margin(12);
         convo_view.set_bottom_margin(12);
         convo_view.set_left_margin(12);
@@ -241,7 +178,6 @@ impl AiPanel {
             gtk4::accessible::Property::Label("AI conversation"),
             gtk4::accessible::Property::ReadOnly(true),
         ]);
-
         let convo_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
@@ -273,8 +209,6 @@ impl AiPanel {
         transcript_overlay.add_overlay(&empty_state);
         transcript_overlay.set_vexpand(true);
 
-        // A compact status row is hidden when idle and exposes activity with a
-        // spinner instead of changing the Send button label back and forth.
         let status_spinner = Spinner::new();
         status_spinner.set_visible(false);
         let status_label = Label::new(None);
@@ -290,8 +224,6 @@ impl AiPanel {
         status_row.set_visible(false);
         status_row.set_accessible_role(gtk4::AccessibleRole::Status);
 
-        // Composer: a growing TextView, overlay placeholder, explicit shortcut
-        // hint, and a bottom-aligned action button.
         let input_buffer = TextBuffer::new(None);
         let input_view = TextView::with_buffer(&input_buffer);
         input_view.set_wrap_mode(WrapMode::WordChar);
@@ -315,7 +247,6 @@ impl AiPanel {
             .child(&input_view)
             .build();
         input_scroll.add_css_class("ai-panel-input");
-
         let input_placeholder = Label::new(Some("Ask about commands, errors, or output…"));
         input_placeholder.set_halign(gtk4::Align::Start);
         input_placeholder.set_valign(gtk4::Align::Start);
@@ -332,7 +263,6 @@ impl AiPanel {
         send_btn.add_css_class("suggested-action");
         send_btn.add_css_class("ai-send-button");
         send_btn.set_tooltip_text(Some("Send (Enter / Ctrl+Enter) · New line (Shift+Enter)"));
-
         let input_hint = Label::new(Some("Enter to send · Shift+Enter for new line"));
         input_hint.set_halign(gtk4::Align::Start);
         input_hint.set_hexpand(true);
@@ -345,18 +275,70 @@ impl AiPanel {
         composer.append(&input_overlay);
         composer.append(&composer_actions);
 
+        let chat_page = GBox::new(Orientation::Vertical, 0);
+        chat_page.append(&transcript_overlay);
+        chat_page.append(&status_row);
+        chat_page.append(&composer);
+
+        let library_heading = Label::new(Some("Chats"));
+        library_heading.set_halign(gtk4::Align::Start);
+        library_heading.add_css_class("heading");
+        let library_hint = Label::new(Some("Select a chat, including archived conversations."));
+        library_hint.set_halign(gtk4::Align::Start);
+        library_hint.set_wrap(true);
+        library_hint.add_css_class("dim-label");
+        let chat_search = SearchEntry::new();
+        chat_search.set_placeholder_text(Some("Search chats…"));
+        chat_search.add_css_class("ai-chat-search");
+        let library_toolbar = GBox::new(Orientation::Vertical, 6);
+        library_toolbar.add_css_class("ai-chat-library-toolbar");
+        library_toolbar.append(&library_heading);
+        library_toolbar.append(&library_hint);
+        library_toolbar.append(&chat_search);
+
+        let chat_list = ListBox::new();
+        chat_list.set_selection_mode(gtk4::SelectionMode::Single);
+        chat_list.add_css_class("ai-chat-list");
+        let library_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&chat_list)
+            .build();
+        let library_page = GBox::new(Orientation::Vertical, 0);
+        library_page.add_css_class("ai-chat-library");
+        library_page.append(&library_toolbar);
+        library_page.append(&library_scroll);
+
+        let content_stack = Stack::new();
+        content_stack.set_vexpand(true);
+        content_stack.add_named(&chat_page, Some(CHAT_PAGE));
+        content_stack.add_named(&library_page, Some(CHAT_LIBRARY_PAGE));
+        content_stack.set_visible_child_name(CHAT_PAGE);
+
         let root = GBox::new(Orientation::Vertical, 0);
         root.add_css_class("ai-panel");
         root.set_hexpand(false);
         root.set_vexpand(true);
         root.append(&header);
-        root.append(&transcript_overlay);
-        root.append(&status_row);
-        root.append(&composer);
+        root.append(&content_stack);
 
-        let panel = AiPanel {
+        let panel = Self {
             root,
-            conversation: Rc::new(RefCell::new(ConversationState::default())),
+            store: Rc::new(RefCell::new(ChatStore::default())),
+            content_stack,
+            library_btn: library_btn.clone(),
+            new_chat_btn: new_chat_btn.clone(),
+            chat_title,
+            header_meta,
+            actions_popover: actions_popover.clone(),
+            rename_chat_btn: rename_chat_btn.clone(),
+            archive_chat_btn: archive_chat_btn.clone(),
+            delete_chat_btn: delete_chat_btn.clone(),
+            close_btn,
+            chat_search: chat_search.clone(),
+            chat_list: chat_list.clone(),
+            chat_row_ids: Rc::new(RefCell::new(Vec::new())),
             convo_buffer: convo_buffer.clone(),
             convo_view,
             convo_scroll: convo_scroll.clone(),
@@ -368,50 +350,85 @@ impl AiPanel {
             status_row,
             status_spinner,
             status_label: status_label.clone(),
-            header_meta,
-            close_btn,
-            block_context: Rc::new(RefCell::new(None)),
             persistence_callback: Rc::new(RefCell::new(None)),
+            draft_persist_epoch: Rc::new(Cell::new(0)),
             config,
         };
-        panel.refresh_config_display();
 
-        // Wire Clear: drop history + clear the transcript buffer.
         {
             let p = panel.clone();
-            clear_btn.connect_clicked(move |_| {
-                let interrupted = p.conversation.borrow().is_busy();
-                p.conversation.borrow_mut().clear();
-                *p.block_context.borrow_mut() = None;
-                p.convo_buffer.set_text("");
-                p.sync_empty_state();
-                if interrupted {
-                    p.set_info_status("New chat started; the previous response will be ignored.");
-                } else {
-                    p.clear_status();
+            library_btn.connect_clicked(move |_| p.toggle_chat_library());
+        }
+        {
+            let p = panel.clone();
+            new_chat_btn.connect_clicked(move |_| p.create_new_chat());
+        }
+        {
+            let p = panel.clone();
+            rename_chat_btn.connect_clicked(move |_| {
+                p.actions_popover.popdown();
+                p.show_rename_chat_dialog();
+            });
+        }
+        {
+            let p = panel.clone();
+            archive_chat_btn.connect_clicked(move |_| {
+                p.actions_popover.popdown();
+                p.toggle_archive_active_chat();
+            });
+        }
+        {
+            let p = panel.clone();
+            delete_chat_btn.connect_clicked(move |_| {
+                p.actions_popover.popdown();
+                p.show_delete_chat_dialog();
+            });
+        }
+        {
+            let p = panel.clone();
+            chat_search.connect_search_changed(move |_| p.refresh_chat_library());
+        }
+        {
+            let p = panel.clone();
+            chat_search.connect_activate(move |_| {
+                let id = p.chat_row_ids.borrow().iter().flatten().next().copied();
+                if let Some(id) = id {
+                    p.select_chat(id);
                 }
+            });
+        }
+        {
+            let p = panel.clone();
+            chat_list.connect_row_activated(move |_, row| {
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let id = p
+                    .chat_row_ids
+                    .borrow()
+                    .get(index as usize)
+                    .copied()
+                    .flatten();
+                if let Some(id) = id {
+                    p.select_chat(id);
+                }
+            });
+        }
+        {
+            let p = panel.clone();
+            send_btn.connect_clicked(move |_| p.send_from_input(None));
+        }
+        {
+            let p = panel.clone();
+            input_buffer.connect_changed(move |_| {
+                let changed = p.store.borrow_mut().set_active_draft(p.input_text());
                 p.sync_composer_state();
-                p.publish_persisted_conversation();
+                if changed {
+                    p.schedule_draft_persistence();
+                }
             });
         }
-
-        // Wire Send button.
-        {
-            let p = panel.clone();
-            send_btn.connect_clicked(move |_| {
-                p.send_from_input(None);
-            });
-        }
-
-        {
-            let p = panel.clone();
-            input_buffer.connect_changed(move |_| p.sync_composer_state());
-        }
-
-        // Offer Enter to the TextView IM context first. If an active input
-        // method consumes it to confirm a candidate, Stop prevents accidental
-        // submission. Otherwise Enter sends and Shift+Enter reaches TextView's
-        // native newline path (Shift wins even when Ctrl is also held).
         {
             let key = EventControllerKey::new();
             key.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -438,9 +455,21 @@ impl AiPanel {
             });
             input_view.add_controller(key);
         }
+        {
+            let key = EventControllerKey::new();
+            let p = panel.clone();
+            key.connect_key_pressed(move |_, keyval, _, _| {
+                if keyval == gtk4::gdk::Key::Escape {
+                    p.show_chat_page();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            library_page.add_controller(key);
+        }
 
-        panel.sync_empty_state();
-        panel.sync_composer_state();
+        panel.render_active_chat();
         panel
     }
 
@@ -451,10 +480,16 @@ impl AiPanel {
             "ollama" => "Ollama",
             _ => "Anthropic",
         };
-        let summary = if config.ai_model.trim().is_empty() {
+        let provider_model = if config.ai_model.trim().is_empty() {
             provider.to_string()
         } else {
             format!("{provider} · {}", config.ai_model.trim())
+        };
+        drop(config);
+        let summary = if self.store.borrow().active_archived() {
+            format!("Archived · {provider_model}")
+        } else {
+            provider_model
         };
         self.header_meta.set_text(&summary);
         self.header_meta.set_tooltip_text(Some(&summary));
@@ -468,39 +503,299 @@ impl AiPanel {
         *self.persistence_callback.borrow_mut() = Some(Rc::new(callback));
     }
 
-    /// Restore only after `load_tabs_state` has claimed this window's snapshot.
-    /// Safe mode and `--no-restore` never call this method.
     pub(crate) fn restore_persisted_conversation(&self) {
         let Some(snapshot) = crate::state::get_ai_conversation_snapshot() else {
             return;
         };
-        let (turns, context) = snapshot.into_parts();
-        let has_context = context.is_some();
-        self.conversation.borrow_mut().restore(turns.clone());
-        *self.block_context.borrow_mut() = context;
+        *self.store.borrow_mut() = ChatStore::restore(snapshot);
+        let count = self.store.borrow().len();
+        self.store.borrow_mut().set_active_info(format!(
+            "Restored {count} chat{} for this window.",
+            plural(count)
+        ));
+        self.render_active_chat();
+    }
+
+    pub(crate) fn focus_input(&self) {
+        self.show_chat_page();
+        if self.store.borrow().active_archived() {
+            self.convo_view.grab_focus();
+        } else {
+            self.input_view.grab_focus();
+        }
+    }
+
+    pub(crate) fn handles_enter_key(&self) -> bool {
+        self.input_view.has_focus()
+            || self.chat_search_has_focus()
+            || self.chat_list.has_focus()
+            || self.chat_list.focus_child().is_some()
+    }
+
+    fn toggle_chat_library(&self) {
+        if self.content_stack.visible_child_name().as_deref() == Some(CHAT_LIBRARY_PAGE) {
+            self.show_chat_page();
+        } else {
+            self.show_chat_library();
+        }
+    }
+
+    fn show_chat_library(&self) {
+        self.refresh_chat_library();
+        self.content_stack.set_visible_child_name(CHAT_LIBRARY_PAGE);
+        self.library_btn.set_label("Back");
+        self.chat_search.grab_focus();
+    }
+
+    fn show_chat_page(&self) {
+        self.content_stack.set_visible_child_name(CHAT_PAGE);
+        self.library_btn.set_label("Chats");
+        if self.store.borrow().active_archived() {
+            self.convo_view.grab_focus();
+        } else {
+            self.input_view.grab_focus();
+        }
+    }
+
+    fn create_new_chat(&self) {
+        let result = self.store.borrow_mut().new_chat();
+        match result {
+            Ok(_) => {
+                self.store.borrow_mut().clear_active_status();
+                self.render_active_chat();
+                self.publish_persisted_conversation();
+                self.show_chat_page();
+            }
+            Err(ChatStoreError::LimitReached) => {
+                self.show_chat_page();
+                self.show_error_status(
+                    "Chat limit reached. Delete a chat before creating another one.",
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn select_chat(&self, id: u64) {
+        let selected = self.store.borrow_mut().select_chat(id);
+        if selected {
+            self.render_active_chat();
+            self.publish_persisted_conversation();
+        }
+        self.show_chat_page();
+    }
+
+    fn toggle_archive_active_chat(&self) {
+        let result = self.store.borrow_mut().toggle_archive_active();
+        match result {
+            Ok(_) => {
+                self.render_active_chat();
+                self.publish_persisted_conversation();
+                self.show_chat_page();
+            }
+            Err(_) => self.show_error_status("Could not update this chat's archive state."),
+        }
+    }
+
+    fn show_rename_chat_dialog(&self) {
+        let current = self.store.borrow().active_title().to_string();
+        let dialog = adw::AlertDialog::new(Some("Rename chat"), None);
+        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        let entry = Entry::new();
+        entry.set_text(&current);
+        entry.set_activates_default(true);
+        dialog.set_extra_child(Some(&entry));
+        let p = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "rename" && p.store.borrow_mut().rename_active(&entry.text()) {
+                p.refresh_chat_chrome();
+                p.refresh_chat_library();
+                p.publish_persisted_conversation();
+            }
+        });
+        dialog.present(Some(&self.root));
+    }
+
+    fn show_delete_chat_dialog(&self) {
+        let title = self.store.borrow().active_title().to_string();
+        let dialog = adw::AlertDialog::new(
+            Some("Delete this chat?"),
+            Some(&format!(
+                "“{title}” and its saved messages will be permanently removed."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let p = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            p.store.borrow_mut().delete_active();
+            p.render_active_chat();
+            p.publish_persisted_conversation();
+            p.show_chat_page();
+        });
+        dialog.present(Some(&self.root));
+    }
+
+    fn refresh_chat_chrome(&self) {
+        let (title, archived, at_capacity) = {
+            let store = self.store.borrow();
+            (
+                store.active_title().to_string(),
+                store.active_archived(),
+                store.at_capacity(),
+            )
+        };
+        self.chat_title.set_text(&title);
+        self.chat_title.set_tooltip_text(Some(&title));
+        self.archive_chat_btn
+            .set_label(if archived { "Unarchive" } else { "Archive" });
+        self.new_chat_btn.set_sensitive(!at_capacity);
+        self.new_chat_btn.set_tooltip_text(Some(if at_capacity {
+            "Chat limit reached; delete a chat before creating another"
+        } else {
+            "Create a new chat and keep existing chats"
+        }));
+        self.refresh_config_display();
+    }
+
+    fn refresh_chat_library(&self) {
+        while let Some(row) = self.chat_list.row_at_index(0) {
+            self.chat_list.remove(&row);
+        }
+        self.chat_row_ids.borrow_mut().clear();
+
+        let query = self.chat_search.text().trim().to_lowercase();
+        let summaries: Vec<_> = self
+            .store
+            .borrow()
+            .summaries()
+            .into_iter()
+            .filter(|summary| {
+                query.is_empty()
+                    || summary.title.to_lowercase().contains(&query)
+                    || summary.preview.to_lowercase().contains(&query)
+            })
+            .collect();
+        let active: Vec<_> = summaries
+            .iter()
+            .filter(|summary| !summary.archived)
+            .cloned()
+            .collect();
+        let archived: Vec<_> = summaries
+            .iter()
+            .filter(|summary| summary.archived)
+            .cloned()
+            .collect();
+
+        if !active.is_empty() {
+            self.append_chat_section("Chats");
+            for summary in &active {
+                self.append_chat_row(summary);
+            }
+        }
+        if !archived.is_empty() {
+            self.append_chat_section("Archived");
+            for summary in &archived {
+                self.append_chat_row(summary);
+            }
+        }
+        if active.is_empty() && archived.is_empty() {
+            let row = ListBoxRow::new();
+            row.set_activatable(false);
+            row.set_selectable(false);
+            let label = Label::new(Some("No matching chats"));
+            label.add_css_class("ai-chat-empty");
+            row.set_child(Some(&label));
+            self.chat_list.append(&row);
+            self.chat_row_ids.borrow_mut().push(None);
+        }
+    }
+
+    fn append_chat_section(&self, title: &str) {
+        let row = ListBoxRow::new();
+        row.set_activatable(false);
+        row.set_selectable(false);
+        let label = Label::new(Some(title));
+        label.set_halign(gtk4::Align::Start);
+        label.add_css_class("ai-chat-section");
+        row.set_child(Some(&label));
+        self.chat_list.append(&row);
+        self.chat_row_ids.borrow_mut().push(None);
+    }
+
+    fn append_chat_row(&self, summary: &ChatSummary) {
+        let subtitle = if summary.busy {
+            "Thinking…".to_string()
+        } else if summary.unread {
+            format!("New response · {}", summary.preview)
+        } else if summary.history_truncated {
+            format!("Some local content omitted · {}", summary.preview)
+        } else {
+            summary.preview.clone()
+        };
+        let row = adw::ActionRow::builder()
+            .title(&summary.title)
+            .subtitle(&subtitle)
+            .activatable(true)
+            .build();
+        row.add_css_class("ai-chat-row");
+        if summary.active {
+            row.add_css_class("active");
+        }
+        if summary.archived {
+            row.add_css_class("archived");
+            let icon = Image::from_icon_name("folder-symbolic");
+            icon.set_tooltip_text(Some("Archived"));
+            row.add_suffix(&icon);
+        }
+        if summary.unread {
+            row.add_css_class("unread");
+            let badge = Label::new(Some("New"));
+            badge.add_css_class("accent");
+            row.add_suffix(&badge);
+        }
+        if summary.busy {
+            let spinner = Spinner::new();
+            spinner.start();
+            row.add_suffix(&spinner);
+        }
+        self.chat_list.append(&row);
+        self.chat_row_ids.borrow_mut().push(Some(summary.id));
+        if summary.active {
+            self.chat_list.select_row(Some(&row));
+        }
+    }
+
+    fn render_active_chat(&self) {
+        let (history, draft) = {
+            let store = self.store.borrow();
+            (
+                store.active_history().to_vec(),
+                store.active_draft().to_string(),
+            )
+        };
         self.convo_buffer.set_text("");
-        for turn in turns {
+        for turn in history {
             match turn.role {
                 Role::User => self.insert_visible("You", "role-user", &turn.text),
                 Role::Assistant => self.insert_visible("Assistant", "role-asst", &turn.text),
             }
         }
+        self.input_buffer.set_text(&draft);
         self.sync_empty_state();
-        self.set_info_status(if has_context {
-            "Conversation and selected-block context restored for this window."
-        } else {
-            "Conversation restored for this window."
-        });
-        self.scroll_transcript_to_end();
         self.sync_composer_state();
-    }
-
-    pub(crate) fn focus_input(&self) {
-        self.input_view.grab_focus();
-    }
-
-    pub(crate) fn input_has_focus(&self) -> bool {
-        self.input_view.has_focus()
+        self.sync_active_status();
+        self.refresh_chat_chrome();
+        self.refresh_chat_library();
+        self.scroll_transcript_to_end();
     }
 
     fn sync_empty_state(&self) {
@@ -516,12 +811,49 @@ impl AiPanel {
 
     fn sync_composer_state(&self) {
         let text = self.input_text();
+        let (busy, archived) = {
+            let store = self.store.borrow();
+            (store.is_active_busy(), store.active_archived())
+        };
+        self.input_view.set_editable(!archived);
+        self.input_placeholder.set_text(if archived {
+            "Unarchive this chat to continue"
+        } else {
+            "Ask about commands, errors, or output…"
+        });
         self.input_placeholder.set_visible(text.is_empty());
         self.send_btn
-            .set_sensitive(!self.conversation.borrow().is_busy() && !text.trim().is_empty());
+            .set_sensitive(!archived && !busy && !text.trim().is_empty());
     }
 
-    fn clear_status(&self) {
+    fn sync_active_status(&self) {
+        let (status, archived, truncated, has_context) = {
+            let store = self.store.borrow();
+            (
+                store.active_status().clone(),
+                store.active_archived(),
+                store.active_history_truncated(),
+                store.active_context().is_some(),
+            )
+        };
+        match status {
+            ChatStatus::Thinking(message) => self.show_busy_status(&message),
+            ChatStatus::Info(message) => self.show_info_status(&message),
+            ChatStatus::Error(message) => self.show_error_status(&message),
+            ChatStatus::Idle if archived => {
+                self.show_info_status("Archived chat · Unarchive it to continue.")
+            }
+            ChatStatus::Idle if truncated => self.show_info_status(
+                "Some older local chat content was omitted to stay within storage limits.",
+            ),
+            ChatStatus::Idle if has_context => {
+                self.show_info_status("Selected Block context is attached to this chat.")
+            }
+            ChatStatus::Idle => self.clear_status_widgets(),
+        }
+    }
+
+    fn clear_status_widgets(&self) {
         self.root
             .update_state(&[gtk4::accessible::State::Busy(false)]);
         self.status_spinner.stop();
@@ -531,7 +863,7 @@ impl AiPanel {
         self.status_row.set_visible(false);
     }
 
-    fn set_busy_status(&self, message: &str) {
+    fn show_busy_status(&self, message: &str) {
         self.root
             .update_state(&[gtk4::accessible::State::Busy(true)]);
         self.status_row.remove_css_class("error");
@@ -541,7 +873,7 @@ impl AiPanel {
         self.status_row.set_visible(true);
     }
 
-    fn set_info_status(&self, message: &str) {
+    fn show_info_status(&self, message: &str) {
         self.root
             .update_state(&[gtk4::accessible::State::Busy(false)]);
         self.status_spinner.stop();
@@ -551,7 +883,7 @@ impl AiPanel {
         self.status_row.set_visible(!message.is_empty());
     }
 
-    fn set_error_status(&self, message: &str) {
+    fn show_error_status(&self, message: &str) {
         self.root
             .update_state(&[gtk4::accessible::State::Busy(false)]);
         self.status_spinner.stop();
@@ -561,24 +893,62 @@ impl AiPanel {
         self.status_row.set_visible(true);
     }
 
-    /// Update the per-window snapshot. The persistence implementation plugs
-    /// into this method; keeping the call at every stable state transition
-    /// makes Clear and stale-response invalidation share the same boundary.
     fn publish_persisted_conversation(&self) {
-        let state = self.conversation.borrow();
-        let context = self.block_context.borrow();
-        let snapshot = conversation_snapshot_for_persistence(
-            &state.history,
-            context.as_ref(),
-            self.config.borrow().ai_redact_secrets,
-        );
+        let redact = self.config.borrow().ai_redact_secrets;
+        let result = self.store.borrow_mut().snapshot_for_persistence(redact);
+        let (snapshot, truncation_changed) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!("Could not safely build AI chat snapshot: {error:?}");
+                self.show_error_status("Chat changes could not be saved safely.");
+                return;
+            }
+        };
+        if truncation_changed {
+            self.sync_active_status();
+            self.refresh_chat_library();
+        }
+        let snapshot = Some(snapshot);
         let changed = crate::state::get_ai_conversation_snapshot() != snapshot;
         crate::state::set_ai_conversation_snapshot(snapshot);
         if changed {
-            if let Some(callback) = self.persistence_callback.borrow().as_ref().cloned() {
+            let callback = self.persistence_callback.borrow().as_ref().cloned();
+            if let Some(callback) = callback {
                 callback();
             }
         }
+        self.sync_persisted_truncation();
+    }
+
+    /// Window-state compaction has an additional whole-workspace budget. Pull
+    /// its durable truncation markers back into the live chat library after a
+    /// successful save without discarding history still available in memory.
+    pub(crate) fn sync_persisted_truncation(&self) {
+        let Some(snapshot) = crate::state::get_ai_conversation_snapshot() else {
+            return;
+        };
+        let changed = self.store.borrow_mut().sync_truncation_markers(&snapshot);
+        if changed {
+            self.sync_active_status();
+            self.refresh_chat_library();
+        }
+    }
+
+    fn schedule_draft_persistence(&self) {
+        let epoch = self.draft_persist_epoch.get().wrapping_add(1);
+        self.draft_persist_epoch.set(epoch);
+        let p = self.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+            if p.draft_persist_epoch.get() == epoch {
+                p.publish_persisted_conversation();
+            }
+        });
+    }
+
+    pub(crate) fn flush_persisted_conversation(&self) {
+        self.draft_persist_epoch
+            .set(self.draft_persist_epoch.get().wrapping_add(1));
+        self.publish_persisted_conversation();
     }
 
     pub(crate) fn refresh_persisted_privacy(&self) {
@@ -587,12 +957,13 @@ impl AiPanel {
         }
     }
 
-    /// Copy a mouse/keyboard selection from the focused composer or transcript.
-    ///
-    /// The application owns Ctrl+Shift+C at the window capture phase for
-    /// terminal copying, so either TextView needs priority before the active
-    /// terminal fallback.
     pub(crate) fn copy_focused_selection(&self) -> bool {
+        if self.chat_search_has_focus() {
+            if let Some(text) = self.chat_search_text_delegate() {
+                text.emit_copy_clipboard();
+            }
+            return true;
+        }
         if self.status_label.has_focus() {
             if let Some((start, end)) = self.status_label.selection_bounds() {
                 let lower = start.min(end).max(0) as usize;
@@ -618,20 +989,23 @@ impl AiPanel {
             return false;
         };
         let Some((start, end)) = buffer.selection_bounds() else {
-            // The shortcut still belongs to the focused AI text widget; do
-            // not unexpectedly copy a stale terminal selection instead.
             return true;
         };
         let text = buffer.text(&start, &end, false);
-        if text.is_empty() {
-            return true;
+        if !text.is_empty() {
+            view.clipboard().set_text(&text);
         }
-        view.clipboard().set_text(&text);
         true
     }
 
     pub(crate) fn paste_into_composer_if_focused(&self) -> bool {
-        if !self.input_view.has_focus() {
+        if self.chat_search_has_focus() {
+            if let Some(text) = self.chat_search_text_delegate() {
+                text.emit_paste_clipboard();
+            }
+            return true;
+        }
+        if !self.input_view.has_focus() || self.store.borrow().active_archived() {
             return false;
         }
         self.input_buffer
@@ -639,35 +1013,43 @@ impl AiPanel {
         true
     }
 
+    fn chat_search_has_focus(&self) -> bool {
+        self.chat_search.has_focus()
+            || self
+                .chat_search_text_delegate()
+                .is_some_and(|text| text.has_focus())
+    }
+
+    fn chat_search_text_delegate(&self) -> Option<gtk4::Text> {
+        self.chat_search.delegate()?.downcast::<gtk4::Text>().ok()
+    }
+
     fn insert_visible(&self, label: &str, role_tag: &str, body: &str) {
         let mut end = self.convo_buffer.end_iter();
         if self.convo_buffer.char_count() > 0 {
             self.convo_buffer.insert(&mut end, "\n\n");
         }
-        let label_start_off = end.offset();
+        let label_start = end.offset();
         self.convo_buffer.insert(&mut end, label);
-        let label_end_off = end.offset();
+        let label_end = end.offset();
         self.convo_buffer.insert(&mut end, "\n");
         self.convo_buffer.insert(&mut end, body);
-        // Re-fetch iters via offsets (insert invalidates the prior `end`).
-        let start = self.convo_buffer.iter_at_offset(label_start_off);
-        let end = self.convo_buffer.iter_at_offset(label_end_off);
+        let start = self.convo_buffer.iter_at_offset(label_start);
+        let end = self.convo_buffer.iter_at_offset(label_end);
         self.convo_buffer.apply_tag_by_name(role_tag, &start, &end);
     }
 
     fn scroll_transcript_to_end(&self) {
-        let convo_view = self.convo_view.clone();
-        let convo_buffer = self.convo_buffer.clone();
+        let view = self.convo_view.clone();
+        let buffer = self.convo_buffer.clone();
         let adjustment = self.convo_scroll.vadjustment();
         glib::idle_add_local_once(move || {
-            let mut end = convo_buffer.end_iter();
-            convo_view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+            let mut end = buffer.end_iter();
+            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
             adjustment.set_value(adjustment.upper());
         });
     }
 
-    /// Append a labelled message to the visible transcript and scroll to end.
-    /// Pure UI — does NOT mutate `history` (the API-facing transcript).
     fn append_visible(&self, label: &str, role_tag: &str, body: &str) {
         let adjustment = self.convo_scroll.vadjustment();
         let was_empty = self.convo_buffer.char_count() == 0;
@@ -675,18 +1057,17 @@ impl AiPanel {
             adjustment.value() + adjustment.page_size() >= adjustment.upper() - 32.0;
         self.insert_visible(label, role_tag, body);
         self.sync_empty_state();
-        // Keep a reader's position when they have scrolled up to copy an older
-        // answer. New/near-bottom conversations continue following replies.
         if was_empty || was_near_bottom {
             self.scroll_transcript_to_end();
         }
     }
 
-    /// Convenience: pop the input box's full content (or use `override_text`)
-    /// and fire a request. No-op if both sources are empty or a request is
-    /// already in flight.
     fn send_from_input(&self, override_text: Option<String>) {
-        if self.conversation.borrow().is_busy() {
+        let (busy, archived) = {
+            let store = self.store.borrow();
+            (store.is_active_busy(), store.active_archived())
+        };
+        if busy || archived {
             return;
         }
         let text = override_text.unwrap_or_else(|| self.input_text());
@@ -696,16 +1077,21 @@ impl AiPanel {
         }
         let user_text = trimmed.to_string();
         self.input_buffer.set_text("");
-        self.send_with_context(user_text, None);
+        self.send_with_context(user_text, None, true);
     }
 
-    /// Public entry point used by the action dispatcher (ToggleAiPanel sister
-    /// action `AskAiAboutSelectedBlock`). Posts the question, attaches the
-    /// block as system context.
     pub(crate) fn ask_about_block(&self, ctx: BlockContext) {
-        if self.conversation.borrow().is_busy() {
-            // Don't queue — quietly drop the second click. The status label
-            // already says "Thinking…", which is signal enough.
+        if self.store.borrow().active_archived() {
+            if self.store.borrow_mut().new_chat().is_err() {
+                self.show_error_status(
+                    "Unarchive this chat or delete another chat before asking about a Block.",
+                );
+                return;
+            }
+            self.render_active_chat();
+            self.publish_persisted_conversation();
+        }
+        if self.store.borrow().is_active_busy() {
             return;
         }
         let prompt = if ctx.exit_code == 0 {
@@ -713,168 +1099,179 @@ impl AiPanel {
         } else {
             "This command failed. Diagnose the error and suggest a fix."
         };
-        self.send_with_context(prompt.to_string(), Some(ctx));
+        self.show_chat_page();
+        self.send_with_context(prompt.to_string(), Some(ctx), false);
     }
 
-    pub(crate) fn command_generation_started(&self, request: &str) {
+    pub(crate) fn command_generation_started(&self, request: &str) -> u64 {
+        let id = self.store.borrow().active_id();
         self.append_visible("You", "role-user", &format!("Generate command: {request}"));
-        self.set_busy_status("Generating a reviewable command…");
+        self.show_busy_status("Generating a reviewable command…");
+        id
     }
 
-    pub(crate) fn command_generation_review_required(&self, command: &str) {
-        self.set_info_status("Review the generated command before inserting it.");
-        self.append_visible("Assistant", "role-asst", command);
+    pub(crate) fn command_generation_review_required(&self, chat_id: u64, command: &str) {
+        if chat_id == self.store.borrow().active_id() {
+            self.show_info_status("Review the generated command before inserting it.");
+            self.append_visible("Assistant", "role-asst", command);
+        }
     }
 
-    pub(crate) fn command_generation_inserted(&self) {
-        self.set_info_status("Inserted in the terminal for review; it was not run.");
+    pub(crate) fn command_generation_inserted(&self, chat_id: u64) {
+        if chat_id == self.store.borrow().active_id() {
+            self.show_info_status("Inserted in the terminal for review; it was not run.");
+        }
     }
 
-    pub(crate) fn command_generation_failed(&self, error: &str) {
-        self.set_error_status(error);
-        self.append_visible("Assistant", "role-err", error);
+    pub(crate) fn command_generation_failed(&self, chat_id: u64, error: &str) {
+        if chat_id == self.store.borrow().active_id() {
+            self.show_error_status(error);
+            self.append_visible("Assistant", "role-err", error);
+        }
     }
 
-    /// Core send path. Appends to the visible transcript + the API history,
-    /// spawns a worker thread, posts the result back via glib channel.
-    fn send_with_context(&self, user_text: String, ctx: Option<BlockContext>) {
-        // Redact secrets before anything else — the visible transcript shows
-        // exactly what gets sent, so a leaked AWS key in the input box stays
-        // visible nowhere from this point on. Opt-out via `ai_redact_secrets`.
-        let (user_text, ctx) = {
-            let cfg = self.config.borrow();
-            if cfg.ai_redact_secrets {
+    fn send_with_context(
+        &self,
+        user_text: String,
+        context: Option<BlockContext>,
+        restore_pending_as_draft: bool,
+    ) {
+        let (user_text, context) = {
+            let config = self.config.borrow();
+            if config.ai_redact_secrets {
                 let user_text = crate::redact::redact_secrets(&user_text);
-                let ctx = ctx.map(|c| BlockContext {
-                    cmd: crate::redact::redact_secrets(&c.cmd),
-                    output: crate::redact::redact_secrets(&c.output),
-                    cwd: c.cwd,
-                    exit_code: c.exit_code,
+                let context = context.map(|context| BlockContext {
+                    cmd: crate::redact::redact_secrets(&context.cmd),
+                    output: crate::redact::redact_secrets(&context.output),
+                    cwd: context.cwd.map(|cwd| crate::redact::redact_secrets(&cwd)),
+                    exit_code: context.exit_code,
                 });
-                (user_text, ctx)
+                (user_text, context)
             } else {
-                (user_text, ctx)
+                (user_text, context)
             }
         };
 
-        // A selected block seeds the conversation's system context. Retain it
-        // for follow-up turns until Clear, otherwise the second question would
-        // send the role history but silently lose the command/output being
-        // discussed.
-        if let Some(context) = ctx.as_ref() {
-            *self.block_context.borrow_mut() = Some(context.clone());
-        }
-        let effective_context = ctx.clone().or_else(|| self.block_context.borrow().clone());
-
-        // Show what we sent.
-        let visible_user = match &ctx {
-            Some(c) => format!("{user_text}\n[context: `{}`, exit {}]", c.cmd, c.exit_code),
-            None => user_text.clone(),
-        };
-        self.append_visible("You", "role-user", &visible_user);
-        // History always holds the raw user message — the block context goes
-        // into the system prompt, not the user turn.
-        let (request_epoch, history) = self.conversation.borrow_mut().begin(user_text);
         let client = ai::AiClient::from_config(&self.config.borrow());
         let provider_label = client
             .as_ref()
             .map(ai::AiClient::display_name)
             .unwrap_or_else(|_| "AI unavailable".to_string());
-        let system = ai::build_system_prompt(effective_context.as_ref());
+        let thinking = format!("Thinking… ({provider_label})");
+        let visible_user = match context.as_ref() {
+            Some(context) => format!(
+                "{user_text}\n[context: `{}`, exit {}]",
+                context.cmd, context.exit_code
+            ),
+            None => user_text.clone(),
+        };
+        let start = match self.store.borrow_mut().begin_turn(
+            user_text,
+            context,
+            thinking,
+            restore_pending_as_draft,
+        ) {
+            Ok(start) => start,
+            Err(ChatStoreError::Archived) => {
+                self.show_info_status("Unarchive this chat before sending a message.");
+                return;
+            }
+            Err(ChatStoreError::Busy | ChatStoreError::EmptyMessage) => return,
+            Err(ChatStoreError::LimitReached) => return,
+            Err(ChatStoreError::SnapshotInvalid) => return,
+        };
 
+        self.append_visible("You", "role-user", &visible_user);
         self.sync_composer_state();
-        self.set_busy_status(&format!("Thinking… ({provider_label})"));
+        self.sync_active_status();
+        self.refresh_chat_chrome();
+        self.refresh_chat_library();
+        let system = ai::build_system_prompt(start.effective_context.as_ref());
+        let history = start.history;
+        let token = start.token;
 
-        // mpsc + polling timeout matches the pattern in pty.rs:346 (gtk-rs 0.11
-        // dropped MainContext::channel; the codebase polls a std::sync::mpsc
-        // from a glib timer instead). 50ms is well below human-perceptible
-        // latency and far cheaper than an API call's hundreds-of-ms cost.
         let (tx, rx) = std::sync::mpsc::channel::<Result<String, ai::AiError>>();
         std::thread::spawn(move || {
-            let res =
+            let result =
                 client.and_then(|client| client.send_turns_blocking(system.as_deref(), &history));
-            let _ = tx.send(res);
+            let _ = tx.send(result);
         });
 
         let p = self.clone();
-        let rx_cell = std::cell::RefCell::new(rx);
-        glib::timeout_add_local(std::time::Duration::from_millis(50), move || match rx_cell
-            .borrow()
-            .try_recv()
-        {
-            Ok(res) => {
-                match res {
-                    Ok(text) => {
-                        if !p
-                            .conversation
-                            .borrow_mut()
-                            .complete_success(request_epoch, text.clone())
-                        {
-                            return glib::ControlFlow::Break;
-                        }
-                        p.clear_status();
+        let rx = RefCell::new(rx);
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            match rx.borrow().try_recv() {
+                Ok(Ok(text)) => {
+                    let owner_active = p.store.borrow_mut().complete_success(token, text.clone());
+                    let Some(owner_active) = owner_active else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if owner_active {
                         p.append_visible("Assistant", "role-asst", &text);
+                        p.sync_active_status();
                         p.sync_composer_state();
-                        p.publish_persisted_conversation();
+                        p.refresh_chat_chrome();
                     }
-                    Err(e) => {
-                        if !p.conversation.borrow_mut().complete_error(request_epoch) {
-                            return glib::ControlFlow::Break;
-                        }
-                        let msg = format!("Error: {e}");
-                        p.set_error_status(&msg);
-                        p.append_visible("Assistant", "role-err", &msg);
-                        p.sync_composer_state();
-                    }
+                    p.refresh_chat_library();
+                    p.publish_persisted_conversation();
+                    glib::ControlFlow::Break
                 }
-                glib::ControlFlow::Break
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                if !p.conversation.borrow_mut().complete_error(request_epoch) {
-                    return glib::ControlFlow::Break;
+                Ok(Err(error)) => {
+                    p.finish_request_error(token, format!("Error: {error}"));
+                    glib::ControlFlow::Break
                 }
-                let msg = "Error: worker thread disconnected";
-                p.set_error_status(msg);
-                p.append_visible("Assistant", "role-err", msg);
-                p.sync_composer_state();
-                glib::ControlFlow::Break
+                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    p.finish_request_error(token, "Error: worker thread disconnected".to_string());
+                    glib::ControlFlow::Break
+                }
             }
         });
+    }
+
+    fn finish_request_error(&self, token: RequestToken, message: String) {
+        let owner_active = self
+            .store
+            .borrow_mut()
+            .complete_error(token, message.clone());
+        let Some(owner_active) = owner_active else {
+            return;
+        };
+        if owner_active {
+            let draft = self.store.borrow().active_draft().to_string();
+            self.input_buffer.set_text(&draft);
+            self.show_error_status(&message);
+            self.append_visible("Assistant", "role-err", &message);
+            self.sync_composer_state();
+            self.refresh_chat_chrome();
+        }
+        self.refresh_chat_library();
+        self.publish_persisted_conversation();
+    }
+}
+
+fn menu_button(label: &str) -> Button {
+    let button = Button::with_label(label);
+    button.set_has_frame(false);
+    button.set_halign(gtk4::Align::Fill);
+    if let Some(child) = button.child() {
+        child.set_halign(gtk4::Align::Start);
+    }
+    button.add_css_class("flat");
+    button
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clear_invalidates_in_flight_reply_and_prevents_assistant_only_history() {
-        let mut state = ConversationState::default();
-        let (epoch, sent) = state.begin("first".into());
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].role, Role::User);
-
-        state.clear();
-        assert!(!state.complete_success(epoch, "stale".into()));
-        assert!(state.history.is_empty());
-        assert!(!state.is_busy());
-    }
-
-    #[test]
-    fn success_alternates_roles_and_error_rolls_back_only_its_user_turn() {
-        let mut state = ConversationState::default();
-        let (first, _) = state.begin("one".into());
-        assert!(state.complete_success(first, "answer one".into()));
-        let (second, sent) = state.begin("two".into());
-        assert_eq!(sent.len(), 3);
-        assert_eq!(sent[0].role, Role::User);
-        assert_eq!(sent[1].role, Role::Assistant);
-        assert_eq!(sent[2].role, Role::User);
-        assert!(state.complete_error(second));
-        assert_eq!(state.history.len(), 2);
-        assert_eq!(state.history[1].role, Role::Assistant);
-    }
 
     #[test]
     fn composer_enter_shortcuts_send_or_insert_newline_as_documented() {
@@ -913,56 +1310,5 @@ mod tests {
         for (key, modifiers, expected) in cases {
             assert_eq!(classify_composer_key(key, modifiers), expected);
         }
-    }
-
-    #[test]
-    fn restoring_history_invalidates_an_in_flight_epoch() {
-        let mut state = ConversationState::default();
-        let (stale_epoch, _) = state.begin("stale".into());
-        state.restore(vec![
-            Turn {
-                role: Role::User,
-                text: "restored question".into(),
-            },
-            Turn {
-                role: Role::Assistant,
-                text: "restored answer".into(),
-            },
-        ]);
-
-        assert!(!state.complete_success(stale_epoch, "late answer".into()));
-        assert!(!state.is_busy());
-        assert_eq!(state.history.len(), 2);
-    }
-
-    #[test]
-    fn enabling_redaction_scrubs_every_persisted_conversation_field() {
-        const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
-        let history = vec![
-            Turn {
-                role: Role::User,
-                text: format!("question {SECRET}"),
-            },
-            Turn {
-                role: Role::Assistant,
-                text: format!("answer {SECRET}"),
-            },
-        ];
-        let context = BlockContext {
-            cmd: format!("echo {SECRET}"),
-            output: format!("result {SECRET}"),
-            cwd: Some(format!("/tmp/{SECRET}")),
-            exit_code: 0,
-        };
-
-        let snapshot =
-            conversation_snapshot_for_persistence(&history, Some(&context), true).unwrap();
-        for turn in snapshot.turns() {
-            assert!(!turn.text.contains(SECRET));
-        }
-        let context = snapshot.block_context().unwrap();
-        assert!(!context.cmd.contains(SECRET));
-        assert!(!context.output.contains(SECRET));
-        assert!(!context.cwd.as_deref().unwrap().contains(SECRET));
     }
 }

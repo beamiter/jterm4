@@ -28,7 +28,8 @@ const API_KEY_ENV_NAMES: [&str; 4] = [
 mod conversation;
 
 pub(crate) use conversation::{
-    ConversationSnapshot, ConversationSnapshotError, MAX_CONVERSATION_SNAPSHOT_JSON_BYTES,
+    ChatSnapshot, ConversationSnapshot, ConversationSnapshotError,
+    MAX_CONVERSATION_SNAPSHOT_JSON_BYTES, MAX_PERSISTED_CHATS,
 };
 
 /// Supported wire protocols. OpenAI-compatible intentionally includes local
@@ -130,6 +131,7 @@ impl Role {
 
 /// One turn in a provider-neutral conversation transcript.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Turn {
     pub(crate) role: Role,
     pub(crate) text: String,
@@ -809,6 +811,7 @@ pub(crate) fn build_system_prompt(block: Option<&BlockContext>) -> Option<String
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockContext {
     pub cmd: String,
     pub output: String,

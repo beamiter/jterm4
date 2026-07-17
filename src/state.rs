@@ -20,7 +20,9 @@ use crate::terminal::{find_first_terminal, terminal_working_directory};
 use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
-const MAX_WINDOW_STATE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_WORKSPACE_STATE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_AI_METADATA_RESERVE_BYTES: usize = 64 * 1024;
+const MAX_WINDOW_STATE_BYTES: usize = MAX_WORKSPACE_STATE_BYTES + MAX_AI_METADATA_RESERVE_BYTES;
 const READY_STATE_EXTENSION: &str = "state";
 const ACTIVE_STATE_EXTENSION: &str = "active";
 const AI_CONVERSATION_PREFIX: &str = "ai_conversation=";
@@ -53,7 +55,7 @@ pub(crate) fn get_ai_conversation_snapshot() -> Option<crate::ai::ConversationSn
 }
 
 /// Replace the AI conversation that the next window-state save will embed.
-/// Passing `None` makes Clear durable without manufacturing an empty record.
+/// Passing `None` durably removes the entire chat library from the snapshot.
 pub(crate) fn set_ai_conversation_snapshot(snapshot: Option<crate::ai::ConversationSnapshot>) {
     *ai_conversation_slot()
         .lock()
@@ -453,23 +455,42 @@ fn ai_conversation_state_line(
     Ok(format!("{AI_CONVERSATION_PREFIX}{escaped}"))
 }
 
-/// Encode line-oriented window state within its hard limit. If the optional
-/// line (the AI transcript) is what tips the payload over the boundary, omit
-/// it so tabs and pane layouts still reach disk.
-fn bounded_window_state_payload(
-    lines: &mut Vec<String>,
-    optional_line_index: Option<usize>,
-    max_bytes: usize,
-) -> Option<(String, bool)> {
-    let mut payload = lines.join("\n") + "\n";
-    if payload.len() <= max_bytes {
-        return Some((payload, false));
+fn compact_ai_conversation_for_window(
+    snapshot: &crate::ai::ConversationSnapshot,
+    base_lines: &[String],
+    max_workspace_bytes: usize,
+    max_total_bytes: usize,
+) -> Option<(String, crate::ai::ConversationSnapshot, bool)> {
+    let base_len = window_state_payload_len(base_lines)?;
+    if base_len > max_workspace_bytes {
+        return None;
     }
 
-    let optional_line_index = optional_line_index.filter(|index| *index < lines.len())?;
-    lines.remove(optional_line_index);
-    payload = lines.join("\n") + "\n";
-    (payload.len() <= max_bytes).then_some((payload, true))
+    let line_separator = usize::from(!base_lines.is_empty());
+    let mut compacted = snapshot.clone();
+    compacted.compact_to_measured_limit(max_total_bytes, |candidate| {
+        let line = ai_conversation_state_line(candidate).ok()?;
+        base_len
+            .checked_add(line_separator)?
+            .checked_add(line.len())
+    })?;
+    let line = ai_conversation_state_line(&compacted).ok()?;
+    let changed = compacted != *snapshot;
+    Some((line, compacted, changed))
+}
+
+fn window_state_payload_len(lines: &[String]) -> Option<usize> {
+    if lines.is_empty() {
+        return Some(1);
+    }
+    lines.iter().try_fold(0usize, |total, line| {
+        total.checked_add(line.len())?.checked_add(1)
+    })
+}
+
+fn bounded_window_state_payload(lines: &[String], max_bytes: usize) -> Option<String> {
+    let payload = lines.join("\n") + "\n";
+    (payload.len() <= max_bytes).then_some(payload)
 }
 
 /// When the current workspace itself is too large to replace, preserve the
@@ -495,29 +516,50 @@ fn rewrite_existing_ai_conversation(
         return Ok(false);
     }
 
-    let mut ai_line_index = None;
+    let mut compacted_ai = false;
+    let mut durable_ai_snapshot = None;
     if let Some(snapshot) = snapshot {
-        let line = ai_conversation_state_line(snapshot)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let (line, compacted_snapshot, compacted) = compact_ai_conversation_for_window(
+            snapshot,
+            &lines,
+            MAX_WORKSPACE_STATE_BYTES,
+            MAX_WINDOW_STATE_BYTES,
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "AI chat metadata cannot fit the preserved workspace snapshot",
+            )
+        })?;
+        compacted_ai = compacted;
+        durable_ai_snapshot = Some(compacted_snapshot);
+        if compacted {
+            log::warn!("Compacted AI chats to fit the preserved workspace snapshot");
+        }
         let insertion = usize::from(
             lines
                 .first()
                 .is_some_and(|line| line.starts_with("current_page=")),
         );
         lines.insert(insertion, line);
-        ai_line_index = Some(insertion);
     }
 
-    let (payload, omitted_ai) =
-        bounded_window_state_payload(&mut lines, ai_line_index, MAX_WINDOW_STATE_BYTES)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "previous workspace snapshot cannot be safely rewritten",
-                )
-            })?;
+    let payload_limit = if snapshot.is_some() {
+        MAX_WINDOW_STATE_BYTES
+    } else {
+        MAX_WORKSPACE_STATE_BYTES
+    };
+    let payload = bounded_window_state_payload(&lines, payload_limit).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "previous workspace snapshot cannot be safely rewritten",
+        )
+    })?;
     atomic_write_private_file(path, payload.as_bytes())?;
-    Ok(omitted_ai)
+    if let Some(snapshot) = durable_ai_snapshot {
+        set_ai_conversation_snapshot(Some(snapshot));
+    }
+    Ok(compacted_ai)
 }
 
 /// Parse the AI payload independently from tabs. Any malformed, duplicated,
@@ -1051,22 +1093,6 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         lines.push(format!("current_page={current}"));
     }
     let ai_snapshot = get_ai_conversation_snapshot();
-    let mut ai_line_index = None;
-    if let Some(snapshot) = ai_snapshot.as_ref() {
-        match ai_conversation_state_line(snapshot) {
-            Ok(line) => {
-                ai_line_index = Some(lines.len());
-                lines.push(line);
-            }
-            Err(error) => {
-                // AI state is optional. A malformed in-memory payload must
-                // never prevent newer tabs/panes from reaching durable state.
-                log::error!(
-                    "Omitting unserializable AI conversation from window snapshot: {error}"
-                );
-            }
-        }
-    }
 
     for i in 0..n_pages {
         let Some(widget) = notebook.nth_page(Some(i)) else {
@@ -1091,16 +1117,14 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         lines.push(line);
     }
 
-    let Some((payload, omitted_ai)) =
-        bounded_window_state_payload(&mut lines, ai_line_index, MAX_WINDOW_STATE_BYTES)
-    else {
+    if window_state_payload_len(&lines).is_none_or(|length| length > MAX_WORKSPACE_STATE_BYTES) {
         log::error!(
             "Refusing to save window snapshot because tabs and panes exceed the {} byte limit",
-            MAX_WINDOW_STATE_BYTES
+            MAX_WORKSPACE_STATE_BYTES
         );
         match rewrite_existing_ai_conversation(&path, ai_snapshot.as_ref()) {
             Ok(true) => log::warn!(
-                "Preserved the previous workspace snapshot but omitted its AI conversation"
+                "Preserved the previous workspace snapshot and compacted its AI conversation"
             ),
             Ok(false) => log::warn!(
                 "Preserved the previous workspace snapshot and refreshed its AI conversation"
@@ -1114,13 +1138,53 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
             ),
         }
         return;
-    };
-    if omitted_ai {
-        log::warn!(
-            "Omitting AI conversation so the window snapshot stays within the {} byte limit",
-            MAX_WINDOW_STATE_BYTES
-        );
     }
+
+    let mut has_ai_line = false;
+    let mut durable_ai_snapshot = None;
+    if let Some(snapshot) = ai_snapshot.as_ref() {
+        match compact_ai_conversation_for_window(
+            snapshot,
+            &lines,
+            MAX_WORKSPACE_STATE_BYTES,
+            MAX_WINDOW_STATE_BYTES,
+        ) {
+            Some((line, compacted_snapshot, compacted)) => {
+                if compacted {
+                    log::warn!(
+                        "Compacted older AI chat content to fit the complete window snapshot"
+                    );
+                }
+                let insertion = usize::from(
+                    lines
+                        .first()
+                        .is_some_and(|line| line.starts_with("current_page=")),
+                );
+                lines.insert(insertion, line);
+                has_ai_line = true;
+                durable_ai_snapshot = Some(compacted_snapshot);
+            }
+            None => {
+                log::error!(
+                    "Refusing to replace the window snapshot because valid AI chat metadata cannot fit its reserved budget"
+                );
+                return;
+            }
+        }
+    }
+
+    let payload_limit = if has_ai_line {
+        MAX_WINDOW_STATE_BYTES
+    } else {
+        MAX_WORKSPACE_STATE_BYTES
+    };
+    let Some(payload) = bounded_window_state_payload(&lines, payload_limit) else {
+        log::error!(
+            "Refusing to replace the window snapshot because its measured payload exceeds the {} byte limit",
+            payload_limit
+        );
+        return;
+    };
 
     // Write, fsync, atomically replace, then fsync the directory. A failure at
     // any earlier stage leaves the last good active snapshot untouched.
@@ -1130,6 +1194,9 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
             path.display()
         );
         return;
+    }
+    if let Some(snapshot) = durable_ai_snapshot {
+        set_ai_conversation_snapshot(Some(snapshot));
     }
     log::info!("Successfully saved tabs state to {}", path.display());
 }
@@ -1250,6 +1317,80 @@ mod tests {
     }
 
     #[test]
+    fn window_headroom_compacts_chat_payload_without_dropping_metadata() {
+        let snapshot = conversation_snapshot(&"q".repeat(4096), &"a".repeat(4096));
+        let mut base_lines = vec!["current_page=0".to_string(), "tab=/tmp".to_string()];
+        let base_len = base_lines.iter().map(String::len).sum::<usize>() + base_lines.len();
+        let max_bytes = base_len + 512;
+
+        let (line, compacted, changed) =
+            compact_ai_conversation_for_window(&snapshot, &base_lines, base_len, max_bytes)
+                .unwrap();
+        assert!(changed);
+        assert_eq!(compacted.chats().len(), 1);
+        assert!(compacted.active_chat().unwrap().turns().is_empty());
+        assert!(compacted.active_chat().unwrap().history_truncated());
+
+        base_lines.insert(1, line.clone());
+        let payload = base_lines.join("\n") + "\n";
+        assert!(payload.len() <= max_bytes);
+        assert_eq!(parse_ai_conversation(&line), Some(compacted));
+    }
+
+    #[test]
+    fn metadata_reserve_keeps_fifty_worst_case_chat_rows() {
+        let first_id = u64::MAX - (crate::ai::MAX_PERSISTED_CHATS as u64 - 1);
+        let title = "\\".repeat(80);
+        let draft = "d".repeat(64 * 1024);
+        let chats: Vec<_> = (0..crate::ai::MAX_PERSISTED_CHATS)
+            .map(|offset| {
+                crate::ai::ChatSnapshot::from_completed_history(
+                    first_id + offset as u64,
+                    &title,
+                    offset % 2 == 0,
+                    &[],
+                    None,
+                    &draft,
+                )
+            })
+            .collect();
+        let snapshot = crate::ai::ConversationSnapshot::from_chats(u64::MAX, chats).unwrap();
+        let workspace_limit = 1024;
+        let mut base_lines = vec!["x".repeat(workspace_limit - 1)];
+
+        let (line, compacted, changed) = compact_ai_conversation_for_window(
+            &snapshot,
+            &base_lines,
+            workspace_limit,
+            workspace_limit + MAX_AI_METADATA_RESERVE_BYTES,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(compacted.active_chat_id(), u64::MAX);
+        assert_eq!(compacted.chats().len(), crate::ai::MAX_PERSISTED_CHATS);
+        assert!(compacted.chats().iter().all(|chat| chat.title() == title));
+        assert!(compacted.chats().iter().all(|chat| chat.draft().is_empty()));
+        assert!(compacted
+            .chats()
+            .iter()
+            .all(crate::ai::ChatSnapshot::history_truncated));
+
+        base_lines.push(line);
+        assert!(
+            (base_lines.join("\n") + "\n").len() <= workspace_limit + MAX_AI_METADATA_RESERVE_BYTES
+        );
+
+        let oversized_base = vec!["x".repeat(workspace_limit)];
+        assert!(compact_ai_conversation_for_window(
+            &snapshot,
+            &oversized_base,
+            workspace_limit,
+            workspace_limit + MAX_AI_METADATA_RESERVE_BYTES,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn invalid_ai_payload_does_not_prevent_tab_recovery() {
         let contents = concat!(
             "ai_conversation={not-json}\n",
@@ -1269,7 +1410,7 @@ mod tests {
         let line = ai_conversation_state_line(&snapshot).unwrap();
         assert!(parse_ai_conversation(&format!("{line}\n{line}\n")).is_none());
 
-        let future = r#"ai_conversation={"version":2,"turns":[{"role":"user","text":"q"},{"role":"assistant","text":"a"}]}"#;
+        let future = r#"ai_conversation={"version":3,"active_chat_id":1,"chats":[]}"#;
         assert!(parse_ai_conversation(future).is_none());
     }
 
@@ -1332,17 +1473,14 @@ mod tests {
     }
 
     #[test]
-    fn oversized_optional_ai_line_never_blocks_workspace_payload() {
-        let mut lines = vec![
+    fn bounded_payload_refuses_oversize_instead_of_dropping_ai() {
+        let lines = vec![
             "current_page=0".to_string(),
             "ai_conversation=xxxxxxxxxxxxxxxx".to_string(),
             "tab=workspace".to_string(),
         ];
-        let (payload, omitted) = bounded_window_state_payload(&mut lines, Some(1), 40).unwrap();
-
-        assert!(omitted);
-        assert_eq!(payload, "current_page=0\ntab=workspace\n");
-        assert!(!payload.contains(AI_CONVERSATION_PREFIX));
+        assert!(bounded_window_state_payload(&lines, 40).is_none());
+        assert_eq!(lines[1], "ai_conversation=xxxxxxxxxxxxxxxx");
     }
 
     #[test]
