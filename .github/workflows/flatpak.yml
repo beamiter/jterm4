@@ -162,7 +162,9 @@ jobs:
               jterm4-ci "file://${PWD}/flatpak-repo"
             flatpak --user install -y jterm4-ci ${APP_ID}
             flatpak run ${APP_ID} --version
-            flatpak run ${APP_ID} --doctor
+            # The Flatpak host bridge uses flatpak-spawn over the session bus.
+            # Run headless diagnostics inside a bus even when no display exists.
+            dbus-run-session -- flatpak run ${APP_ID} --doctor
           } 2>&1 | tee flatpak-install.log
 
       - name: Upload Flatpak install diagnostics
