@@ -1,16 +1,15 @@
 name: Apply block capture and sidebar contrast fix
 
 on:
-  push:
-    branches:
-      - fix/block-command-capture-sidebar-contrast
+  pull_request:
+    branches: [master]
 
 permissions:
   contents: write
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && contains(github.event.head_commit.message, 'run block capture contrast fix')
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/block-command-capture-sidebar-contrast'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
