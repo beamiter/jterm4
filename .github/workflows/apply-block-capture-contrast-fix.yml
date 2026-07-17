@@ -9,14 +9,14 @@ permissions:
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && github.head_ref == 'fix/block-command-capture-sidebar-contrast'
+    if: github.actor != 'github-actions[bot]' && startsWith(github.head_ref, 'fix/block-command-capture-sidebar-contrast')
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - name: Check out fix branch
         uses: actions/checkout@v4
         with:
-          ref: fix/block-command-capture-sidebar-contrast
+          ref: ${{ github.head_ref }}
 
       - name: Install GTK and VTE development packages
         run: |
@@ -52,4 +52,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "fix: preserve block commands and improve sidebar contrast"
-          git push origin HEAD:fix/block-command-capture-sidebar-contrast
+          git push origin HEAD:${{ github.head_ref }}
