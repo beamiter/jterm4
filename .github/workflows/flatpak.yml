@@ -50,6 +50,7 @@ jobs:
             appstream \
             dbus-x11 \
             desktop-file-utils \
+            elfutils \
             flatpak \
             flatpak-builder \
             librsvg2-bin \
