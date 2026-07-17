@@ -4,7 +4,6 @@ pub mod agent;
 pub mod ai;
 pub mod block_view;
 pub mod cli;
-mod command_fix;
 mod command_history;
 pub mod config;
 pub mod config_store;
