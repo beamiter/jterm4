@@ -48,7 +48,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: rustfmt-diagnostics
-          path: rustfmt.patch
+          path: |
+            rustfmt.patch
+            src/ui/command_correction.rs
           if-no-files-found: error
           retention-days: 1
 
