@@ -3963,6 +3963,7 @@ impl TermView {
         let programmatic = self.programmatic_scroll.clone();
         let attempts = Rc::new(Cell::new(0u8));
         let stable_turns = Rc::new(Cell::new(0u8));
+        let last_target = Rc::new(Cell::new(None::<f64>));
         glib::idle_add_local(move || {
             attempts.set(attempts.get().saturating_add(1));
             user_scrolled.set(false);
@@ -3973,7 +3974,11 @@ impl TermView {
             adj.set_value(target);
             programmatic.set(false);
 
-            if (adj.value() - target).abs() < 1.0 {
+            let target_is_stable = last_target
+                .get()
+                .is_some_and(|previous| (previous - target).abs() < 1.0);
+            last_target.set(Some(target));
+            if target_is_stable && (adj.value() - target).abs() < 1.0 {
                 stable_turns.set(stable_turns.get().saturating_add(1));
             } else {
                 stable_turns.set(0);

@@ -151,8 +151,6 @@ pub(crate) struct FinishedBlock {
     pub(crate) cols: i64,
     /// Visible rows allocated to this full-height finished block.
     pub(crate) viewport_cap: i64,
-    /// True only when this block has more output rows than can be shown at once.
-    pub(crate) output_scrollable: bool,
     /// Whether this block exceeds the configured long-output threshold.
     pub(crate) long_output: bool,
 }
@@ -182,7 +180,6 @@ impl Clone for FinishedBlock {
             status_icon: self.status_icon.clone(),
             cols: self.cols,
             viewport_cap: self.viewport_cap,
-            output_scrollable: self.output_scrollable,
             long_output: self.long_output,
         }
     }
@@ -524,7 +521,11 @@ pub(crate) fn estimated_finished_block_height_for_text(
     cols: i64,
 ) -> i32 {
     let rows = output_visual_row_count(output, cols).max(1);
-    estimated_finished_block_height(config, rows)
+    // Before the widget maps, the configured cap is the only stable height
+    // available. Using all output rows here makes virtualization reserve a
+    // hundreds-of-lines phantom block even though the mapped VTE is capped.
+    let fallback_cap = (config.finished_block_viewport_rows as i64).max(3);
+    estimated_finished_block_height(config, rows.min(fallback_cap))
 }
 
 fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static str) {
@@ -966,7 +967,6 @@ impl FinishedBlock {
         // the VTE until an edge, then continue through the outer block document.
         let full_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
         let displayed_output: Rc<RefCell<String>> = Rc::new(RefCell::new(output.to_string()));
-        let output_scrollable = long_output;
         let output_vte = create_finished_terminal(config, cols, output_rows, viewport_cap, false);
         let initial_visible_rows = output_rows.min(viewport_cap).max(1);
         output_vte
@@ -1016,7 +1016,10 @@ impl FinishedBlock {
             });
         }
 
-        if long_output {
+        // Geometry is finalized on map, so install the handler for every
+        // block and let the map callback decide whether expansion is useful.
+        expand_btn.set_visible(long_output);
+        {
             let expand_for_btn = expanded.clone();
             let output_vte_for_btn = output_vte.clone();
             let displayed_for_btn = displayed_output.clone();
@@ -1058,8 +1061,6 @@ impl FinishedBlock {
                     "Expand block"
                 }));
             });
-        } else {
-            expand_btn.set_visible(false);
         }
 
         // Command row: Warp-style accent prompt chevron + the command VTE.
@@ -1378,7 +1379,6 @@ impl FinishedBlock {
             status_icon,
             cols,
             viewport_cap,
-            output_scrollable,
             long_output,
         }
     }
@@ -1419,13 +1419,14 @@ impl FinishedBlock {
         let block_for_jump = self.clone();
         let outer_for_jump = outer.clone();
         self.jump_bottom_btn.connect_clicked(move |_| {
-            if block_for_jump.output_scrollable {
-                if let Some(adj) = block_for_jump.output_vte.vadjustment() {
-                    adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
+            if let Some(adj) = block_for_jump.output_vte.vadjustment() {
+                let target = (adj.upper() - adj.page_size()).max(adj.lower());
+                if target > adj.lower() + f64::EPSILON {
+                    adj.set_value(target);
+                    return;
                 }
-            } else {
-                block_for_jump.scroll_to_edge(&outer_for_jump, true);
             }
+            block_for_jump.scroll_to_edge(&outer_for_jump, true);
         });
 
         let command_scroll =
@@ -1442,13 +1443,10 @@ impl FinishedBlock {
             gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
         let vte = self.output_vte.clone();
         let outer_for_vte = outer.clone();
-        let output_scrollable = self.output_scrollable;
         scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-            if !output_scrollable {
-                forward_outer_scroll(&outer_for_vte, dy);
-                return glib::Propagation::Stop;
-            }
-
+            // The cap is determined only after map/resize. Inspect the actual
+            // VTE adjustment on every wheel event rather than trusting a stale
+            // construction-time flag.
             let Some(inner_adj) = vte.vadjustment() else {
                 return glib::Propagation::Proceed;
             };
