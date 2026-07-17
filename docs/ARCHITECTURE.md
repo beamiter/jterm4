@@ -27,9 +27,9 @@ GTK widgets are only mutated on the main context. PTY reads, directory enumerati
 
 ## Persistence
 
-Each process owns one active window snapshot. A snapshot becomes available to a future process only after graceful shutdown, using an atomic rename from `.active` to `.state`. Launches atomically claim one ready snapshot, stale active snapshots are recovered after their owner PID exits, and legacy `tabs.state` is migrated without allowing two processes to restore it. Ready snapshots are retained with a bounded count.
+Each process owns one active window snapshot. A snapshot becomes available to a future process only after graceful shutdown, using an atomic rename from `.active` to `.state`. Launches atomically claim one ready snapshot, stale active snapshots are recovered after their owner PID exits, and legacy `tabs.state` is migrated without allowing two processes to restore it. Ready snapshots are retained with a bounded count. The same snapshot carries a versioned, bounded AI payload containing only complete user/assistant pairs plus the provider-bound Block context; malformed or future AI payloads are discarded independently so tab recovery still succeeds. In-flight user turns never become apparently completed restored conversations.
 
-Session snapshots and Block history use owner-only Unix permissions. File contents are written to a sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes. The separate JSONL command index deliberately stores no output and enforces record/file bounds.
+Session snapshots and Block history use owner-only Unix permissions. File contents are written to a uniquely created sibling temporary file, synced, atomically renamed, and followed by a directory sync where applicable. Parsers retain legacy compatibility and reject pathological record sizes. Safe mode and fresh-workspace launches do not restore the AI payload. The separate JSONL command index deliberately stores no output and enforces record/file bounds.
 
 ## Native and Flatpak execution boundary
 

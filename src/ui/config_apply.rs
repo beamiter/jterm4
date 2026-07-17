@@ -138,7 +138,48 @@ impl UiState {
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}
              .tab-strip-search {{ color: rgb({fr},{fg_g},{fb}); }}
-             .tab-strip-search text {{ color: rgb({fr},{fg_g},{fb}); caret-color: rgb({fr},{fg_g},{fb}); }}"
+             .tab-strip-search text {{ color: rgb({fr},{fg_g},{fb}); caret-color: rgb({fr},{fg_g},{fb}); }}
+             .ai-panel {{
+                 min-width: 240px;
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+                 border-left: 1px solid rgba({fr},{fg_g},{fb},0.16);
+             }}
+             .ai-panel-header {{
+                 padding: 10px 10px 8px 10px;
+                 border-bottom: 1px solid rgba({fr},{fg_g},{fb},0.12);
+             }}
+             .ai-panel-title {{ color: rgb({fr},{fg_g},{fb}); font-weight: 700; }}
+             .ai-panel-subtitle {{ color: rgba({fr},{fg_g},{fb},0.60); font-size: 0.86em; }}
+             .ai-transcript, .ai-transcript text {{
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+             }}
+             .ai-empty-state {{ color: rgba({fr},{fg_g},{fb},0.62); padding: 24px; }}
+             .ai-empty-title {{ color: rgba({fr},{fg_g},{fb},0.88); font-weight: 700; font-size: 1.08em; }}
+             .ai-panel-status-row {{
+                 min-height: 22px;
+                 padding: 2px 10px 4px 10px;
+                 color: rgba({fr},{fg_g},{fb},0.66);
+             }}
+             .ai-panel-status-row.error {{ color: @error_color; }}
+             .ai-panel-composer {{
+                 padding: 8px;
+                 border-top: 1px solid rgba({fr},{fg_g},{fb},0.12);
+             }}
+             .ai-panel-input {{
+                 background-color: rgba({fr},{fg_g},{fb},0.06);
+                 border: 1px solid rgba({fr},{fg_g},{fb},0.20);
+                 border-radius: 10px;
+             }}
+             .ai-panel-input textview, .ai-panel-input text {{
+                 background-color: transparent;
+                 color: rgb({fr},{fg_g},{fb});
+                 caret-color: rgb({fr},{fg_g},{fb});
+             }}
+             .ai-input-placeholder {{ color: rgba({fr},{fg_g},{fb},0.44); padding: 8px; }}
+             .ai-input-hint {{ color: rgba({fr},{fg_g},{fb},0.52); font-size: 0.82em; }}
+             .ai-send-button {{ min-width: 72px; min-height: 32px; }}"
         );
         self.scrollbar_css.load_from_string(&css);
     }
@@ -242,7 +283,7 @@ impl UiState {
         let tab_placement = new_config.tab_placement;
         let sidebar_view = new_config.sidebar_view;
         let sidebar_visible = new_config.sidebar_visible;
-        let ai_visible = new_config.ai_panel_visible;
+        let ai_visible = new_config.ai_enabled && new_config.ai_panel_visible;
 
         // New panes/tabs immediately use a changed shell; all other config is
         // replaced as one coherent snapshot instead of retaining stale fields.
@@ -269,9 +310,12 @@ impl UiState {
         self.ai_panel_visible.set(ai_visible);
         if ai_visible {
             self.ai_paned.set_end_child(Some(&self.ai_panel.root));
+            self.restore_ai_panel_width();
         } else {
             self.ai_paned.set_end_child(None::<&gtk4::Widget>);
         }
+        self.ai_panel.refresh_config_display();
+        self.ai_panel.refresh_persisted_privacy();
 
         // Update keybindings
         *self.keybinding_map.borrow_mut() = new_keybindings;

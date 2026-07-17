@@ -3,13 +3,14 @@ use gtk4::prelude::*;
 use gtk4::{Label, Notebook, Paned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vte4::Terminal;
@@ -19,8 +20,11 @@ use crate::terminal::{find_first_terminal, terminal_working_directory};
 use crate::ui::{PaneLeaf, PaneNode};
 
 const MAX_READY_WINDOW_STATES: usize = 32;
+const MAX_WINDOW_STATE_BYTES: usize = 20 * 1024 * 1024;
 const READY_STATE_EXTENSION: &str = "state";
 const ACTIVE_STATE_EXTENSION: &str = "active";
+const AI_CONVERSATION_PREFIX: &str = "ai_conversation=";
+const MAX_AI_CONVERSATION_LINE_BYTES: usize = crate::ai::MAX_CONVERSATION_SNAPSHOT_JSON_BYTES * 2;
 
 #[derive(Debug)]
 struct WindowStatePaths {
@@ -31,6 +35,30 @@ struct WindowStatePaths {
 
 static WINDOW_STATE_PATHS: OnceLock<WindowStatePaths> = OnceLock::new();
 static WINDOW_STATE_FINALIZED: AtomicBool = AtomicBool::new(false);
+static WINDOW_STATE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static AI_CONVERSATION_SNAPSHOT: OnceLock<Mutex<Option<crate::ai::ConversationSnapshot>>> =
+    OnceLock::new();
+
+fn ai_conversation_slot() -> &'static Mutex<Option<crate::ai::ConversationSnapshot>> {
+    AI_CONVERSATION_SNAPSHOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Return the complete, bounded AI conversation associated with this process's
+/// active window snapshot.
+pub(crate) fn get_ai_conversation_snapshot() -> Option<crate::ai::ConversationSnapshot> {
+    ai_conversation_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Replace the AI conversation that the next window-state save will embed.
+/// Passing `None` makes Clear durable without manufacturing an empty record.
+pub(crate) fn set_ai_conversation_snapshot(snapshot: Option<crate::ai::ConversationSnapshot>) {
+    *ai_conversation_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+}
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
@@ -47,13 +75,48 @@ fn make_file_private(path: &Path) -> io::Result<()> {
 fn write_private_file(path: &Path, payload: &[u8]) -> io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     file.write_all(payload)?;
     file.sync_all()
+}
+
+fn unique_state_temp_path(target: &Path) -> io::Result<PathBuf> {
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("state path has no parent: {}", target.display()),
+        )
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("state path has no file name: {}", target.display()),
+        )
+    })?;
+    let sequence = WINDOW_STATE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+    Ok(parent.join(temp_name))
+}
+
+/// Durably replace a private state file without ever truncating the last good
+/// snapshot. The sibling temporary file also prevents cross-filesystem rename.
+fn atomic_write_private_file(target: &Path, payload: &[u8]) -> io::Result<()> {
+    let temp_path = unique_state_temp_path(target)?;
+    let result = (|| {
+        write_private_file(&temp_path, payload)?;
+        fs::rename(&temp_path, target)?;
+        make_file_private(target)?;
+        sync_parent_directory(target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
@@ -379,6 +442,115 @@ pub fn unescape_tab_state(value: &str) -> String {
     out
 }
 
+fn ai_conversation_state_line(
+    snapshot: &crate::ai::ConversationSnapshot,
+) -> Result<String, crate::ai::ConversationSnapshotError> {
+    let encoded = snapshot.to_json()?;
+    let escaped = escape_tab_state(&encoded);
+    if escaped.len() > MAX_AI_CONVERSATION_LINE_BYTES {
+        return Err(crate::ai::ConversationSnapshotError::EncodedTooLarge);
+    }
+    Ok(format!("{AI_CONVERSATION_PREFIX}{escaped}"))
+}
+
+/// Encode line-oriented window state within its hard limit. If the optional
+/// line (the AI transcript) is what tips the payload over the boundary, omit
+/// it so tabs and pane layouts still reach disk.
+fn bounded_window_state_payload(
+    lines: &mut Vec<String>,
+    optional_line_index: Option<usize>,
+    max_bytes: usize,
+) -> Option<(String, bool)> {
+    let mut payload = lines.join("\n") + "\n";
+    if payload.len() <= max_bytes {
+        return Some((payload, false));
+    }
+
+    let optional_line_index = optional_line_index.filter(|index| *index < lines.len())?;
+    lines.remove(optional_line_index);
+    payload = lines.join("\n") + "\n";
+    (payload.len() <= max_bytes).then_some((payload, true))
+}
+
+/// When the current workspace itself is too large to replace, preserve the
+/// previous tab/pane payload but still refresh its optional AI line. This
+/// keeps New chat and newly enabled redaction durable even at the workspace
+/// size boundary.
+fn rewrite_existing_ai_conversation(
+    path: &Path,
+    snapshot: Option<&crate::ai::ConversationSnapshot>,
+) -> io::Result<bool> {
+    let contents = read_window_state_bounded(path)?;
+    let mut lines = Vec::new();
+    let mut had_ai_line = false;
+    for line in contents.lines() {
+        if line.trim().starts_with(AI_CONVERSATION_PREFIX) {
+            had_ai_line = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if snapshot.is_none() && !had_ai_line {
+        return Ok(false);
+    }
+
+    let mut ai_line_index = None;
+    if let Some(snapshot) = snapshot {
+        let line = ai_conversation_state_line(snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let insertion = usize::from(
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("current_page=")),
+        );
+        lines.insert(insertion, line);
+        ai_line_index = Some(insertion);
+    }
+
+    let (payload, omitted_ai) =
+        bounded_window_state_payload(&mut lines, ai_line_index, MAX_WINDOW_STATE_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "previous workspace snapshot cannot be safely rewritten",
+                )
+            })?;
+    atomic_write_private_file(path, payload.as_bytes())?;
+    Ok(omitted_ai)
+}
+
+/// Parse the AI payload independently from tabs. Any malformed, duplicated,
+/// unsupported, or oversized value is ignored without affecting tab recovery.
+fn parse_ai_conversation(contents: &str) -> Option<crate::ai::ConversationSnapshot> {
+    let mut parsed = None;
+    let mut found = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        let Some(value) = line.strip_prefix(AI_CONVERSATION_PREFIX) else {
+            continue;
+        };
+        if found {
+            log::warn!("Ignoring duplicated AI conversation in window snapshot");
+            return None;
+        }
+        found = true;
+        if value.len() > MAX_AI_CONVERSATION_LINE_BYTES {
+            log::warn!("Ignoring oversized AI conversation in window snapshot");
+            return None;
+        }
+        let encoded = unescape_tab_state(value);
+        match crate::ai::ConversationSnapshot::from_json(&encoded) {
+            Ok(snapshot) => parsed = Some(snapshot),
+            Err(error) => {
+                log::warn!("Ignoring invalid AI conversation in window snapshot: {error}");
+                return None;
+            }
+        }
+    }
+    parsed
+}
+
 pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
     let mut current_page: Option<u32> = None;
     let mut tabs: Vec<(Option<String>, PaneLayout)> = Vec::new();
@@ -468,6 +640,11 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
             }
             continue;
         }
+        // Parsed separately so a damaged or future AI payload cannot create a
+        // bogus legacy path tab or interfere with workspace recovery.
+        if line.starts_with(AI_CONVERSATION_PREFIX) {
+            continue;
+        }
         // Legacy: bare path line
         let layout = PaneLayout::Leaf {
             dir: line.to_string(),
@@ -481,15 +658,55 @@ pub fn parse_tabs_state(contents: &str) -> (Option<u32>, Vec<(Option<String>, Pa
     (current_page, tabs)
 }
 
+fn read_window_state_bounded(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_WINDOW_STATE_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "window snapshot exceeds the {} byte limit",
+                MAX_WINDOW_STATE_BYTES
+            ),
+        ));
+    }
+    let mut contents = String::new();
+    file.take((MAX_WINDOW_STATE_BYTES + 1) as u64)
+        .read_to_string(&mut contents)?;
+    if contents.len() > MAX_WINDOW_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "window snapshot exceeds the {} byte limit",
+                MAX_WINDOW_STATE_BYTES
+            ),
+        ));
+    }
+    Ok(contents)
+}
+
 pub(crate) fn load_tabs_state() -> (Option<u32>, Vec<(Option<String>, PaneLayout)>) {
     let path = prepare_active_tabs_state_path();
     log::info!("Loading tabs state from: {}", path.display());
 
-    let Ok(contents) = fs::read_to_string(&path) else {
-        log::info!("No window snapshot found (first run or a new window)");
-        return (None, Vec::new());
+    let contents = match read_window_state_bounded(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            set_ai_conversation_snapshot(None);
+            log::info!("No window snapshot found (first run or a new window)");
+            return (None, Vec::new());
+        }
+        Err(error) => {
+            set_ai_conversation_snapshot(None);
+            log::warn!(
+                "Ignoring unreadable window snapshot {}: {error}",
+                path.display()
+            );
+            return (None, Vec::new());
+        }
     };
 
+    set_ai_conversation_snapshot(parse_ai_conversation(&contents));
     let (current_page, tabs) = parse_tabs_state(&contents);
     log::info!("Loaded {} tabs from window snapshot", tabs.len());
     (current_page, tabs)
@@ -674,7 +891,7 @@ pub(crate) fn kill_all_terminal_children(notebook: &Notebook) {
     }
 }
 
-/// Read /proc/<pid>/cmdline and return the argv as a Vec<String>.
+/// Read `/proc/<pid>/cmdline` and return the argv as a `Vec<String>`.
 pub(crate) fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {
@@ -692,7 +909,7 @@ pub(crate) fn read_proc_cmdline(pid: i32) -> Option<Vec<String>> {
     }
 }
 
-/// Read the parent PID from /proc/<pid>/stat.
+/// Read the parent PID from `/proc/<pid>/stat`.
 pub(crate) fn read_ppid(pid: i32) -> Option<i32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Format: "<pid> (<comm>) <state> <ppid> ..."
@@ -829,9 +1046,26 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
     let _home = std::env::var("HOME").ok();
     let n_pages = notebook.n_pages();
     log::info!("Saving {} tabs", n_pages);
-    let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 1);
+    let mut lines: Vec<String> = Vec::with_capacity((n_pages as usize) + 2);
     if let Some(current) = notebook.current_page() {
         lines.push(format!("current_page={current}"));
+    }
+    let ai_snapshot = get_ai_conversation_snapshot();
+    let mut ai_line_index = None;
+    if let Some(snapshot) = ai_snapshot.as_ref() {
+        match ai_conversation_state_line(snapshot) {
+            Ok(line) => {
+                ai_line_index = Some(lines.len());
+                lines.push(line);
+            }
+            Err(error) => {
+                // AI state is optional. A malformed in-memory payload must
+                // never prevent newer tabs/panes from reaching durable state.
+                log::error!(
+                    "Omitting unserializable AI conversation from window snapshot: {error}"
+                );
+            }
+        }
     }
 
     for i in 0..n_pages {
@@ -857,49 +1091,45 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
         lines.push(line);
     }
 
-    let payload = lines.join("\n") + "\n";
-
-    // Write atomically to avoid partially-written state when the process is interrupted.
-    let tmp_path = path.with_file_name(
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .map(|name| format!("{name}.tmp"))
-            .unwrap_or_else(|| "tabs.state.tmp".to_string()),
-    );
-
-    if let Err(err) = write_private_file(&tmp_path, payload.as_bytes()) {
+    let Some((payload, omitted_ai)) =
+        bounded_window_state_payload(&mut lines, ai_line_index, MAX_WINDOW_STATE_BYTES)
+    else {
         log::error!(
-            "Failed to write temp state file {}: {err}",
-            tmp_path.display()
+            "Refusing to save window snapshot because tabs and panes exceed the {} byte limit",
+            MAX_WINDOW_STATE_BYTES
+        );
+        match rewrite_existing_ai_conversation(&path, ai_snapshot.as_ref()) {
+            Ok(true) => log::warn!(
+                "Preserved the previous workspace snapshot but omitted its AI conversation"
+            ),
+            Ok(false) => log::warn!(
+                "Preserved the previous workspace snapshot and refreshed its AI conversation"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::debug!("No previous workspace snapshot exists to refresh")
+            }
+            Err(error) => log::error!(
+                "Failed to refresh AI state in previous workspace snapshot {}: {error}",
+                path.display()
+            ),
+        }
+        return;
+    };
+    if omitted_ai {
+        log::warn!(
+            "Omitting AI conversation so the window snapshot stays within the {} byte limit",
+            MAX_WINDOW_STATE_BYTES
+        );
+    }
+
+    // Write, fsync, atomically replace, then fsync the directory. A failure at
+    // any earlier stage leaves the last good active snapshot untouched.
+    if let Err(err) = atomic_write_private_file(&path, payload.as_bytes()) {
+        log::error!(
+            "Failed to atomically save state file {}: {err}",
+            path.display()
         );
         return;
-    }
-
-    if let Err(err) = fs::rename(&tmp_path, &path) {
-        // On some platforms rename may fail if the destination exists; fall back to remove+rename.
-        let _ = fs::remove_file(&path);
-        if let Err(err2) = fs::rename(&tmp_path, &path) {
-            log::error!(
-                "Failed to move temp state file {} into place {}: {err} / {err2}",
-                tmp_path.display(),
-                path.display()
-            );
-            let _ = fs::remove_file(&tmp_path);
-            return;
-        }
-    }
-
-    if let Err(err) = make_file_private(&path) {
-        log::warn!(
-            "Failed to tighten state permissions {}: {err}",
-            path.display()
-        );
-    }
-    if let Err(err) = sync_parent_directory(&path) {
-        log::debug!(
-            "Failed to sync state directory for {}: {err}",
-            path.display()
-        );
     }
     log::info!("Successfully saved tabs state to {}", path.display());
 }
@@ -907,6 +1137,20 @@ pub(crate) fn save_tabs_state(notebook: &Notebook, session_ids: &HashMap<u32, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conversation_snapshot(question: &str, answer: &str) -> crate::ai::ConversationSnapshot {
+        let history = vec![
+            crate::ai::Turn {
+                role: crate::ai::Role::User,
+                text: question.into(),
+            },
+            crate::ai::Turn {
+                role: crate::ai::Role::Assistant,
+                text: answer.into(),
+            },
+        ];
+        crate::ai::ConversationSnapshot::from_completed_history(&history, None).unwrap()
+    }
 
     fn temporary_state_dir(test_name: &str) -> PathBuf {
         let directory =
@@ -990,6 +1234,139 @@ mod tests {
             fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ai_conversation_line_round_trips_without_becoming_a_tab() {
+        let snapshot = conversation_snapshot("为什么？\n第二行", "因为 C:\\tmp");
+        let line = ai_conversation_state_line(&snapshot).unwrap();
+        let contents = format!("current_page=0\n{line}\ntab=/tmp\n");
+
+        assert_eq!(parse_ai_conversation(&contents), Some(snapshot));
+        let (current_page, tabs) = parse_tabs_state(&contents);
+        assert_eq!(current_page, Some(0));
+        assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn invalid_ai_payload_does_not_prevent_tab_recovery() {
+        let contents = concat!(
+            "ai_conversation={not-json}\n",
+            "current_page=0\n",
+            "tab=Terminal 1\t/tmp\t123-456\n"
+        );
+
+        assert!(parse_ai_conversation(contents).is_none());
+        let (current_page, tabs) = parse_tabs_state(contents);
+        assert_eq!(current_page, Some(0));
+        assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_or_future_ai_payload_is_ignored() {
+        let snapshot = conversation_snapshot("q", "a");
+        let line = ai_conversation_state_line(&snapshot).unwrap();
+        assert!(parse_ai_conversation(&format!("{line}\n{line}\n")).is_none());
+
+        let future = r#"ai_conversation={"version":2,"turns":[{"role":"user","text":"q"},{"role":"assistant","text":"a"}]}"#;
+        assert!(parse_ai_conversation(future).is_none());
+    }
+
+    #[test]
+    fn stale_active_recovery_keeps_conversation_with_its_window() {
+        let directory = temporary_state_dir("recover-ai");
+        let snapshot = conversation_snapshot("crash question", "last complete answer");
+        let line = ai_conversation_state_line(&snapshot).unwrap();
+        let stale = directory.join(format!("window-{}-1.active", i32::MAX));
+        fs::write(&stale, format!("{line}\ntab=/tmp\n")).unwrap();
+
+        recover_stale_active_snapshots(&directory);
+        let ready = stale.with_extension(READY_STATE_EXTENSION);
+        assert!(ready.exists());
+        let claimed = directory.join("window-10-10.active");
+        assert!(claim_ready_snapshot_in(&directory, &claimed).is_some());
+        let contents = fs::read_to_string(claimed).unwrap();
+        assert_eq!(parse_ai_conversation(&contents), Some(snapshot));
+        assert_eq!(parse_tabs_state(&contents).1.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_private_replace_is_durable_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_state_dir("atomic-replace");
+        let directory = root.join("windows");
+        ensure_private_directory(&directory).unwrap();
+        let target = directory.join("window-1-1.active");
+        atomic_write_private_file(&target, b"first").unwrap();
+        atomic_write_private_file(&target, b"second").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_reader_rejects_pathological_snapshot_before_parsing() {
+        let root = temporary_state_dir("bounded-read");
+        let path = root.join("oversized.state");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((MAX_WINDOW_STATE_BYTES + 1) as u64).unwrap();
+        drop(file);
+
+        let error = read_window_state_bounded(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_optional_ai_line_never_blocks_workspace_payload() {
+        let mut lines = vec![
+            "current_page=0".to_string(),
+            "ai_conversation=xxxxxxxxxxxxxxxx".to_string(),
+            "tab=workspace".to_string(),
+        ];
+        let (payload, omitted) = bounded_window_state_payload(&mut lines, Some(1), 40).unwrap();
+
+        assert!(omitted);
+        assert_eq!(payload, "current_page=0\ntab=workspace\n");
+        assert!(!payload.contains(AI_CONVERSATION_PREFIX));
+    }
+
+    #[test]
+    fn fallback_rewrites_ai_without_touching_previous_workspace() {
+        let root = temporary_state_dir("rewrite-ai-only");
+        let path = root.join("window-1-1.active");
+        let original = conversation_snapshot("old question", "old answer");
+        let replacement = conversation_snapshot("new question", "new answer");
+        let original_line = ai_conversation_state_line(&original).unwrap();
+        fs::write(
+            &path,
+            format!("current_page=0\n{original_line}\ntab=/tmp\n"),
+        )
+        .unwrap();
+
+        assert!(!rewrite_existing_ai_conversation(&path, Some(&replacement)).unwrap());
+        let replaced = fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_ai_conversation(&replaced), Some(replacement));
+        assert_eq!(parse_tabs_state(&replaced).1.len(), 1);
+
+        assert!(!rewrite_existing_ai_conversation(&path, None).unwrap());
+        let cleared = fs::read_to_string(&path).unwrap();
+        assert!(parse_ai_conversation(&cleared).is_none());
+        assert_eq!(parse_tabs_state(&cleared).1.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 }

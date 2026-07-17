@@ -1545,6 +1545,7 @@ impl UiState {
         let ui = self.clone();
         redact_row.connect_active_notify(move |row| {
             ui.config.borrow_mut().ai_redact_secrets = row.is_active();
+            ui.ai_panel.refresh_persisted_privacy();
             ui.persist_config();
         });
 

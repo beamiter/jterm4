@@ -1,5 +1,6 @@
 //! actions — UiState methods extracted from ui (mechanical split, no logic changes)
 use adw::prelude::*;
+use gtk4::glib;
 use gtk4::Orientation;
 use libadwaita as adw;
 use std::rc::Rc;
@@ -11,6 +12,34 @@ use super::*;
 use crate::block_view::TermView;
 use crate::keybindings::{Action, Direction};
 use crate::terminal::terminal_working_directory;
+
+const MIN_AI_PANEL_WIDTH: i32 = 240;
+const MAX_AI_PANEL_WIDTH: i32 = 1200;
+const MIN_AI_WORKSPACE_WIDTH: i32 = 200;
+
+fn apply_ai_panel_width(paned: &gtk4::Paned, requested_width: u32) {
+    let total_width = paned.width();
+    let Some(position) = restored_ai_panel_position(total_width, requested_width) else {
+        return;
+    };
+    paned.set_position(position);
+}
+
+fn restored_ai_panel_position(total_width: i32, requested_width: u32) -> Option<i32> {
+    if total_width <= MIN_AI_PANEL_WIDTH + MIN_AI_WORKSPACE_WIDTH {
+        return None;
+    }
+    let available = total_width - MIN_AI_WORKSPACE_WIDTH;
+    let panel_width = (requested_width as i32).clamp(MIN_AI_PANEL_WIDTH, available);
+    Some(total_width - panel_width)
+}
+
+fn ai_panel_width_from_geometry(total_width: i32, position: i32) -> Option<u32> {
+    if total_width <= 0 || position < 0 || position >= total_width {
+        return None;
+    }
+    Some((total_width - position).clamp(MIN_AI_PANEL_WIDTH, MAX_AI_PANEL_WIDTH) as u32)
+}
 
 impl UiState {
     pub(crate) fn execute_action(&self, action: Action) {
@@ -312,21 +341,63 @@ impl UiState {
             self.show_ai_error("AI features are disabled in Settings or safe mode.");
             return;
         }
+        if !next {
+            // Capture the divider before detaching the end child; once hidden,
+            // Paned no longer exposes the panel's allocated width.
+            self.capture_ai_panel_width();
+        }
         self.ai_panel_visible.set(next);
         if next {
             self.ai_paned.set_end_child(Some(&self.ai_panel.root));
-            // Place the splitter so the AI panel gets its configured width
-            // (Paned position is measured from the left edge).
-            let width = self.ai_paned.width();
-            let panel_w = self.config.borrow().ai_panel_width as i32;
-            if width > panel_w + 200 {
-                self.ai_paned.set_position(width - panel_w);
-            }
+            self.restore_ai_panel_width();
+            self.ai_panel.focus_input();
         } else {
             self.ai_paned.set_end_child(None::<&gtk4::Widget>);
+            self.focus_current_terminal();
         }
         self.config.borrow_mut().ai_panel_visible = next;
         self.persist_config();
+    }
+
+    /// Restore the configured end-child width after GTK has allocated the
+    /// Paned. The idle retry covers startup, config reload, and re-showing the
+    /// panel before the current layout pass has completed.
+    pub(crate) fn restore_ai_panel_width(&self) {
+        if !self.ai_panel_visible.get() {
+            return;
+        }
+        let requested_width = self.config.borrow().ai_panel_width;
+        self.ai_panel_width_restoring.set(true);
+        apply_ai_panel_width(&self.ai_paned, requested_width);
+
+        let paned = self.ai_paned.clone();
+        let visible = self.ai_panel_visible.clone();
+        let restoring = self.ai_panel_width_restoring.clone();
+        glib::idle_add_local_once(move || {
+            if visible.get() {
+                apply_ai_panel_width(&paned, requested_width);
+            }
+            glib::idle_add_local_once(move || restoring.set(false));
+        });
+    }
+
+    /// Copy the currently allocated AI width into Config. Callers decide when
+    /// to flush Config so drag notifications can be debounced into one write.
+    pub(crate) fn capture_ai_panel_width(&self) -> bool {
+        if !self.ai_panel_visible.get() || self.ai_panel_width_restoring.get() {
+            return false;
+        }
+        let total_width = self.ai_paned.width();
+        let position = self.ai_paned.position();
+        let Some(measured) = ai_panel_width_from_geometry(total_width, position) else {
+            return false;
+        };
+        let mut config = self.config.borrow_mut();
+        if config.ai_panel_width == measured {
+            return false;
+        }
+        config.ai_panel_width = measured;
+        true
     }
 
     /// Grab the selected block's context (cmd + output + cwd + exit) from
@@ -407,5 +478,22 @@ impl UiState {
 
     pub(crate) fn current_term_view(&self) -> Option<Rc<TermView>> {
         self.current_pane_leaf().and_then(|leaf| leaf.block_view())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ai_panel_width_from_geometry, restored_ai_panel_position};
+
+    #[test]
+    fn ai_panel_geometry_preserves_workspace_and_clamps_configured_limits() {
+        assert_eq!(restored_ai_panel_position(800, 360), Some(440));
+        assert_eq!(restored_ai_panel_position(800, 1200), Some(200));
+        assert_eq!(restored_ai_panel_position(800, 100), Some(560));
+        assert_eq!(restored_ai_panel_position(440, 360), None);
+
+        assert_eq!(ai_panel_width_from_geometry(800, 440), Some(360));
+        assert_eq!(ai_panel_width_from_geometry(2000, 100), Some(1200));
+        assert_eq!(ai_panel_width_from_geometry(800, 800), None);
     }
 }

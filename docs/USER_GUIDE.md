@@ -241,6 +241,10 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 
 文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
+面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。
+
+每个窗口快照还保存最多 100 个完整成功聊天 turn，以及当时实际发给 provider 的选中 Block 上下文（开启 `ai_redact_secrets` 时为脱敏版本）。**New chat** 会立即清除这一窗口的持久化对话；在途请求、错误回合和命令生成审阅事件不会伪装成已完成回答恢复。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode`、`--no-restore` 和显式新工作区不会读取旧对话。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
+
 自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 在当前 active Block pane 打开原生 **Shell Agent**；它在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：

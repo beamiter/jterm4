@@ -12,7 +12,7 @@ A useful private report contains the affected commit or version, environment, re
 
 ## Sensitive surfaces
 
-Pay particular attention to PTY lifecycle and process-group signalling, OSC/clipboard handling, SSH and reconnect flows, AI-context redaction, configuration parsing, session snapshots, and Block history files. Session snapshots and Block history are owner-only on Unix (`0700` directories and `0600` files), but users should still avoid persisting secrets in terminal history.
+Pay particular attention to PTY lifecycle and process-group signalling, OSC/clipboard handling, SSH and reconnect flows, AI-context redaction, configuration parsing, session snapshots, and Block history files. Session snapshots include completed AI chat turns and provider-bound Block context. Snapshots and Block history are owner-only on Unix (`0700` directories and `0600` files), but file permissions and optional redaction do not make stored commands/output non-sensitive; users should still avoid persisting secrets.
 
 ## Disclosure
 

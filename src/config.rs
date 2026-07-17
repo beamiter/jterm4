@@ -254,7 +254,7 @@ pub struct Config {
     /// Optional owner-only file used when no AI API key environment variable
     /// is present. The path is persisted; the credential itself is not.
     pub(crate) ai_api_key_file: Option<String>,
-    /// Show the right-side AI chat panel. Toggled via Ctrl+Shift+A and
+    /// Show the right-side AI chat panel. Toggled via Ctrl+Alt+Shift+A and
     /// persisted across sessions.
     pub(crate) ai_panel_visible: bool,
     /// Width in pixels of the AI panel when visible (right Paned position is

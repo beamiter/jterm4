@@ -127,4 +127,7 @@ pub(crate) struct UiState {
     /// area. Toggling visibility flips the end child + resize start_child.
     pub(crate) ai_paned: gtk4::Paned,
     pub(crate) ai_panel_visible: Rc<Cell<bool>>,
+    /// Suppresses divider notifications caused by restoring a configured
+    /// width; only user-driven positions should flow back into Config.
+    pub(crate) ai_panel_width_restoring: Rc<Cell<bool>>,
 }

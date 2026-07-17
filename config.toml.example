@@ -84,7 +84,7 @@ ai_provider = "anthropic"
 ai_base_url = "https://api.anthropic.com"
 
 ai_panel_visible = false
-ai_panel_width = 360           # 240 .. 1200
+ai_panel_width = 360           # 240 .. 1200；拖动 AI 分隔条后自动更新
 ai_model = "claude-sonnet-4-6"
 ai_max_tokens = 1024           # 64 .. 32768
 ai_redact_secrets = true

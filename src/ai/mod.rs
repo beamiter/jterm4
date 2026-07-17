@@ -5,6 +5,7 @@
 //! and avoids adding a second TLS stack. Every API here only returns text; no
 //! function in this module executes or submits a generated command.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
@@ -23,6 +24,12 @@ const API_KEY_ENV_NAMES: [&str; 4] = [
     "OPENAI_API_KEY",
     "OLLAMA_API_KEY",
 ];
+
+mod conversation;
+
+pub(crate) use conversation::{
+    ConversationSnapshot, ConversationSnapshotError, MAX_CONVERSATION_SNAPSHOT_JSON_BYTES,
+};
 
 /// Supported wire protocols. OpenAI-compatible intentionally includes local
 /// and hosted services which implement the Chat Completions endpoint.
@@ -105,7 +112,8 @@ impl FromStr for Provider {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Role {
     User,
     Assistant,
@@ -121,7 +129,7 @@ impl Role {
 }
 
 /// One turn in a provider-neutral conversation transcript.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct Turn {
     pub(crate) role: Role,
     pub(crate) text: String,
@@ -800,7 +808,7 @@ pub(crate) fn build_system_prompt(block: Option<&BlockContext>) -> Option<String
     Some(prompt)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BlockContext {
     pub cmd: String,
     pub output: String,

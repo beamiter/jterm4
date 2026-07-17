@@ -457,7 +457,10 @@ pub fn run() -> glib::ExitCode {
         ai_paned.set_resize_end_child(false);
         ai_paned.set_shrink_start_child(true);
         ai_paned.set_shrink_end_child(false);
-        let ai_initially_visible = config.borrow().ai_panel_visible;
+        let ai_initially_visible = {
+            let config = config.borrow();
+            config.ai_enabled && config.ai_panel_visible
+        };
         if ai_initially_visible {
             ai_paned.set_end_child(Some(&ai_panel_widget.root));
         }
@@ -525,6 +528,7 @@ pub fn run() -> glib::ExitCode {
             ai_panel: ai_panel_widget.clone(),
             ai_paned: ai_paned.clone(),
             ai_panel_visible: Rc::new(Cell::new(ai_initially_visible)),
+            ai_panel_width_restoring: Rc::new(Cell::new(false)),
         });
 
         // Register the dynamic scrollbar CSS provider and apply initial colors
@@ -534,6 +538,43 @@ pub fn run() -> glib::ExitCode {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
         ui.apply_dynamic_css();
+
+        let ui_for_ai_close = Rc::downgrade(&ui);
+        ui.ai_panel.connect_close_requested(move || {
+            if let Some(ui) = ui_for_ai_close.upgrade() {
+                ui.toggle_ai_panel();
+            }
+        });
+
+        // Persist only the settled AI divider width. Paned emits position
+        // notifications continuously while dragging; the generation guard
+        // coalesces them into one config write after the drag pauses.
+        let ai_width_epoch = Rc::new(Cell::new(0_u64));
+        let ui_for_ai_width = Rc::downgrade(&ui);
+        let epoch_for_ai_width = ai_width_epoch.clone();
+        ai_paned.connect_notify_local(Some("position"), move |_, _| {
+            let Some(ui) = ui_for_ai_width.upgrade() else {
+                return;
+            };
+            if ui.ai_panel_width_restoring.get() {
+                return;
+            }
+            if !ui.capture_ai_panel_width() {
+                return;
+            }
+            let epoch = epoch_for_ai_width.get().wrapping_add(1);
+            epoch_for_ai_width.set(epoch);
+            let ui_for_save = Rc::downgrade(&ui);
+            let epoch_for_save = epoch_for_ai_width.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                if epoch_for_save.get() != epoch {
+                    return;
+                }
+                if let Some(ui) = ui_for_save.upgrade() {
+                    ui.persist_config();
+                }
+            });
+        });
 
         // Wire toggle sidebar button
         let ui_for_toggle = ui.clone();
@@ -610,8 +651,12 @@ pub fn run() -> glib::ExitCode {
         let (saved_current, saved_tabs) = if restore_session {
             load_tabs_state()
         } else {
+            crate::state::set_ai_conversation_snapshot(None);
             (None, Vec::new())
         };
+        if restore_session {
+            ui.ai_panel.restore_persisted_conversation();
+        }
         if saved_tabs.is_empty() {
             if let Some(argv) = launch.execute.clone() {
                 ui.add_new_tab_with_argv(requested_cwd, argv);
@@ -633,6 +678,17 @@ pub fn run() -> glib::ExitCode {
         }
 
         if session_persistence {
+            // A snapshot may have been written while redaction was disabled
+            // and restored after the user enabled it in config. Upgrade the
+            // in-memory copy before the unconditional initial state save.
+            ui.ai_panel.refresh_persisted_privacy();
+
+            let notebook_for_ai = notebook.clone();
+            let session_ids_for_ai = ui.session_ids.clone();
+            ui.ai_panel.set_persistence_callback(move || {
+                save_tabs_state(&notebook_for_ai, &session_ids_for_ai.borrow());
+            });
+
             // Auto-save tabs state when tabs are added or removed. Defer until
             // the page's typed pane controller is fully attached.
             let session_ids_for_page_added = ui.session_ids.clone();
@@ -667,6 +723,14 @@ pub fn run() -> glib::ExitCode {
         let ui_clone = ui.clone();
 
         key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+            // Composer Enter semantics must win over optional user-defined
+            // global bindings. The focused TextView controller also gives IME
+            // candidate confirmation first refusal.
+            if ui_clone.ai_panel.input_has_focus()
+                && matches!(keyval, Key::Return | Key::KP_Enter)
+            {
+                return false.into();
+            }
             // Mask to only the modifier keys we care about
             let mods = state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK);
             let combo = KeyCombo {
@@ -706,9 +770,9 @@ pub fn run() -> glib::ExitCode {
                         // mouse-selecting text inside a finished block,
                         // focus lives on that TextView and the per-VTE
                         // block-mode handler never fires.
-                        // A focused selection in the read-only AI transcript
-                        // takes priority over terminal/block selections.
-                        if ui_clone.ai_panel.copy_transcript_selection() {
+                        // A focused AI composer/transcript selection takes
+                        // priority over terminal/block selections.
+                        if ui_clone.ai_panel.copy_focused_selection() {
                             return true.into();
                         }
                         // copy_to_clipboard handles Warp block-selection,
@@ -724,6 +788,9 @@ pub fn run() -> glib::ExitCode {
                         return true.into();
                     }
                     Action::Paste => {
+                        if ui_clone.ai_panel.paste_into_composer_if_focused() {
+                            return true.into();
+                        }
                         ui_clone.execute_action(action);
                         return true.into();
                     }
@@ -911,6 +978,9 @@ pub fn run() -> glib::ExitCode {
         let config_for_close = ui.config.clone();
         let sidebar_for_close = sidebar.clone();
         let paned_for_close = content_box.clone();
+        let ai_paned_for_close = ai_paned.clone();
+        let ai_panel_visible_for_close = ui.ai_panel_visible.clone();
+        let ai_panel_width_restoring_for_close = ui.ai_panel_width_restoring.clone();
         let zoom_for_close = ui.zoom_state.clone();
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
@@ -957,6 +1027,13 @@ pub fn run() -> glib::ExitCode {
                 let mut config = config_for_close.borrow_mut();
                 config.sidebar_width = width;
                 config.sidebar_visible = sidebar_for_close.is_visible();
+                if ai_panel_visible_for_close.get() && !ai_panel_width_restoring_for_close.get() {
+                    let total_width = ai_paned_for_close.width();
+                    let position = ai_paned_for_close.position();
+                    if total_width > 0 && position >= 0 && position < total_width {
+                        config.ai_panel_width = (total_width - position).clamp(240, 1200) as u32;
+                    }
+                }
             }
             let _ = crate::config::save_config(&config_for_close.borrow());
 
@@ -989,6 +1066,9 @@ pub fn run() -> glib::ExitCode {
 
         window.set_content(Some(&main_box));
         window.present();
+
+        // Paned positions are meaningful only after the first allocation.
+        ui.restore_ai_panel_width();
 
         // Focus the active terminal after window is shown
         ui.focus_current_terminal();
