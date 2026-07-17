@@ -1,0 +1,33 @@
+name: Command correction autofix cleanup
+
+on:
+  push:
+    branches:
+      - agent/smart-command-correction
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Allow the autofix job to finish
+        run: sleep 240
+
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/smart-command-correction
+          fetch-depth: 0
+
+      - name: Remove one-shot workflows
+        run: |
+          git pull --rebase origin agent/smart-command-correction
+          git rm -f \
+            .github/workflows/command-fix-autofix.yml \
+            .github/workflows/command-fix-autofix-cleanup.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "remove temporary command correction autofix workflows"
+          git push origin HEAD:agent/smart-command-correction
