@@ -445,27 +445,20 @@ impl UiState {
         }
     }
 
-    /// Try to focus the page's live input surface synchronously.
+    /// Return the page's exact live input surface.
     ///
-    /// Tab switching owns its own page-scoped retry loop, so it must not use
-    /// `PaneLeaf::grab_focus`: that helper schedules an unscoped idle retry
-    /// which can outlive the switch and steal focus back to an older page when
-    /// Ctrl+PageUp/PageDown is pressed repeatedly.
-    pub(crate) fn focus_terminal_in_page_now(&self, widget: &gtk4::Widget) -> bool {
-        let Some(terminal) = PaneNode::from_widget(widget).and_then(|node| node.active_terminal())
-        else {
-            return false;
-        };
-        terminal.grab_focus();
-        terminal.has_focus()
+    /// Block pages contain read-only VTE snapshots in addition to the active
+    /// input VTE, so callers must use the typed pane controller rather than
+    /// walking the GTK widget tree.
+    pub(crate) fn terminal_in_page(&self, widget: &gtk4::Widget) -> Option<Terminal> {
+        PaneNode::from_widget(widget).and_then(|node| node.active_terminal())
     }
 
     pub(crate) fn current_terminal(&self) -> Option<Terminal> {
         self.notebook
             .current_page()
             .and_then(|page_num| self.notebook.nth_page(Some(page_num)))
-            .and_then(|widget| PaneNode::from_widget(&widget))
-            .and_then(|node| node.active_terminal())
+            .and_then(|widget| self.terminal_in_page(&widget))
     }
 
     pub(crate) fn current_pane_leaf(&self) -> Option<PaneLeaf> {

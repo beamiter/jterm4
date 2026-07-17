@@ -25,6 +25,8 @@ use crate::ui::{self, UiState};
 /// GApplication receives only a program name. All real launch arguments are
 /// consumed by `cli::handle_early_args` before GTK is initialized.
 const GTK_APPLICATION_ARGV: [&str; 1] = ["jterm4"];
+const TAB_SWITCH_FOCUS_STABLE_FRAMES: u8 = 2;
+const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 8;
 
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())
@@ -901,7 +903,7 @@ pub fn run() -> glib::ExitCode {
         // Focus terminal when switching tabs (split-aware) and sync tab strip
         let ui_for_switch = ui.clone();
         let notebook_for_switch = notebook.clone();
-        // Invalidates deferred focus work from earlier pages during a rapid
+        // Invalidates frame-scoped focus work from earlier pages during a rapid
         // Ctrl+PageUp/PageDown sequence.
         let tab_focus_generation = Rc::new(Cell::new(0u64));
         notebook.connect_switch_page(move |_, widget, page_num| {
@@ -910,40 +912,51 @@ pub fn run() -> glib::ExitCode {
             if ui_for_switch.search_bar.is_search_mode() {
                 ui_for_switch.search_apply();
                 ui_for_switch.search_entry.grab_focus();
-            } else {
-                ui_for_switch.focus_terminal_in_page_now(widget);
+            } else if let Some(target_terminal) = ui_for_switch.terminal_in_page(widget) {
+                target_terminal.grab_focus();
+
+                // `switch-page` can run before the selected child has completed
+                // its map/focus reconciliation. Follow the notebook's frame
+                // clock instead of guessing with wall-clock timeouts, and only
+                // finish once the exact live VTE has retained focus across two
+                // frames. Generation and page checks prevent callbacks from an
+                // intermediate tab in a held-key burst stealing focus back.
+                let notebook_for_focus = notebook_for_switch.clone();
+                let ui_for_focus = ui_for_switch.clone();
+                let focus_generation = tab_focus_generation.clone();
+                let frame_count = Cell::new(0u8);
+                let stable_frames = Cell::new(0u8);
+                notebook_for_switch.add_tick_callback(move |_, _| {
+                    if focus_generation.get() != generation
+                        || notebook_for_focus.current_page() != Some(page_num)
+                    {
+                        return glib::ControlFlow::Break;
+                    }
+
+                    if ui_for_focus.search_bar.is_search_mode() {
+                        ui_for_focus.search_apply();
+                        ui_for_focus.search_entry.grab_focus();
+                        return glib::ControlFlow::Break;
+                    }
+
+                    frame_count.set(frame_count.get() + 1);
+                    if target_terminal.has_focus() {
+                        stable_frames.set(stable_frames.get() + 1);
+                        if stable_frames.get() >= TAB_SWITCH_FOCUS_STABLE_FRAMES {
+                            return glib::ControlFlow::Break;
+                        }
+                    } else {
+                        stable_frames.set(0);
+                        target_terminal.grab_focus();
+                    }
+
+                    if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
             }
-            // `switch-page` runs before GTK has completed map/allocation and a
-            // held Ctrl+PageUp can queue several switches in one event burst.
-            // Retry across a few frames until the live VTE is mapped and accepts
-            // focus. Every retry is scoped to both the selected page and this
-            // switch generation, so stale callbacks cannot focus an older tab.
-            let notebook_for_focus = notebook_for_switch.clone();
-            let target_widget = widget.clone();
-            let ui_for_focus = ui_for_switch.clone();
-            let focus_generation = tab_focus_generation.clone();
-            let attempts = Rc::new(Cell::new(0u8));
-            glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                if focus_generation.get() != generation
-                    || notebook_for_focus.current_page() != Some(page_num)
-                {
-                    return glib::ControlFlow::Break;
-                }
-
-                if ui_for_focus.search_bar.is_search_mode() {
-                    ui_for_focus.search_apply();
-                    ui_for_focus.search_entry.grab_focus();
-                    return glib::ControlFlow::Break;
-                }
-
-                attempts.set(attempts.get() + 1);
-                let focused = ui_for_focus.focus_terminal_in_page_now(&target_widget);
-                if focused || attempts.get() >= 4 {
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
-                }
-            });
             // Clear activity/bell indicators for the tab being switched to
             let tab_name = widget.widget_name();
             ui_for_switch.clear_tab_indicators(tab_name.as_str());
