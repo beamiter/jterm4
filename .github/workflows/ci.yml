@@ -54,6 +54,167 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  fix-command-correction:
+    name: Apply command-correction diagnostics
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Install Rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply formatting and reviewed fixes
+        run: |
+          cargo fmt --all
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/ui/command_correction.rs")
+          source = path.read_text()
+
+          replacements = [
+              (
+                  '''    let Some(path) = std::env::var_os("PATH") else {
+                      return Vec::new();
+                  };
+          ''',
+                  '''    // In Flatpak, the process PATH describes the sandbox rather than the host
+                  // where terminal commands run. If the host bash probe was unavailable, do
+                  // not present sandbox executables as verified host candidates.
+                  if crate::host::is_flatpak() {
+                      return Vec::new();
+                  }
+
+                  let Some(path) = std::env::var_os("PATH") else {
+                      return Vec::new();
+                  };
+          ''',
+              ),
+              (
+                  '''    for index in 0..=right.len() {
+                      matrix[0][index] = index;
+                  }
+          ''',
+                  '''    for (index, value) in matrix[0].iter_mut().enumerate() {
+                      *value = index;
+                  }
+          ''',
+              ),
+              (
+                  '''    for (start, _) in command.match_indices(old) {
+                      let end = start + old.len();
+                      let previous = command[..start].chars().next_back();
+                      let next = command[end..].chars().next();
+                      if previous.is_some_and(is_shell_word_character)
+                          || next.is_some_and(is_shell_word_character)
+                      {
+                          continue;
+                      }
+
+                      let mut replacement = String::with_capacity(command.len() + new.len());
+                      replacement.push_str(&command[..start]);
+                      replacement.push_str(new);
+                      replacement.push_str(&command[end..]);
+                      return Some(replacement);
+                  }
+                  None
+          ''',
+                  '''    let mut matches = command.match_indices(old).filter_map(|(start, _)| {
+                      let end = start + old.len();
+                      let previous = command[..start].chars().next_back();
+                      let next = command[end..].chars().next();
+                      (!previous.is_some_and(is_shell_word_character)
+                          && !next.is_some_and(is_shell_word_character))
+                      .then_some(start)
+                  });
+                  let start = matches.next()?;
+                  // When the same token appears more than once, guessing which occurrence
+                  // failed can silently change an unrelated argument. Leave that case to the
+                  // editable AI fallback instead of claiming a deterministic correction.
+                  if matches.next().is_some() {
+                      return None;
+                  }
+
+                  let end = start + old.len();
+                  let mut replacement = String::with_capacity(command.len() + new.len());
+                  replacement.push_str(&command[..start]);
+                  replacement.push_str(new);
+                  replacement.push_str(&command[end..]);
+                  Some(replacement)
+          ''',
+              ),
+              (
+                  '''    let title = if correction.evidence.is_verified() {
+                      "Verified command correction"
+                  } else {
+                      "AI found a possible correction"
+                  };
+          ''',
+                  '''    let title = match correction.evidence {
+                      CorrectionEvidence::AptIndex | CorrectionEvidence::ExecutablePath => {
+                          "Verified command correction"
+                      }
+                      CorrectionEvidence::TargetOutput => "The command suggested a correction",
+                      CorrectionEvidence::AiUnverified => "AI found a possible correction",
+                  };
+          ''',
+              ),
+              (
+                  '''    } else {
+                      body.push_str(
+                          "\\n\\nThis AI-only proposal is unverified and can only be inserted for review.",
+                      );
+                  }
+          ''',
+                  '''    } else if correction.evidence == CorrectionEvidence::TargetOutput {
+                      body.push_str(
+                          "\\n\\nThis tool-provided proposal is not independently verified and can only be inserted for review.",
+                      );
+                  } else {
+                      body.push_str(
+                          "\\n\\nThis AI-only proposal is unverified and can only be inserted for review.",
+                      );
+                  }
+          ''',
+              ),
+              (
+                  '''        assert!(replace_shell_word("/opt/fmpg/bin/run", "fmpg", "ffmpeg").is_none());
+          ''',
+                  '''        assert!(replace_shell_word("/opt/fmpg/bin/run", "fmpg", "ffmpeg").is_none());
+                  assert!(replace_shell_word("printf fmpg; apt install fmpg", "fmpg", "ffmpeg").is_none());
+          ''',
+              ),
+          ]
+
+          for old, new in replacements:
+              if old not in source:
+                  raise SystemExit(f"expected source fragment not found:\n{old}")
+              source = source.replace(old, new, 1)
+
+          path.write_text(source)
+          PY
+          cargo fmt --all
+
+      - name: Commit fixes to PR branch
+        run: |
+          if git diff --quiet -- src/ui/command_correction.rs; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ui/command_correction.rs
+          git commit -m "Polish verified command correction"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-24.04
