@@ -35,9 +35,14 @@ struct CommandCorrection {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum CorrectionReply {
-    Suggest { command: String, message: String },
+    Suggest {
+        command: String,
+        message: String,
+    },
     #[serde(rename = "none")]
-    NoSuggestion { message: String },
+    NoSuggestion {
+        message: String,
+    },
 }
 
 impl UiState {
@@ -47,11 +52,7 @@ impl UiState {
     /// `apply_dynamic_css` can run repeatedly, so this method is deliberately
     /// idempotent and stores its marker on the Notebook GObject.
     pub(crate) fn install_command_correction_monitor(&self) {
-        if unsafe {
-            self.notebook
-                .data::<bool>(MONITOR_DATA_KEY)
-                .is_some()
-        } {
+        if unsafe { self.notebook.data::<bool>(MONITOR_DATA_KEY).is_some() } {
             return;
         }
         unsafe {
@@ -62,13 +63,7 @@ impl UiState {
         let pending = Rc::new(Cell::new(false));
         for index in 0..self.notebook.n_pages() {
             if let Some(page) = self.notebook.nth_page(Some(index)) {
-                attach_page(
-                    &page,
-                    &self.window,
-                    &self.config,
-                    &agent_dialog,
-                    &pending,
-                );
+                attach_page(&page, &self.window, &self.config, &agent_dialog, &pending);
             }
         }
 
