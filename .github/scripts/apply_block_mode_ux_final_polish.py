@@ -28,9 +28,6 @@ def require(stage: str, args: list[str]) -> subprocess.CompletedProcess[str]:
             print(result.stderr, end="")
         return result
 
-    # Preserve actionable diagnostics on the PR branch because GitHub may truncate
-    # the downloaded job log. Abort only an unfinished merge; a successful merge
-    # commit is intentionally retained for the next retry.
     call(["git", "merge", "--abort"])
     call(["git", "reset", "--hard", "HEAD"])
     status = call(["git", "status", "--short"], capture=True)
@@ -63,8 +60,6 @@ require(
         "41898282+github-actions[bot]@users.noreply.github.com",
     ],
 )
-# actions/checkout created a depth-one clone. Expand it, then explicitly populate
-# both remote-tracking refs so `origin/master` is guaranteed to exist.
 call(["git", "fetch", "--unshallow", "origin"])
 require(
     "fetch-refs",
@@ -84,6 +79,29 @@ original = require(
         f"{ORIGINAL_COMMIT}:.github/scripts/apply_block_mode_ux_final_polish.py",
     ],
 ).stdout
+
+# Current master contains the same arrow-navigation block twice. The original
+# patch intentionally handles one generic occurrence first and the Enter-specific
+# occurrence later, so allow exactly this first 2-match case while keeping every
+# other asserted replacement strict.
+strict_guard = (
+    "    if count != 1:\n"
+    "        raise SystemExit(f\"{path}: expected one match, found {count}: {old[:100]!r}\")\n"
+)
+relaxed_guard = (
+    "    if count != 1:\n"
+    "        duplicate_arrow_move = (\n"
+    "            count == 2\n"
+    "            and path == \"src/block_view/mod.rs\"\n"
+    "            and old.lstrip().startswith(\"move_finished_block_selection(\")\n"
+    "            and \"// Enter recalls\" not in old\n"
+    "        )\n"
+    "        if not duplicate_arrow_move:\n"
+    "            raise SystemExit(f\"{path}: expected one match, found {count}: {old[:100]!r}\")\n"
+)
+if original.count(strict_guard) != 1:
+    raise SystemExit("could not locate the original patch assertion guard")
+original = original.replace(strict_guard, relaxed_guard, 1)
 ORIGINAL.write_text(original, encoding="utf-8")
 require(
     "merge-master",
