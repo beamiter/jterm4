@@ -1,65 +1,132 @@
 )
 replace_once(
     'src/pty.rs',
-    '''        let child_pid = self.pid;\n        let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);\n''',
-    '''        let child_pid = self.pid;\n        let terminated = Arc::clone(&self.terminated);\n        let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);\n''',
+    '''        let child_pid = self.pid;
+        let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
+''',
+    '''        let child_pid = self.pid;
+        let terminated = Arc::clone(&self.terminated);
+        let (tx, rx) = mpsc::sync_channel::<PtyMsg>(PTY_QUEUE_CAPACITY);
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''            self.start_reader_polling(reader_fd, child_pid, tx, rx, callback, on_exit);\n''',
-    '''            self.start_reader_polling(\n                reader_fd, child_pid, terminated, tx, rx, callback, on_exit,\n            );\n''',
+    '''            self.start_reader_polling(reader_fd, child_pid, tx, rx, callback, on_exit);
+''',
+    '''            self.start_reader_polling(
+                reader_fd, child_pid, terminated, tx, rx, callback, on_exit,
+            );
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''            shell_bracketed_paste,\n            move || {\n''',
-    '''            shell_bracketed_paste,\n            terminated,\n            move || {\n''',
+    '''            shell_bracketed_paste,
+            move || {
+''',
+    '''            shell_bracketed_paste,
+            terminated,
+            move || {
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''        child_pid: Pid,\n        tx: mpsc::SyncSender<PtyMsg>,\n''',
-    '''        child_pid: Pid,\n        terminated: Arc<AtomicBool>,\n        tx: mpsc::SyncSender<PtyMsg>,\n''',
+    '''        child_pid: Pid,
+        tx: mpsc::SyncSender<PtyMsg>,
+''',
+    '''        child_pid: Pid,
+        terminated: Arc<AtomicBool>,
+        tx: mpsc::SyncSender<PtyMsg>,
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''            Arc::clone(&self.shell_bracketed_paste),\n            || {},\n''',
-    '''            Arc::clone(&self.shell_bracketed_paste),\n            terminated,\n            || {},\n''',
+    '''            Arc::clone(&self.shell_bracketed_paste),
+            || {},
+''',
+    '''            Arc::clone(&self.shell_bracketed_paste),
+            terminated,
+            || {},
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''    shell_bracketed_paste: Arc<AtomicBool>,\n    notify: impl Fn() + Send + 'static,\n''',
-    '''    shell_bracketed_paste: Arc<AtomicBool>,\n    terminated: Arc<AtomicBool>,\n    notify: impl Fn() + Send + 'static,\n''',
+    '''    shell_bracketed_paste: Arc<AtomicBool>,
+    notify: impl Fn() + Send + 'static,
+''',
+    '''    shell_bracketed_paste: Arc<AtomicBool>,
+    terminated: Arc<AtomicBool>,
+    notify: impl Fn() + Send + 'static,
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''            let code = wait_for_child_exit(child_pid);\n            if tx.send(PtyMsg::Exit(code)).is_ok() {\n''',
-    '''            let code = wait_for_child_exit(child_pid);\n            terminated.store(true, Ordering::Release);\n            if tx.send(PtyMsg::Exit(code)).is_ok() {\n''',
+    '''            let code = wait_for_child_exit(child_pid);
+            if tx.send(PtyMsg::Exit(code)).is_ok() {
+''',
+    '''            let code = wait_for_child_exit(child_pid);
+            terminated.store(true, Ordering::Release);
+            if tx.send(PtyMsg::Exit(code)).is_ok() {
+''',
 )
 replace_once(
     'src/pty.rs',
-    '''impl Drop for OwnedPty {\n    fn drop(&mut self) {\n        self.close_master_fd();\n        terminate_terminal_process(self.pid.as_raw());\n    }\n}\n''',
-    '''impl Drop for OwnedPty {\n    fn drop(&mut self) {\n        self.kill();\n    }\n}\n''',
+    '''impl Drop for OwnedPty {
+    fn drop(&mut self) {
+        self.close_master_fd();
+        terminate_terminal_process(self.pid.as_raw());
+    }
+}
+''',
+    '''impl Drop for OwnedPty {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+''',
 )
 insert_before_once(
     'src/pty.rs',
-    '''    #[test]\n    fn complete_writer_delivers_the_entire_payload() {\n''',
-    '''    #[test]\n    fn process_group_termination_is_claimed_once() {\n        let terminated = AtomicBool::new(false);\n        assert!(claim_termination(&terminated));\n        assert!(!claim_termination(&terminated));\n        terminated.store(true, Ordering::Release);\n        assert!(!claim_termination(&terminated));\n    }\n\n''',
+    '''    #[test]
+    fn complete_writer_delivers_the_entire_payload() {
+''',
+    '''    #[test]
+    fn process_group_termination_is_claimed_once() {
+        let terminated = AtomicBool::new(false);
+        assert!(claim_termination(&terminated));
+        assert!(!claim_termination(&terminated));
+        terminated.store(true, Ordering::Release);
+        assert!(!claim_termination(&terminated));
+    }
+
+''',
 )
 
 # User-facing behavior and manual acceptance coverage.
 replace_once(
     'README.md',
-    '''从 Block pane 发起分屏时会保留当前 Block，并创建一个传统 VTE sibling；VTE pane 可继续嵌套分屏。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。\n''',
-    '''从 Block pane 发起分屏时会创建原生 Block sibling；VTE pane 仍创建 VTE sibling，两种后端都可继续嵌套分屏。每个可见 pane 都拥有独立的 controller、PTY/reader、会话 ID、Block 历史文件和进程清理路径；粘贴、文件树、workflow、SSH 重连、AI 上下文和键盘输入始终路由到当前聚焦 pane。\n''',
+    '''从 Block pane 发起分屏时会保留当前 Block，并创建一个传统 VTE sibling；VTE pane 可继续嵌套分屏。每个可见 pane 都独立拥有并清理其进程，关闭 pane、标签或窗口前会统一检查前台任务。
+''',
+    '''从 Block pane 发起分屏时会创建原生 Block sibling；VTE pane 仍创建 VTE sibling，两种后端都可继续嵌套分屏。每个可见 pane 都拥有独立的 controller、PTY/reader、会话 ID、Block 历史文件和进程清理路径；粘贴、文件树、workflow、SSH 重连、AI 上下文和键盘输入始终路由到当前聚焦 pane。
+''',
 )
 replace_once(
     'CHANGELOG.md',
-    '''- Block is now the default terminal backend. Starting a split from Block preserves the Block leaf and creates a managed VTE sibling instead of rejecting the action.\n''',
-    '''- Block is now the default terminal backend. Splitting a Block pane creates another independently owned Block pane; VTE panes continue to create VTE siblings. Session restore preserves each leaf backend, session identity, and per-pane Block history owner.\n''',
+    '''- Block is now the default terminal backend. Starting a split from Block preserves the Block leaf and creates a managed VTE sibling instead of rejecting the action.
+''',
+    '''- Block is now the default terminal backend. Splitting a Block pane creates another independently owned Block pane; VTE panes continue to create VTE siblings. Session restore preserves each leaf backend, session identity, and per-pane Block history owner.
+''',
 )
 replace_once(
     'docs/BLOCK_MODE_ACCEPTANCE.md',
-    '''- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见，新建 VTE sibling，没有隐藏或孤儿 PTY。\n- 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常。\n''',
-    '''- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见并新建原生 Block sibling；两个 pane 的命令、输出、搜索、选择、工作目录、会话 ID 与历史文件相互独立，没有隐藏或孤儿 PTY。\n- 在两个 Block pane 中分别验证长输出、CJK 输入、后台输出、块选择和搜索；粘贴、文件树插入、workflow 回填与 AI/Agent 上下文只影响聚焦 pane。\n- 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常；关闭后迟到的 PTY 回调不能改变剩余树。\n- 保存窗口后恢复，确认每个 Block leaf 仍使用原来的 backend/session/history 身份，旧版无 backend 字段的布局保持兼容且重复身份会被修复。\n''',
+    '''- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见，新建 VTE sibling，没有隐藏或孤儿 PTY。
+- 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常。
+''',
+    '''- 在 Block pane 按 `Ctrl+Shift+E` / `Ctrl+Shift+D`，当前 Block 保持可见并新建原生 Block sibling；两个 pane 的命令、输出、搜索、选择、工作目录、会话 ID 与历史文件相互独立，没有隐藏或孤儿 PTY。
+- 在两个 Block pane 中分别验证长输出、CJK 输入、后台输出、块选择和搜索；粘贴、文件树插入、workflow 回填与 AI/Agent 上下文只影响聚焦 pane。
+- 在 sibling 中继续嵌套分屏，方向聚焦、resize、zoom/unzoom 和关闭当前 pane 正常；关闭后迟到的 PTY 回调不能改变剩余树。
+- 保存窗口后恢复，确认每个 Block leaf 仍使用原来的 backend/session/history 身份，旧版无 backend 字段的布局保持兼容且重复身份会被修复。
+''',
 )
 
+PATCH_SUCCEEDED = True
 print('Applied native Block split pane ownership')
