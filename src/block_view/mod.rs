@@ -226,16 +226,29 @@ fn record_external_input(
     true
 }
 
-fn build_clipboard_paste_payload(text: &str, bracketed_paste: bool) -> Vec<u8> {
-    if !bracketed_paste {
-        return text.as_bytes().to_vec();
+fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> (String, Vec<u8>) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let inserted = if bracketed_paste {
+        normalized
+    } else {
+        // Without bracketed paste, the PTY safety boundary keeps only the first
+        // logical line. Mirror that exact text in the fallback editor model.
+        normalized.split('\n').next().unwrap_or("").to_string()
+    };
+    if inserted.is_empty() {
+        return (inserted, Vec::new());
     }
 
-    let mut payload = Vec::with_capacity(text.len() + 12);
-    payload.extend_from_slice(b"\x1b[200~");
-    payload.extend_from_slice(text.as_bytes());
-    payload.extend_from_slice(b"\x1b[201~");
-    payload
+    let payload = if bracketed_paste {
+        let mut payload = Vec::with_capacity(inserted.len() + 12);
+        payload.extend_from_slice(b"\x1b[200~");
+        payload.extend_from_slice(inserted.as_bytes());
+        payload.extend_from_slice(b"\x1b[201~");
+        payload
+    } else {
+        inserted.as_bytes().to_vec()
+    };
+    (inserted, payload)
 }
 
 fn history_edge_navigation_available(state: BlockState, editor_dirty: bool) -> bool {
@@ -447,6 +460,14 @@ fn clear_finished_block_selection(
     selected_block_id.set(None);
     selection_anchor_id.set(None);
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn clear_vte_text_selections(finished: &[FinishedBlock], active_vte: &Terminal) {
+    active_vte.unselect_all();
+    for block in finished {
+        block.command_vte.unselect_all();
+        block.output_vte.unselect_all();
+    }
 }
 
 fn replace_finished_block_selection(
@@ -1542,6 +1563,7 @@ impl ReaderCtx {
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                                     {
                                         let finished = finished_blocks_for_menu.borrow();
+                                        clear_vte_text_selections(&finished, &vte_for_copy);
                                         activate_finished_block_selection(
                                             &finished,
                                             &selected_ids_for_menu,
@@ -2337,6 +2359,7 @@ fn running_root_control_bytes(
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
+    active_vte_for_key: Terminal,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
@@ -2356,6 +2379,7 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
+            active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
@@ -2426,6 +2450,7 @@ impl KeyCtx {
                     &block_scroll_for_key,
                     direction,
                 ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
                     return glib::Propagation::Stop;
                 }
             }
@@ -2440,15 +2465,17 @@ impl KeyCtx {
             {
                 let finished = finished_blocks_for_key.borrow();
                 let direction = if keyval == Key::Up { -1 } else { 1 };
-                move_finished_block_selection(
+                if move_finished_block_selection(
                     &finished,
                     &selected_block_ids_for_key,
                     &selected_block_id_for_key,
                     &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
-                );
-                return glib::Propagation::Stop;
+                ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Ctrl+Shift+Up/Down aligns the selected card's top/bottom edge.
@@ -2469,15 +2496,17 @@ impl KeyCtx {
             if ctrl && shift && !alt && matches!(keyval, Key::bracketleft | Key::bracketright) {
                 let finished = finished_blocks_for_key.borrow();
                 let direction = if keyval == Key::bracketleft { -1 } else { 1 };
-                move_finished_block_selection(
+                if move_finished_block_selection(
                     &finished,
                     &selected_block_ids_for_key,
                     &selected_block_id_for_key,
                     &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
-                );
-                return glib::Propagation::Stop;
+                ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Enter recalls every selected command in terminal order as one
@@ -2664,6 +2693,7 @@ impl KeyCtx {
                         .or_else(|| marked_idx.first().copied())
                 };
                 if let Some(idx) = target {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
                     let new_id = finished.get(idx).map(|b| b.id);
                     replace_finished_block_selection(
                         &finished,
@@ -3596,6 +3626,7 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
+                active_vte_for_key: active_vte.clone(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
@@ -4082,9 +4113,14 @@ impl TermView {
                 return;
             }
 
+            let (inserted_text, payload) = build_clipboard_paste(&text, bracketed_paste.get());
+            if payload.is_empty() {
+                return;
+            }
+
             record_external_input(
                 bstate.get(),
-                text.as_bytes(),
+                inserted_text.as_bytes(),
                 &typed_cmd,
                 &pty_synced,
                 &idle_input_dirty,
@@ -4099,7 +4135,6 @@ impl TermView {
                 );
             }
 
-            let payload = build_clipboard_paste_payload(&text, bracketed_paste.get());
             pty.write_bytes(&payload);
             active.borrow().grab_focus();
         });
@@ -4606,7 +4641,7 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        background_output_has_visible_text, build_clipboard_paste_payload, build_command_recall,
+        background_output_has_visible_text, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
         history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
         record_external_input, scroll_delta_to_reveal, selected_command_text, selected_id_range,
@@ -4705,14 +4740,17 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_paste_is_framed_as_one_payload() {
+    fn clipboard_paste_matches_the_effective_editor_text() {
         assert_eq!(
-            build_clipboard_paste_payload("one\ntwo", false),
-            b"one\ntwo".to_vec()
+            build_clipboard_paste("one\r\ntwo", false),
+            ("one".to_string(), b"one".to_vec())
         );
         assert_eq!(
-            build_clipboard_paste_payload("one\ntwo", true),
-            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+            build_clipboard_paste("one\r\ntwo", true),
+            (
+                "one\ntwo".to_string(),
+                b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+            )
         );
     }
 
@@ -5279,12 +5317,9 @@ mod tests {
     }
     #[test]
     fn clipboard_paste_payload_is_one_ordered_transaction() {
+        assert_eq!(build_clipboard_paste("plain", false).1.as_slice(), b"plain");
         assert_eq!(
-            build_clipboard_paste_payload("plain", false).as_slice(),
-            b"plain"
-        );
-        assert_eq!(
-            build_clipboard_paste_payload("one\ntwo", true).as_slice(),
+            build_clipboard_paste("one\ntwo", true).1.as_slice(),
             b"\x1b[200~one\ntwo\x1b[201~"
         );
     }
