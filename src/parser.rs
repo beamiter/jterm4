@@ -66,10 +66,11 @@ pub enum ParserEvent {
     /// startup. The UI stores it on the tab's RemoteConn so subsequent
     /// reconnects pass `--session <id>` and rsh restores cwd/env/aliases.
     RemoteSessionId(String),
-    /// CSI ? 1049 h — alt screen entered (vim, less, etc.)
-    AltScreenEnter,
-    /// CSI ? 1049 l — alt screen left.
-    AltScreenLeave,
+    /// CSI ? 47/1047/1049 h — alt screen entered (vim, less, etc.).
+    /// Carries the exact DEC private mode so VTE receives matching semantics.
+    AltScreenEnter(u32),
+    /// CSI ? 47/1047/1049 l — alt screen left.
+    AltScreenLeave(u32),
     /// OSC 52 — application set clipboard content.
     ClipboardSet(String),
     /// OSC 52 with `?` — app is asking for current clipboard content.
@@ -189,8 +190,13 @@ impl Default for ParserConfig {
     }
 }
 
-fn is_alt_screen_mode(params: &[u8]) -> bool {
-    matches!(params, b"?47" | b"?1047" | b"?1049")
+fn alt_screen_mode(params: &[u8]) -> Option<u32> {
+    match params {
+        b"?47" => Some(47),
+        b"?1047" => Some(1047),
+        b"?1049" => Some(1049),
+        _ => None,
+    }
 }
 
 fn is_mouse_reporting_mode(params: &[u8]) -> bool {
@@ -405,9 +411,10 @@ impl Parser {
                         // Final byte of CSI sequence
                         let params = std::mem::take(buf);
                         self.state = State::Ground;
+                        let alt_mode = alt_screen_mode(&params);
                         if (b == b'h' || b == b'l')
                             && params.first() == Some(&b'?')
-                            && !is_alt_screen_mode(&params)
+                            && alt_mode.is_none()
                         {
                             for mode in self.update_dec_private_modes(&params[1..], b == b'h') {
                                 events.push(ParserEvent::DecsetMode {
@@ -416,14 +423,14 @@ impl Parser {
                                 });
                             }
                         }
-                        if b == b'h' && is_alt_screen_mode(&params) {
+                        if let (b'h', Some(mode)) = (b, alt_mode) {
                             // Recognized alt-screen enter: drop the sequence bytes
-                            // (never passed through) and emit the semantic event.
+                            // (never passed through) and emit the exact DEC mode.
                             flush!();
-                            events.push(ParserEvent::AltScreenEnter);
-                        } else if b == b'l' && is_alt_screen_mode(&params) {
+                            events.push(ParserEvent::AltScreenEnter(mode));
+                        } else if let (b'l', Some(mode)) = (b, alt_mode) {
                             flush!();
-                            events.push(ParserEvent::AltScreenLeave);
+                            events.push(ParserEvent::AltScreenLeave(mode));
                         } else if !self.config.mouse_reporting
                             && (b == b'h' || b == b'l')
                             && is_mouse_reporting_mode(&params)
@@ -916,8 +923,20 @@ mod tests {
         let mut p = Parser::new();
         let mut events = Vec::new();
         p.feed(b"\x1b[?1049h\x1b[?1049l", &mut events);
-        assert!(matches!(events[0], ParserEvent::AltScreenEnter));
-        assert!(matches!(events[1], ParserEvent::AltScreenLeave));
+        assert!(matches!(events[0], ParserEvent::AltScreenEnter(1049)));
+        assert!(matches!(events[1], ParserEvent::AltScreenLeave(1049)));
+        assert!(collect_bytes(&events).is_empty());
+    }
+
+    #[test]
+    fn legacy_alt_screen_modes_keep_their_exact_mode() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"\x1b[?47h\x1b[?47l\x1b[?1047h\x1b[?1047l", &mut events);
+        assert!(matches!(events[0], ParserEvent::AltScreenEnter(47)));
+        assert!(matches!(events[1], ParserEvent::AltScreenLeave(47)));
+        assert!(matches!(events[2], ParserEvent::AltScreenEnter(1047)));
+        assert!(matches!(events[3], ParserEvent::AltScreenLeave(1047)));
         assert!(collect_bytes(&events).is_empty());
     }
 

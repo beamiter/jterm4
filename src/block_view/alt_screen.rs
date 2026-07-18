@@ -1,9 +1,9 @@
 //! alt — VTE builder + small parser helpers for the live terminal.
 //!
 //! jterm4 aligns with Warp's alt-screen model: when an alt-screen app
-//! (top/vim/htop/...) sends `?1049h`, the live VTE switches to its alt buffer
-//! and renders full-viewport; when it sends `?1049l`, the alt-screen content
-//! is **discarded** — the active block keeps only the command name + exit code.
+//! (top/vim/htop/...) sends `?47h`, `?1047h`, or `?1049h`, the live VTE receives
+//! that exact DEC mode and renders full-viewport. The matching leave sequence
+//! discards the alt-screen frame; the block keeps only command metadata.
 //! No frame-merge / pager-snapshot path runs, matching Warp.
 use crate::config::Config;
 use crate::terminal::apply_terminal_theme;
@@ -132,6 +132,24 @@ pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
     });
 }
 
+/// Keep a deliberately capped snapshot anchored at its first retained row.
+/// VTE applies `feed()` asynchronously, so one immediate adjustment write can
+/// be overwritten by the final buffer layout. Reassert the top over two idles.
+pub(crate) fn settle_finished_terminal_at_top(terminal: &Terminal) {
+    let terminal = terminal.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(adj) = terminal.vadjustment() {
+            adj.set_value(adj.lower());
+        }
+        let terminal = terminal.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(adj) = terminal.vadjustment() {
+                adj.set_value(adj.lower());
+            }
+        });
+    });
+}
+
 // ─── VTE builder ─────────────────────────────────────────────────────────────
 
 /// The single persistent live VTE for block mode. It keeps `input_enabled(true)`
@@ -188,9 +206,9 @@ pub(crate) fn apply_snapshot_theme_to_vte(terminal: &Terminal, config: &Config) 
 
 /// A read-only PTY-less VTE used as the renderer for a single finished block.
 /// Input is disabled; cursor is hidden (block widget shows completed output, not
-/// a live prompt). `output_rows` sizes the widget to exactly the captured row
-/// count up to `viewport_cap`; anything beyond goes into the widget's own
-/// scrollback so the user can scroll within a long block (e.g. `git log`).
+/// a live prompt). Most completed outputs expand to their full retained buffer
+/// and participate in the outer block history. Only exceptionally large outputs
+/// stay capped at `viewport_cap` and keep private scrollback as a safety valve.
 pub(crate) fn create_finished_terminal(
     config: &Config,
     cols: i64,

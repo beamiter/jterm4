@@ -1110,6 +1110,7 @@ struct ReaderCtx {
     event_buf: Rc<RefCell<Vec<ParserEvent>>>,
     unread_count_rc: Rc<Cell<u32>>,
     jump_fab: gtk4::Button,
+    sticky_bar: gtk4::Box,
     selected_block_ids_rc: SelectedBlockIds,
     selected_block_id_rc: Rc<Cell<Option<u64>>>,
     selection_anchor_id_rc: Rc<Cell<Option<u64>>>,
@@ -1235,6 +1236,7 @@ impl ReaderCtx {
             event_buf,
             unread_count_rc,
             jump_fab,
+            sticky_bar,
             selected_block_ids_rc,
             selected_block_id_rc,
             selection_anchor_id_rc,
@@ -1245,6 +1247,7 @@ impl ReaderCtx {
             repo_strip,
             block_finished_cbs,
         } = self;
+        let active_alt_screen_mode_rc: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
         pty.start_reader(
             move |data: Vec<u8>| {
                 let mut events = event_buf.borrow_mut();
@@ -2107,12 +2110,28 @@ impl ReaderCtx {
                             // crashed or exited without rmcup, force the UI back
                             // to the block list so the next prompt is usable.
                             if state == BlockState::AltScreen {
-                                active_vte.feed(b"\x1b[?1049l");
+                                let mode = active_alt_screen_mode_rc.replace(None).unwrap_or(1049);
+                                let leave = format!("\x1b[?{mode}l");
+                                active_vte.feed(leave.as_bytes());
                                 exit_fullscreen(
                                     &finished_blocks_for_cb,
                                     &visible_indices_rc,
                                     &fullscreen_rc,
                                 );
+                                {
+                                    let config = config_for_cb.borrow();
+                                    let cwd = current_cwd_for_cb.borrow();
+                                    exit_alt_screen_chrome(
+                                        &active_rc,
+                                        &sticky_bar,
+                                        &jump_fab,
+                                        &repo_strip,
+                                        &config,
+                                        cwd.as_str(),
+                                        scroll_debouncer.user_scrolled_up.get(),
+                                        unread_count_rc.get(),
+                                    );
+                                }
                                 layout_active_surface();
                             }
                             pending_exit_code_rc.set(*code);
@@ -2121,7 +2140,7 @@ impl ReaderCtx {
                             scroll_debouncer.mark_dirty(&block_scroll_rc);
                         }
 
-                        ParserEvent::AltScreenEnter => {
+                        ParserEvent::AltScreenEnter(mode) => {
                             let from_state = bstate_rc.get();
                             if from_state != BlockState::CollectingOutput
                                 && from_state != BlockState::AwaitingCommand
@@ -2130,6 +2149,13 @@ impl ReaderCtx {
                             }
                             prev_state_rc.set(from_state);
                             bstate_rc.set(BlockState::AltScreen);
+                            active_alt_screen_mode_rc.set(Some(*mode));
+                            enter_alt_screen_chrome(
+                                &active_rc,
+                                &sticky_bar,
+                                &jump_fab,
+                                &repo_strip,
+                            );
                             // Hand the viewport to the alt-screen app: hide finished
                             // blocks so the live VTE fills the scroll area.
                             enter_fullscreen(
@@ -2145,22 +2171,39 @@ impl ReaderCtx {
                                 &block_scroll_rc,
                                 &pty_for_init,
                             );
-                            active_vte.feed(b"\x1b[?1049h");
+                            let enter = format!("\x1b[?{mode}h");
+                            active_vte.feed(enter.as_bytes());
                         }
 
-                        ParserEvent::AltScreenLeave => {
+                        ParserEvent::AltScreenLeave(mode) => {
                             if bstate_rc.get() != BlockState::AltScreen {
                                 continue;
                             }
                             // Warp parity: alt-screen content is ephemeral and is
                             // NOT merged into the block. The active block keeps
                             // just the command name + exit code.
-                            active_vte.feed(b"\x1b[?1049l");
+                            active_alt_screen_mode_rc.set(None);
+                            let leave = format!("\x1b[?{mode}l");
+                            active_vte.feed(leave.as_bytes());
                             exit_fullscreen(
                                 &finished_blocks_for_cb,
                                 &visible_indices_rc,
                                 &fullscreen_rc,
                             );
+                            {
+                                let config = config_for_cb.borrow();
+                                let cwd = current_cwd_for_cb.borrow();
+                                exit_alt_screen_chrome(
+                                    &active_rc,
+                                    &sticky_bar,
+                                    &jump_fab,
+                                    &repo_strip,
+                                    &config,
+                                    cwd.as_str(),
+                                    scroll_debouncer.user_scrolled_up.get(),
+                                    unread_count_rc.get(),
+                                );
+                            }
                             osc133_depth_rc.set(0);
                             bstate_rc.set(prev_state_rc.get());
                             // The primary and alternate screens share the same
@@ -2270,9 +2313,18 @@ fn viewport_rows_for(vte: &Terminal, scroll: &ScrolledWindow) -> Option<i64> {
     if page <= 1 {
         return None;
     }
-    // .block-active wraps the VTE with margin+border+padding; subtract it from
-    // page_size so a full running surface fits exactly inside the pane.
-    let usable = (page - css::BLOCK_ACTIVE_VCHROME_PX).max(cell_h);
+    // Normal active cards reserve margin/border/padding. Alt-screen mode removes
+    // that chrome so vim/less/htop receive every row in the pane.
+    let fullscreen = vte
+        .ancestor(gtk4::Box::static_type())
+        .and_then(|widget| widget.downcast::<gtk4::Box>().ok())
+        .is_some_and(|holder| holder.has_css_class("block-fullscreen"));
+    let chrome = if fullscreen {
+        0
+    } else {
+        css::BLOCK_ACTIVE_VCHROME_PX
+    };
+    let usable = (page - chrome).max(cell_h);
     Some(((usable / cell_h).max(1)) as i64)
 }
 
@@ -2322,17 +2374,17 @@ fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet
 
 fn apply_visible_indices(
     finished: &[FinishedBlock],
+    block_data: &mut VecDeque<BlockData>,
     visible: &mut std::collections::HashSet<usize>,
     new_visible: std::collections::HashSet<usize>,
 ) {
-    for &i in visible.difference(&new_visible) {
-        if let Some(block) = finished.get(i) {
-            block.widget().set_visible(false);
-        }
-    }
-    for &i in new_visible.difference(visible) {
-        if let Some(block) = finished.get(i) {
-            block.widget().set_visible(true);
+    for (i, block) in finished.iter().enumerate() {
+        let should_render = new_visible.contains(&i);
+        let height = block.set_virtualized(!should_render);
+        if !should_render {
+            if let Some(data) = block_data.get_mut(i) {
+                data.estimated_height = height;
+            }
         }
     }
     *visible = new_visible;
@@ -2349,12 +2401,8 @@ fn enter_fullscreen(
         return;
     }
     let finished = finished.borrow();
-    let mut visible = visible_indices.borrow_mut();
-    visible.clear();
-    for (i, block) in finished.iter().enumerate() {
-        if block.widget().is_visible() {
-            visible.insert(i);
-        }
+    let _visible = visible_indices.borrow();
+    for block in finished.iter() {
         block.widget().set_visible(false);
     }
 }
@@ -2369,9 +2417,52 @@ fn exit_fullscreen(
     if !fullscreen.replace(false) {
         return;
     }
-    let visible = visible_indices.borrow();
-    for (i, block) in finished.borrow().iter().enumerate() {
-        block.widget().set_visible(visible.contains(&i));
+    let _visible = visible_indices.borrow();
+    for block in finished.borrow().iter() {
+        // The outer placeholder remains part of the history document; each card's
+        // content remembers whether virtual scrolling had unmapped it.
+        block.widget().set_visible(true);
+    }
+}
+
+fn enter_alt_screen_chrome(
+    active: &Rc<RefCell<ActiveBlock>>,
+    sticky: &gtk4::Box,
+    jump_fab: &gtk4::Button,
+    repo_strip: &gtk4::Label,
+) {
+    active.borrow().widget().add_css_class("block-fullscreen");
+    sticky.set_visible(false);
+    jump_fab.set_visible(false);
+    repo_strip.set_visible(false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exit_alt_screen_chrome(
+    active: &Rc<RefCell<ActiveBlock>>,
+    sticky: &gtk4::Box,
+    jump_fab: &gtk4::Button,
+    repo_strip: &gtk4::Label,
+    config: &Config,
+    cwd: &str,
+    user_scrolled: bool,
+    unread: u32,
+) {
+    active
+        .borrow()
+        .widget()
+        .remove_css_class("block-fullscreen");
+    sticky.set_visible(false);
+    if user_scrolled {
+        set_jump_fab_label(jump_fab, unread);
+        jump_fab.set_visible(true);
+    } else {
+        jump_fab.set_visible(false);
+    }
+    if config.show_repo_strip {
+        refresh_repo_strip(repo_strip, cwd);
+    } else {
+        repo_strip.set_visible(false);
     }
 }
 
@@ -3183,6 +3274,7 @@ impl TermView {
             let current_cwd_for_signal = current_cwd.clone();
             let vte_for_cwd = active_vte.clone();
             let repo_strip_for_cwd = repo_strip.clone();
+            let fullscreen_for_cwd = fullscreen.clone();
             active_vte.connect_current_directory_uri_notify(move |_| {
                 if let Some(uri) = vte_for_cwd.current_directory_uri() {
                     let file = gtk4::gio::File::for_uri(uri.as_str());
@@ -3192,7 +3284,11 @@ impl TermView {
                         .filter(|s| !s.is_empty())
                     {
                         *current_cwd_for_signal.borrow_mut() = path.clone();
-                        refresh_repo_strip(&repo_strip_for_cwd, &path);
+                        if fullscreen_for_cwd.get() {
+                            repo_strip_for_cwd.set_visible(false);
+                        } else {
+                            refresh_repo_strip(&repo_strip_for_cwd, &path);
+                        }
                         for cb in cwd_cbs.borrow().iter() {
                             cb(&path);
                         }
@@ -3316,6 +3412,7 @@ impl TermView {
                 event_buf,
                 unread_count_rc: unread_count.clone(),
                 jump_fab: jump_fab.clone(),
+                sticky_bar: sticky_bar.clone(),
                 selected_block_ids_rc: selected_block_ids.clone(),
                 selected_block_id_rc: selected_block_id.clone(),
                 selection_anchor_id_rc: selection_anchor_id.clone(),
@@ -3346,6 +3443,7 @@ impl TermView {
             let scroll = block_scroll.clone();
             let holder = active.borrow().widget().clone();
             let programmatic_scroll = programmatic_scroll.clone();
+            let fullscreen = fullscreen.clone();
             let check_pending = Rc::new(Cell::new(false));
             let pending_programmatic_only = Rc::new(Cell::new(true));
             block_scroll
@@ -3370,11 +3468,18 @@ impl TermView {
                     let unread = unread.clone();
                     let scroll = scroll.clone();
                     let holder = holder.clone();
+                    let fullscreen = fullscreen.clone();
                     let check_pending = check_pending.clone();
                     let pending_programmatic_only = pending_programmatic_only.clone();
                     glib::idle_add_local_once(move || {
                         check_pending.set(false);
                         if pending_programmatic_only.replace(true) {
+                            return;
+                        }
+                        if fullscreen.get() {
+                            user_scrolled.set(false);
+                            unread.set(0);
+                            fab.set_visible(false);
                             return;
                         }
                         let vp_h = scroll.height() as f64;
@@ -3486,11 +3591,18 @@ impl TermView {
             let user_scrolled = user_scrolled_up.clone();
             let finished = finished_blocks_rc.clone();
             let scroll = block_scroll.clone();
+            let fullscreen = fullscreen.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if sticky.parent().is_none() {
                     return glib::ControlFlow::Break;
                 }
                 let minimized = sticky_minimized.get();
+                if fullscreen.get() {
+                    sticky_target.set(None);
+                    sticky_jump_bottom.set_visible(false);
+                    sticky.set_visible(false);
+                    return glib::ControlFlow::Continue;
+                }
                 if !user_scrolled.get() {
                     sticky_target.set(None);
                     sticky_jump_bottom.set_visible(false);
@@ -3841,6 +3953,19 @@ impl TermView {
         if repaired_ids > 0 {
             log::warn!("repaired {repaired_ids} duplicate block-history ids");
         }
+        {
+            let config = term_view.config.borrow();
+            let fallback_cols = term_view.active.borrow().grid_cols() as i64;
+            for block in term_view.block_data.borrow_mut().iter_mut() {
+                let cols = if block.cols > 0 {
+                    block.cols as i64
+                } else {
+                    fallback_cols
+                };
+                block.estimated_height =
+                    estimated_finished_block_height_for_text(&config, &block.output, cols);
+            }
+        }
 
         // Create widgets for loaded blocks. Each block's `cols` is what the live
         // VTE was wrapping at when the command ran; restoring at the same cols
@@ -3941,6 +4066,7 @@ impl TermView {
                 // Schedule visibility update on next idle
                 let vp = viewport.clone();
                 let finished = finished_blocks.clone();
+                let block_data = block_data.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
                 let pending = visibility_update_pending.clone();
@@ -3953,8 +4079,14 @@ impl TermView {
                     let new_visible = visible_indices_for_viewport(&vp_ref);
 
                     let finished_ref = finished.borrow();
+                    let mut block_data_ref = block_data.borrow_mut();
                     let mut visible_ref = visible.borrow_mut();
-                    apply_visible_indices(&finished_ref, &mut visible_ref, new_visible);
+                    apply_visible_indices(
+                        &finished_ref,
+                        &mut block_data_ref,
+                        &mut visible_ref,
+                        new_visible,
+                    );
                 });
             });
         }
@@ -4513,8 +4645,9 @@ impl TermView {
         let new_visible = visible_indices_for_viewport(&vp);
 
         let finished = self.finished_blocks.borrow();
+        let mut block_data = self.block_data.borrow_mut();
         let mut visible = self.visible_indices.borrow_mut();
-        apply_visible_indices(&finished, &mut visible, new_visible);
+        apply_visible_indices(&finished, &mut block_data, &mut visible, new_visible);
     }
 
     /// Collect a snapshot of internal runtime state for the debug dashboard.
@@ -4822,8 +4955,8 @@ mod tests {
                 ParserEvent::PromptEnd => "PE".to_string(),
                 ParserEvent::CommandStart => "CS".to_string(),
                 ParserEvent::CommandEnd(c) => format!("CE({})", c),
-                ParserEvent::AltScreenEnter => "ALT+".to_string(),
-                ParserEvent::AltScreenLeave => "ALT-".to_string(),
+                ParserEvent::AltScreenEnter(mode) => format!("ALT+({mode})"),
+                ParserEvent::AltScreenLeave(mode) => format!("ALT-({mode})"),
                 _ => "?".to_string(),
             })
             .collect()
