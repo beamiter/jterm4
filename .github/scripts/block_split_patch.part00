@@ -6,7 +6,13 @@ def replace_once(path: str, old: str, new: str) -> None:
     file = Path(path)
     text = file.read_text(encoding='utf-8')
     count = text.count(old)
-    if count != 1:
+    duplicate_exit_prefix = (
+        path == 'src/ui/tabs.rs'
+        and count == 2
+        and 'tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit)' in old
+        and 'let is_split = root_for_exit' in old
+    )
+    if count != 1 and not duplicate_exit_prefix:
         raise SystemExit(f'{path}: expected one match, found {count}: {old[:160]!r}')
     file.write_text(text.replace(old, new, 1), encoding='utf-8')
 
@@ -18,23 +24,70 @@ def insert_before_once(path: str, marker: str, insertion: str) -> None:
 # Typed backend identity on every PaneLeaf.
 replace_once(
     'src/ui/pane_leaf.rs',
-    '''//! model without introducing Relm4 or enabling unsafe Block splits prematurely.\n''',
-    '''//! model with explicit backend identity and native Block split ownership.\n''',
+    '''//! model without introducing Relm4 or enabling unsafe Block splits prematurely.
+''',
+    '''//! model with explicit backend identity and native Block split ownership.
+''',
 )
 replace_once(
     'src/ui/pane_leaf.rs',
-    '''#[derive(Clone)]\npub(crate) enum PaneLeaf {\n    Block(Rc<TermView>),\n    Vte(Rc<VteTerminalView>),\n}\n''',
-    '''#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n#[serde(rename_all = "lowercase")]\npub enum PaneBackend {\n    Block,\n    Vte,\n}\n\n#[derive(Clone)]\npub(crate) enum PaneLeaf {\n    Block(Rc<TermView>),\n    Vte(Rc<VteTerminalView>),\n}\n''',
+    '''#[derive(Clone)]
+pub(crate) enum PaneLeaf {
+    Block(Rc<TermView>),
+    Vte(Rc<VteTerminalView>),
+}
+''',
+    '''#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneBackend {
+    Block,
+    Vte,
+}
+
+#[derive(Clone)]
+pub(crate) enum PaneLeaf {
+    Block(Rc<TermView>),
+    Vte(Rc<VteTerminalView>),
+}
+''',
 )
 insert_before_once(
     'src/ui/pane_leaf.rs',
-    '''    /// Focus the actual live surface rather than the first VTE found in the tree.\n''',
-    '''    pub(crate) fn backend(&self) -> PaneBackend {\n        match self {\n            Self::Block(_) => PaneBackend::Block,\n            Self::Vte(_) => PaneBackend::Vte,\n        }\n    }\n\n    pub(crate) fn history_path(&self) -> Option<String> {\n        match self {\n            Self::Block(view) => view.history_path(),\n            Self::Vte(_) => None,\n        }\n    }\n\n''',
+    '''    /// Focus the actual live surface rather than the first VTE found in the tree.
+''',
+    '''    pub(crate) fn backend(&self) -> PaneBackend {
+        match self {
+            Self::Block(_) => PaneBackend::Block,
+            Self::Vte(_) => PaneBackend::Vte,
+        }
+    }
+
+    pub(crate) fn history_path(&self) -> Option<String> {
+        match self {
+            Self::Block(view) => view.history_path(),
+            Self::Vte(_) => None,
+        }
+    }
+
+''',
 )
 replace_once(
     'src/ui/pane_leaf.rs',
-    '''    pub(crate) fn kill(&self) {\n        let (_, shell_pid) = self.process_probe();\n        crate::state::terminate_terminal_process(shell_pid);\n    }\n''',
-    '''    pub(crate) fn kill(&self) {\n        match self {\n            Self::Block(view) => view.kill(),\n            Self::Vte(_) => {\n                let (_, shell_pid) = self.process_probe();\n                crate::state::terminate_terminal_process(shell_pid);\n            }\n        }\n    }\n''',
+    '''    pub(crate) fn kill(&self) {
+        let (_, shell_pid) = self.process_probe();
+        crate::state::terminate_terminal_process(shell_pid);
+    }
+''',
+    '''    pub(crate) fn kill(&self) {
+        match self {
+            Self::Block(view) => view.kill(),
+            Self::Vte(_) => {
+                let (_, shell_pid) = self.process_probe();
+                crate::state::terminate_terminal_process(shell_pid);
+            }
+        }
+    }
+''',
 )
 replace_once(
     'src/ui/mod.rs',
@@ -45,8 +98,22 @@ replace_once(
 # Expose the exact Block history identity stored by each pane.
 replace_once(
     'src/block_view/mod.rs',
-    '''    pub fn cwd(&self) -> String {\n        self.current_cwd.borrow().clone()\n    }\n\n    pub fn grab_focus(&self) {\n''',
-    '''    pub fn cwd(&self) -> String {\n        self.current_cwd.borrow().clone()\n    }\n\n    pub fn history_path(&self) -> Option<String> {\n        self.config.borrow().block_history_path.clone()\n    }\n\n    pub fn grab_focus(&self) {\n''',
+    '''    pub fn cwd(&self) -> String {
+        self.current_cwd.borrow().clone()
+    }
+
+    pub fn grab_focus(&self) {
+''',
+    '''    pub fn cwd(&self) -> String {
+        self.current_cwd.borrow().clone()
+    }
+
+    pub fn history_path(&self) -> Option<String> {
+        self.config.borrow().block_history_path.clone()
+    }
+
+    pub fn grab_focus(&self) {
+''',
 )
 
 # Persist backend/history ownership and repair duplicate restored identities.
@@ -62,9 +129,30 @@ replace_once(
 )
 replace_once(
     'src/state.rs',
-    '''    Leaf {\n        dir: String,\n        sid: String,\n        #[serde(skip_serializing_if = "Option::is_none")]\n        cmds: Option<String>,\n        #[serde(skip_serializing_if = "Option::is_none")]\n        pinned: Option<bool>,\n    },\n''',
-    '''    Leaf {\n        dir: String,\n        sid: String,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        cmds: Option<String>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        pinned: Option<bool>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        backend: Option<PaneBackend>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        history_path: Option<String>,\n    },\n''',
+    '''    Leaf {
+        dir: String,
+        sid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+    },
+''',
+    '''    Leaf {
+        dir: String,
+        sid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<PaneBackend>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_path: Option<String>,
+    },
+''',
 )
 insert_before_once(
     'src/state.rs',
-    '''/// Serialize a pane layout tree from a GTK widget\n''',
+    '''/// Serialize a pane layout tree from a GTK widget
+''',
