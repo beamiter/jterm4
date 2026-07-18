@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import atexit
+from pathlib import Path
+import subprocess
+import sys
+
+
+TARGET_BRANCH = 'agent/native-block-splits'
+FAILURE_LOG = Path('.github/native-block-split-patch-failure.log')
+PATCH_SUCCEEDED = False
+LAST_SYSTEM_EXIT = None
+PERSISTING_FAILURE = False
+
+
+def persist_failure(detail: str) -> None:
+    global PERSISTING_FAILURE
+    if PERSISTING_FAILURE:
+        return
+    PERSISTING_FAILURE = True
+    # Drop any partially applied source edits while keeping the checked-out
+    # staging branch (and any current-master merge made by the verifier).
+    subprocess.run(['git', 'reset', '--hard', 'HEAD'], check=False)
+    FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    FAILURE_LOG.write_text(detail + '\n', encoding='utf-8')
+    subprocess.run(['git', 'add', str(FAILURE_LOG)], check=True)
+    subprocess.run(
+        ['git', 'commit', '-m', 'ci: capture native Block split patch anchor failure'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'push', '--force', 'origin', f'HEAD:{TARGET_BRANCH}'],
+        check=True,
+    )
+
+
+def trace_system_exit(frame, event, arg):
+    del frame
+    global LAST_SYSTEM_EXIT
+    if event == 'exception' and arg[0] is SystemExit:
+        LAST_SYSTEM_EXIT = str(arg[1])
+    return trace_system_exit
+
+
+def persist_unfinished_patch() -> None:
+    if not PATCH_SUCCEEDED and not PERSISTING_FAILURE:
+        persist_failure(
+            LAST_SYSTEM_EXIT
+            or 'native Block split patch exited before setting PATCH_SUCCEEDED'
+        )
+
+
+sys.settrace(trace_system_exit)
+sys._getframe().f_trace = trace_system_exit
+atexit.register(persist_unfinished_patch)
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    file = Path(path)
+    text = file.read_text(encoding='utf-8')
+    count = text.count(old)
+    duplicate_exit_prefix = (
+        path == 'src/ui/tabs.rs'
+        and count == 2
+        and 'tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit)' in old
+        and 'let is_split = root_for_exit' in old
+    )
+    if count != 1 and not duplicate_exit_prefix:
+        detail = f'{path}: expected one match, found {count}: {old[:500]!r}'
+        persist_failure(detail)
+        raise SystemExit(detail)
+    file.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+
+def insert_before_once(path: str, marker: str, insertion: str) -> None:
+    replace_once(path, marker, insertion + marker)
+
+
+# Typed backend identity on every PaneLeaf.
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''//! model without introducing Relm4 or enabling unsafe Block splits prematurely.
+''',
+    '''//! model with explicit backend identity and native Block split ownership.
+''',
+)
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''#[derive(Clone)]
+pub(crate) enum PaneLeaf {
+    Block(Rc<TermView>),
+    Vte(Rc<VteTerminalView>),
+}
+''',
+    '''#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneBackend {
+    Block,
+    Vte,
+}
+
+#[derive(Clone)]
+pub(crate) enum PaneLeaf {
+    Block(Rc<TermView>),
+    Vte(Rc<VteTerminalView>),
+}
+''',
+)
+insert_before_once(
+    'src/ui/pane_leaf.rs',
+    '''    /// Focus the actual live surface rather than the first VTE found in the tree.
+''',
+    '''    pub(crate) fn backend(&self) -> PaneBackend {
+        match self {
+            Self::Block(_) => PaneBackend::Block,
+            Self::Vte(_) => PaneBackend::Vte,
+        }
+    }
+
+    pub(crate) fn history_path(&self) -> Option<String> {
+        match self {
+            Self::Block(view) => view.history_path(),
+            Self::Vte(_) => None,
+        }
+    }
+
+''',
+)
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''    pub(crate) fn kill(&self) {
+        let (_, shell_pid) = self.process_probe();
+        crate::state::terminate_terminal_process(shell_pid);
+    }
+''',
+    '''    pub(crate) fn kill(&self) {
+        match self {
+            Self::Block(view) => view.kill(),
+            Self::Vte(_) => {
+                let (_, shell_pid) = self.process_probe();
+                crate::state::terminate_terminal_process(shell_pid);
+            }
+        }
+    }
+''',
+)
+replace_once(
+    'src/ui/mod.rs',
+    'pub(crate) use pane_leaf::PaneLeaf;\n',
+    'pub(crate) use pane_leaf::{PaneBackend, PaneLeaf};\n',
+)
+
+# Expose the exact Block history identity stored by each pane.
+replace_once(
+    'src/block_view/mod.rs',
+    '''    pub fn cwd(&self) -> String {
+        self.current_cwd.borrow().clone()
+    }
+
+    pub fn grab_focus(&self) {
+''',
+    '''    pub fn cwd(&self) -> String {
+        self.current_cwd.borrow().clone()
+    }
+
+    pub fn history_path(&self) -> Option<String> {
+        self.config.borrow().block_history_path.clone()
+    }
+
+    pub fn grab_focus(&self) {
+''',
+)
+
+# Persist backend/history ownership and repair duplicate restored identities.
+replace_once(
+    'src/state.rs',
+    'use std::collections::HashMap;\n',
+    'use std::collections::{HashMap, HashSet};\n',
+)
+replace_once(
+    'src/state.rs',
+    'use crate::ui::{PaneLeaf, PaneNode};\n',
+    'use crate::ui::{PaneBackend, PaneLeaf, PaneNode};\n',
+)
+replace_once(
+    'src/state.rs',
+    '''    Leaf {
+        dir: String,
+        sid: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+    },
+''',
+    '''    Leaf {
+        dir: String,
+        sid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cmds: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<PaneBackend>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        history_path: Option<String>,
+    },
+''',
+)
+insert_before_once(
+    'src/state.rs',
+    '''/// Serialize a pane layout tree from a GTK widget
+''',

@@ -1,0 +1,70 @@
+    '''/// Derive a per-pane Block history file without changing the configured\n/// directory or extension. A missing base path keeps persistence disabled.\npub(crate) fn block_history_path_for_pane(\n    base: Option<&str>,\n    session_id: &str,\n) -> Option<String> {\n    let base = base?.trim();\n    if base.is_empty() {\n        return None;\n    }\n    let safe_id: String = session_id\n        .chars()\n        .map(|ch| {\n            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {\n                ch\n            } else {\n                '_'\n            }\n        })\n        .collect();\n    if safe_id.is_empty() {\n        return None;\n    }\n\n    let path = Path::new(base);\n    let name = path.file_name()?.to_string_lossy();\n    let (stem, extension) = name\n        .rsplit_once('.')\n        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())\n        .map_or((name.as_ref(), None), |(stem, extension)| {\n            (stem, Some(extension))\n        });\n    let file_name = match extension {\n        Some(extension) => format!("{stem}.pane-{safe_id}.{extension}"),\n        None => format!("{stem}.pane-{safe_id}"),\n    };\n    Some(path.with_file_name(file_name).to_string_lossy().into_owned())\n}\n\nfn normalize_pane_layout_with<F>(layout: &mut PaneLayout, mut next_sid: F) -> usize\nwhere\n    F: FnMut() -> String,\n{\n    fn visit<F>(\n        layout: &mut PaneLayout,\n        seen_sids: &mut HashSet<String>,\n        seen_history: &mut HashSet<String>,\n        next_sid: &mut F,\n    ) -> usize\n    where\n        F: FnMut() -> String,\n    {\n        match layout {\n            PaneLayout::Leaf {\n                sid,\n                backend,\n                history_path,\n                ..\n            } => {\n                let mut repairs = 0usize;\n                if sid.trim().is_empty() || !seen_sids.insert(sid.clone()) {\n                    loop {\n                        let candidate = next_sid();\n                        if !candidate.trim().is_empty() && seen_sids.insert(candidate.clone()) {\n                            *sid = candidate;\n                            repairs += 1;\n                            break;\n                        }\n                    }\n                }\n\n                if *backend != Some(PaneBackend::Vte) {\n                    if let Some(existing) = history_path.clone() {\n                        if !seen_history.insert(existing.clone()) {\n                            let mut suffix = 1u32;\n                            loop {\n                                let identity = if suffix == 1 {\n                                    sid.clone()\n                                } else {\n                                    format!("{sid}-{suffix}")\n                                };\n                                let candidate = block_history_path_for_pane(\n                                    Some(&existing),\n                                    &identity,\n                                );\n                                if let Some(candidate) = candidate {\n                                    if seen_history.insert(candidate.clone()) {\n                                        *history_path = Some(candidate);\n                                        repairs += 1;\n                                        break;\n                                    }\n                                } else {\n                                    *history_path = None;\n                                    repairs += 1;\n                                    break;\n                                }\n                                suffix = suffix.saturating_add(1);\n                            }\n                        }\n                    }\n                }\n                repairs\n            }\n            PaneLayout::Split { start, end, .. } => {\n                visit(start, seen_sids, seen_history, next_sid)\n                    + visit(end, seen_sids, seen_history, next_sid)\n            }\n        }\n    }\n\n    visit(\n        layout,\n        &mut HashSet::new(),\n        &mut HashSet::new(),\n        &mut next_sid,\n    )\n}\n\npub(crate) fn normalize_pane_layout(layout: &mut PaneLayout) {\n    let repairs = normalize_pane_layout_with(layout, generate_session_id);\n    if repairs > 0 {\n        log::warn!("repaired {repairs} duplicate pane session/history identities");\n    }\n}\n\n''',
+)
+replace_once(
+    'src/state.rs',
+    '''        PaneLayout::Leaf {\n            dir,\n            sid,\n            cmds,\n            pinned,\n        }\n''',
+    '''        PaneLayout::Leaf {\n            dir,\n            sid,\n            cmds,\n            pinned,\n            backend: pane_leaf.as_ref().map(PaneLeaf::backend),\n            history_path: pane_leaf.as_ref().and_then(PaneLeaf::history_path),\n        }\n''',
+)
+insert_before_once(
+    'src/state.rs',
+    '''    #[test]\n    fn parses_snapshot_owner_pid() {\n''',
+    '''    #[test]\n    fn legacy_pane_layout_defaults_to_unspecified_backend_identity() {\n        let layout: PaneLayout = serde_json::from_str(\n            r#"{\"type\":\"leaf\",\"dir\":\"/tmp\",\"sid\":\"legacy\"}"#,\n        )\n        .unwrap();\n        let PaneLayout::Leaf {\n            backend,\n            history_path,\n            ..\n        } = layout\n        else {\n            panic!("expected leaf");\n        };\n        assert_eq!(backend, None);\n        assert_eq!(history_path, None);\n    }\n\n    #[test]\n    fn block_history_paths_are_stable_and_pane_specific() {\n        assert_eq!(\n            block_history_path_for_pane(Some("~/.local/state/jterm4/blocks.rkyv"), "pane/2"),\n            Some("~/.local/state/jterm4/blocks.pane-pane_2.rkyv".to_string())\n        );\n        assert_eq!(block_history_path_for_pane(None, "pane-2"), None);\n    }\n\n    #[test]\n    fn restored_layout_repairs_duplicate_session_and_history_owners() {\n        let mut layout = PaneLayout::Split {\n            orientation: 'h',\n            position: 320,\n            start: Box::new(PaneLayout::Leaf {\n                dir: "/tmp".into(),\n                sid: "same".into(),\n                cmds: None,\n                pinned: None,\n                backend: Some(PaneBackend::Block),\n                history_path: Some("/tmp/blocks.rkyv".into()),\n            }),\n            end: Box::new(PaneLayout::Leaf {\n                dir: "/tmp".into(),\n                sid: "same".into(),\n                cmds: None,\n                pinned: None,\n                backend: Some(PaneBackend::Block),\n                history_path: Some("/tmp/blocks.rkyv".into()),\n            }),\n        };\n        let mut generated = ["repaired".to_string()].into_iter();\n        let repairs = normalize_pane_layout_with(&mut layout, || generated.next().unwrap());\n        assert_eq!(repairs, 2);\n\n        let PaneLayout::Split { start, end, .. } = layout else {\n            panic!("expected split");\n        };\n        let PaneLayout::Leaf {\n            sid: start_sid,\n            history_path: start_history,\n            ..\n        } = *start\n        else {\n            panic!("expected start leaf");\n        };\n        let PaneLayout::Leaf {\n            sid: end_sid,\n            history_path: end_history,\n            ..\n        } = *end\n        else {\n            panic!("expected end leaf");\n        };\n        assert_eq!(start_sid, "same");\n        assert_eq!(end_sid, "repaired");\n        assert_ne!(start_history, end_history);\n    }\n\n''',
+)
+
+# Restore exact backends/history paths; old snapshots retain their historical defaults.
+replace_once(
+    'src/ui/tabs.rs',
+    '''    remote: Option<(crate::config::RemoteHost, u32)>,\n    terminal_mode: crate::config::TerminalMode,\n}\n''',
+    '''    remote: Option<(crate::config::RemoteHost, u32)>,\n    terminal_mode: crate::config::TerminalMode,\n    block_history_path: Option<String>,\n}\n''',
+)
+replace_once(
+    'src/ui/tabs.rs',
+    '''            remote: None,\n            terminal_mode,\n        })\n    }\n\n    /// Launch an explicit argv instead of the configured interactive shell.\n''',
+    '''            remote: None,\n            terminal_mode,\n            block_history_path: None,\n        })\n    }\n\n    pub(crate) fn add_restored_tab(\n        &self,\n        working_directory: Option<String>,\n        tab_name: Option<String>,\n        session_id: Option<String>,\n        initial_commands: Option<String>,\n        terminal_mode: crate::config::TerminalMode,\n        block_history_path: Option<String>,\n    ) -> Terminal {\n        self.add_tab_with_argv(TabLaunch {\n            working_directory,\n            tab_name,\n            session_id,\n            initial_commands,\n            argv_override: None,\n            remote: None,\n            terminal_mode,\n            block_history_path,\n        })\n    }\n\n    /// Launch an explicit argv instead of the configured interactive shell.\n''',
+)
+replace_once(
+    'src/ui/tabs.rs',
+    '''            remote: None,\n            terminal_mode,\n        })\n    }\n\n    /// Open a new tab connecting to a saved remote host over ssh.\n''',
+    '''            remote: None,\n            terminal_mode,\n            block_history_path: None,\n        })\n    }\n\n    /// Open a new tab connecting to a saved remote host over ssh.\n''',
+)
+replace_once(
+    'src/ui/tabs.rs',
+    '''            remote: Some((host.clone(), attempt)),\n            terminal_mode,\n        })\n''',
+    '''            remote: Some((host.clone(), attempt)),\n            terminal_mode,\n            block_history_path: None,\n        })\n''',
+)
+replace_once(
+    'src/ui/tabs.rs',
+    '''            remote,\n            terminal_mode,\n        } = launch;\n''',
+    '''            remote,\n            terminal_mode,\n            block_history_path,\n        } = launch;\n''',
+)
+replace_once(
+    'src/ui/tabs.rs',
+    '''                crate::config::TerminalMode::Block => {\n                    let term_view = Rc::new(TermView::new(\n                        &self.config.borrow(),\n                        shell_argv,\n                        working_directory.as_deref(),\n                        Some(&sid),\n                        initial_commands.as_deref(),\n                    ));\n''',
+    '''                crate::config::TerminalMode::Block => {\n                    let mut block_config = self.config.borrow().clone();\n                    if let Some(history_path) = block_history_path.as_ref() {\n                        block_config.block_history_path = Some(history_path.clone());\n                    }\n                    let term_view = Rc::new(TermView::new(\n                        &block_config,\n                        shell_argv,\n                        working_directory.as_deref(),\n                        Some(&sid),\n                        initial_commands.as_deref(),\n                    ));\n''',
+)
+# Guard callbacks after a removed pane has already been detached.
+replace_once(
+    'src/ui/tabs.rs',
+    '''                    let current_tab_num =\n                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);\n                    let is_split = root_for_exit\n''',
+    '''                    let current_tab_num =\n                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);\n                    if !ui_for_exit.pane_root_is_attached(&root_for_exit) {\n                        return;\n                    }\n                    let is_split = root_for_exit\n''',
+)
+# There are two identical callback fragments; replace the second one separately.
+text = Path('src/ui/tabs.rs').read_text(encoding='utf-8')
+needle = '''                    let current_tab_num =\n                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);\n                    let is_split = root_for_exit\n'''
+if text.count(needle) != 1:
+    raise SystemExit(f'src/ui/tabs.rs: expected remaining VTE exit callback once, found {text.count(needle)}')
+Path('src/ui/tabs.rs').write_text(
+    text.replace(
+        needle,
+        '''                    let current_tab_num =\n                        tab_num_for_widget(&root_for_exit).unwrap_or(tab_num_for_exit);\n                    if !ui_for_exit.pane_root_is_attached(&root_for_exit) {\n                        return;\n                    }\n                    let is_split = root_for_exit\n''',
+        1,
+    ),
+    encoding='utf-8',
+)
+
+# Native Block split constructor and backend-preserving split selection.
+replace_once(
+    'src/ui/panes.rs',
+    'use crate::state::generate_session_id;\n',
+    'use crate::block_view::TermView;\nuse crate::state::{block_history_path_for_pane, generate_session_id};\n',
+)
