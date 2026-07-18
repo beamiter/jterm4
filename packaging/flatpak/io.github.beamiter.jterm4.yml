@@ -92,6 +92,8 @@ modules:
       - cargo build --offline --release --all-features --locked
       - install -Dm0755 target/release/jterm4 ${FLATPAK_DEST}/bin/jterm4
       - install -Dm0755 scripts/support-bundle.sh ${FLATPAK_DEST}/bin/jterm4-support-bundle
+      - install -Dm0644 LICENSE-MIT ${FLATPAK_DEST}/share/licenses/io.github.beamiter.jterm4/LICENSE-MIT
+      - install -Dm0644 LICENSE-APACHE ${FLATPAK_DEST}/share/licenses/io.github.beamiter.jterm4/LICENSE-APACHE
       - install -Dm0644 data/io.github.beamiter.jterm4.desktop ${FLATPAK_DEST}/share/applications/io.github.beamiter.jterm4.desktop
       - install -Dm0644 data/io.github.beamiter.jterm4.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.beamiter.jterm4.metainfo.xml
       - install -Dm0644 data/io.github.beamiter.jterm4.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.beamiter.jterm4.svg

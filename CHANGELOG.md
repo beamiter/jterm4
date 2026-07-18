@@ -6,6 +6,7 @@ All notable user-visible and operational changes are recorded here.
 
 ### Added
 
+- Project licensing under `MIT OR Apache-2.0`, including canonical license texts, Cargo/AppStream metadata, inbound-contribution terms, and license files in release artifacts.
 - Reproducible GNOME 50 Flatpak packaging, stable desktop application ID, AppStream metadata, scalable/raster icons, checksummed CI bundles, and X11/Wayland VTE/Block smoke tests.
 - A Flatpak host-command bridge so shells, SSH, Git probes, AI curl requests, and desktop notifications operate on the host instead of the application sandbox.
 - Modern GTK4 `TreeListModel`/`ListView` file browser with asynchronous lazy directory scans.
@@ -56,4 +57,4 @@ All notable user-visible and operational changes are recorded here.
 - Agent approval is refused while the bound Block prompt is busy or already contains input; malformed model output never degrades into a runnable proposal.
 - History, workflow, file-tree and AI review insertions reject line breaks and terminal control characters before writing to a PTY.
 - Support archives are created owner-only, make no network requests, and exclude configuration/history/session contents, credentials, host identity, SSH targets, and local paths.
-- The package is marked `publish = false` until a project license is selected.
+- The repository is dual-licensed under `MIT OR Apache-2.0`; crates.io publication remains separately disabled with `publish = false`.

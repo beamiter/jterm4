@@ -5,6 +5,11 @@ shell integrations, example workflows, documented configuration, and welcome
 notebook. It installs into the current user's `~/.local` prefix; root access is
 not required, and an existing `config.toml` is never overwritten.
 
+## License
+
+jterm4 is dual-licensed under `MIT OR Apache-2.0`. The archive includes both
+canonical license texts under `share/doc/jterm4/`.
+
 ## Runtime requirements
 
 This is not a statically linked or self-contained portable application. A

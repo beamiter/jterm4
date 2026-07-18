@@ -105,7 +105,6 @@ and foreground-process inspection can only see the sandbox-side
 `flatpak-spawn` helper, so integrations that omit OSC 7 may have less precise
 process names or current-directory recovery. This does not affect command I/O.
 
-The project license remains an explicit owner decision tracked separately. The
-AppStream metadata uses `LicenseRef-proprietary` until that decision is made; the
-Flatpak is intended for testing and direct project distribution, not Flathub
-submission, until the license issue is resolved.
+The project is distributed under `MIT OR Apache-2.0`. The Flatpak installs both
+canonical license texts below `/app/share/licenses/io.github.beamiter.jterm4/`,
+and the AppStream `project_license` field uses the same SPDX expression.
