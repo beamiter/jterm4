@@ -39,27 +39,18 @@ jobs:
 
           path = Path('src/parser.rs')
           text = path.read_text()
-          old = '''                        if b == b'h' && alt_mode.is_some() {
-                              // Recognized alt-screen enter: drop the sequence bytes
-                              // (never passed through) and emit the exact DEC mode.
-                              flush!();
-                              events.push(ParserEvent::AltScreenEnter(alt_mode.unwrap()));
-                          } else if b == b'l' && alt_mode.is_some() {
-                              flush!();
-                              events.push(ParserEvent::AltScreenLeave(alt_mode.unwrap()));
-          '''
-          new = '''                        if let (b'h', Some(mode)) = (b, alt_mode) {
-                              // Recognized alt-screen enter: drop the sequence bytes
-                              // (never passed through) and emit the exact DEC mode.
-                              flush!();
-                              events.push(ParserEvent::AltScreenEnter(mode));
-                          } else if let (b'l', Some(mode)) = (b, alt_mode) {
-                              flush!();
-                              events.push(ParserEvent::AltScreenLeave(mode));
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected one parser anchor, found {text.count(old)}')
-          path.write_text(text.replace(old, new, 1))
+          replacements = [
+              ("if b == b'h' && alt_mode.is_some() {", "if let (b'h', Some(mode)) = (b, alt_mode) {"),
+              ("ParserEvent::AltScreenEnter(alt_mode.unwrap())", "ParserEvent::AltScreenEnter(mode)"),
+              ("} else if b == b'l' && alt_mode.is_some() {", "} else if let (b'l', Some(mode)) = (b, alt_mode) {"),
+              ("ParserEvent::AltScreenLeave(alt_mode.unwrap())", "ParserEvent::AltScreenLeave(mode)"),
+          ]
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one parser anchor, found {count}: {old!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
           PY
 
       - name: Format and verify
