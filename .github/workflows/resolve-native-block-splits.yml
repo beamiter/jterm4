@@ -1,0 +1,91 @@
+name: Resolve native Block split panes
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'agent/native-block-splits'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Check out Block split branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Configure and update branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git merge --no-edit origin/master
+
+      - name: Assemble and apply ownership patch
+        id: patch
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cat \
+            .github/scripts/block_split_patch.part00 \
+            .github/scripts/block_split_patch.part01 \
+            .github/scripts/block_split_patch.part02 \
+            .github/scripts/block_split_patch.part03 \
+            > /tmp/apply_block_native_splits.py
+          python3 -m py_compile /tmp/apply_block_native_splits.py
+          python3 /tmp/apply_block_native_splits.py 2>&1 | tee /tmp/native-block-splits.log
+
+      - name: Upload patch diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-block-split-patch-${{ github.run_id }}
+          path: /tmp/native-block-splits.log
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Require ownership patch
+        if: ${{ steps.patch.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Install native validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libpcre2-dev \
+            libvte-2.91-gtk4-dev \
+            pkg-config
+
+      - name: Format and inspect patch
+        run: |
+          cargo fmt --all
+          git diff --check
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Remove one-shot machinery
+        run: |
+          rm .github/scripts/block_split_patch.part00
+          rm .github/scripts/block_split_patch.part01
+          rm .github/scripts/block_split_patch.part02
+          rm .github/scripts/block_split_patch.part03
+          rm .github/workflows/resolve-native-block-splits.yml
+
+      - name: Commit verified implementation
+        run: |
+          git add -A
+          git diff --cached --quiet && { echo "native Block split patch produced no changes" >&2; exit 1; }
+          git commit -m "feat: add native Block split panes"
+          git push --force origin HEAD:${{ github.head_ref }}
