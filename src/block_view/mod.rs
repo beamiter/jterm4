@@ -162,10 +162,20 @@ fn normalize_captured_command(captured: &str, prompt: &str) -> String {
 /// Resolve the command at CommandStart without trusting VTE feed timing. The PTY
 /// reader can deliver the echoed command and OSC 133;C in one chunk: `feed()`
 /// queues the echo for VTE, then the semantic event is handled immediately, so
-/// the text range can still be empty. The keystroke shadow is deliberately only
-/// a fallback; a settled VTE capture remains authoritative for history recall,
-/// autosuggestions, IME, and shell line-editor redraws.
-fn resolve_submitted_command(captured: &str, prompt: &str, typed_shadow: &str) -> String {
+/// the text range can still be empty. An explicitly submitted programmatic
+/// command is authoritative because it can race ahead of VTE rendering. For
+/// interactive input, the keystroke shadow is deliberately only a fallback; a
+/// settled VTE capture remains authoritative for history recall, autosuggestions,
+/// IME, and shell line-editor redraws.
+fn resolve_submitted_command(
+    captured: &str,
+    prompt: &str,
+    typed_shadow: &str,
+    external_submission: Option<&str>,
+) -> String {
+    if let Some(command) = external_submission {
+        return command.trim().to_string();
+    }
     let captured = normalize_captured_command(captured, prompt);
     if captured.trim().is_empty() {
         typed_shadow.trim().to_string()
@@ -987,6 +997,10 @@ pub struct TermView {
     /// finished-command text is read off the live VTE at CommandStart.
     #[allow(dead_code)]
     typed_cmd: Rc<RefCell<String>>,
+    /// Exact command supplied by an execution-approved programmatic path. It is
+    /// consumed at CommandStart before the VTE capture, which may still show a
+    /// previous line when submission outruns display rendering.
+    external_submission: Rc<RefCell<Option<String>>>,
     /// Programmatic input and native VTE commits both set this while the current
     /// prompt has been edited. It prevents background output and Agent insertion
     /// from treating a non-empty readline buffer as clean.
@@ -1069,6 +1083,8 @@ struct ReaderCtx {
     /// Keystroke-shadow input line, used only as a fallback if the VTE-text
     /// capture at CommandStart returns empty.
     typed_cmd_rc: Rc<RefCell<String>>,
+    /// Exact command from an approved programmatic submission, if any.
+    external_submission_rc: Rc<RefCell<Option<String>>>,
     /// Bytes emitted asynchronously after PromptEnd and before the next PromptStart.
     /// Empty-command blocks are inferred from this separate buffer, so no history
     /// schema change is needed.
@@ -1206,6 +1222,7 @@ impl ReaderCtx {
             osc133_depth_rc,
             prompt_buf_rc,
             typed_cmd_rc,
+            external_submission_rc,
             background_output_rc,
             idle_input_dirty_rc,
             vte_typed_cmd_rc,
@@ -1996,6 +2013,7 @@ impl ReaderCtx {
                             prompt_buf_rc.borrow_mut().clear();
                             typed_cmd_rc.borrow_mut().clear();
                             vte_typed_cmd_rc.borrow_mut().clear();
+                            external_submission_rc.borrow_mut().take();
                             background_output_rc.borrow_mut().clear();
                             idle_input_dirty_rc.set(false);
                             // Snapshot the live VTE cursor at the moment the
@@ -2018,6 +2036,7 @@ impl ReaderCtx {
                             // a fast command cannot outrun command capture.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
                                 *typed_cmd_rc.borrow_mut() = cmd.clone();
+                                *external_submission_rc.borrow_mut() = Some(cmd.clone());
                                 idle_input_dirty_rc.set(true);
                                 pty_synced_rc.set(true);
                                 let text = format!("{}\r", cmd);
@@ -2071,10 +2090,13 @@ impl ReaderCtx {
                                 .unwrap_or_default();
                             let prompt_display = prompt_display_rc.borrow().clone();
                             let typed_shadow = typed_cmd_rc.borrow().clone();
+                            let external_submission =
+                                external_submission_rc.borrow_mut().take();
                             let submitted_command = resolve_submitted_command(
                                 &captured,
                                 &prompt_display,
                                 &typed_shadow,
+                                external_submission.as_deref(),
                             );
                             *vte_typed_cmd_rc.borrow_mut() = submitted_command.clone();
                             *running_cmd_rc.borrow_mut() = submitted_command;
@@ -3064,6 +3086,7 @@ impl TermView {
         // off the VTE at CommandStart; this remains a best-effort fallback when
         // a shell-integration anchor cannot be captured.
         let typed_cmd: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let external_submission: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let background_output: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
         let idle_input_dirty: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Command text snapshot taken at CommandStart from the VTE itself,
@@ -3382,6 +3405,7 @@ impl TermView {
                 osc133_depth_rc,
                 prompt_buf_rc,
                 typed_cmd_rc,
+                external_submission_rc: external_submission.clone(),
                 background_output_rc: background_output.clone(),
                 idle_input_dirty_rc: idle_input_dirty.clone(),
                 vte_typed_cmd_rc,
@@ -3904,6 +3928,7 @@ impl TermView {
             bstate,
             prompt_buf,
             typed_cmd,
+            external_submission,
             idle_input_dirty,
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
@@ -4155,6 +4180,25 @@ impl TermView {
             );
         }
         self.pty.write_bytes(data);
+    }
+
+    /// Submit the current shell edit buffer as if the user pressed Enter.
+    ///
+    /// A terminal Enter key is carriage return, not line feed. The PTY input
+    /// sanitizer deliberately treats LF as insertion-only multiline content,
+    /// so programmatic execution paths must use this explicit submission API.
+    pub fn submit_input(&self) {
+        self.write_input(b"\r");
+    }
+
+    /// Write and submit one already-approved programmatic command.
+    ///
+    /// Save the exact text before exposing bytes to the PTY so a fast shell
+    /// cannot emit CommandStart before the Block command capture is armed.
+    pub fn submit_command(&self, command: &str) {
+        *self.external_submission.borrow_mut() = Some(command.to_string());
+        self.write_input(command.as_bytes());
+        self.submit_input();
     }
 
     /// Agent commands may only be submitted into a clean, idle shell editor.
@@ -4978,7 +5022,7 @@ mod tests {
     #[test]
     fn submitted_command_falls_back_when_vte_echo_has_not_settled() {
         assert_eq!(
-            resolve_submitted_command("", "yj ~/project ❯", "git status"),
+            resolve_submitted_command("", "yj ~/project ❯", "git status", None),
             "git status"
         );
     }
@@ -4986,12 +5030,25 @@ mod tests {
     #[test]
     fn submitted_command_prefers_the_rendered_line_editor_state() {
         assert_eq!(
-            resolve_submitted_command("git diff --stat", "yj ~/project ❯", "git status"),
+            resolve_submitted_command("git diff --stat", "yj ~/project ❯", "git status", None),
             "git diff --stat"
         );
         assert_eq!(
-            resolve_submitted_command("yj ~/project ❯ cargo test", "yj ~/project ❯", "cargo"),
+            resolve_submitted_command("yj ~/project ❯ cargo test", "yj ~/project ❯", "cargo", None),
             "cargo test"
+        );
+    }
+
+    #[test]
+    fn programmatic_submission_wins_over_stale_vte_capture() {
+        assert_eq!(
+            resolve_submitted_command(
+                "ls",
+                "yj ~/project ❯",
+                "cat monitor_xilem_bar.sh",
+                Some("cat monitor_xilem_bar.sh")
+            ),
+            "cat monitor_xilem_bar.sh"
         );
     }
 

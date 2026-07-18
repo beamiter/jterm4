@@ -14,6 +14,24 @@ use super::UiState;
 use crate::agent::{AgentSession, AgentState, ModelOutcome, ProposalId};
 use crate::block_view::TermView;
 
+/// Bind the next completed foreground block to the approved proposal.
+///
+/// Approval is only possible while the pinned Block prompt is idle and empty,
+/// after the preceding block has already been finalized. The next foreground
+/// completion is therefore the approved command even when VTE's best-effort
+/// command capture is stale or reflects a shell line-editor redraw.
+fn take_pending_for_finished_block<T>(
+    pending: &mut Option<(T, String)>,
+    captured_command: &str,
+) -> Option<T> {
+    let (value, approved_command) = pending.take()?;
+    if captured_command.trim() != approved_command.trim() {
+        // Do not log either command: command text can contain sensitive data.
+        log::debug!("Agent command completed with a differing VTE command capture");
+    }
+    Some(value)
+}
+
 struct AgentRuntime {
     session: RefCell<AgentSession>,
     target: Rc<TermView>,
@@ -281,8 +299,7 @@ impl AgentRuntime {
         *runtime.pending_command.borrow_mut() =
             Some((approved.proposal_id, approved.command.clone()));
         runtime.target.grab_focus();
-        runtime.target.write_input(approved.command.as_bytes());
-        runtime.target.write_input(b"\n");
+        runtime.target.submit_command(&approved.command);
     }
 
     fn reject(runtime: Rc<Self>, id: ProposalId) {
@@ -298,13 +315,13 @@ impl AgentRuntime {
     }
 
     fn observe(runtime: Rc<Self>, command: String, exit_code: i32, output: String) {
-        let Some((id, expected)) = runtime.pending_command.borrow().clone() else {
+        let id = {
+            let mut pending = runtime.pending_command.borrow_mut();
+            take_pending_for_finished_block(&mut pending, &command)
+        };
+        let Some(id) = id else {
             return;
         };
-        if command.trim() != expected.trim() {
-            return;
-        }
-        runtime.pending_command.borrow_mut().take();
         if let Err(error) = runtime.session.borrow_mut().observe(id, exit_code, &output) {
             runtime.status.set_text(&error.to_string());
             return;
@@ -495,5 +512,25 @@ impl UiState {
         *self.agent_dialog.borrow_mut() = Some(dialog.clone());
         dialog.present(Some(&self.window));
         input.grab_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_pending_for_finished_block;
+
+    #[test]
+    fn finished_block_consumes_approval_even_when_vte_capture_differs() {
+        let mut pending = Some((7_u64, "cat monitor_xilem_bar.sh".to_string()));
+
+        assert_eq!(take_pending_for_finished_block(&mut pending, "ls"), Some(7));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn finished_block_without_an_approval_is_ignored() {
+        let mut pending: Option<(u64, String)> = None;
+
+        assert_eq!(take_pending_for_finished_block(&mut pending, "ls"), None);
     }
 }

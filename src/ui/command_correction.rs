@@ -697,9 +697,10 @@ fn show_correction_dialog(
         }
 
         target.grab_focus();
-        target.write_input(command.as_bytes());
         if response == "run" {
-            target.write_input(b"\n");
+            target.submit_command(&command);
+        } else {
+            target.write_input(command.as_bytes());
         }
     });
     dialog.present(Some(window));

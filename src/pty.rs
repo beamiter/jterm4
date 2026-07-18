@@ -702,6 +702,21 @@ mod tests {
     }
 
     #[test]
+    fn enter_is_carriage_return_not_line_feed() {
+        let (enter, active) = sanitize_input_chunk(b"\r", false, true);
+        assert_eq!(enter.as_ref(), b"\r");
+        assert!(!active);
+
+        let (line_feed, active) = sanitize_input_chunk(b"\n", false, true);
+        assert_eq!(
+            line_feed.as_ref(),
+            b"\x1b[200~\n\x1b[201~",
+            "LF is protected as insertion-only multiline content"
+        );
+        assert!(!active);
+    }
+
+    #[test]
     fn bracketed_paste_preserves_multiline_body_across_writes() {
         let (start, active) = sanitize_input_chunk(BRACKETED_PASTE_START, false, false);
         assert_eq!(start.as_ref(), BRACKETED_PASTE_START);
