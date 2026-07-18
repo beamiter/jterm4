@@ -135,6 +135,10 @@ impl UiState {
              .top-bar {{ background-color: rgb({br},{bg_g},{bb}); color: rgb({fr},{fg_g},{fb}); }}
              .top-bar button {{ color: rgb({fr},{fg_g},{fb}); }}
              .sidebar-box {{ background-color: rgb({br},{bg_g},{bb}); }}
+             .sidebar-switcher, .sidebar-switcher button, .sidebar-switcher label,
+             .file-tree-header, .file-tree-header button, .file-tree-header label,
+             .file-tree-root {{ color: rgb({fr},{fg_g},{fb}); }}
+             .file-tree-root {{ opacity: 1.0; }}
              .tab-strip-btn {{ color: rgba({fr},{fg_g},{fb},0.6); }}
              .tab-strip-btn:checked {{ color: rgb({fr},{fg_g},{fb}); }}
              .tab-strip-btn.tab-marked {{ background-color: rgba({fr},{fg_g},{fb},0.2); font-weight: bold; }}
