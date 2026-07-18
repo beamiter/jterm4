@@ -39,6 +39,14 @@ Keep GTK work on the main thread and filesystem/process work off it. Preserve ex
 
 Never commit tokens, private hostnames, personal paths, captured terminal output, or real configuration files. Use placeholders in documentation and tests. Report vulnerabilities through `SECURITY.md`, not a public proof of concept.
 
+## Licensing
+
+jterm4 is distributed under the `MIT OR Apache-2.0` dual license. Unless a
+contribution is conspicuously marked otherwise before it is accepted, submitting
+it for inclusion means that you license that contribution under the same terms,
+without additional restrictions. Contributors must have the right to submit the
+code, documentation, tests, and assets they provide.
+
 ## Pull requests
 
 Prefer reviewable commits with a clear user-visible rationale. Update `README.md`, the user guide, architecture notes, and `CHANGELOG.md` when behavior changes. A pull request should describe residual risk and any manual checks that cannot run in CI.

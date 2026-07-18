@@ -6,6 +6,7 @@ on:
     paths:
       - Cargo.lock
       - Cargo.toml
+      - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
       - scripts/smoke-flatpak.sh
@@ -16,6 +17,7 @@ on:
     paths:
       - Cargo.lock
       - Cargo.toml
+      - 'LICENSE*'
       - data/**
       - packaging/flatpak/**
       - scripts/smoke-flatpak.sh
@@ -161,6 +163,8 @@ jobs:
             flatpak --user remote-add --if-not-exists --no-gpg-verify \
               jterm4-ci "file://${PWD}/flatpak-repo"
             flatpak --user install -y jterm4-ci ${APP_ID}
+            flatpak run --command=sh ${APP_ID} -c \
+              'test -s /app/share/licenses/io.github.beamiter.jterm4/LICENSE-MIT && test -s /app/share/licenses/io.github.beamiter.jterm4/LICENSE-APACHE'
             flatpak run ${APP_ID} --version
             # The Flatpak host bridge uses flatpak-spawn over the session bus.
             # Run headless diagnostics inside a bus even when no display exists.

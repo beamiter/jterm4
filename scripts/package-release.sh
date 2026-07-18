@@ -48,6 +48,8 @@ for size in 128 256; do
 done
 
 install -Dm0644 README.md "${PACKAGE_ROOT}/share/doc/jterm4/README.md"
+install -Dm0644 LICENSE-MIT "${PACKAGE_ROOT}/share/doc/jterm4/LICENSE-MIT"
+install -Dm0644 LICENSE-APACHE "${PACKAGE_ROOT}/share/doc/jterm4/LICENSE-APACHE"
 install -Dm0644 config.toml.example \
     "${PACKAGE_ROOT}/share/doc/jterm4/config.toml.example"
 install -Dm0644 Cargo.lock "${PACKAGE_ROOT}/share/doc/jterm4/Cargo.lock"

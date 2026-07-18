@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>io.github.beamiter.jterm4</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>LicenseRef-proprietary</project_license>
+  <project_license>MIT OR Apache-2.0</project_license>
   <name>jterm4</name>
   <summary>Session-aware GTK4 terminal with structured command blocks</summary>
   <description>
