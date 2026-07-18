@@ -20,12 +20,16 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Configure and update branch
+      - name: Configure clean source branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp .github/scripts/block_split_patch.part00 /tmp/block_split_patch.part00
+          cp .github/scripts/block_split_patch.part01 /tmp/block_split_patch.part01
+          cp .github/scripts/block_split_patch.part02 /tmp/block_split_patch.part02
+          cp .github/scripts/block_split_patch.part03 /tmp/block_split_patch.part03
           git fetch origin master
-          git merge --no-edit origin/master
+          git reset --hard origin/master
 
       - name: Assemble and apply ownership patch
         id: patch
@@ -33,13 +37,22 @@ jobs:
         run: |
           set -o pipefail
           cat \
-            .github/scripts/block_split_patch.part00 \
-            .github/scripts/block_split_patch.part01 \
-            .github/scripts/block_split_patch.part02 \
-            .github/scripts/block_split_patch.part03 \
+            /tmp/block_split_patch.part00 \
+            /tmp/block_split_patch.part01 \
+            /tmp/block_split_patch.part02 \
+            /tmp/block_split_patch.part03 \
             > /tmp/apply_block_native_splits.py
           python3 -m py_compile /tmp/apply_block_native_splits.py
-          python3 /tmp/apply_block_native_splits.py 2>&1 | tee /tmp/native-block-splits.log
+          python3 /tmp/apply_block_native_splits.py 2>&1 | tee native-block-splits.log
+
+      - name: Upload patch diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-block-split-patch-${{ github.run_id }}
+          path: native-block-splits.log
+          if-no-files-found: warn
+          retention-days: 2
 
       - name: Persist patch failure
         if: ${{ steps.patch.outcome == 'failure' }}
@@ -47,9 +60,14 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
-          git reset --hard HEAD
-          cp /tmp/native-block-splits.log .github/native-block-split-patch-failure.log
-          git add .github/native-block-split-patch-failure.log
+          git reset --hard origin/master
+          mkdir -p .github/scripts
+          cp /tmp/block_split_patch.part00 .github/scripts/block_split_patch.part00
+          cp /tmp/block_split_patch.part01 .github/scripts/block_split_patch.part01
+          cp /tmp/block_split_patch.part02 .github/scripts/block_split_patch.part02
+          cp /tmp/block_split_patch.part03 .github/scripts/block_split_patch.part03
+          cp native-block-splits.log .github/native-block-split-patch-failure.log
+          git add .github/scripts/block_split_patch.part* .github/native-block-split-patch-failure.log
           git commit -m "ci: capture native Block split patch failure"
           git push --force origin HEAD:"$HEAD_REF"
           exit 1
@@ -75,17 +93,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Remove one-shot machinery
-        run: |
-          rm .github/scripts/block_split_patch.part00
-          rm .github/scripts/block_split_patch.part01
-          rm .github/scripts/block_split_patch.part02
-          rm .github/scripts/block_split_patch.part03
-          rm .github/workflows/resolve-native-block-splits.yml
-          rm -f .github/native-block-split-patch-failure.log .github/native-block-splits-retry
-
       - name: Commit verified implementation
         run: |
+          rm -f native-block-splits.log
           git add -A
           git diff --cached --quiet && { echo "native Block split patch produced no changes" >&2; exit 1; }
           git commit -m "feat: add native Block split panes"
