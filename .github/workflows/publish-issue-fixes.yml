@@ -155,14 +155,37 @@ jobs:
             pkg-config
 
       - name: Format, test and lint
+        id: validation
+        continue-on-error: true
         run: |
-          cargo fmt --all
-          git diff --check
-          cargo test --all-features --locked
-          cargo clippy --all-targets --all-features --locked -- -D warnings
+          set -o pipefail
+          {
+            cargo fmt --all
+            git diff --check
+            cargo test --all-features --locked
+            cargo clippy --all-targets --all-features --locked -- -D warnings
+          } 2>&1 | tee /tmp/native-block-validation.log
+
+      - name: Persist validation failure
+        if: ${{ steps.validation.outcome == 'failure' }}
+        run: |
+          git reset --hard origin/master
+          mkdir -p .github/scripts
+          cp /tmp/block_split_patch.part00 .github/scripts/block_split_patch.part00
+          cp /tmp/block_split_patch.part01 .github/scripts/block_split_patch.part01
+          cp /tmp/block_split_patch.part02 .github/scripts/block_split_patch.part02
+          cp /tmp/block_split_patch.part03 .github/scripts/block_split_patch.part03
+          cp /tmp/native-block-validation.log .github/native-block-split-validation-failure.log
+          git add .github/scripts/block_split_patch.part* .github/native-block-split-validation-failure.log
+          git commit -m "ci: capture native Block split validation failure"
+          git push --force origin HEAD:agent/native-block-splits
+          exit 1
 
       - name: Publish verified implementation
+        if: ${{ steps.validation.outcome == 'success' }}
         run: |
+          rm -f .github/native-block-split-patch-failure.log \
+            .github/native-block-split-validation-failure.log
           git add -A
           git diff --cached --quiet && { echo "native Block split patch produced no source changes" >&2; exit 1; }
           git commit -m "feat: add native Block split panes"
