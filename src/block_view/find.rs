@@ -408,6 +408,7 @@ impl TermView {
         let Some(block) = finished.iter().find(|b| b.id == block_id) else {
             return false;
         };
+        self.cross_selection.clear_all();
         replace_finished_block_selection(
             &finished,
             &self.selected_block_ids,

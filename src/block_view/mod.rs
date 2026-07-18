@@ -49,6 +49,39 @@ fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Keep newly-created block ids above every id restored from persistent history.
+fn reserve_block_ids_after(blocks: &VecDeque<BlockData>, counter: &AtomicU64) {
+    if let Some(max_id) = blocks.iter().map(|block| block.id).max() {
+        counter.fetch_max(max_id.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
+/// Repair duplicate ids left by older sessions, then reserve the allocator above
+/// all restored ids. Selection, delete, export, search, and bookmarks are id-keyed;
+/// allowing a restarted process to issue id 0 again makes those operations target
+/// the wrong card.
+fn normalize_loaded_block_ids(blocks: &mut VecDeque<BlockData>, counter: &AtomicU64) -> usize {
+    reserve_block_ids_after(blocks, counter);
+
+    let mut seen = HashSet::with_capacity(blocks.len());
+    let mut repaired = 0usize;
+    for block in blocks {
+        if seen.insert(block.id) {
+            continue;
+        }
+
+        let replacement = loop {
+            let candidate = counter.fetch_add(1, Ordering::Relaxed);
+            if seen.insert(candidate) {
+                break candidate;
+            }
+        };
+        block.id = replacement;
+        repaired += 1;
+    }
+    repaired
+}
+
 /// Update the jump-to-bottom FAB's label to show an unread-block badge: just the
 /// chevron when nothing is pending, chevron + count (clamped to "99+") otherwise.
 fn set_jump_fab_label(fab: &gtk4::Button, unread: u32) {
@@ -149,18 +182,85 @@ pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (Str
     }
 }
 
-/// Build one contiguous PTY write for clipboard paste. Keeping the bracket
-/// markers and payload together prevents another asynchronous writer from
-/// interleaving bytes inside a bracketed-paste transaction.
-fn build_clipboard_paste_payload(text: &str, bracketed_paste: bool) -> Vec<u8> {
-    if !bracketed_paste {
-        return text.as_bytes().to_vec();
+fn external_input_changes_editor(state: BlockState, data: &[u8]) -> bool {
+    state == BlockState::AwaitingCommand && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+}
+
+/// Mirror input that bypasses VTE's `commit` signal (clipboard, Agent, and other
+/// programmatic insertion) into the editor-state guards. Escape/control sequences
+/// still mark the line dirty, but are not copied into the fallback command text.
+fn record_external_input(
+    state: BlockState,
+    data: &[u8],
+    typed_cmd: &RefCell<String>,
+    pty_synced: &Cell<bool>,
+    idle_input_dirty: &Cell<bool>,
+) -> bool {
+    if !external_input_changes_editor(state, data) {
+        return false;
     }
-    let mut payload = Vec::with_capacity(text.len() + 12);
-    payload.extend_from_slice(b"\x1b[200~");
-    payload.extend_from_slice(text.as_bytes());
-    payload.extend_from_slice(b"\x1b[201~");
-    payload
+
+    pty_synced.set(true);
+    idle_input_dirty.set(true);
+
+    if data == b"\x08" || data == b"\x7f" {
+        typed_cmd.borrow_mut().pop();
+        return true;
+    }
+    if data == b"\x15" {
+        typed_cmd.borrow_mut().clear();
+        return true;
+    }
+
+    let has_terminal_controls = data
+        .iter()
+        .any(|&byte| byte == 0x7f || (byte < 0x20 && !matches!(byte, b'\t' | b'\r' | b'\n')));
+    if has_terminal_controls {
+        return true;
+    }
+
+    let normalized = String::from_utf8_lossy(data)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    typed_cmd.borrow_mut().push_str(&normalized);
+    true
+}
+
+fn build_clipboard_paste(text: &str, bracketed_paste: bool) -> (String, Vec<u8>) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let inserted = if bracketed_paste {
+        normalized
+    } else {
+        // Without bracketed paste, the PTY safety boundary keeps only the first
+        // logical line. Mirror that exact text in the fallback editor model.
+        normalized.split('\n').next().unwrap_or("").to_string()
+    };
+    if inserted.is_empty() {
+        return (inserted, Vec::new());
+    }
+
+    let payload = if bracketed_paste {
+        let mut payload = Vec::with_capacity(inserted.len() + 12);
+        payload.extend_from_slice(b"\x1b[200~");
+        payload.extend_from_slice(inserted.as_bytes());
+        payload.extend_from_slice(b"\x1b[201~");
+        payload
+    } else {
+        inserted.as_bytes().to_vec()
+    };
+    (inserted, payload)
+}
+
+fn history_edge_navigation_available(state: BlockState, editor_dirty: bool) -> bool {
+    !editor_dirty
+        && !matches!(
+            state,
+            BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
+        )
+}
+
+fn should_buffer_background_output(idle_input_dirty: bool, pty_synced: bool) -> bool {
+    !idle_input_dirty && !pty_synced
 }
 
 /// Collect selected commands in terminal order, skipping background-only blocks.
@@ -360,6 +460,14 @@ fn clear_finished_block_selection(
     selected_block_id.set(None);
     selection_anchor_id.set(None);
     sync_finished_block_selection(finished, selected_block_ids, selected_block_id);
+}
+
+fn clear_vte_text_selections(finished: &[FinishedBlock], active_vte: &Terminal) {
+    active_vte.unselect_all();
+    for block in finished {
+        block.command_vte.unselect_all();
+        block.output_vte.unselect_all();
+    }
 }
 
 fn replace_finished_block_selection(
@@ -864,9 +972,9 @@ pub struct TermView {
     /// finished-command text is read off the live VTE at CommandStart.
     #[allow(dead_code)]
     typed_cmd: Rc<RefCell<String>>,
-    /// True after the user or an insertion action starts editing the idle prompt.
-    /// Async shell output stays inline while this is set instead of being split
-    /// into a misleading background-output block.
+    /// Programmatic input and native VTE commits both set this while the current
+    /// prompt has been edited. It prevents background output and Agent insertion
+    /// from treating a non-empty readline buffer as clean.
     idle_input_dirty: Rc<Cell<bool>>,
     /// True while an alt-screen app owns the viewport (finished blocks hidden).
     fullscreen: Rc<Cell<bool>>,
@@ -1178,7 +1286,10 @@ impl ReaderCtx {
                                     // arrives before the user begins editing. Once input
                                     // is dirty, PTY echo/completion is indistinguishable
                                     // from a background process and remains inline.
-                                    if !idle_input_dirty_rc.get() {
+                                    if should_buffer_background_output(
+                                        idle_input_dirty_rc.get(),
+                                        pty_synced_rc.get(),
+                                    ) {
                                         let mut pending = background_output_rc.borrow_mut();
                                         pending.extend_from_slice(bytes);
                                         if pending.len() > MAX_RAW_OUTPUT_BYTES {
@@ -1452,6 +1563,7 @@ impl ReaderCtx {
                                     gesture.set_state(gtk4::EventSequenceState::Claimed);
                                     {
                                         let finished = finished_blocks_for_menu.borrow();
+                                        clear_vte_text_selections(&finished, &vte_for_copy);
                                         activate_finished_block_selection(
                                             &finished,
                                             &selected_ids_for_menu,
@@ -2247,6 +2359,7 @@ fn running_root_control_bytes(
 /// fall through to the VTE.
 struct KeyCtx {
     pty_for_key: Rc<OwnedPty>,
+    active_vte_for_key: Terminal,
     pty_synced_for_key: Rc<Cell<bool>>,
     bracketed_paste_for_key: Rc<Cell<bool>>,
     typed_cmd_for_key: Rc<RefCell<String>>,
@@ -2266,6 +2379,7 @@ impl KeyCtx {
     fn connect(self, key_ctrl: &gtk4::EventControllerKey) {
         let KeyCtx {
             pty_for_key,
+            active_vte_for_key,
             pty_synced_for_key,
             bracketed_paste_for_key,
             typed_cmd_for_key,
@@ -2286,16 +2400,19 @@ impl KeyCtx {
             let shift = modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
             let alt = modifiers.contains(gtk4::gdk::ModifierType::ALT_MASK);
 
-            // History navigation stays local while the shell is idle. A running
-            // command or fullscreen/raw terminal continues to own these keys.
+            // History navigation stays local while the shell is idle. Once the
+            // readline buffer has been edited, Home/End belong to the shell so
+            // users can move to the beginning/end of the visible command.
+            let state = bstate_for_key.get();
             let history_navigation = !matches!(
-                bstate_for_key.get(),
+                state,
                 BlockState::CollectingOutput | BlockState::AltScreen | BlockState::RawFallback
             );
+            let editor_dirty = pty_synced_for_key.get() || !typed_cmd_for_key.borrow().is_empty();
             if !ctrl
                 && !shift
                 && !alt
-                && history_navigation
+                && history_edge_navigation_available(state, editor_dirty)
                 && matches!(keyval, Key::Home | Key::End)
             {
                 scroll_history_to_edge(&block_scroll_for_key, keyval == Key::End);
@@ -2333,6 +2450,7 @@ impl KeyCtx {
                     &block_scroll_for_key,
                     direction,
                 ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
                     return glib::Propagation::Stop;
                 }
             }
@@ -2347,15 +2465,17 @@ impl KeyCtx {
             {
                 let finished = finished_blocks_for_key.borrow();
                 let direction = if keyval == Key::Up { -1 } else { 1 };
-                move_finished_block_selection(
+                if move_finished_block_selection(
                     &finished,
                     &selected_block_ids_for_key,
                     &selected_block_id_for_key,
                     &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
-                );
-                return glib::Propagation::Stop;
+                ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Ctrl+Shift+Up/Down aligns the selected card's top/bottom edge.
@@ -2376,15 +2496,17 @@ impl KeyCtx {
             if ctrl && shift && !alt && matches!(keyval, Key::bracketleft | Key::bracketright) {
                 let finished = finished_blocks_for_key.borrow();
                 let direction = if keyval == Key::bracketleft { -1 } else { 1 };
-                move_finished_block_selection(
+                if move_finished_block_selection(
                     &finished,
                     &selected_block_ids_for_key,
                     &selected_block_id_for_key,
                     &selection_anchor_id_for_key,
                     &block_scroll_for_key,
                     direction,
-                );
-                return glib::Propagation::Stop;
+                ) {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
+                    return glib::Propagation::Stop;
+                }
             }
 
             // Enter recalls every selected command in terminal order as one
@@ -2392,6 +2514,19 @@ impl KeyCtx {
             if matches!(keyval, Key::Return | Key::KP_Enter) {
                 if selected_block_id_for_key.get().is_some() {
                     let finished = finished_blocks_for_key.borrow();
+                    // Programmatic paste/Agent input does not pass through this
+                    // controller. If it has already dirtied the editor, Enter must
+                    // submit the visible line rather than replacing it with a
+                    // previously selected command.
+                    if pty_synced_for_key.get() || !typed_cmd_for_key.borrow().is_empty() {
+                        clear_finished_block_selection(
+                            &finished,
+                            &selected_block_ids_for_key,
+                            &selected_block_id_for_key,
+                            &selection_anchor_id_for_key,
+                        );
+                        return glib::Propagation::Proceed;
+                    }
                     let recalled = {
                         let selected = selected_block_ids_for_key.borrow();
                         recall_selected_commands_at_prompt(
@@ -2558,6 +2693,7 @@ impl KeyCtx {
                         .or_else(|| marked_idx.first().copied())
                 };
                 if let Some(idx) = target {
+                    clear_vte_text_selections(&finished, &active_vte_for_key);
                     let new_id = finished.get(idx).map(|b| b.id);
                     replace_finished_block_selection(
                         &finished,
@@ -3490,6 +3626,7 @@ impl TermView {
 
             KeyCtx {
                 pty_for_key,
+                active_vte_for_key: active_vte.clone(),
                 pty_synced_for_key: pty_synced.clone(),
                 bracketed_paste_for_key: bracketed_paste.clone(),
                 typed_cmd_for_key,
@@ -3596,6 +3733,9 @@ impl TermView {
             &block_scroll,
             finished_blocks_rc.clone(),
             active_vte.clone(),
+            selected_block_ids.clone(),
+            selected_block_id.clone(),
+            selection_anchor_id.clone(),
         );
 
         let term_view = TermView {
@@ -3609,7 +3749,7 @@ impl TermView {
             bstate,
             prompt_buf,
             typed_cmd,
-            idle_input_dirty: idle_input_dirty.clone(),
+            idle_input_dirty,
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
             programmatic_scroll: programmatic_scroll.clone(),
@@ -3645,8 +3785,19 @@ impl TermView {
             block_finished_callbacks,
         };
 
-        // Load history if configured
-        let _ = term_view.load_history();
+        // Load history if configured. Persisted ids come from another process,
+        // whose allocator also began at zero, so reserve this process above them
+        // before any new command can finish.
+        if let Err(err) = term_view.load_history() {
+            log::warn!("load block history: {err}");
+        }
+        let repaired_ids = {
+            let mut blocks = term_view.block_data.borrow_mut();
+            normalize_loaded_block_ids(&mut blocks, &BLOCK_ID_COUNTER)
+        };
+        if repaired_ids > 0 {
+            log::warn!("repaired {repaired_ids} duplicate block-history ids");
+        }
 
         // Create widgets for loaded blocks. Each block's `cols` is what the live
         // VTE was wrapping at when the command ran; restoring at the same cols
@@ -3812,15 +3963,21 @@ impl TermView {
 
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
-        self.clear_block_selection_for_input();
-        if self.bstate.get() == BlockState::AwaitingCommand
-            && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
-        {
-            self.idle_input_dirty.set(true);
-            self.pty_synced.set(true);
-            self.typed_cmd
-                .borrow_mut()
-                .push_str(&String::from_utf8_lossy(data));
+        let changed_editor = record_external_input(
+            self.bstate.get(),
+            data,
+            &self.typed_cmd,
+            &self.pty_synced,
+            &self.idle_input_dirty,
+        );
+        if changed_editor && self.selected_block_id.get().is_some() {
+            let finished = self.finished_blocks.borrow();
+            clear_finished_block_selection(
+                &finished,
+                &self.selected_block_ids,
+                &self.selected_block_id,
+                &self.selection_anchor_id,
+            );
         }
         self.pty.write_bytes(data);
     }
@@ -3829,6 +3986,8 @@ impl TermView {
     pub fn can_accept_agent_command(&self) -> bool {
         self.bstate.get() == BlockState::AwaitingCommand
             && !self.fullscreen.get()
+            && !self.idle_input_dirty.get()
+            && !self.pty_synced.get()
             && self.typed_cmd.borrow().trim().is_empty()
     }
 
@@ -3866,11 +4025,11 @@ impl TermView {
     }
 
     /// Copy selected text to clipboard.
-    /// Priority: (1) live VTE selection,
-    /// (2) any finished-block TextBuffer with an active selection, (3) PRIMARY
-    /// clipboard as a last-resort fallback. Step 2 is what makes Ctrl+Shift+C
-    /// work for mouse-selected text inside finished command/output views —
-    /// PRIMARY alone is unreliable across compositors (notably Wayland).
+    ///
+    /// Visible text selection wins over card selection. This matters when the
+    /// user selects a block for navigation, then drags a smaller range inside its
+    /// command/output VTE: Ctrl+Shift+C must copy the highlighted text they see,
+    /// not the entire card.
     pub fn copy_to_clipboard(&self) {
         self.copy_to_clipboard_with_modifier(false);
     }
@@ -3880,51 +4039,19 @@ impl TermView {
     pub fn copy_to_clipboard_with_modifier(&self, alt_held: bool) {
         log::debug!(">>> TermView::copy_to_clipboard called (alt={})", alt_held);
 
-        // (0) Cross-block drag: if more than one VTE has a selection (the
-        // user dragged across block boundaries, see cross_selection.rs), copy
-        // the concatenated text in widget order instead of just one widget's.
-        if self.cross_selection.has_cross_selection() {
-            if let Some(text) = self.cross_selection.copy_text() {
-                log::debug!(
-                    ">>> TermView copy: got {} chars from cross-block selection",
-                    text.len()
-                );
-                self.active_vte.clipboard().set_text(&text);
-                return;
-            }
+        // Native and cross-block text selections are collected in document order:
+        // command VTE, output VTE, then the live input surface.
+        if let Some(text) = self.cross_selection.copy_text() {
+            log::debug!(
+                ">>> TermView copy: got {} chars from visible text selection",
+                text.len()
+            );
+            self.active_vte.clipboard().set_text(&text);
+            return;
         }
 
-        // (1) Live VTE selection
-        if let Some(text) = self.active_vte.text_selected(vte4::Format::Text) {
-            if !text.is_empty() {
-                log::debug!(">>> TermView copy: got {} chars from VTE", text.len());
-                self.active_vte.clipboard().set_text(&text);
-                return;
-            }
-        }
-
-        // (2) Finished-block VTEs (output_vte / command_vte). GTK4 selection is
-        // per-widget so only one block can have a live selection at a time —
-        // that's the one we copy.
-        for blk in self.finished_blocks.borrow().iter() {
-            for vte in [&blk.output_vte, &blk.command_vte] {
-                if let Some(text) = vte.text_selected(vte4::Format::Text) {
-                    let s = text.to_string();
-                    if !s.is_empty() {
-                        log::debug!(
-                            ">>> TermView copy: got {} chars from finished block VTE",
-                            s.len()
-                        );
-                        self.active_vte.clipboard().set_text(&s);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // (3) Whole-block selection (Warp's CopyBlock; +Alt -> output only).
-        // This is intentionally after every visible text-selection path: what the
-        // user can see highlighted must win over a stale card-selection outline.
+        // Whole-block selection (Warp's CopyBlock; +Alt -> output only).
+        // Multi-selection preserves terminal order and visual grouping.
         {
             let selected = self.selected_block_ids.borrow();
             if !selected.is_empty() {
@@ -3947,10 +4074,8 @@ impl TermView {
             }
         }
 
-        // No live VTE / finished-block / whole-block selection. We deliberately
-        // do NOT fall back to PRIMARY — on Wayland it is empty for our own widgets
-        // anyway, and on X11 GTK already mirrors widget selections into both
-        // clipboards so the path was never actually load-bearing.
+        // No visible selection. Do not fall back to PRIMARY: it is unreliable on
+        // Wayland and makes the shortcut copy content the user cannot see selected.
         log::debug!(">>> TermView copy: no selection found, nothing to copy");
     }
 
@@ -3958,7 +4083,8 @@ impl TermView {
     ///
     /// The active VTE is display-only in this mode and has no child PTY, so
     /// `Terminal::paste_clipboard()` can lose or reorder multiline input. Read
-    /// the clipboard ourselves and preserve the shell's bracketed-paste mode.
+    /// the clipboard ourselves, update the shared editor guards, and preserve
+    /// bracketed-paste framing in one queued PTY write.
     pub fn paste_from_clipboard(&self) {
         // Pasting is an explicit return to the live editor. Without clearing the
         // card selection, the next Enter is intercepted as “recall selected
@@ -3973,23 +4099,44 @@ impl TermView {
         let typed_cmd = self.typed_cmd.clone();
         let pty_synced = self.pty_synced.clone();
         let idle_input_dirty = self.idle_input_dirty.clone();
+        let finished_blocks = self.finished_blocks.clone();
+        let selected_block_ids = self.selected_block_ids.clone();
+        let selected_block_id = self.selected_block_id.clone();
+        let selection_anchor_id = self.selection_anchor_id.clone();
+        let active = self.active.clone();
         clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |result| {
             let Ok(Some(text)) = result else {
                 return;
             };
+            let text = text.to_string();
             if text.is_empty() {
                 return;
             }
 
-            if bstate.get() == BlockState::AwaitingCommand {
-                idle_input_dirty.set(true);
-                pty_synced.set(true);
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                typed_cmd.borrow_mut().push_str(&normalized);
+            let (inserted_text, payload) = build_clipboard_paste(&text, bracketed_paste.get());
+            if payload.is_empty() {
+                return;
             }
 
-            let payload = build_clipboard_paste_payload(text.as_str(), bracketed_paste.get());
+            record_external_input(
+                bstate.get(),
+                inserted_text.as_bytes(),
+                &typed_cmd,
+                &pty_synced,
+                &idle_input_dirty,
+            );
+            if selected_block_id.get().is_some() {
+                let finished = finished_blocks.borrow();
+                clear_finished_block_selection(
+                    &finished,
+                    &selected_block_ids,
+                    &selected_block_id,
+                    &selection_anchor_id,
+                );
+            }
+
             pty.write_bytes(&payload);
+            active.borrow().grab_focus();
         });
     }
 
@@ -4084,6 +4231,7 @@ impl TermView {
                     lines.signum(),
                 )
             {
+                self.cross_selection.clear_all();
                 return;
             }
         }
@@ -4105,6 +4253,7 @@ impl TermView {
         if self.fullscreen.get() {
             return;
         }
+        self.cross_selection.clear_all();
         let finished = self.finished_blocks.borrow();
         let (Some(first), Some(last)) = (finished.first(), finished.last()) else {
             return;
@@ -4419,6 +4568,7 @@ impl TermView {
     pub fn scroll_to_block(&self, block_index: usize) {
         let finished = self.finished_blocks.borrow();
         if let Some(block) = finished.get(block_index) {
+            self.cross_selection.clear_all();
             replace_finished_block_selection(
                 &finished,
                 &self.selected_block_ids,
@@ -4491,15 +4641,18 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        background_output_has_visible_text, build_command_recall, build_keyboard_query_reply,
-        coalesce_bytes_events, compute_viewport_state, normalize_captured_command,
-        scroll_delta_to_reveal, selected_command_text, selected_id_range, strip_ansi,
-        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
-        visible_indices_for_viewport, BlockData, ViewportState,
+        background_output_has_visible_text, build_clipboard_paste, build_command_recall,
+        build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
+        history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
+        record_external_input, scroll_delta_to_reveal, selected_command_text, selected_id_range,
+        should_buffer_background_output, strip_ansi, strip_ansi_with_clear_detect,
+        take_background_output, truncate_plain_output_for_height, visible_indices_for_viewport,
+        BlockData, BlockState, ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::{HashSet, VecDeque};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn background_output_requires_visible_text() {
@@ -4518,6 +4671,103 @@ mod tests {
         );
         assert!(pending.borrow().is_empty());
         assert!(take_background_output(&pending).is_none());
+    }
+
+    #[test]
+    fn programmatic_editor_sync_keeps_async_output_inline() {
+        assert!(should_buffer_background_output(false, false));
+        assert!(!should_buffer_background_output(true, false));
+        assert!(!should_buffer_background_output(false, true));
+    }
+
+    #[test]
+    fn restored_block_ids_are_unique_and_reserve_the_allocator() {
+        let mut blocks = VecDeque::from([
+            block_with_height(10),
+            block_with_height(20),
+            block_with_height(30),
+        ]);
+        blocks[0].id = 4;
+        blocks[1].id = 4;
+        blocks[2].id = 9;
+        let counter = AtomicU64::new(0);
+
+        assert_eq!(normalize_loaded_block_ids(&mut blocks, &counter), 1);
+        let ids: HashSet<u64> = blocks.iter().map(|block| block.id).collect();
+        assert_eq!(ids.len(), blocks.len());
+        assert!(counter.load(Ordering::Relaxed) >= 11);
+        assert_eq!(blocks[0].id, 4);
+        assert_eq!(blocks[2].id, 9);
+    }
+
+    #[test]
+    fn external_input_marks_the_editor_dirty_without_copying_escape_sequences() {
+        let typed = RefCell::new(String::new());
+        let synced = Cell::new(false);
+        let dirty = Cell::new(false);
+
+        assert!(record_external_input(
+            BlockState::AwaitingCommand,
+            b"hello\nworld",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+        assert_eq!(&*typed.borrow(), "hello\nworld");
+        assert!(synced.get());
+        assert!(dirty.get());
+
+        synced.set(false);
+        dirty.set(false);
+        assert!(record_external_input(
+            BlockState::AwaitingCommand,
+            b"\x1b[D",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+        assert_eq!(&*typed.borrow(), "hello\nworld");
+        assert!(synced.get());
+        assert!(dirty.get());
+
+        assert!(!record_external_input(
+            BlockState::CollectingOutput,
+            b"ignored",
+            &typed,
+            &synced,
+            &dirty,
+        ));
+    }
+
+    #[test]
+    fn clipboard_paste_matches_the_effective_editor_text() {
+        assert_eq!(
+            build_clipboard_paste("one\r\ntwo", false),
+            ("one".to_string(), b"one".to_vec())
+        );
+        assert_eq!(
+            build_clipboard_paste("one\r\ntwo", true),
+            (
+                "one\ntwo".to_string(),
+                b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn home_end_return_to_readline_after_the_editor_is_dirty() {
+        assert!(history_edge_navigation_available(
+            BlockState::AwaitingCommand,
+            false
+        ));
+        assert!(!history_edge_navigation_available(
+            BlockState::AwaitingCommand,
+            true
+        ));
+        assert!(!history_edge_navigation_available(
+            BlockState::CollectingOutput,
+            false
+        ));
     }
 
     fn ev_summary(events: &[ParserEvent]) -> Vec<String> {
@@ -5067,12 +5317,9 @@ mod tests {
     }
     #[test]
     fn clipboard_paste_payload_is_one_ordered_transaction() {
+        assert_eq!(build_clipboard_paste("plain", false).1.as_slice(), b"plain");
         assert_eq!(
-            build_clipboard_paste_payload("plain", false).as_slice(),
-            b"plain"
-        );
-        assert_eq!(
-            build_clipboard_paste_payload("one\ntwo", true).as_slice(),
+            build_clipboard_paste("one\ntwo", true).1.as_slice(),
             b"\x1b[200~one\ntwo\x1b[201~"
         );
     }
