@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
+import atexit
 from pathlib import Path
 import subprocess
+import sys
 
 
 TARGET_BRANCH = 'agent/native-block-splits'
 FAILURE_LOG = Path('.github/native-block-split-patch-failure.log')
+PATCH_SUCCEEDED = False
+LAST_SYSTEM_EXIT = None
+PERSISTING_FAILURE = False
 
 
 def persist_failure(detail: str) -> None:
+    global PERSISTING_FAILURE
+    if PERSISTING_FAILURE:
+        return
+    PERSISTING_FAILURE = True
     # Drop any partially applied source edits while keeping the checked-out
     # staging branch (and any current-master merge made by the verifier).
     subprocess.run(['git', 'reset', '--hard', 'HEAD'], check=False)
@@ -22,6 +31,27 @@ def persist_failure(detail: str) -> None:
         ['git', 'push', '--force', 'origin', f'HEAD:{TARGET_BRANCH}'],
         check=True,
     )
+
+
+def trace_system_exit(frame, event, arg):
+    del frame
+    global LAST_SYSTEM_EXIT
+    if event == 'exception' and arg[0] is SystemExit:
+        LAST_SYSTEM_EXIT = str(arg[1])
+    return trace_system_exit
+
+
+def persist_unfinished_patch() -> None:
+    if not PATCH_SUCCEEDED and not PERSISTING_FAILURE:
+        persist_failure(
+            LAST_SYSTEM_EXIT
+            or 'native Block split patch exited before setting PATCH_SUCCEEDED'
+        )
+
+
+sys.settrace(trace_system_exit)
+sys._getframe().f_trace = trace_system_exit
+atexit.register(persist_unfinished_patch)
 
 
 def replace_once(path: str, old: str, new: str) -> None:
