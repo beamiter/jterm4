@@ -108,6 +108,7 @@ jobs:
 
       - name: Commit verified policy
         run: |
+          rm -f .github/license-policy-retry
           git add -A
           git status --short
           git commit -m "chore: license jterm4 under MIT or Apache-2.0"
