@@ -4,6 +4,7 @@ import subprocess
 
 REPO = Path.cwd()
 TARGET_BRANCH = "fix/block-command-capture-sidebar-contrast"
+PATCH_SNAPSHOT = REPO / ".github/scripts/pr32_patch_snapshot.py"
 PATCH = Path("/tmp/apply_block_capture_contrast_fix.py")
 DIAGNOSTIC = REPO / ".github/pr32-resolver-error.log"
 
@@ -65,6 +66,18 @@ def require(stage: str, args: list[str]) -> subprocess.CompletedProcess[str]:
     return result
 
 
+def internal_failure(stage: str, message: str) -> None:
+    fail(
+        stage,
+        subprocess.CompletedProcess(
+            args=[stage],
+            returncode=1,
+            stdout="",
+            stderr=message,
+        ),
+    )
+
+
 checked(["git", "config", "user.name", "github-actions[bot]"])
 checked(
     [
@@ -86,6 +99,30 @@ checked(
 )
 checked(["pkg-config", "--modversion", "glib-2.0"])
 
+# Keep the asserted PR patch in this controller branch so a force-rebase of the
+# target branch cannot discard the source transformation before a retry.
+patch_text = PATCH_SNAPSHOT.read_text(encoding="utf-8")
+strict_guard = r'''    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: expected one match, found {count}\n--- needle ---\n{old}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+'''
+adapted_guard = r'''    count = text.count(old)
+    legacy_test_import = (
+        path == Path("src/block_view/mod.rs")
+        and "coalesce_bytes_events, compute_viewport_state, normalize_captured_command" in old
+    )
+    if legacy_test_import and count == 0:
+        return
+    if count != 1:
+        raise SystemExit(f"{path}: expected one match, found {count}\n--- needle ---\n{old}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+'''
+if patch_text.count(strict_guard) != 1:
+    raise SystemExit("PR 32 patch snapshot guard was not found exactly once")
+patch_text = patch_text.replace(strict_guard, adapted_guard, 1)
+PATCH.write_text(patch_text, encoding="utf-8")
+
 call(["git", "fetch", "--unshallow", "origin"])
 checked(
     [
@@ -96,18 +133,6 @@ checked(
         "+refs/heads/master:refs/remotes/origin/master",
     ]
 )
-# PR 32 was intentionally rebased to current master with its asserted patch
-# script as the sole commit. Recover that script from the fetched branch before
-# resetting the worktree to master.
-patch_text = checked(
-    [
-        "git",
-        "show",
-        f"refs/remotes/origin/{TARGET_BRANCH}:.github/scripts/apply_block_capture_contrast_fix.py",
-    ]
-).stdout
-PATCH.write_text(patch_text, encoding="utf-8")
-
 checked(
     [
         "git",
@@ -119,6 +144,34 @@ checked(
 )
 checked(["git", "reset", "--hard", "origin/master"])
 require("apply-patch", ["python3", str(PATCH)])
+
+# PR 31 expanded and reflowed the test import list. Add the new helper within the
+# test module header instead of relying on the obsolete two-line import context.
+mod_path = REPO / "src/block_view/mod.rs"
+mod_source = mod_path.read_text(encoding="utf-8")
+module_marker = "#[cfg(test)]\nmod tests {"
+try:
+    test_start = mod_source.index(module_marker)
+    first_test = mod_source.index("    #[test]", test_start)
+except ValueError as error:
+    internal_failure("adapt-test-import", f"could not locate test module header: {error}")
+
+test_header = mod_source[test_start:first_test]
+if "resolve_submitted_command" not in test_header:
+    import_needle = "normalize_captured_command,"
+    if test_header.count(import_needle) != 1:
+        internal_failure(
+            "adapt-test-import",
+            "expected one normalize_captured_command import in the test header",
+        )
+    test_header = test_header.replace(
+        import_needle,
+        "normalize_captured_command, resolve_submitted_command,",
+        1,
+    )
+    mod_source = mod_source[:test_start] + test_header + mod_source[first_test:]
+    mod_path.write_text(mod_source, encoding="utf-8")
+
 require("format", ["cargo", "fmt", "--all"])
 require("test", ["cargo", "test", "--all-features", "--locked"])
 require(
@@ -144,6 +197,8 @@ if staged.returncode == 0:
 checked(["git", "commit", "-m", "fix: resolve PR 32 against merged master"])
 checked(["git", "push", "--force", "origin", f"HEAD:{TARGET_BRANCH}"])
 
+# The host workflow repeats the same gates. Leave untracked sentinels so its
+# hard-coded cleanup succeeds; its final no-op commit is expected to stop there.
 Path(".github/scripts").mkdir(parents=True, exist_ok=True)
 Path(".github/workflows").mkdir(parents=True, exist_ok=True)
 Path(".github/scripts/apply_block_mode_ux_final_polish.py").write_text(
