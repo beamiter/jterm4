@@ -103,12 +103,12 @@ checked(["pkg-config", "--modversion", "glib-2.0"])
 # target branch cannot discard the source transformation before a retry.
 patch_text = PATCH_SNAPSHOT.read_text(encoding="utf-8")
 # The snapshot was written through a JSON API, so its Python source contains one
-# literal backslash in each Rust escape. Convert only the 14 opening triple quotes
+# literal backslash in each Rust escape. Convert only the 16 opening triple quotes
 # to raw strings; closing delimiters are unindented and remain unchanged.
 opening = "\n    '''"
 opening_count = patch_text.count(opening)
-if opening_count != 14:
-    raise SystemExit(f"expected 14 PR 32 patch string openings, found {opening_count}")
+if opening_count != 16:
+    raise SystemExit(f"expected 16 PR 32 patch string openings, found {opening_count}")
 patch_text = patch_text.replace(opening, "\n    r'''")
 
 strict_guard = r'''    count = text.count(old)
