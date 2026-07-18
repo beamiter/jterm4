@@ -353,6 +353,10 @@ pub fn run() -> glib::ExitCode {
              .tab-pinned { font-weight: bold; }
              .tab-dragging { opacity: 0.5; }
              .tab-drop-target { background-color: alpha(currentColor, 0.15); }
+             .top-tabs .tab-drop-before { box-shadow: inset 3px 0 currentColor; }
+             .top-tabs .tab-drop-after { box-shadow: inset -3px 0 currentColor; }
+             .tab-strip:not(.top-tabs) .tab-drop-before { box-shadow: inset 0 3px currentColor; }
+             .tab-strip:not(.top-tabs) .tab-drop-after { box-shadow: inset 0 -3px currentColor; }
              .tab-process-indicator { font-size: 0.8em; opacity: 0.6; margin-left: 4px; }
              .tab-pin-icon { font-size: 0.9em; opacity: 0.8; margin-right: 2px; color: #ffb86c; }
              .tab-selected { background-color: alpha(currentColor, 0.14); outline: 2px solid alpha(currentColor, 0.8); outline-offset: -2px; }
@@ -400,6 +404,10 @@ pub fn run() -> glib::ExitCode {
         toggle_placement_btn.set_tooltip_text(Some("Toggle tabs: sidebar / top bar"));
         toggle_placement_btn.add_css_class("flat");
 
+        // The tab filter moves here when tabs are placed horizontally.
+        let top_tab_search_holder = gtk4::Box::new(Orientation::Horizontal, 0);
+        top_tab_search_holder.set_visible(false);
+
         // Holder for the tab strip when it lives in the top bar (horizontal).
         let top_tab_scroll = ScrolledWindow::new();
         top_tab_scroll.set_hexpand(true);
@@ -412,16 +420,27 @@ pub fn run() -> glib::ExitCode {
         top_bar.add_css_class("top-bar");
         top_bar.append(&toggle_sidebar_btn);
         top_bar.append(&toggle_placement_btn);
+        top_bar.append(&top_tab_search_holder);
         top_bar.append(&top_tab_scroll);
         // Spacer pushes + and ✕ to the right (disabled when tabs fill the top bar)
         let spacer = gtk4::Box::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
         top_bar.append(&spacer);
+
+        // A visible, stateful counterpart to Ctrl+Alt+G. Its checked state
+        // follows the lifetime of the approval-gated Shell Agent dialog.
+        let agent_toggle = gtk4::ToggleButton::with_label("Agent");
+        agent_toggle.set_focus_on_click(false);
+        agent_toggle.set_can_focus(false);
+        agent_toggle.set_tooltip_text(Some("Activate Shell Agent (Ctrl+Alt+G)"));
+        agent_toggle.add_css_class("flat");
+        top_bar.append(&agent_toggle);
         top_bar.append(&add_tab_button);
         top_bar.append(&close_window_button);
 
         // Vertical sidebar with tab buttons (collapsible)
         let tab_strip = gtk4::Box::new(Orientation::Vertical, 2);
+        tab_strip.add_css_class("tab-strip");
         tab_strip.set_hexpand(false);
         tab_strip.set_vexpand(true);
         tab_strip.set_valign(gtk4::Align::Start);
@@ -464,7 +483,9 @@ pub fn run() -> glib::ExitCode {
         // Tabs view: filter entry + tab strip.
         let sidebar_tabs_page = gtk4::Box::new(Orientation::Vertical, 0);
         sidebar_tabs_page.set_vexpand(true);
-        sidebar_tabs_page.append(&tab_search_wrapper);
+        let sidebar_tab_search_holder = gtk4::Box::new(Orientation::Horizontal, 0);
+        sidebar_tab_search_holder.append(&tab_search_wrapper);
+        sidebar_tabs_page.append(&sidebar_tab_search_holder);
         sidebar_tabs_page.append(&tab_strip_scroll);
 
         // File tree section (header + tree), shown in the sidebar.
@@ -599,6 +620,9 @@ pub fn run() -> glib::ExitCode {
             top_spacer: spacer.clone(),
             tab_strip_scroll: tab_strip_scroll.clone(),
             top_tab_scroll: top_tab_scroll.clone(),
+            sidebar_tab_search_holder: sidebar_tab_search_holder.clone(),
+            top_tab_search_holder: top_tab_search_holder.clone(),
+            tab_search_wrapper: tab_search_wrapper.clone(),
             tab_placement: Rc::new(Cell::new(config.borrow().tab_placement)),
             sidebar_stack: sidebar_stack.clone(),
             sidebar_tabs_btn: sidebar_tabs_btn.clone(),
@@ -617,6 +641,7 @@ pub fn run() -> glib::ExitCode {
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             agent_dialog: Rc::new(RefCell::new(None)),
+            agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
             zoom_state: Rc::new(RefCell::new(None)),
@@ -636,6 +661,7 @@ pub fn run() -> glib::ExitCode {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
         ui.apply_dynamic_css();
+        ui.sync_agent_toggle();
 
         let ui_for_ai_close = Rc::downgrade(&ui);
         ui.ai_panel.connect_close_requested(move || {
@@ -684,6 +710,12 @@ pub fn run() -> glib::ExitCode {
         let ui_for_placement = ui.clone();
         toggle_placement_btn.connect_clicked(move |_| {
             ui_for_placement.toggle_tab_placement();
+        });
+
+        // Wire the visible Shell Agent state toggle.
+        let ui_for_agent = ui.clone();
+        agent_toggle.connect_clicked(move |_| {
+            ui_for_agent.toggle_agent_panel();
         });
 
         // Wire file-tree header buttons
@@ -809,6 +841,21 @@ pub fn run() -> glib::ExitCode {
                 let nb = notebook_clone_for_removed.clone();
                 let sids = session_ids_for_page_removed.clone();
                 let ai_panel = ai_panel_for_page_removed.clone();
+                glib::idle_add_local_once(move || {
+                    save_tabs_state(&nb, &sids.borrow());
+                    ai_panel.sync_persisted_truncation();
+                });
+            });
+
+            // Drag/drop and keyboard tab moves are state changes too. Persist
+            // their final Notebook order instead of waiting for window close.
+            let session_ids_for_page_reordered = ui.session_ids.clone();
+            let notebook_clone_for_reordered = notebook.clone();
+            let ai_panel_for_page_reordered = ui.ai_panel.clone();
+            notebook.connect_page_reordered(move |_notebook, _child, _page_num| {
+                let nb = notebook_clone_for_reordered.clone();
+                let sids = session_ids_for_page_reordered.clone();
+                let ai_panel = ai_panel_for_page_reordered.clone();
                 glib::idle_add_local_once(move || {
                     save_tabs_state(&nb, &sids.borrow());
                     ai_panel.sync_persisted_truncation();
@@ -1005,29 +1052,7 @@ pub fn run() -> glib::ExitCode {
         // Wire tab search entry: filter tabs by name
         let ui_for_tab_search = ui.clone();
         tab_search_entry.connect_search_changed(move |entry| {
-            let query = entry.text().to_string().to_lowercase();
-            let tab_strip = &ui_for_tab_search.tab_strip;
-
-            let mut child = tab_strip.first_child();
-            while let Some(ref c) = child {
-                if let Ok(btn) = c.clone().downcast::<gtk4::ToggleButton>() {
-                    let title = unsafe {
-                        btn.data::<gtk4::Label>("tab-title-label")
-                            .map(|label| label.as_ref().text().to_string())
-                    }
-                    // Compatibility fallback for old/restored strip buttons
-                    // that predate the explicit title-label data.
-                    .or_else(|| {
-                        btn.child()
-                            .and_then(|child| child.downcast::<gtk4::Label>().ok())
-                            .map(|label| label.text().to_string())
-                    })
-                    .unwrap_or_default()
-                    .to_lowercase();
-                    c.set_visible(query.is_empty() || title.contains(query.as_str()));
-                }
-                child = c.next_sibling();
-            }
+            ui_for_tab_search.apply_tab_filter(entry.text().as_str());
         });
 
         // Focus terminal when switching tabs (split-aware) and sync tab strip

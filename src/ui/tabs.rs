@@ -457,6 +457,7 @@ impl UiState {
             button.set_data::<Label>("tab-title-label", strip_label.clone());
             button.set_data::<bool>("pinned", pinned);
         }
+        self.track_tab_title_for_filter(&button, &strip_label);
 
         let hover = gtk4::EventControllerMotion::new();
         let close_for_enter = close_icon.clone();
@@ -551,8 +552,8 @@ impl UiState {
         }
 
         let ui_for_select = self.clone();
-        let button_for_select = button.clone();
         let name_for_select = tab_widget_name.clone();
+        let notebook_for_select = self.notebook.clone();
         let select = GestureClick::new();
         select.set_button(GDK_BUTTON_PRIMARY as u32);
         select.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -566,16 +567,43 @@ impl UiState {
                 ui_for_select.toggle_tab_selection(&name_for_select);
                 return;
             }
-            gesture.set_state(gtk4::EventSequenceState::Claimed);
-            ui_for_select.clear_tab_selection();
-            for index in 0..ui_for_select.notebook.n_pages() {
-                if ui_for_select
+            if modifiers.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+                let selected = ui_for_select.selected_tabs.borrow();
+                let from_name = selected.last().cloned().or_else(|| {
+                    notebook_for_select
+                        .current_page()
+                        .and_then(|page| notebook_for_select.nth_page(Some(page)))
+                        .map(|page| page.widget_name().to_string())
+                });
+                drop(selected);
+                ui_for_select.select_tab_range(
+                    from_name.as_deref().unwrap_or(&name_for_select),
+                    &name_for_select,
+                );
+            }
+        });
+        let ui_for_release = self.clone();
+        let name_for_release = tab_widget_name.clone();
+        select.connect_released(move |gesture, presses, _, _| {
+            if presses != 1 {
+                return;
+            }
+            let modifiers = gesture.current_event_state();
+            if modifiers.intersects(
+                gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK,
+            ) {
+                return;
+            }
+            ui_for_release.clear_tab_selection();
+            for index in 0..ui_for_release.notebook.n_pages() {
+                if ui_for_release
                     .notebook
                     .nth_page(Some(index))
-                    .is_some_and(|page| page.widget_name() == button_for_select.widget_name())
+                    .is_some_and(|page| page.widget_name().as_str() == name_for_release)
                 {
-                    ui_for_select.notebook.set_current_page(Some(index));
-                    ui_for_select.sync_tab_strip_active(Some(index));
+                    ui_for_release.notebook.set_current_page(Some(index));
+                    ui_for_release.sync_tab_strip_active(Some(index));
                     break;
                 }
             }
@@ -745,6 +773,7 @@ impl UiState {
             popover.popup();
         });
         button.add_controller(context);
+        self.install_tab_drag_drop(&button);
 
         // Match the strip index to the Notebook insertion index.
         let mut sibling = self.tab_strip.first_child();
@@ -760,6 +789,7 @@ impl UiState {
             self.set_tab_conn_status(tab_num, status);
         }
         self.apply_strip_btn_placement(&button);
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
         self.notebook.set_current_page(Some(page_num));
         self.sync_tab_strip_active(Some(page_num));
         self.sync_tab_bar_visibility();
@@ -1434,6 +1464,7 @@ impl UiState {
         unsafe {
             strip_btn.set_data::<Label>("tab-title-label", strip_label.clone());
         }
+        self.track_tab_title_for_filter(&strip_btn, &strip_label);
         strip_btn.add_css_class("tab-strip-btn");
         strip_btn.add_css_class("flat");
         strip_btn.set_active(true); // new tab is current
@@ -1822,10 +1853,8 @@ impl UiState {
         click_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         let ui_for_select = self.clone();
-        let strip_btn_for_select = strip_btn.clone();
         let tab_name_for_select = tab_widget_name.clone();
         let notebook_for_select = self.notebook.clone();
-        let tab_strip_for_select = self.tab_strip.clone();
 
         click_gesture.connect_pressed(move |gesture, n_press, _, _| {
             if n_press != 1 {
@@ -1859,23 +1888,31 @@ impl UiState {
                 };
                 drop(selected);
                 ui_for_select.select_tab_range(&from_name, &tab_name_for_select);
-            } else {
-                // Plain click: clear selection and switch tab
-                gesture.set_state(gtk4::EventSequenceState::Claimed);
-                ui_for_select.clear_tab_selection();
-
-                // Find the index of this button in the strip
-                let mut idx = 0u32;
-                let mut child = tab_strip_for_select.first_child();
-                while let Some(ref c) = child {
-                    if c == strip_btn_for_select.upcast_ref::<gtk4::Widget>() {
-                        break;
-                    }
-                    idx += 1;
-                    child = c.next_sibling();
+            }
+        });
+        let ui_for_release = self.clone();
+        let tab_name_for_release = tab_widget_name.clone();
+        click_gesture.connect_released(move |gesture, n_press, _, _| {
+            if n_press != 1 {
+                return;
+            }
+            let modifiers = gesture.current_event_state();
+            if modifiers.intersects(
+                gtk4::gdk::ModifierType::CONTROL_MASK | gtk4::gdk::ModifierType::SHIFT_MASK,
+            ) {
+                return;
+            }
+            ui_for_release.clear_tab_selection();
+            for index in 0..ui_for_release.notebook.n_pages() {
+                if ui_for_release
+                    .notebook
+                    .nth_page(Some(index))
+                    .is_some_and(|page| page.widget_name().as_str() == tab_name_for_release)
+                {
+                    ui_for_release.notebook.set_current_page(Some(index));
+                    ui_for_release.sync_tab_strip_active(Some(index));
+                    break;
                 }
-                notebook_for_select.set_current_page(Some(idx));
-                ui_for_select.sync_tab_strip_active(Some(idx));
             }
         });
         strip_btn.add_controller(click_gesture);
@@ -1895,118 +1932,7 @@ impl UiState {
             });
         });
 
-        // Drag source: carry the widget name so we can identify the dragged button
-        let drag_source = gtk4::DragSource::new();
-        drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
-        let strip_btn_for_drag = strip_btn.clone();
-        drag_source.connect_prepare(move |_, _, _| {
-            let name = strip_btn_for_drag.widget_name().to_string();
-            Some(gtk4::gdk::ContentProvider::for_value(&name.to_value()))
-        });
-
-        // Visual feedback during drag
-        let strip_btn_drag_begin = strip_btn.clone();
-        drag_source.connect_drag_begin(move |_, _| {
-            strip_btn_drag_begin.add_css_class("tab-dragging");
-        });
-
-        let strip_btn_drag_end = strip_btn.clone();
-        drag_source.connect_drag_end(move |_, _, _| {
-            strip_btn_drag_end.remove_css_class("tab-dragging");
-        });
-
-        strip_btn.add_controller(drag_source);
-
-        // Drop target: reorder strip buttons and notebook pages
-        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
-        let tab_strip_for_drop = self.tab_strip.clone();
-        let notebook_for_drop = self.notebook.clone();
-        let strip_btn_for_drop = strip_btn.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
-            let Ok(drag_name) = value.get::<String>() else {
-                return false;
-            };
-            let target_name = strip_btn_for_drop.widget_name().to_string();
-            if drag_name == target_name {
-                return false; // dropped on itself
-            }
-
-            // Find source and target indices in the strip
-            let mut src_idx: Option<u32> = None;
-            let mut dst_idx: Option<u32> = None;
-            let mut src_widget: Option<gtk4::Widget> = None;
-            let mut idx = 0u32;
-            let mut child = tab_strip_for_drop.first_child();
-            while let Some(ref c) = child {
-                if c.widget_name().as_str() == drag_name {
-                    src_idx = Some(idx);
-                    src_widget = Some(c.clone());
-                }
-                if c.widget_name().as_str() == target_name {
-                    dst_idx = Some(idx);
-                }
-                idx += 1;
-                child = c.next_sibling();
-            }
-
-            let (Some(src), Some(dst), Some(src_w)) = (src_idx, dst_idx, src_widget) else {
-                return false;
-            };
-
-            // Reorder strip item: move src before/after dst
-            let mut target_w: Option<gtk4::Widget> = None;
-            let mut child = tab_strip_for_drop.first_child();
-            while let Some(ref c) = child {
-                if c.widget_name().as_str() == target_name {
-                    target_w = Some(c.clone());
-                    break;
-                }
-                child = c.next_sibling();
-            }
-            let Some(target_w) = target_w else {
-                return false;
-            };
-
-            if src < dst {
-                src_w.insert_after(&tab_strip_for_drop, Some(&target_w));
-            } else {
-                src_w.insert_before(&tab_strip_for_drop, Some(&target_w));
-            }
-
-            // Reorder notebook page to match
-            if let Some(page_widget) = notebook_for_drop.nth_page(Some(src)) {
-                notebook_for_drop.reorder_child(&page_widget, Some(dst));
-            }
-
-            // Sync active indicator
-            if let Some(current) = notebook_for_drop.current_page() {
-                let mut child = tab_strip_for_drop.first_child();
-                let mut i = 0u32;
-                while let Some(c) = child {
-                    if let Ok(btn) = c.clone().downcast::<ToggleButton>() {
-                        btn.set_active(i == current);
-                    }
-                    i += 1;
-                    child = c.next_sibling();
-                }
-            }
-
-            true
-        });
-
-        // Visual feedback for drop target
-        let strip_btn_for_drop_motion = strip_btn.clone();
-        drop_target.connect_motion(move |_, _x, _y| {
-            strip_btn_for_drop_motion.add_css_class("tab-drop-target");
-            gtk4::gdk::DragAction::MOVE
-        });
-
-        let strip_btn_for_drop_leave = strip_btn.clone();
-        drop_target.connect_leave(move |_| {
-            strip_btn_for_drop_leave.remove_css_class("tab-drop-target");
-        });
-
-        strip_btn.add_controller(drop_target);
+        self.install_tab_drag_drop(&strip_btn);
 
         // Insert strip button at the correct position
         if page_num as i32 >= self.tab_strip.observe_children().n_items() as i32 {
@@ -2026,6 +1952,7 @@ impl UiState {
 
         // Size the new button for the active placement (sidebar vs top bar)
         self.apply_strip_btn_placement(&strip_btn);
+        self.apply_tab_filter(self.tab_search_entry.text().as_str());
 
         // Deactivate all other strip buttons
         self.sync_tab_strip_active(Some(page_num));

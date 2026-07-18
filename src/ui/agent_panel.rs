@@ -351,23 +351,49 @@ impl AgentRuntime {
 }
 
 impl UiState {
+    /// Keep the visible top-bar Agent control aligned with both configuration
+    /// availability and the lifetime of the active Agent dialog.
+    pub(crate) fn sync_agent_toggle(&self) {
+        let available = {
+            let config = self.config.borrow();
+            config.ai_enabled && config.agent_enabled
+        };
+        self.agent_toggle.set_sensitive(available);
+
+        if !available {
+            // Drop the RefCell borrow before force_close because `closed`
+            // clears the same slot synchronously.
+            let dialog_to_close = self.agent_dialog.borrow_mut().take();
+            if let Some(dialog) = dialog_to_close {
+                dialog.force_close();
+            }
+            self.agent_toggle.set_active(false);
+        } else {
+            self.agent_toggle
+                .set_active(self.agent_dialog.borrow().is_some());
+        }
+    }
+
     pub(crate) fn toggle_agent_panel(&self) {
         // Drop the RefCell borrow before `force_close`: libadwaita emits
         // `closed` synchronously and that callback clears the same slot.
         let dialog_to_close = self.agent_dialog.borrow_mut().take();
         if let Some(dialog) = dialog_to_close {
             dialog.force_close();
+            self.agent_toggle.set_active(false);
             return;
         }
         let config = self.config.borrow();
         if !config.ai_enabled || !config.agent_enabled {
             drop(config);
+            self.agent_toggle.set_active(false);
             self.show_ai_error("Agent mode is disabled in Settings or safe mode.");
             return;
         }
         let max_turns = config.agent_max_turns;
         drop(config);
         let Some(target) = self.current_term_view() else {
+            self.agent_toggle.set_active(false);
             self.show_ai_error("Agent mode requires an active Block pane.");
             return;
         };
@@ -496,6 +522,7 @@ impl UiState {
         });
 
         let slot = self.agent_dialog.clone();
+        let agent_toggle = self.agent_toggle.clone();
         let weak = Rc::downgrade(&runtime);
         unsafe {
             dialog.set_data::<Rc<AgentRuntime>>("jterm4-agent-runtime", runtime.clone());
@@ -508,8 +535,10 @@ impl UiState {
                 let _ = closed_dialog.steal_data::<Rc<AgentRuntime>>("jterm4-agent-runtime");
             }
             *slot.borrow_mut() = None;
+            agent_toggle.set_active(false);
         });
         *self.agent_dialog.borrow_mut() = Some(dialog.clone());
+        self.agent_toggle.set_active(true);
         dialog.present(Some(&self.window));
         input.grab_focus();
     }

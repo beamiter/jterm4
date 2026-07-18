@@ -136,11 +136,10 @@ impl UiState {
             }
             Action::FilterTabs => {
                 log::debug!("Filter tabs");
-                self.set_sidebar_visible(true, true);
-                // The search entry lives on the Tabs sidebar page even when
-                // tabs themselves are placed in the top bar. Show that page so
-                // the focused entry is never invisible.
-                self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
+                if self.tab_placement.get() == crate::config::TabPlacement::Sidebar {
+                    self.set_sidebar_visible(true, true);
+                    self.apply_sidebar_view(crate::config::SidebarView::Tabs, false);
+                }
                 self.tab_search_entry.set_can_focus(true);
                 self.tab_search_entry.set_focusable(true);
                 self.tab_search_entry.grab_focus();

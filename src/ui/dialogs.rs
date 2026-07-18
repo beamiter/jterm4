@@ -1469,6 +1469,7 @@ impl UiState {
                 dependent.set_sensitive(enabled);
             }
             agent_turns_for_ai.set_sensitive(enabled && agent_enabled_for_ai.is_active());
+            ui.sync_agent_toggle();
             ui.persist_config();
         });
 
@@ -1478,6 +1479,7 @@ impl UiState {
             let enabled = row.is_active();
             ui.config.borrow_mut().agent_enabled = enabled;
             turns_for_agent.set_sensitive(enabled);
+            ui.sync_agent_toggle();
             ui.persist_config();
         });
 

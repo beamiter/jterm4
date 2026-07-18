@@ -352,6 +352,7 @@ impl UiState {
         }
         self.ai_panel.refresh_config_display();
         self.ai_panel.refresh_persisted_privacy();
+        self.sync_agent_toggle();
 
         // Update keybindings
         *self.keybinding_map.borrow_mut() = new_keybindings;

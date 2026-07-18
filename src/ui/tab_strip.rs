@@ -6,6 +6,28 @@ use libadwaita as adw;
 
 use super::*;
 
+/// Translate a before/after drop on a target in the original ordering into
+/// the destination index expected after removing the source item.
+fn dropped_tab_index(source: u32, target: u32, after: bool) -> u32 {
+    match (source < target, after) {
+        (true, false) => target.saturating_sub(1),
+        (true, true) => target,
+        (false, false) => target,
+        (false, true) => target.saturating_add(1),
+    }
+}
+
+fn clear_tab_drop_classes(widget: &gtk4::Widget) {
+    widget.remove_css_class("tab-drop-target");
+    widget.remove_css_class("tab-drop-before");
+    widget.remove_css_class("tab-drop-after");
+}
+
+fn tab_title_matches(query: &str, title: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || title.to_lowercase().contains(&query)
+}
+
 impl UiState {
     /// Update which tab strip button is :checked to match the active notebook page.
     pub(crate) fn sync_tab_strip_active(&self, active_page: Option<u32>) {
@@ -31,12 +53,184 @@ impl UiState {
             TabPlacement::Sidebar => {
                 self.tab_strip_scroll.set_visible(true);
                 self.top_tab_scroll.set_visible(false);
+                self.sidebar_tab_search_holder.set_visible(true);
+                self.top_tab_search_holder.set_visible(false);
             }
             TabPlacement::TopBar => {
                 self.top_tab_scroll.set_visible(show_strip);
+                self.top_tab_search_holder.set_visible(show_strip);
+                self.sidebar_tab_search_holder.set_visible(false);
                 self.tab_strip_scroll.set_visible(true);
             }
         }
+    }
+
+    pub(crate) fn apply_tab_filter(&self, query: &str) {
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            if let Ok(button) = widget.clone().downcast::<ToggleButton>() {
+                let title = unsafe {
+                    button
+                        .data::<gtk4::Label>("tab-title-label")
+                        .map(|label| label.as_ref().text().to_string())
+                }
+                .unwrap_or_default();
+                button.set_visible(tab_title_matches(query, &title));
+            }
+            child = widget.next_sibling();
+        }
+    }
+
+    /// Keep a filtered tab's visibility correct when OSC title/cwd updates or
+    /// rename operations change its title without changing the query.
+    pub(crate) fn track_tab_title_for_filter(&self, button: &ToggleButton, title: &gtk4::Label) {
+        let filter = self.tab_search_entry.clone();
+        let button = button.clone();
+        title.connect_notify_local(Some("label"), move |label, _| {
+            button.set_visible(tab_title_matches(
+                filter.text().as_str(),
+                label.text().as_str(),
+            ));
+        });
+    }
+
+    /// Install native mouse drag/drop reordering on a tab strip button.
+    ///
+    /// The pointer half nearest the leading edge inserts before the target;
+    /// the trailing half inserts after it. This works for both the vertical
+    /// sidebar and horizontal top bar and is shared by ordinary tabs and tabs
+    /// created by moving a split pane into a new tab.
+    pub(crate) fn install_tab_drag_drop(&self, button: &ToggleButton) {
+        let drag_source = gtk4::DragSource::new();
+        drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
+        let button_for_drag = button.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            let name = button_for_drag.widget_name().to_string();
+            Some(gtk4::gdk::ContentProvider::for_value(&name.to_value()))
+        });
+
+        let button_for_drag_begin = button.clone();
+        drag_source.connect_drag_begin(move |_, _| {
+            button_for_drag_begin.add_css_class("tab-dragging");
+        });
+
+        let button_for_drag_end = button.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            button_for_drag_end.remove_css_class("tab-dragging");
+        });
+        button.add_controller(drag_source);
+
+        let drop_target = gtk4::DropTarget::new(glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
+        let ui_for_drop = self.clone();
+        let button_for_drop = button.clone();
+        drop_target.connect_drop(move |_, value, x, y| {
+            clear_tab_drop_classes(button_for_drop.upcast_ref());
+            let Ok(drag_name) = value.get::<String>() else {
+                return false;
+            };
+            let after = match ui_for_drop.tab_placement.get() {
+                crate::config::TabPlacement::TopBar => {
+                    x >= f64::from(button_for_drop.width()) / 2.0
+                }
+                crate::config::TabPlacement::Sidebar => {
+                    y >= f64::from(button_for_drop.height()) / 2.0
+                }
+            };
+            ui_for_drop.reorder_tab_from_drop(
+                &drag_name,
+                button_for_drop.widget_name().as_str(),
+                after,
+            )
+        });
+
+        let placement_for_motion = self.tab_placement.clone();
+        let button_for_motion = button.clone();
+        drop_target.connect_motion(move |_, x, y| {
+            let after = match placement_for_motion.get() {
+                crate::config::TabPlacement::TopBar => {
+                    x >= f64::from(button_for_motion.width()) / 2.0
+                }
+                crate::config::TabPlacement::Sidebar => {
+                    y >= f64::from(button_for_motion.height()) / 2.0
+                }
+            };
+            button_for_motion.add_css_class("tab-drop-target");
+            if after {
+                button_for_motion.remove_css_class("tab-drop-before");
+                button_for_motion.add_css_class("tab-drop-after");
+            } else {
+                button_for_motion.remove_css_class("tab-drop-after");
+                button_for_motion.add_css_class("tab-drop-before");
+            }
+            gtk4::gdk::DragAction::MOVE
+        });
+
+        let button_for_leave = button.clone();
+        drop_target.connect_leave(move |_| {
+            clear_tab_drop_classes(button_for_leave.upcast_ref());
+        });
+        button.add_controller(drop_target);
+    }
+
+    fn reorder_tab_from_drop(&self, source_name: &str, target_name: &str, after: bool) -> bool {
+        if source_name == target_name {
+            return false;
+        }
+
+        let mut source = None;
+        let mut target = None;
+        let mut source_index = None;
+        let mut target_index = None;
+        let mut index = 0_u32;
+        let mut child = self.tab_strip.first_child();
+        while let Some(widget) = child {
+            if widget.widget_name().as_str() == source_name {
+                source = Some(widget.clone());
+                source_index = Some(index);
+            }
+            if widget.widget_name().as_str() == target_name {
+                target = Some(widget.clone());
+                target_index = Some(index);
+            }
+            index += 1;
+            child = widget.next_sibling();
+        }
+
+        let (Some(source), Some(target), Some(source_index), Some(target_index)) =
+            (source, target, source_index, target_index)
+        else {
+            return false;
+        };
+        let destination = dropped_tab_index(source_index, target_index, after);
+        if after {
+            source.insert_after(&self.tab_strip, Some(&target));
+        } else {
+            source.insert_before(&self.tab_strip, Some(&target));
+        }
+
+        let active = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)));
+        let page = (0..self.notebook.n_pages()).find_map(|page| {
+            self.notebook
+                .nth_page(Some(page))
+                .filter(|widget| widget.widget_name().as_str() == source_name)
+        });
+        let Some(page) = page else {
+            // Keep the two representations coherent if a stale drag somehow
+            // outlived its Notebook page.
+            self.reorder_tab_strip_buttons();
+            return false;
+        };
+        self.notebook.reorder_child(&page, Some(destination));
+
+        let active_page = active
+            .as_ref()
+            .and_then(|widget| self.notebook.page_num(widget));
+        self.notebook.set_current_page(active_page);
+        self.sync_tab_strip_active(active_page);
+        true
     }
 
     /// Remove the tab strip button that corresponds to a notebook page widget.
@@ -529,4 +723,24 @@ fn find_pin_icon(btn: &ToggleButton) -> Option<gtk4::Image> {
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dropped_tab_index, tab_title_matches};
+
+    #[test]
+    fn drop_before_and_after_adjust_for_source_removal() {
+        assert_eq!(dropped_tab_index(0, 2, false), 1);
+        assert_eq!(dropped_tab_index(0, 2, true), 2);
+        assert_eq!(dropped_tab_index(3, 1, false), 1);
+        assert_eq!(dropped_tab_index(3, 1, true), 2);
+    }
+
+    #[test]
+    fn tab_filter_is_trimmed_and_case_insensitive() {
+        assert!(tab_title_matches("  SERV  ", "Build Server"));
+        assert!(tab_title_matches("", "anything"));
+        assert!(!tab_title_matches("prod", "Build Server"));
+    }
 }
