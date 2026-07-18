@@ -17,15 +17,39 @@ use vte4::{TerminalExt, TerminalExtManual};
 
 use crate::config::Config;
 
-/// Focus a terminal now and once after GTK finishes the current page/focus
-/// transition. Notebook switches can emit `switch-page` before the newly
-/// selected child is mapped, so the immediate grab is occasionally discarded
-/// by the container's own focus reconciliation.
-pub(crate) fn focus_terminal_deferred(terminal: &Terminal) {
-    terminal.grab_focus();
+fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
+    let mut page_child = terminal.clone().upcast::<gtk4::Widget>();
+    while let Some(parent) = page_child.parent() {
+        if let Ok(notebook) = parent.clone().downcast::<gtk4::Notebook>() {
+            return notebook.current_page().is_some_and(|page| {
+                notebook
+                    .nth_page(Some(page))
+                    .is_some_and(|selected| selected == page_child)
+            });
+        }
+        page_child = parent;
+    }
+    true
+}
+
+/// Focus a mapped terminal now, then once more after the current container
+/// transition.
+///
+/// Notebook activation owns its page- and generation-scoped frame retries in
+/// `main.rs`. This generic fallback is deliberately gated by `is_mapped()`, so
+/// a page hidden by a later Ctrl+PageUp/PageDown cannot steal focus back while
+/// dialogs and freshly reparented panes can still restore focus after closing.
+/// Never logically focus an unmapped VTE: doing so can prevent its IM context
+/// from receiving a real focus-in when the widget is first mapped.
+pub(crate) fn focus_terminal(terminal: &Terminal) {
+    if terminal.is_mapped() && belongs_to_selected_notebook_page(terminal) {
+        terminal.grab_focus();
+    }
     let deferred = terminal.clone();
     glib::idle_add_local_once(move || {
-        deferred.grab_focus();
+        if deferred.is_mapped() && belongs_to_selected_notebook_page(&deferred) {
+            deferred.grab_focus();
+        }
     });
 }
 
@@ -225,7 +249,7 @@ impl VteTerminalView {
     }
 
     pub fn grab_focus(&self) {
-        focus_terminal_deferred(&self.terminal);
+        focus_terminal(&self.terminal);
     }
 
     pub fn copy_to_clipboard(&self) {

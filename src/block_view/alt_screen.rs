@@ -10,7 +10,7 @@ use crate::terminal::apply_terminal_theme;
 use gtk4::glib;
 use gtk4::prelude::*;
 use vte4::TerminalExt;
-use vte4::{CursorBlinkMode, CursorShape, Terminal};
+use vte4::{CursorBlinkMode, CursorShape, Format, Terminal};
 
 /// Give dense block output the same breathing room as jterm1. Patched
 /// monospace fonts often paint close to VTE's default cell boundary.
@@ -90,18 +90,97 @@ fn finished_buffer_rows_from_adjustment(lower: f64, upper: f64, visible_rows: i6
     }
 }
 
-/// Grow a read-only finished VTE from its provisional grid to every row VTE
-/// actually rendered. Measuring the post-feed terminal buffer covers ANSI
-/// controls, tabs, combining/wide glyphs, CR redraws, and automatic wrapping.
-pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
+/// Count visual rows in VTE's plain-text buffer export.
+///
+/// VTE preserves hard line breaks in `text_format`, but joins soft-wrapped rows
+/// back into one logical line. Re-apply the terminal width so a wrapped last
+/// line cannot be clipped when the provisional grid is resized.
+fn rendered_text_rows(text: &str, cols: i64) -> i64 {
+    use unicode_width::UnicodeWidthChar;
+
+    let text = text.trim_end_matches(['\n', '\r', ' ', '\t', '\0']);
+    if text.is_empty() {
+        return 0;
+    }
+
+    let cols = cols.max(1) as usize;
+    text.split('\n')
+        .map(|line| {
+            let mut width = 0usize;
+            for ch in line.trim_end_matches('\r').chars() {
+                width += match ch {
+                    '\t' => 8 - (width % 8),
+                    _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+                };
+            }
+            width.max(1).div_ceil(cols) as i64
+        })
+        .sum()
+}
+
+/// Resolve actual occupied rows from VTE's rendered text and final cursor.
+///
+/// Unlike the old adjustment-only calculation, this may shrink below
+/// `visible_rows`: the provisional grid itself contributes blank rows to the
+/// adjustment extent, so treating that extent as content made every
+/// overestimate permanent.
+fn finished_content_rows(
+    rendered_text: Option<&str>,
+    cols: i64,
+    cursor_row: i64,
+    lower: f64,
+    upper: f64,
+    visible_rows: i64,
+) -> i64 {
+    let fallback = finished_buffer_rows_from_adjustment(lower, upper, visible_rows);
+    let lower_row = if lower.is_finite() {
+        lower.floor().clamp(i64::MIN as f64, i64::MAX as f64) as i64
+    } else {
+        0
+    };
+    let cursor_rows = cursor_row
+        .saturating_sub(lower_row)
+        .saturating_add(1)
+        .max(1);
+    let text_rows = rendered_text
+        .map(|text| rendered_text_rows(text, cols))
+        .unwrap_or(fallback);
+    cursor_rows.max(text_rows).clamp(1, fallback.max(1))
+}
+
+/// Fit a read-only finished VTE to the rows it actually rendered.
+///
+/// Measuring VTE's text/cursor state covers ANSI cursor movement, erases, tabs,
+/// combining/wide glyphs, CR redraws, and automatic wrapping. The resize is
+/// intentionally bidirectional: estimates are only capture capacity, never a
+/// minimum visible height.
+pub(crate) fn fit_finished_terminal_to_content(terminal: &Terminal) {
     let visible_rows = terminal.row_count().max(1);
+    let cols = terminal.column_count().max(1);
+    let (_, cursor_row) = terminal.cursor_position();
+    let rendered = terminal
+        .text_format(Format::Text)
+        .map(|text| text.to_string());
     let rows = terminal
         .vadjustment()
-        .map(|adj| finished_buffer_rows_from_adjustment(adj.lower(), adj.upper(), visible_rows))
-        .unwrap_or(visible_rows);
-    let cols = terminal.column_count().max(1);
+        .map(|adj| {
+            finished_content_rows(
+                rendered.as_deref(),
+                cols,
+                cursor_row,
+                adj.lower(),
+                adj.upper(),
+                visible_rows,
+            )
+        })
+        .unwrap_or_else(|| {
+            rendered
+                .as_deref()
+                .map(|text| rendered_text_rows(text, cols).max(1))
+                .unwrap_or(visible_rows)
+        });
 
-    if rows > visible_rows {
+    if rows != visible_rows {
         terminal.set_size(cols, rows);
     }
     let cell_height = (terminal.char_height() as i32).max(1);
@@ -118,10 +197,10 @@ pub(crate) fn expand_finished_terminal_to_buffer(terminal: &Terminal) {
 pub(crate) fn settle_finished_terminal_after_feed(terminal: &Terminal) {
     let terminal = terminal.clone();
     glib::idle_add_local_once(move || {
-        expand_finished_terminal_to_buffer(&terminal);
+        fit_finished_terminal_to_content(&terminal);
         let terminal = terminal.clone();
         glib::idle_add_local_once(move || {
-            expand_finished_terminal_to_buffer(&terminal);
+            fit_finished_terminal_to_content(&terminal);
             let terminal = terminal.clone();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = terminal.vadjustment() {
@@ -310,5 +389,46 @@ mod tests {
     fn finished_buffer_rows_never_shrink_the_provisional_grid() {
         assert_eq!(finished_buffer_rows_from_adjustment(0.0, 1.0, 5), 5);
         assert_eq!(finished_buffer_rows_from_adjustment(f64::NAN, 1.0, 3), 3);
+    }
+
+    #[test]
+    fn measured_content_can_shrink_an_overestimated_grid() {
+        assert_eq!(
+            finished_content_rows(Some("alpha\nbeta\n\n\n"), 80, 1, 0.0, 60.0, 60,),
+            2
+        );
+        assert_eq!(finished_content_rows(Some(""), 80, 0, 0.0, 60.0, 60), 1);
+    }
+
+    #[test]
+    fn measured_content_keeps_rows_below_an_upward_moved_cursor() {
+        assert_eq!(
+            finished_content_rows(Some("top\nmiddle\nbottom"), 80, 0, 0.0, 40.0, 40,),
+            3
+        );
+    }
+
+    #[test]
+    fn measured_content_reapplies_soft_wrapping() {
+        assert_eq!(rendered_text_rows("123456789", 4), 3);
+        assert_eq!(rendered_text_rows("12345678", 4), 2);
+        assert_eq!(rendered_text_rows("界界界", 4), 2);
+        assert_eq!(rendered_text_rows("\tX", 4), 3);
+    }
+
+    #[test]
+    fn measured_content_never_exceeds_retained_vte_buffer() {
+        assert_eq!(
+            finished_content_rows(Some("alpha"), 80, 999, 0.0, 60.0, 60),
+            60
+        );
+    }
+
+    #[test]
+    fn cursor_preserves_intentional_trailing_blank_rows() {
+        assert_eq!(
+            finished_content_rows(Some("alpha\n\n"), 80, 2, 0.0, 20.0, 20),
+            3
+        );
     }
 }

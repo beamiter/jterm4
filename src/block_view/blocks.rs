@@ -584,6 +584,11 @@ pub(crate) fn render_bytes_into_finished_vte(
     let visible_rows = output_rows.min(viewport_cap).max(1);
     let overflow_rows = output_rows.saturating_sub(visible_rows).saturating_add(64);
     let scrollback = capture_rows.max(overflow_rows).max(64);
+    let cell_height = vte.char_height() as i32;
+    if cell_height > 0 {
+        let rows = visible_rows.clamp(1, i32::MAX as i64) as i32;
+        vte.set_height_request(rows.saturating_mul(cell_height));
+    }
     vte.set_scroll_on_output(false);
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
@@ -1018,6 +1023,7 @@ impl FinishedBlock {
                 let manually_expanded = expanded_for_map.get();
                 let cap = finished_output_cap(rows, fitted_cap, manually_expanded);
                 let visible_rows = rows.min(cap).max(1);
+                let fit_to_content = document_scroll || manually_expanded;
                 let can_expand = rows > fitted_cap && !document_scroll;
                 expand_btn_for_map.set_visible(can_expand);
                 jump_btn_for_map.set_visible(rows > fitted_cap);
@@ -1026,16 +1032,18 @@ impl FinishedBlock {
                     &text,
                     cols_for_map,
                     rows,
-                    cap,
+                    fitted_cap,
                     capture_rows,
-                    document_scroll || manually_expanded,
+                    fit_to_content,
                 );
-                // The VTE grid and pixel request use the identical row count.
-                // This prevents GTK from allocating a tall empty card around a
-                // smaller terminal surface.
-                let ch = w.char_height() as i32;
-                if ch > 0 {
-                    w.set_height_request((visible_rows as i32) * ch);
+                // Capped snapshots keep grid and pixel request identical.
+                // Full-document snapshots let the post-feed VTE measurement
+                // set both values, including shrinking an overestimate.
+                if !fit_to_content {
+                    let ch = w.char_height() as i32;
+                    if ch > 0 {
+                        w.set_height_request((visible_rows as i32) * ch);
+                    }
                 }
             });
         }
@@ -1062,18 +1070,21 @@ impl FinishedBlock {
                 let document_scroll = uses_outer_document_scroll(rows);
                 let cap = finished_output_cap(rows, fitted_cap, now_expanded);
                 let visible_rows = rows.min(cap).max(1);
+                let fit_to_content = document_scroll || now_expanded;
                 render_bytes_into_finished_vte(
                     &output_vte_for_btn,
                     &displayed_for_btn.borrow(),
                     cols_for_btn,
                     rows,
-                    cap,
+                    fitted_cap,
                     capture_rows,
-                    document_scroll || now_expanded,
+                    fit_to_content,
                 );
-                let ch = output_vte_for_btn.char_height() as i32;
-                if ch > 0 {
-                    output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
+                if !fit_to_content {
+                    let ch = output_vte_for_btn.char_height() as i32;
+                    if ch > 0 {
+                        output_vte_for_btn.set_height_request((visible_rows as i32) * ch);
+                    }
                 }
                 btn.set_label(if now_expanded { "\u{f066}" } else { "\u{f065}" });
                 btn.set_tooltip_text(Some(if now_expanded {
@@ -1283,20 +1294,23 @@ impl FinishedBlock {
                     let manually_expanded = expanded.get();
                     let active_cap =
                         finished_output_cap(shown_visual_rows, fitted_cap, manually_expanded);
+                    let fit_to_content = document_scroll || manually_expanded;
                     render_bytes_into_finished_vte(
                         &output_vte,
                         &shown,
                         cols,
                         shown_visual_rows,
-                        active_cap,
+                        fitted_cap,
                         capture_rows,
-                        document_scroll || manually_expanded,
+                        fit_to_content,
                     );
-                    let ch = output_vte.char_height() as i32;
-                    if ch > 0 {
-                        output_vte.set_height_request(
-                            (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
-                        );
+                    if !fit_to_content {
+                        let ch = output_vte.char_height() as i32;
+                        if ch > 0 {
+                            output_vte.set_height_request(
+                                (shown_visual_rows.min(active_cap).max(1) as i32) * ch,
+                            );
+                        }
                     }
                     let has_query = filter_enabled.get() && !q.trim().is_empty();
                     if invalid_regex {
@@ -1613,17 +1627,9 @@ impl ActiveBlock {
         active_vte.set_vexpand(false);
         widget.append(&active_vte);
 
-        // Focus the live VTE as soon as it is realized (jterm1 block.rs:324-328).
-        {
-            let av = active_vte.clone();
-            active_vte.connect_realize(move |_| {
-                av.grab_focus();
-            });
-        }
-        // realize fires before the toplevel is presented, so grab_focus there
-        // can be lost. connect_map fires when the VTE actually becomes visible
-        // (window shown / tab switched), which is the reliable point to take
-        // keyboard focus.
+        // `realize` is too early: the VTE's IM context does not have a mapped
+        // surface yet. Taking logical focus there can suppress the real
+        // focus-in fcitx/ibus need. `map` is the first valid point to focus.
         {
             let av = active_vte.clone();
             active_vte.connect_map(move |_| {

@@ -13,7 +13,7 @@ use vte4::TerminalExt;
 use crate::config::Config;
 use crate::parser::{ColorKind, KeyboardProtocolQuery, Parser, ParserConfig, ParserEvent};
 use crate::pty::OwnedPty;
-use crate::terminal::{apply_terminal_theme, focus_terminal_deferred};
+use crate::terminal::{apply_terminal_theme, focus_terminal};
 
 mod alt_screen;
 mod ansi;
@@ -1015,6 +1015,10 @@ pub struct TermView {
     /// them for a user drag.
     #[allow(dead_code)]
     programmatic_scroll: Rc<Cell<bool>>,
+    /// The one coalesced, frame-spaced follow-bottom controller shared by output
+    /// updates and tab activation. Sharing it prevents activation from racing a
+    /// still-running output/layout pin.
+    scroll_debouncer: ScrollDebouncer,
     pty: Rc<OwnedPty>,
     pty_synced: Rc<Cell<bool>>,
     cwd_callbacks: StrCallbacks,
@@ -3104,6 +3108,10 @@ impl TermView {
         // mistake them for a user drag.
         let user_scrolled_up: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let programmatic_scroll: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
+            user_scrolled_up.clone(),
+            programmatic_scroll.clone(),
+        );
 
         // ── Hybrid live-surface layout ─────────────────────────────────────
         // Idle prompts use a compact visual cell so completed output exists only
@@ -3367,10 +3375,6 @@ impl TermView {
             })));
             let block_data_for_cb = block_data_rc.clone();
             let finished_blocks_for_cb = finished_blocks_rc.clone();
-            let scroll_debouncer = ScrollDebouncer::with_scroll_lock(
-                user_scrolled_up.clone(),
-                programmatic_scroll.clone(),
-            );
             let widget_pool_for_cb = widget_pool.clone();
             let pty_synced_rc = pty_synced.clone();
             let visible_indices_rc = visible_indices.clone();
@@ -3422,7 +3426,7 @@ impl TermView {
                 parser,
                 block_data_for_cb,
                 finished_blocks_for_cb,
-                scroll_debouncer,
+                scroll_debouncer: scroll_debouncer.clone(),
                 widget_pool_for_cb,
                 pty_synced_rc,
                 visible_indices_rc,
@@ -3933,6 +3937,7 @@ impl TermView {
             fullscreen,
             user_scrolled_up: user_scrolled_up.clone(),
             programmatic_scroll: programmatic_scroll.clone(),
+            scroll_debouncer,
             pty,
             pty_synced: pty_synced.clone(),
             cwd_callbacks,
@@ -4119,9 +4124,6 @@ impl TermView {
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
         term_view.install_resize_tick();
 
-        // Give initial focus to the live VTE.
-        term_view.active_vte.grab_focus();
-
         term_view
     }
 
@@ -4240,7 +4242,7 @@ impl TermView {
     }
 
     pub fn grab_focus(&self) {
-        focus_terminal_deferred(&self.active_vte);
+        focus_terminal(&self.active_vte);
     }
 
     /// Copy selected text to clipboard.
@@ -4390,50 +4392,20 @@ impl TermView {
         self.block_finished_callbacks.borrow_mut().push(Box::new(f));
     }
 
-    /// Reveal the live input when its tab becomes active. A single bottom
-    /// adjustment is too early during `switch-page`: mapping and virtualized block
-    /// visibility can change `upper` for several idle turns. Re-pin until the
-    /// geometry is stable, while marking every write as programmatic so it cannot
-    /// accidentally engage history scroll-lock.
+    /// Reveal the live input when its tab becomes active.
+    ///
+    /// This deliberately reuses the same frame-spaced, generation-aware bottom
+    /// pin as output finalization. The old activation-only idle loop could spend
+    /// all twelve retries before GTK produced another allocation, so a newly
+    /// selected tab sometimes stopped above its bottom input block.
     pub(crate) fn reveal_live_input(&self) {
-        self.user_scrolled_up.set(false);
+        self.scroll_debouncer.reset_scroll_lock();
         self.unread_count.set(0);
         set_jump_fab_label(&self.jump_fab, 0);
         self.jump_fab.set_visible(false);
         self.block_list.queue_allocate();
-
-        let scroll = self.block_scroll.clone();
-        let user_scrolled = self.user_scrolled_up.clone();
-        let programmatic = self.programmatic_scroll.clone();
-        let attempts = Rc::new(Cell::new(0u8));
-        let stable_turns = Rc::new(Cell::new(0u8));
-        let last_target = Rc::new(Cell::new(None::<f64>));
-        glib::idle_add_local(move || {
-            attempts.set(attempts.get().saturating_add(1));
-            user_scrolled.set(false);
-
-            let adj = scroll.vadjustment();
-            let target = (adj.upper() - adj.page_size()).max(adj.lower());
-            programmatic.set(true);
-            adj.set_value(target);
-            programmatic.set(false);
-
-            let target_is_stable = last_target
-                .get()
-                .is_some_and(|previous| (previous - target).abs() < 1.0);
-            last_target.set(Some(target));
-            if target_is_stable && (adj.value() - target).abs() < 1.0 {
-                stable_turns.set(stable_turns.get().saturating_add(1));
-            } else {
-                stable_turns.set(0);
-            }
-
-            if stable_turns.get() >= 2 || attempts.get() >= 12 {
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
-            }
-        });
+        self.scroll_debouncer
+            .pin_to_bottom_deferred(&self.block_scroll);
     }
 
     pub fn scroll_lines(&self, lines: i32) {

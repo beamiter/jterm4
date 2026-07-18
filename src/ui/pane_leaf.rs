@@ -12,7 +12,7 @@ use gtk4::glib::prelude::ObjectExt;
 use vte4::Terminal;
 
 use crate::block_view::TermView;
-use crate::terminal::{focus_terminal_deferred, VteTerminalView};
+use crate::terminal::{focus_terminal, VteTerminalView};
 
 const PANE_LEAF_DATA_KEY: &str = "terminal-view-type";
 const PANE_SESSION_ID_DATA_KEY: &str = "terminal-session-id";
@@ -48,7 +48,7 @@ impl PaneLeaf {
     pub(crate) fn grab_focus(&self) {
         match self {
             Self::Block(view) => view.grab_focus(),
-            Self::Vte(view) => focus_terminal_deferred(view.vte()),
+            Self::Vte(view) => focus_terminal(view.vte()),
         }
     }
 

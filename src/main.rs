@@ -26,7 +26,103 @@ use crate::ui::{self, UiState};
 /// consumed by `cli::handle_early_args` before GTK is initialized.
 const GTK_APPLICATION_ARGV: [&str; 1] = ["jterm4"];
 const TAB_SWITCH_FOCUS_STABLE_FRAMES: u8 = 2;
-const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 8;
+const TAB_SWITCH_FOCUS_MAX_FRAMES: u8 = 16;
+
+fn shortcut_modifiers(state: ModifierType) -> ModifierType {
+    state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK)
+}
+
+/// A shortcut which must let its trigger key finish dispatching before
+/// mutating focus.
+///
+/// Creating and focusing a VTE from Ctrl+Shift+T's key-pressed callback sends
+/// the press to the old IM context but subsequent releases to the new one.
+/// fcitx/ibus can then leave the new context inactive until a later tab
+/// round-trip. Waiting for T's release gives the old IM context the matching
+/// press/release pair. Do not wait for modifier-state notifications here:
+/// capture-phase shortcut handling does not guarantee a later `modifiers`
+/// signal, which could leave tab creation pending indefinitely.
+#[derive(Debug)]
+struct DeferredFocusShortcut {
+    action: Action,
+    trigger_keycode: u32,
+    trigger_released: bool,
+}
+
+impl DeferredFocusShortcut {
+    fn new(action: Action, trigger_keycode: u32) -> Self {
+        Self {
+            action,
+            trigger_keycode,
+            trigger_released: false,
+        }
+    }
+
+    fn key_released(&mut self, keycode: u32) {
+        if keycode == self.trigger_keycode {
+            self.trigger_released = true;
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.trigger_released
+    }
+}
+
+fn take_ready_shortcut(pending: &RefCell<Option<DeferredFocusShortcut>>) -> Option<Action> {
+    let mut pending = pending.borrow_mut();
+    pending
+        .as_ref()
+        .is_some_and(DeferredFocusShortcut::ready)
+        .then(|| pending.take().expect("ready shortcut must exist").action)
+}
+
+fn tab_focus_request_is_current(
+    current_generation: u64,
+    request_generation: u64,
+    selected_page: Option<u32>,
+    request_page: u32,
+) -> bool {
+    current_generation == request_generation && selected_page == Some(request_page)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabFocusFrame {
+    stable_frames: u8,
+    should_grab: bool,
+    complete: bool,
+}
+
+/// Advance one frame of a page-switch focus request.
+///
+/// An unmapped VTE must not receive `grab_focus()`: GTK can record it as the
+/// logical focus widget before VTE's IM context is ready, suppressing the real
+/// mapped `focus-in` that fcitx/ibus need. Once mapped, retry until focus has
+/// remained on the exact live VTE for two consecutive frames.
+fn next_tab_focus_frame(mapped: bool, has_focus: bool, stable_frames: u8) -> TabFocusFrame {
+    if !mapped {
+        return TabFocusFrame {
+            stable_frames: 0,
+            should_grab: false,
+            complete: false,
+        };
+    }
+
+    if !has_focus {
+        return TabFocusFrame {
+            stable_frames: 0,
+            should_grab: true,
+            complete: false,
+        };
+    }
+
+    let stable_frames = stable_frames.saturating_add(1);
+    TabFocusFrame {
+        stable_frames,
+        should_grab: false,
+        complete: stable_frames >= TAB_SWITCH_FOCUS_STABLE_FRAMES,
+    }
+}
 
 fn env_is_unset(k: &str) -> bool {
     std::env::var_os(k).is_none_or(|v| v.is_empty())
@@ -730,8 +826,11 @@ pub fn run() -> glib::ExitCode {
         key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
 
         let ui_clone = ui.clone();
+        let pending_focus_shortcut: Rc<RefCell<Option<DeferredFocusShortcut>>> =
+            Rc::new(RefCell::new(None));
+        let pending_for_press = pending_focus_shortcut.clone();
 
-        key_controller.connect_key_pressed(move |_controller, keyval, _keycode, state| {
+        key_controller.connect_key_pressed(move |_controller, keyval, keycode, state| {
             // Composer Enter semantics must win over optional user-defined
             // global bindings. The focused TextView controller also gives IME
             // candidate confirmation first refusal.
@@ -741,7 +840,7 @@ pub fn run() -> glib::ExitCode {
                 return false.into();
             }
             // Mask to only the modifier keys we care about
-            let mods = state & (ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK | ModifierType::ALT_MASK);
+            let mods = shortcut_modifiers(state);
             let combo = KeyCombo {
                 modifiers: mods,
                 key: normalize_key(keyval),
@@ -773,6 +872,16 @@ pub fn run() -> glib::ExitCode {
 
             if let Some(action) = action {
                 match action {
+                    Action::NewTab => {
+                        // Keep the old VTE/IME context focused until it has seen
+                        // T's matching release. Modifier release signals are
+                        // intentionally not part of the completion condition.
+                        let mut pending = pending_for_press.borrow_mut();
+                        if pending.is_none() {
+                            *pending = Some(DeferredFocusShortcut::new(action, keycode));
+                        }
+                        return true.into();
+                    }
                     Action::Copy => {
                         // Handle at the window level so the shortcut works no
                         // matter which child has focus — in particular, after
@@ -811,6 +920,27 @@ pub fn run() -> glib::ExitCode {
             }
 
             false.into()
+        });
+
+        let pending_for_release = pending_focus_shortcut.clone();
+        let ui_for_release = ui.clone();
+        key_controller.connect_key_released(move |_, _, keycode, _| {
+            if let Some(pending) = pending_for_release.borrow_mut().as_mut() {
+                pending.key_released(keycode);
+            }
+            if let Some(action) = take_ready_shortcut(&pending_for_release) {
+                let ui = ui_for_release.clone();
+                // Let the old widget and its IM context finish dispatching the
+                // release before the action maps/focuses a new VTE.
+                glib::idle_add_local_once(move || ui.execute_action(action));
+            }
+        });
+
+        let pending_for_deactivate = pending_focus_shortcut.clone();
+        window.connect_is_active_notify(move |window| {
+            if !window.is_active() {
+                pending_for_deactivate.borrow_mut().take();
+            }
         });
 
         // Enter/Shift+Enter are handled by the capture-phase key controller
@@ -916,7 +1046,6 @@ pub fn run() -> glib::ExitCode {
                 if let Some(term_view) = ui_for_switch.term_view_in_page(widget) {
                     term_view.reveal_live_input();
                 }
-                target_terminal.grab_focus();
 
                 // `switch-page` can run before the selected child has completed
                 // its map/focus reconciliation. Follow the notebook's frame
@@ -930,9 +1059,12 @@ pub fn run() -> glib::ExitCode {
                 let frame_count = Cell::new(0u8);
                 let stable_frames = Cell::new(0u8);
                 notebook_for_switch.add_tick_callback(move |_, _| {
-                    if focus_generation.get() != generation
-                        || notebook_for_focus.current_page() != Some(page_num)
-                    {
+                    if !tab_focus_request_is_current(
+                        focus_generation.get(),
+                        generation,
+                        notebook_for_focus.current_page(),
+                        page_num,
+                    ) {
                         return glib::ControlFlow::Break;
                     }
 
@@ -943,14 +1075,17 @@ pub fn run() -> glib::ExitCode {
                     }
 
                     frame_count.set(frame_count.get() + 1);
-                    if target_terminal.has_focus() {
-                        stable_frames.set(stable_frames.get() + 1);
-                        if stable_frames.get() >= TAB_SWITCH_FOCUS_STABLE_FRAMES {
-                            return glib::ControlFlow::Break;
-                        }
-                    } else {
-                        stable_frames.set(0);
+                    let focus_frame = next_tab_focus_frame(
+                        target_terminal.is_mapped(),
+                        target_terminal.has_focus(),
+                        stable_frames.get(),
+                    );
+                    stable_frames.set(focus_frame.stable_frames);
+                    if focus_frame.should_grab {
                         target_terminal.grab_focus();
+                    }
+                    if focus_frame.complete {
+                        return glib::ControlFlow::Break;
                     }
 
                     if frame_count.get() >= TAB_SWITCH_FOCUS_MAX_FRAMES {
@@ -1149,6 +1284,8 @@ pub fn run() -> glib::ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use crate::keybindings::Action;
+
     #[test]
     fn gtk_receives_only_the_sanitized_program_name() {
         // Keep this assertion beside the GApplication boundary.  Launch
@@ -1156,5 +1293,89 @@ mod tests {
         // be forwarded for a second parse.
         assert_eq!(super::GTK_APPLICATION_ARGV, ["jterm4"]);
         assert_eq!(super::GTK_APPLICATION_ARGV.len(), 1);
+    }
+
+    #[test]
+    fn new_tab_runs_after_trigger_release_even_with_modifiers_still_held() {
+        let pending =
+            std::cell::RefCell::new(Some(super::DeferredFocusShortcut::new(Action::NewTab, 28)));
+
+        pending.borrow_mut().as_mut().unwrap().key_released(28);
+        assert_eq!(super::take_ready_shortcut(&pending), Some(Action::NewTab));
+        assert!(pending.borrow().is_none());
+        assert_eq!(super::take_ready_shortcut(&pending), None);
+    }
+
+    #[test]
+    fn new_tab_ignores_unrelated_key_releases() {
+        let pending =
+            std::cell::RefCell::new(Some(super::DeferredFocusShortcut::new(Action::NewTab, 28)));
+
+        pending.borrow_mut().as_mut().unwrap().key_released(37);
+        assert_eq!(super::take_ready_shortcut(&pending), None);
+
+        pending.borrow_mut().as_mut().unwrap().key_released(28);
+        assert_eq!(super::take_ready_shortcut(&pending), Some(Action::NewTab));
+    }
+
+    #[test]
+    fn tab_focus_waits_for_mapping_before_grabbing() {
+        let frame = super::next_tab_focus_frame(false, false, 1);
+        assert_eq!(
+            frame,
+            super::TabFocusFrame {
+                stable_frames: 0,
+                should_grab: false,
+                complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unmapped_logical_focus_does_not_complete_ime_focus_request() {
+        let frame = super::next_tab_focus_frame(false, true, 1);
+        assert_eq!(
+            frame,
+            super::TabFocusFrame {
+                stable_frames: 0,
+                should_grab: false,
+                complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mapped_tab_retries_focus_then_requires_two_stable_frames() {
+        let retry = super::next_tab_focus_frame(true, false, 0);
+        assert!(retry.should_grab);
+        assert!(!retry.complete);
+
+        let first = super::next_tab_focus_frame(true, true, retry.stable_frames);
+        assert_eq!(first.stable_frames, 1);
+        assert!(!first.complete);
+
+        let second = super::next_tab_focus_frame(true, true, first.stable_frames);
+        assert_eq!(second.stable_frames, 2);
+        assert!(second.complete);
+    }
+
+    #[test]
+    fn losing_focus_resets_stability_and_requests_another_grab() {
+        let frame = super::next_tab_focus_frame(true, false, 1);
+        assert_eq!(
+            frame,
+            super::TabFocusFrame {
+                stable_frames: 0,
+                should_grab: true,
+                complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_tab_focus_request_cannot_steal_focus_back() {
+        assert!(super::tab_focus_request_is_current(9, 9, Some(2), 2));
+        assert!(!super::tab_focus_request_is_current(10, 9, Some(2), 2));
+        assert!(!super::tab_focus_request_is_current(9, 9, Some(1), 2));
     }
 }

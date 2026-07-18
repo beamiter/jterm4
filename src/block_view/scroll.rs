@@ -46,6 +46,7 @@ fn request_bottom_pin(user_scrolled: bool, active: &Cell<bool>, generation: &Cel
 /// The synchronous update in `mark_dirty` intentionally runs before GTK lays out
 /// a freshly appended block. The short frame-spaced settling pass then handles
 /// virtualized blocks whose heights become known only after subsequent layouts.
+#[derive(Clone)]
 pub(crate) struct ScrollDebouncer {
     pub(crate) user_scrolled_up: Rc<Cell<bool>>,
     pub(crate) programmatic_scroll: Rc<Cell<bool>>,
@@ -250,5 +251,38 @@ mod tests {
         assert!(!request_bottom_pin(true, &active, &generation));
         assert!(!active.get());
         assert_eq!(generation.get(), 2);
+    }
+
+    #[test]
+    fn cloned_controller_shares_one_bottom_pin_generation() {
+        let controller =
+            ScrollDebouncer::with_scroll_lock(Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let activation = controller.clone();
+
+        assert!(request_bottom_pin(
+            false,
+            &controller.bottom_pin_active,
+            &controller.bottom_pin_generation,
+        ));
+        assert!(!request_bottom_pin(
+            false,
+            &activation.bottom_pin_active,
+            &activation.bottom_pin_generation,
+        ));
+        assert_eq!(controller.bottom_pin_generation.get(), 2);
+        assert_eq!(activation.bottom_pin_generation.get(), 2);
+    }
+
+    #[test]
+    fn activation_clone_resets_the_shared_user_scroll_lock() {
+        let user_scrolled = Rc::new(Cell::new(true));
+        let controller =
+            ScrollDebouncer::with_scroll_lock(user_scrolled.clone(), Rc::new(Cell::new(false)));
+        let activation = controller.clone();
+
+        activation.reset_scroll_lock();
+
+        assert!(!user_scrolled.get());
+        assert!(!controller.user_scrolled_up.get());
     }
 }
