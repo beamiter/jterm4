@@ -1,7 +1,7 @@
 name: Resolve project license policy
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [master]
     types: [opened, reopened, synchronize]
 
@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && github.head_ref == 'agent/license-policy'
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.head_ref == 'agent/license-policy' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
