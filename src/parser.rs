@@ -423,14 +423,14 @@ impl Parser {
                                 });
                             }
                         }
-                        if b == b'h' && alt_mode.is_some() {
+                        if let (b'h', Some(mode)) = (b, alt_mode) {
                             // Recognized alt-screen enter: drop the sequence bytes
                             // (never passed through) and emit the exact DEC mode.
                             flush!();
-                            events.push(ParserEvent::AltScreenEnter(alt_mode.unwrap()));
-                        } else if b == b'l' && alt_mode.is_some() {
+                            events.push(ParserEvent::AltScreenEnter(mode));
+                        } else if let (b'l', Some(mode)) = (b, alt_mode) {
                             flush!();
-                            events.push(ParserEvent::AltScreenLeave(alt_mode.unwrap()));
+                            events.push(ParserEvent::AltScreenLeave(mode));
                         } else if !self.config.mouse_reporting
                             && (b == b'h' || b == b'l')
                             && is_mouse_reporting_mode(&params)
