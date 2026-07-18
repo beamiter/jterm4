@@ -2390,6 +2390,45 @@ fn compute_viewport_state(
     }
 }
 
+/// Convert GTK's scroll geometry into a usable block viewport.
+///
+/// Notebook pages temporarily report a zero-sized adjustment while they are
+/// unmapped during tab switches. Treating that transient geometry as a real
+/// viewport can produce `first_visible > last_visible` at an exact block
+/// boundary, virtualizing every card and leaving only empty placeholders. Keep
+/// the last valid visibility set until the page is mapped and allocated again.
+fn viewport_state_for_scroll(
+    block_data: &VecDeque<BlockData>,
+    scroll_top: f64,
+    viewport_height: f64,
+    margin_pages: u32,
+) -> Option<ViewportState> {
+    if !scroll_top.is_finite() || !viewport_height.is_finite() || viewport_height < 1.0 {
+        return None;
+    }
+
+    let scroll_top = scroll_top.max(0.0) as i32;
+    let viewport_height = viewport_height as i32;
+    if viewport_height <= 0 {
+        return None;
+    }
+    let margin_pages = i32::try_from(margin_pages).unwrap_or(i32::MAX);
+    let margin = viewport_height.saturating_mul(margin_pages);
+    let visible_top = scroll_top.saturating_sub(margin).max(0);
+    let visible_bottom = scroll_top
+        .saturating_add(viewport_height)
+        .saturating_add(margin);
+    if visible_bottom <= visible_top {
+        return None;
+    }
+
+    Some(compute_viewport_state(
+        block_data,
+        visible_top,
+        visible_bottom,
+    ))
+}
+
 fn visible_indices_for_viewport(vp: &ViewportState) -> std::collections::HashSet<usize> {
     let mut new_visible = std::collections::HashSet::new();
     for i in vp.first_visible..=vp.last_visible.min(vp.first_visible + 1000) {
@@ -4051,11 +4090,16 @@ impl TermView {
             }
         }
 
-        // Initialize viewport and visibility
+        // Before the first map GTK has no real page_size. In that case
+        // update_viewport leaves the conservative initial range (block 0)
+        // untouched, preventing every restored snapshot VTE from mapping at
+        // once. The map handler below replaces it with the first valid range.
         term_view.update_viewport();
         term_view.update_block_visibility();
 
-        // Wire virtual scrolling: connect scroll signals
+        // Wire virtual scrolling. Both range changes and value changes affect
+        // which cards intersect the viewport; map is the reliable recovery
+        // point after a Notebook page temporarily reports zero-sized geometry.
         {
             let viewport = term_view.viewport.clone();
             let block_scroll = term_view.block_scroll.clone();
@@ -4065,48 +4109,50 @@ impl TermView {
             let visible_indices = term_view.visible_indices.clone();
             let fullscreen = term_view.fullscreen.clone();
             let visibility_update_pending = Rc::new(Cell::new(false));
+            let block_scroll_weak = block_scroll.downgrade();
 
-            let vadjust = block_scroll.vadjustment();
-            vadjust.connect_changed(move |_| {
-                if fullscreen.get() {
+            let schedule_visibility_update: Rc<dyn Fn()> = Rc::new(move || {
+                let Some(block_scroll) = block_scroll_weak.upgrade() else {
+                    return;
+                };
+                if fullscreen.get()
+                    || !block_scroll.is_mapped()
+                    || visibility_update_pending.replace(true)
+                {
                     return;
                 }
-                // Update viewport on scroll change
-                let adj = block_scroll.vadjustment();
-                let scroll_top = adj.value() as i32;
-                let viewport_height = adj.page_size() as i32;
-                let margin = (config.borrow().virtual_scroll_margin as i32) * viewport_height;
 
-                let visible_top = (scroll_top - margin).max(0);
-                let visible_bottom = scroll_top + viewport_height + margin;
-
-                let block_data_ref = block_data.borrow();
-                let next_viewport =
-                    compute_viewport_state(&block_data_ref, visible_top, visible_bottom);
-
-                let mut vp = viewport.borrow_mut();
-                *vp = next_viewport;
-                drop(vp);
-
-                if visibility_update_pending.get() {
-                    return;
-                }
-                visibility_update_pending.set(true);
-
-                // Schedule visibility update on next idle
                 let vp = viewport.clone();
+                let scroll = block_scroll.clone();
                 let finished = finished_blocks.clone();
                 let block_data = block_data.clone();
+                let config = config.clone();
                 let visible = visible_indices.clone();
                 let fullscreen = fullscreen.clone();
                 let pending = visibility_update_pending.clone();
                 glib::idle_add_local_once(move || {
                     pending.set(false);
-                    if fullscreen.get() {
+                    if fullscreen.get() || !scroll.is_mapped() {
                         return;
                     }
-                    let vp_ref = vp.borrow();
-                    let new_visible = visible_indices_for_viewport(&vp_ref);
+
+                    // Re-read geometry in the idle instead of applying a value
+                    // captured during switch-page. Mapping/allocation may have
+                    // completed between the signal and this callback.
+                    let adj = scroll.vadjustment();
+                    let block_data_ref = block_data.borrow();
+                    let Some(next_viewport) = viewport_state_for_scroll(
+                        &block_data_ref,
+                        adj.value(),
+                        adj.page_size(),
+                        config.borrow().virtual_scroll_margin,
+                    ) else {
+                        return;
+                    };
+                    drop(block_data_ref);
+
+                    let new_visible = visible_indices_for_viewport(&next_viewport);
+                    *vp.borrow_mut() = next_viewport;
 
                     let finished_ref = finished.borrow();
                     let mut block_data_ref = block_data.borrow_mut();
@@ -4119,6 +4165,19 @@ impl TermView {
                     );
                 });
             });
+
+            let vadjust = term_view.block_scroll.vadjustment();
+            {
+                let schedule = schedule_visibility_update.clone();
+                vadjust.connect_changed(move |_| schedule());
+            }
+            {
+                let schedule = schedule_visibility_update.clone();
+                vadjust.connect_value_changed(move |_| schedule());
+            }
+            term_view
+                .block_scroll
+                .connect_map(move |_| schedule_visibility_update());
         }
 
         // ── Resize handler: sync PTY cols/rows when widget allocation changes ──
@@ -4641,15 +4700,16 @@ impl TermView {
     /// Update virtual scrolling viewport state based on scroll position.
     pub fn update_viewport(&self) {
         let adj = self.block_scroll.vadjustment();
-        let scroll_top = adj.value() as i32;
-        let viewport_height = adj.page_size() as i32;
-        let margin = (self.config.borrow().virtual_scroll_margin as i32) * viewport_height;
-
-        let visible_top = (scroll_top - margin).max(0);
-        let visible_bottom = scroll_top + viewport_height + margin;
-
         let block_data = self.block_data.borrow();
-        let next_viewport = compute_viewport_state(&block_data, visible_top, visible_bottom);
+        let Some(next_viewport) = viewport_state_for_scroll(
+            &block_data,
+            adj.value(),
+            adj.page_size(),
+            self.config.borrow().virtual_scroll_margin,
+        ) else {
+            return;
+        };
+        drop(block_data);
 
         let mut vp = self.viewport.borrow_mut();
         *vp = next_viewport;
@@ -4839,7 +4899,8 @@ mod tests {
         record_external_input, resolve_submitted_command, scroll_delta_to_reveal,
         selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
-        visible_indices_for_viewport, BlockData, BlockState, ViewportState,
+        viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
+        ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -5087,6 +5148,35 @@ mod tests {
         assert_eq!(vp.first_visible, 1);
         assert_eq!(vp.last_visible, 2);
         assert_eq!(vp.total_height, 100);
+    }
+
+    #[test]
+    fn zero_sized_tab_viewport_is_ignored() {
+        let blocks: VecDeque<BlockData> = [10, 20, 30, 40]
+            .into_iter()
+            .map(block_with_height)
+            .collect();
+
+        // Hidden GtkNotebook pages transiently expose page_size == 0. At this
+        // exact block boundary the raw range would have first=2, last=1 and
+        // virtualize every card.
+        assert!(viewport_state_for_scroll(&blocks, 30.0, 0.0, 0).is_none());
+        assert!(viewport_state_for_scroll(&blocks, 30.0, 0.5, 0).is_none());
+    }
+
+    #[test]
+    fn remapped_tab_viewport_restores_visible_range() {
+        let blocks: VecDeque<BlockData> = [10, 20, 30, 40]
+            .into_iter()
+            .map(block_with_height)
+            .collect();
+
+        let vp = viewport_state_for_scroll(&blocks, 30.0, 40.0, 0)
+            .expect("mapped viewport should be valid");
+
+        assert_eq!(vp.first_visible, 2);
+        assert_eq!(vp.last_visible, 3);
+        assert_eq!(visible_indices_for_viewport(&vp), HashSet::from([2, 3]));
     }
 
     #[test]
