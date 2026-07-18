@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
 
 jobs:
   apply-and-verify:
@@ -47,31 +45,35 @@ jobs:
           python3 -m py_compile /tmp/apply_block_native_splits.py
           python3 /tmp/apply_block_native_splits.py 2>&1 | tee native-block-splits.log
 
-      - name: Report patch failure
+      - name: Persist patch failure
         if: ${{ steps.patch.outcome == 'failure' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           python3 - <<'PY'
+          import base64
           import json
           import os
           from pathlib import Path
 
-          log = Path('native-block-splits.log').read_text(encoding='utf-8', errors='replace')
-          body = (
-              'Native Block split patch application failed on current `master`:\n\n'
-              '```text\n' + log[-50000:] + '\n```'
+          log = Path('native-block-splits.log').read_bytes()
+          payload = {
+              'message': 'ci: capture native Block split patch failure',
+              'content': base64.b64encode(log).decode('ascii'),
+              'branch': os.environ['HEAD_REF'],
+          }
+          Path('/tmp/contents-payload.json').write_text(
+              json.dumps(payload), encoding='utf-8'
           )
-          Path('/tmp/pr-comment.json').write_text(json.dumps({'body': body}), encoding='utf-8')
           PY
           curl --fail-with-body --silent --show-error \
-            -X POST \
+            -X PUT \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            --data-binary @/tmp/pr-comment.json \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments"
+            --data-binary @/tmp/contents-payload.json \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/contents/.github/native-block-split-patch-failure-${GITHUB_RUN_ID}.log"
           exit 1
 
       - name: Install native validation dependencies
