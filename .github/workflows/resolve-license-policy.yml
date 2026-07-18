@@ -20,12 +20,13 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Configure and update branch
+      - name: Configure clean source branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp .github/scripts/apply_license_policy.py /tmp/apply_license_policy.py
           git fetch origin master
-          git merge --no-edit origin/master
+          git reset --hard origin/master
 
       - name: Install native validation dependencies
         run: |
@@ -40,7 +41,7 @@ jobs:
             pkg-config
 
       - name: Apply license policy
-        run: python3 .github/scripts/apply_license_policy.py
+        run: python3 /tmp/apply_license_policy.py
 
       - name: Verify Cargo metadata and license files
         run: |
@@ -84,6 +85,11 @@ jobs:
           tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-MIT$'
           tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-APACHE$'
 
+      - name: Preserve workflow update for connector publication
+        run: |
+          cp .github/workflows/flatpak.yml /tmp/flatpak-license-workflow.yml
+          git checkout -- .github/workflows/flatpak.yml
+
       - name: Upload verified policy snapshot
         uses: actions/upload-artifact@v4
         with:
@@ -102,14 +108,13 @@ jobs:
             scripts/package-release.sh
             packaging/RELEASE_README.md
             packaging/flatpak/io.github.beamiter.jterm4.yml
-            .github/workflows/flatpak.yml
+            /tmp/flatpak-license-workflow.yml
           if-no-files-found: error
           retention-days: 2
 
-      - name: Commit verified policy
+      - name: Commit verified source policy
         run: |
-          rm -f .github/license-policy-retry
           git add -A
-          git status --short
+          git diff --cached --quiet && { echo "license policy produced no source changes" >&2; exit 1; }
           git commit -m "chore: license jterm4 under MIT or Apache-2.0"
           git push --force origin HEAD:${{ github.head_ref }}
