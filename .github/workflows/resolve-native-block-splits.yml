@@ -41,18 +41,18 @@ jobs:
           python3 -m py_compile /tmp/apply_block_native_splits.py
           python3 /tmp/apply_block_native_splits.py 2>&1 | tee /tmp/native-block-splits.log
 
-      - name: Upload patch diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-block-split-patch-${{ github.run_id }}
-          path: /tmp/native-block-splits.log
-          if-no-files-found: warn
-          retention-days: 2
-
-      - name: Require ownership patch
+      - name: Persist patch failure
         if: ${{ steps.patch.outcome == 'failure' }}
-        run: exit 1
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          git reset --hard HEAD
+          cp /tmp/native-block-splits.log .github/native-block-split-patch-failure.log
+          git add .github/native-block-split-patch-failure.log
+          git commit -m "ci: capture native Block split patch failure"
+          git push --force origin HEAD:"$HEAD_REF"
+          exit 1
 
       - name: Install native validation dependencies
         run: |
@@ -82,6 +82,7 @@ jobs:
           rm .github/scripts/block_split_patch.part02
           rm .github/scripts/block_split_patch.part03
           rm .github/workflows/resolve-native-block-splits.yml
+          rm -f .github/native-block-split-patch-failure.log .github/native-block-splits-retry
 
       - name: Commit verified implementation
         run: |
