@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import subprocess
+
+
+TARGET_BRANCH = 'agent/native-block-splits'
+FAILURE_LOG = Path('.github/native-block-split-patch-failure.log')
+
+
+def persist_failure(detail: str) -> None:
+    # Drop any partially applied source edits while keeping the checked-out
+    # staging branch (and any current-master merge made by the verifier).
+    subprocess.run(['git', 'reset', '--hard', 'HEAD'], check=False)
+    FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    FAILURE_LOG.write_text(detail + '\n', encoding='utf-8')
+    subprocess.run(['git', 'add', str(FAILURE_LOG)], check=True)
+    subprocess.run(
+        ['git', 'commit', '-m', 'ci: capture native Block split patch anchor failure'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', 'push', '--force', 'origin', f'HEAD:{TARGET_BRANCH}'],
+        check=True,
+    )
 
 
 def replace_once(path: str, old: str, new: str) -> None:
@@ -13,7 +35,9 @@ def replace_once(path: str, old: str, new: str) -> None:
         and 'let is_split = root_for_exit' in old
     )
     if count != 1 and not duplicate_exit_prefix:
-        raise SystemExit(f'{path}: expected one match, found {count}: {old[:160]!r}')
+        detail = f'{path}: expected one match, found {count}: {old[:500]!r}'
+        persist_failure(detail)
+        raise SystemExit(detail)
     file.write_text(text.replace(old, new, 1), encoding='utf-8')
 
 
