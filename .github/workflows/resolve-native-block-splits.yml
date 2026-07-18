@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   apply-and-verify:
@@ -45,31 +47,31 @@ jobs:
           python3 -m py_compile /tmp/apply_block_native_splits.py
           python3 /tmp/apply_block_native_splits.py 2>&1 | tee native-block-splits.log
 
-      - name: Upload patch diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-block-split-patch-${{ github.run_id }}
-          path: native-block-splits.log
-          if-no-files-found: warn
-          retention-days: 2
-
-      - name: Persist patch failure
+      - name: Report patch failure
         if: ${{ steps.patch.outcome == 'failure' }}
         env:
-          HEAD_REF: ${{ github.head_ref }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          set -euo pipefail
-          git reset --hard origin/master
-          mkdir -p .github/scripts
-          cp /tmp/block_split_patch.part00 .github/scripts/block_split_patch.part00
-          cp /tmp/block_split_patch.part01 .github/scripts/block_split_patch.part01
-          cp /tmp/block_split_patch.part02 .github/scripts/block_split_patch.part02
-          cp /tmp/block_split_patch.part03 .github/scripts/block_split_patch.part03
-          cp native-block-splits.log .github/native-block-split-patch-failure.log
-          git add .github/scripts/block_split_patch.part* .github/native-block-split-patch-failure.log
-          git commit -m "ci: capture native Block split patch failure"
-          git push --force origin HEAD:"$HEAD_REF"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          log = Path('native-block-splits.log').read_text(encoding='utf-8', errors='replace')
+          body = (
+              'Native Block split patch application failed on current `master`:\n\n'
+              '```text\n' + log[-50000:] + '\n```'
+          )
+          Path('/tmp/pr-comment.json').write_text(json.dumps({'body': body}), encoding='utf-8')
+          PY
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data-binary @/tmp/pr-comment.json \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments"
           exit 1
 
       - name: Install native validation dependencies
