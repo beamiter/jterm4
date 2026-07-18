@@ -118,6 +118,27 @@ require(
     ["git", "merge", "--no-edit", "-X", "ours", "origin/master"],
 )
 require("apply-original-patch", ["python3", str(ORIGINAL)])
+
+# The focused patch replaces the clipboard helper with one that returns both the
+# normalized editor text and the PTY payload. Keep the two existing unit tests in
+# sync with the new tuple return type.
+mod_path = REPO / "src/block_view/mod.rs"
+mod_source = mod_path.read_text(encoding="utf-8")
+test_replacements = {
+    'build_clipboard_paste_payload("plain", false).as_slice()':
+        'build_clipboard_paste("plain", false).1.as_slice()',
+    'build_clipboard_paste_payload("one\\ntwo", true).as_slice()':
+        'build_clipboard_paste("one\\ntwo", true).1.as_slice()',
+}
+for old, new in test_replacements.items():
+    count = mod_source.count(old)
+    if count != 1:
+        raise SystemExit(
+            f"src/block_view/mod.rs: expected one clipboard test match, found {count}: {old!r}"
+        )
+    mod_source = mod_source.replace(old, new, 1)
+mod_path.write_text(mod_source, encoding="utf-8")
+
 require("format-after-patch", ["cargo", "fmt", "--all"])
 require("test-after-patch", ["cargo", "test", "--all-features", "--locked"])
 require(
