@@ -60,6 +60,20 @@ require(
         "41898282+github-actions[bot]@users.noreply.github.com",
     ],
 )
+# The legacy workflow omitted GLib's pkg-config metadata on this runner image.
+# Install it explicitly before Cargo invokes glib-sys.
+require(
+    "install-glib-dev",
+    [
+        "sudo",
+        "apt-get",
+        "install",
+        "--no-install-recommends",
+        "-y",
+        "libglib2.0-dev",
+    ],
+)
+require("verify-glib-pkgconfig", ["pkg-config", "--modversion", "glib-2.0"])
 call(["git", "fetch", "--unshallow", "origin"])
 require(
     "fetch-refs",
@@ -80,10 +94,6 @@ original = require(
     ],
 ).stdout
 
-# Current master contains the same arrow-navigation block twice. The original
-# patch intentionally handles one generic occurrence first and the Enter-specific
-# occurrence later, so allow exactly this first 2-match case while keeping every
-# other asserted replacement strict.
 strict_guard = (
     "    if count != 1:\n"
     "        raise SystemExit(f\"{path}: expected one match, found {count}: {old[:100]!r}\")\n"
@@ -108,8 +118,6 @@ require(
     ["git", "merge", "--no-edit", "-X", "ours", "origin/master"],
 )
 require("apply-original-patch", ["python3", str(ORIGINAL)])
-# Run the same gates inside the diagnostic wrapper. If a gate fails, its complete
-# tail is committed to the branch before the surrounding legacy workflow stops.
 require("format-after-patch", ["cargo", "fmt", "--all"])
 require("test-after-patch", ["cargo", "test", "--all-features", "--locked"])
 require(
