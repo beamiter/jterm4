@@ -1,4 +1,4 @@
-name: Publish verified issue fixes
+name: Publish native Block split fix
 
 on:
   push:
@@ -10,90 +10,10 @@ permissions:
   contents: write
 
 concurrency:
-  group: publish-open-issue-fixes
+  group: publish-native-block-splits
   cancel-in-progress: true
 
 jobs:
-  license-policy:
-    name: Verify and publish license policy
-    runs-on: ubuntu-24.04
-    timeout-minutes: 70
-    steps:
-      - name: Check out staged license branch
-        uses: actions/checkout@v4
-        with:
-          ref: agent/license-policy
-          fetch-depth: 0
-
-      - name: Configure clean source branch
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp .github/scripts/apply_license_policy.py /tmp/apply_license_policy.py
-          git fetch origin master
-          git reset --hard origin/master
-
-      - name: Install validation dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            appstream \
-            desktop-file-utils \
-            libadwaita-1-dev \
-            libgtk-4-dev \
-            libpcre2-dev \
-            libvte-2.91-gtk4-dev \
-            pkg-config
-
-      - name: Apply policy
-        run: python3 /tmp/apply_license_policy.py
-
-      - name: Verify metadata
-        run: |
-          cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          metadata = json.loads(Path('/tmp/cargo-metadata.json').read_text())
-          package = next(item for item in metadata['packages'] if item['name'] == 'jterm4')
-          assert package['license'] == 'MIT OR Apache-2.0', package['license']
-          assert package['publish'] == [], package['publish']
-          for name in ('LICENSE-MIT', 'LICENSE-APACHE'):
-              path = Path(name)
-              assert path.is_file() and path.stat().st_size > 500, name
-          PY
-          cargo fmt --all -- --check
-          appstreamcli validate --no-net data/io.github.beamiter.jterm4.metainfo.xml
-          bash -n scripts/package-release.sh
-
-      - name: Test and lint
-        run: |
-          cargo test --all-features --locked
-          cargo clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Check dependency licenses
-        run: |
-          cargo install cargo-deny --locked
-          cargo deny check licenses
-
-      - name: Verify release archive licensing
-        run: |
-          cargo build --release --all-features --locked
-          scripts/package-release.sh target/release/jterm4
-          archive="$(find target/dist -maxdepth 1 -name 'jterm4-*.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-MIT$'
-          tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-APACHE$'
-
-      - name: Publish verified source policy
-        run: |
-          git checkout -- .github/workflows/flatpak.yml
-          git add -A
-          git diff --cached --quiet && { echo "license policy produced no source changes" >&2; exit 1; }
-          git commit -m "chore: license jterm4 under MIT or Apache-2.0"
-          git push --force origin HEAD:agent/license-policy
-
   native-block-splits:
     name: Verify and publish native Block splits
     runs-on: ubuntu-24.04
