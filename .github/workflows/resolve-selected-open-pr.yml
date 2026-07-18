@@ -72,12 +72,30 @@ jobs:
         run: cargo fmt --all
 
       - name: Test
-        run: cargo test --all-features --locked
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --all-features --locked 2>&1 | tee /tmp/resolver-test.log
+
+      - name: Persist failed test diagnostics
+        if: steps.tests.outcome == 'failure'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          tail -n 500 /tmp/resolver-test.log > .github/resolver-test-failure.log
+          git add -A
+          git commit -m "ci: capture resolver test failure for ${HEAD_REF}"
+          git push --force-with-lease origin HEAD:"$HEAD_REF"
+          exit 1
 
       - name: Clippy
+        if: steps.tests.outcome == 'success'
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Commit and push resolved branch
+        if: steps.tests.outcome == 'success'
         env:
           HEAD_REF: ${{ github.head_ref }}
         run: |
