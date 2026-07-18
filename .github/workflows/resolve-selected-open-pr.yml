@@ -57,7 +57,22 @@ jobs:
             fix/block-command-capture-sidebar-contrast)
               cp .github/scripts/apply_block_capture_contrast_fix.py /tmp/apply_block_capture_contrast_fix.py
               git reset --hard origin/master
-              python3 /tmp/apply_block_capture_contrast_fix.py
+              set +e
+              python3 /tmp/apply_block_capture_contrast_fix.py > /tmp/pr32-apply.log 2>&1
+              apply_status=$?
+              set -e
+              cat /tmp/pr32-apply.log
+              if [ "$apply_status" -ne 0 ]; then
+                git reset --hard origin/master
+                mkdir -p .github/scripts
+                cp /tmp/apply_block_capture_contrast_fix.py .github/scripts/apply_block_capture_contrast_fix.py
+                tail -n 500 /tmp/pr32-apply.log > .github/resolver-apply-failure.log
+                git add -A
+                git commit -m "ci: capture PR 32 patch assertion failure"
+                git push --force-with-lease origin HEAD:"$HEAD_REF"
+                exit "$apply_status"
+              fi
+              rm -f .github/resolver-apply-failure.log
               ;;
             fix/block-command-capture-sidebar-contrast-v2)
               git reset --hard origin/master
