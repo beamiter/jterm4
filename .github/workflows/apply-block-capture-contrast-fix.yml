@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]' && startsWith(github.head_ref, 'fix/block-command-capture-sidebar-contrast')
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
