@@ -1,0 +1,82 @@
+name: Fix Warp block Clippy diagnostic
+
+on:
+  pull_request:
+    types: [synchronize]
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-verify:
+    if: github.head_ref == 'agent/warp-block-rendering'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Install GTK and VTE development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libvte-2.91-gtk4-dev \
+            libpcre2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Apply Clippy-safe parser change
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/parser.rs')
+          text = path.read_text()
+          old = '''                        if b == b'h' && alt_mode.is_some() {
+                              // Recognized alt-screen enter: drop the sequence bytes
+                              // (never passed through) and emit the exact DEC mode.
+                              flush!();
+                              events.push(ParserEvent::AltScreenEnter(alt_mode.unwrap()));
+                          } else if b == b'l' && alt_mode.is_some() {
+                              flush!();
+                              events.push(ParserEvent::AltScreenLeave(alt_mode.unwrap()));
+          '''
+          new = '''                        if let (b'h', Some(mode)) = (b, alt_mode) {
+                              // Recognized alt-screen enter: drop the sequence bytes
+                              // (never passed through) and emit the exact DEC mode.
+                              flush!();
+                              events.push(ParserEvent::AltScreenEnter(mode));
+                          } else if let (b'l', Some(mode)) = (b, alt_mode) {
+                              flush!();
+                              events.push(ParserEvent::AltScreenLeave(mode));
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one parser anchor, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+      - name: Format and verify
+        run: |
+          cargo fmt --all
+          cargo clippy --all-targets -- -D warnings
+          cargo test --all-targets
+          cargo check --all-targets
+
+      - name: Commit verified fix
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          rm -f .github/workflows/fix-warp-block-clippy.yml
+          rmdir .github/workflows 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix alt-screen parser Clippy diagnostic"
+          git push origin "HEAD:${BRANCH}"
