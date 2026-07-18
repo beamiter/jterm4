@@ -84,14 +84,31 @@ jobs:
           tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-MIT$'
           tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-APACHE$'
 
-      - name: Remove one-shot machinery
-        run: |
-          rm .github/scripts/apply_license_policy.py
-          rm .github/workflows/apply-license-policy.yml
-          rm .github/workflows/resolve-license-policy.yml
+      - name: Upload verified policy snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-policy-source-${{ github.run_id }}
+          path: |
+            LICENSE-MIT
+            LICENSE-APACHE
+            Cargo.toml
+            README.md
+            CONTRIBUTING.md
+            CHANGELOG.md
+            deny.toml
+            docs/RELEASING.md
+            docs/FLATPAK.md
+            data/io.github.beamiter.jterm4.metainfo.xml
+            scripts/package-release.sh
+            packaging/RELEASE_README.md
+            packaging/flatpak/io.github.beamiter.jterm4.yml
+            .github/workflows/flatpak.yml
+          if-no-files-found: error
+          retention-days: 2
 
       - name: Commit verified policy
         run: |
           git add -A
+          git status --short
           git commit -m "chore: license jterm4 under MIT or Apache-2.0"
-          git push origin HEAD:${{ github.head_ref }}
+          git push --force origin HEAD:${{ github.head_ref }}
