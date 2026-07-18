@@ -4,7 +4,6 @@ import subprocess
 
 REPO = Path.cwd()
 TARGET_BRANCH = "fix/block-command-capture-sidebar-contrast"
-PATCH_COMMIT = "544bf949b92ccfe63fb8977b5686007b12cd15e1"
 PATCH = Path("/tmp/apply_block_capture_contrast_fix.py")
 DIAGNOSTIC = REPO / ".github/pr32-resolver-error.log"
 
@@ -34,8 +33,6 @@ def checked(args: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def fail(stage: str, result: subprocess.CompletedProcess[str]) -> None:
-    # Discard a partial source transformation, retain only an actionable log on
-    # top of current master, and update the conflicted PR branch atomically.
     call(["git", "merge", "--abort"])
     call(["git", "reset", "--hard", "HEAD"])
     status = call(["git", "status", "--short"], capture=True)
@@ -52,15 +49,7 @@ def fail(stage: str, result: subprocess.CompletedProcess[str]) -> None:
     DIAGNOSTIC.write_text(detail, encoding="utf-8")
     checked(["git", "add", str(DIAGNOSTIC.relative_to(REPO))])
     checked(["git", "commit", "-m", f"ci: capture PR 32 failure at {stage}"])
-    checked(
-        [
-            "git",
-            "push",
-            "--force-with-lease",
-            "origin",
-            f"HEAD:{TARGET_BRANCH}",
-        ]
-    )
+    checked(["git", "push", "--force", "origin", f"HEAD:{TARGET_BRANCH}"])
     print(detail)
     raise SystemExit(result.returncode or 1)
 
@@ -85,7 +74,6 @@ checked(
         "41898282+github-actions[bot]@users.noreply.github.com",
     ]
 )
-# Ensure the native metadata needed by gtk-rs is present before validation.
 checked(
     [
         "sudo",
@@ -108,11 +96,14 @@ checked(
         "+refs/heads/master:refs/remotes/origin/master",
     ]
 )
+# PR 32 was intentionally rebased to current master with its asserted patch
+# script as the sole commit. Recover that script from the fetched branch before
+# resetting the worktree to master.
 patch_text = checked(
     [
         "git",
         "show",
-        f"{PATCH_COMMIT}:.github/scripts/apply_block_capture_contrast_fix.py",
+        f"refs/remotes/origin/{TARGET_BRANCH}:.github/scripts/apply_block_capture_contrast_fix.py",
     ]
 ).stdout
 PATCH.write_text(patch_text, encoding="utf-8")
@@ -151,19 +142,8 @@ staged = call(["git", "diff", "--cached", "--quiet"])
 if staged.returncode == 0:
     raise SystemExit("PR 32 resolver produced no source changes")
 checked(["git", "commit", "-m", "fix: resolve PR 32 against merged master"])
-checked(
-    [
-        "git",
-        "push",
-        "--force-with-lease",
-        "origin",
-        f"HEAD:{TARGET_BRANCH}",
-    ]
-)
+checked(["git", "push", "--force", "origin", f"HEAD:{TARGET_BRANCH}"])
 
-# The legacy validation job that hosts this controller removes these paths after
-# repeating fmt/test/clippy. Recreate them as untracked sentinels so that cleanup
-# succeeds, while the final no-op commit stops before its hard-coded PR 31 push.
 Path(".github/scripts").mkdir(parents=True, exist_ok=True)
 Path(".github/workflows").mkdir(parents=True, exist_ok=True)
 Path(".github/scripts/apply_block_mode_ux_final_polish.py").write_text(
