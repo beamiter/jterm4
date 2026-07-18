@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    file = Path(path)
+    text = file.read_text(encoding='utf-8')
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f'{path}: expected one match, found {count}: {old[:160]!r}')
+    file.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+
+def insert_before_once(path: str, marker: str, insertion: str) -> None:
+    replace_once(path, marker, insertion + marker)
+
+
+# Typed backend identity on every PaneLeaf.
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''//! model without introducing Relm4 or enabling unsafe Block splits prematurely.\n''',
+    '''//! model with explicit backend identity and native Block split ownership.\n''',
+)
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''#[derive(Clone)]\npub(crate) enum PaneLeaf {\n    Block(Rc<TermView>),\n    Vte(Rc<VteTerminalView>),\n}\n''',
+    '''#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n#[serde(rename_all = "lowercase")]\npub enum PaneBackend {\n    Block,\n    Vte,\n}\n\n#[derive(Clone)]\npub(crate) enum PaneLeaf {\n    Block(Rc<TermView>),\n    Vte(Rc<VteTerminalView>),\n}\n''',
+)
+insert_before_once(
+    'src/ui/pane_leaf.rs',
+    '''    /// Focus the actual live surface rather than the first VTE found in the tree.\n''',
+    '''    pub(crate) fn backend(&self) -> PaneBackend {\n        match self {\n            Self::Block(_) => PaneBackend::Block,\n            Self::Vte(_) => PaneBackend::Vte,\n        }\n    }\n\n    pub(crate) fn history_path(&self) -> Option<String> {\n        match self {\n            Self::Block(view) => view.history_path(),\n            Self::Vte(_) => None,\n        }\n    }\n\n''',
+)
+replace_once(
+    'src/ui/pane_leaf.rs',
+    '''    pub(crate) fn kill(&self) {\n        let (_, shell_pid) = self.process_probe();\n        crate::state::terminate_terminal_process(shell_pid);\n    }\n''',
+    '''    pub(crate) fn kill(&self) {\n        match self {\n            Self::Block(view) => view.kill(),\n            Self::Vte(_) => {\n                let (_, shell_pid) = self.process_probe();\n                crate::state::terminate_terminal_process(shell_pid);\n            }\n        }\n    }\n''',
+)
+replace_once(
+    'src/ui/mod.rs',
+    'pub(crate) use pane_leaf::PaneLeaf;\n',
+    'pub(crate) use pane_leaf::{PaneBackend, PaneLeaf};\n',
+)
+
+# Expose the exact Block history identity stored by each pane.
+replace_once(
+    'src/block_view/mod.rs',
+    '''    pub fn cwd(&self) -> String {\n        self.current_cwd.borrow().clone()\n    }\n\n    pub fn grab_focus(&self) {\n''',
+    '''    pub fn cwd(&self) -> String {\n        self.current_cwd.borrow().clone()\n    }\n\n    pub fn history_path(&self) -> Option<String> {\n        self.config.borrow().block_history_path.clone()\n    }\n\n    pub fn grab_focus(&self) {\n''',
+)
+
+# Persist backend/history ownership and repair duplicate restored identities.
+replace_once(
+    'src/state.rs',
+    'use std::collections::HashMap;\n',
+    'use std::collections::{HashMap, HashSet};\n',
+)
+replace_once(
+    'src/state.rs',
+    'use crate::ui::{PaneLeaf, PaneNode};\n',
+    'use crate::ui::{PaneBackend, PaneLeaf, PaneNode};\n',
+)
+replace_once(
+    'src/state.rs',
+    '''    Leaf {\n        dir: String,\n        sid: String,\n        #[serde(skip_serializing_if = "Option::is_none")]\n        cmds: Option<String>,\n        #[serde(skip_serializing_if = "Option::is_none")]\n        pinned: Option<bool>,\n    },\n''',
+    '''    Leaf {\n        dir: String,\n        sid: String,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        cmds: Option<String>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        pinned: Option<bool>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        backend: Option<PaneBackend>,\n        #[serde(default, skip_serializing_if = "Option::is_none")]\n        history_path: Option<String>,\n    },\n''',
+)
+insert_before_once(
+    'src/state.rs',
+    '''/// Serialize a pane layout tree from a GTK widget\n''',
