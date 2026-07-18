@@ -159,6 +159,21 @@ fn normalize_captured_command(captured: &str, prompt: &str) -> String {
     captured.to_string()
 }
 
+/// Resolve the command at CommandStart without trusting VTE feed timing. The PTY
+/// reader can deliver the echoed command and OSC 133;C in one chunk: `feed()`
+/// queues the echo for VTE, then the semantic event is handled immediately, so
+/// the text range can still be empty. The keystroke shadow is deliberately only
+/// a fallback; a settled VTE capture remains authoritative for history recall,
+/// autosuggestions, IME, and shell line-editor redraws.
+fn resolve_submitted_command(captured: &str, prompt: &str, typed_shadow: &str) -> String {
+    let captured = normalize_captured_command(captured, prompt);
+    if captured.trim().is_empty() {
+        typed_shadow.trim().to_string()
+    } else {
+        captured
+    }
+}
+
 /// Build editable text and the PTY byte stream used to recall finished commands.
 /// Multiline input is safe only while the shell advertises bracketed paste.
 pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (String, Vec<u8>) {
@@ -1347,7 +1362,7 @@ impl ReaderCtx {
                                 // keystroke shadow only if the VTE read came back
                                 // empty (which would indicate the prompt-end
                                 // anchor never captured a valid cursor position).
-                                let cmd = if is_background {
+                                let mut cmd = if is_background {
                                     String::new()
                                 } else {
                                     let vte_cmd = vte_typed_cmd_rc.borrow().trim().to_string();
@@ -1359,13 +1374,31 @@ impl ReaderCtx {
                                 };
 
                                 if cmd.is_empty() && !is_background {
-                                    // Nothing meaningful to record; just reset.
-                                    let preserve = config_for_cb.borrow().preserve_live_scrollback;
-                                    active_rc.borrow().reset_active(preserve);
-                                    bstate_rc.set(BlockState::CollectingPrompt);
-                                    prompt_buf_rc.borrow_mut().clear();
-                                    scroll_debouncer.mark_dirty(&block_scroll_rc);
-                                    continue;
+                                    // Never silently discard a command lifecycle. The
+                                    // VTE range can be empty during an echo/feed race,
+                                    // and line-editor control sequences do not always
+                                    // populate the printable keystroke shadow. Keep a
+                                    // visible diagnostic card whenever input activity
+                                    // or actual output proves that something ran.
+                                    let output_visible = background_output_has_visible_text(
+                                        active_rc.borrow().output_text().as_bytes(),
+                                    );
+                                    if pty_synced_rc.get() || output_visible {
+                                        log::warn!(
+                                            "finished command text was unavailable; preserving block with placeholder"
+                                        );
+                                        cmd = "(command capture unavailable)".to_string();
+                                    } else {
+                                        // A genuinely empty submission with no output
+                                        // is not useful history; reset for the prompt.
+                                        let preserve =
+                                            config_for_cb.borrow().preserve_live_scrollback;
+                                        active_rc.borrow().reset_active(preserve);
+                                        bstate_rc.set(BlockState::CollectingPrompt);
+                                        prompt_buf_rc.borrow_mut().clear();
+                                        scroll_debouncer.mark_dirty(&block_scroll_rc);
+                                        continue;
+                                    }
                                 }
 
                                 let prompt = if is_background {
@@ -1977,8 +2010,13 @@ impl ReaderCtx {
                                 active_for_focus.borrow().grab_focus();
                             });
 
-                            // Feed next initial command if any.
+                            // Feed next initial command if any. Seed the same
+                            // fallback state as interactive input before writing, so
+                            // a fast command cannot outrun command capture.
                             if let Some(cmd) = init_cmds_queue_for_cb.borrow_mut().pop_front() {
+                                *typed_cmd_rc.borrow_mut() = cmd.clone();
+                                idle_input_dirty_rc.set(true);
+                                pty_synced_rc.set(true);
                                 let text = format!("{}\r", cmd);
                                 pty_for_init.write_bytes(text.as_bytes());
                             }
@@ -2028,10 +2066,15 @@ impl ReaderCtx {
                                 .0
                                 .map(|gs| gs.to_string())
                                 .unwrap_or_default();
-                            let cmd_from_vte =
-                                normalize_captured_command(&captured, &prompt_display_rc.borrow());
-                            *vte_typed_cmd_rc.borrow_mut() = cmd_from_vte.clone();
-                            *running_cmd_rc.borrow_mut() = cmd_from_vte;
+                            let prompt_display = prompt_display_rc.borrow().clone();
+                            let typed_shadow = typed_cmd_rc.borrow().clone();
+                            let submitted_command = resolve_submitted_command(
+                                &captured,
+                                &prompt_display,
+                                &typed_shadow,
+                            );
+                            *vte_typed_cmd_rc.borrow_mut() = submitted_command.clone();
+                            *running_cmd_rc.borrow_mut() = submitted_command;
                             cmd_running_rc.set(true);
                             bstate_rc.set(BlockState::CollectingOutput);
                             typed_cmd_rc.borrow_mut().clear();
@@ -3550,21 +3593,19 @@ impl TermView {
                     );
                 }
 
-                if bstate_for_commit.get() == BlockState::AwaitingCommand {
+                let awaiting_command = bstate_for_commit.get() == BlockState::AwaitingCommand;
+                if awaiting_command {
                     idle_input_dirty_for_commit.set(true);
                     if text.as_bytes().iter().any(|&b| b != b'\r' && b != b'\n') {
                         // A later recall must replace this edited readline buffer,
                         // not append to it. PromptEnd resets the flag for a new line.
                         pty_synced_for_commit.set(true);
                     }
-                }
 
-                pty_for_commit.write_bytes(text.as_bytes());
-                // The finished-block command text comes from a live-VTE
-                // text_range read at CommandStart (see PromptEnd / CommandStart
-                // handlers), so this shadow buffer is only a fallback. It need
-                // not reproduce every line-editor escape sequence.
-                if bstate_for_commit.get() == BlockState::AwaitingCommand {
+                    // Update the fallback before exposing bytes to the PTY. A very
+                    // fast shell can echo the line and emit OSC 133;C immediately;
+                    // the reader must never observe CommandStart while this shadow
+                    // still describes the previous editor state.
                     let mut cmd = typed_cmd_for_commit.borrow_mut();
                     for ch in text.chars() {
                         if ch == '\r' || ch == '\n' {
@@ -3579,6 +3620,8 @@ impl TermView {
                         }
                     }
                 }
+
+                pty_for_commit.write_bytes(text.as_bytes());
             });
         }
 
@@ -4644,10 +4687,10 @@ mod tests {
         background_output_has_visible_text, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
         history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
-        record_external_input, scroll_delta_to_reveal, selected_command_text, selected_id_range,
-        should_buffer_background_output, strip_ansi, strip_ansi_with_clear_detect,
-        take_background_output, truncate_plain_output_for_height, visible_indices_for_viewport,
-        BlockData, BlockState, ViewportState,
+        record_external_input, resolve_submitted_command, scroll_delta_to_reveal,
+        selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
+        strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
+        visible_indices_for_viewport, BlockData, BlockState, ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -4796,6 +4839,26 @@ mod tests {
         assert_eq!(
             normalize_captured_command("printf pwd", "yj ~ ❯"),
             "printf pwd"
+        );
+    }
+
+    #[test]
+    fn submitted_command_falls_back_when_vte_echo_has_not_settled() {
+        assert_eq!(
+            resolve_submitted_command("", "yj ~/project ❯", "git status"),
+            "git status"
+        );
+    }
+
+    #[test]
+    fn submitted_command_prefers_the_rendered_line_editor_state() {
+        assert_eq!(
+            resolve_submitted_command("git diff --stat", "yj ~/project ❯", "git status"),
+            "git diff --stat"
+        );
+        assert_eq!(
+            resolve_submitted_command("yj ~/project ❯ cargo test", "yj ~/project ❯", "cargo"),
+            "cargo test"
         );
     }
 
