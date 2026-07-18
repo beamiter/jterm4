@@ -2,6 +2,12 @@
 
 jterm4 can offer a reviewable correction after a Block-mode command fails with an error that looks like a typo, an unknown executable, an unknown package, an invalid subcommand, or an invalid option.
 
+The feature can be toggled from the Shell Agent dashboard or Settings and is
+persisted as `command_correction_enabled`. It defaults to `true` when absent
+from older configuration files; `JTERM4_COMMAND_CORRECTION_ENABLED` can
+override it for one launch. Turning it off while a correction is being resolved
+also prevents the pending result from opening a dialog.
+
 ## Interaction
 
 A correction is never submitted automatically. The confirmation dialog presents the exact candidate command and keeps three distinct choices:

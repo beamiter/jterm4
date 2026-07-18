@@ -33,6 +33,8 @@ All notable user-visible and operational changes are recorded here.
   and shell-owned `Ctrl+P` passthrough.
 - Session snapshots and Block history now use owner-only Unix permissions and durable atomic replacement.
 - Block is now the default terminal backend. Starting a split from Block preserves the Block leaf and creates a managed VTE sibling instead of rejecting the action.
+- Repeated same-axis splits rebalance by pane-tree span, keeping three or more panes evenly sized instead of recursively squeezing newer siblings.
+- Directional pane focus now recognizes the complete focused Block/VTE subtree and retains the last active leaf across transient container focus, so all four focus shortcuts work from finished blocks and other pane descendants.
 - Runtime configuration updates propagate to Block leaves nested in pane trees.
 - Pane-to-tab moves preserve stable process/session identities, tab chrome, and remote reconnect ownership across repeated primary or remote pane moves.
 - Application config saves now validate syntax/semantics, serialize through an advisory lock, reject stale revisions, rotate two valid backups, and use private durable atomic replacement.
@@ -42,6 +44,7 @@ All notable user-visible and operational changes are recorded here.
 - Notebook output transport now applies bounded backpressure, and both cancellation
   and normal interpreter exit terminate the cell process group before joining pipes.
 - The AI panel now restores and persists its dragged width, has a themed empty/composer/status UI, routes focused copy/paste correctly, and uses Enter or Ctrl+Enter to send while Shift+Enter inserts a newline without stealing IME candidate confirmation.
+- The Shell Agent is now a target-aware dashboard with provider/shell context, turn progress, richer proposal/status surfaces, transcript clearing, and a persistent toggle for review-first typo-like command correction.
 - **New chat** now creates and selects a separate retained chat instead of clearing the previous conversation. Background replies remain bound to their originating chat, and a late reply cannot resurrect a deleted chat.
 - AI persistence schema v2 stores the current selection and up to 50 chat rows, automatically migrates v1 single-chat snapshots, retains at most 100 turns per chat, and compacts the oldest history with a visible `truncated` marker to keep the complete JSON collection within 8 MiB.
 - Failed or interrupted sends are recoverable as drafts, selected-Block requests preserve unrelated composer text, and window close flushes pending draft persistence before the final snapshot.

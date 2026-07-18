@@ -45,15 +45,26 @@ impl PaneNode {
     }
 
     pub(crate) fn focused_leaf(&self) -> Option<PaneLeaf> {
-        match self {
-            Self::Leaf(controller) if controller.terminal().has_focus() => Some(controller.clone()),
-            Self::Leaf(_) => None,
-            Self::Split { start, end } => start.focused_leaf().or_else(|| end.focused_leaf()),
+        let focus = self
+            .first_leaf()?
+            .root_widget()
+            .root()
+            .and_then(|root| root.focus());
+        if let Some(focus) = focus {
+            if let Some(leaf) = self.leaf_owning_widget(&focus) {
+                return Some(leaf);
+            }
         }
+
+        // Retain the exact live-terminal check for unusual embedding states
+        // where GTK has not exposed the root focus widget yet.
+        self.focused_live_terminal_leaf()
     }
 
     pub(crate) fn active_leaf(&self) -> Option<PaneLeaf> {
-        self.focused_leaf().or_else(|| self.first_leaf())
+        self.focused_leaf()
+            .or_else(|| self.last_focused_leaf())
+            .or_else(|| self.first_leaf())
     }
 
     pub(crate) fn active_terminal(&self) -> Option<Terminal> {
@@ -75,6 +86,33 @@ impl PaneNode {
                 end.collect_leaves(leaves);
             }
         }
+    }
+
+    fn leaf_owning_widget(&self, widget: &Widget) -> Option<PaneLeaf> {
+        match self {
+            Self::Leaf(controller) if controller.owns_widget(widget) => Some(controller.clone()),
+            Self::Leaf(_) => None,
+            Self::Split { start, end } => start
+                .leaf_owning_widget(widget)
+                .or_else(|| end.leaf_owning_widget(widget)),
+        }
+    }
+
+    fn focused_live_terminal_leaf(&self) -> Option<PaneLeaf> {
+        match self {
+            Self::Leaf(controller) if controller.terminal().has_focus() => Some(controller.clone()),
+            Self::Leaf(_) => None,
+            Self::Split { start, end } => start
+                .focused_live_terminal_leaf()
+                .or_else(|| end.focused_live_terminal_leaf()),
+        }
+    }
+
+    fn last_focused_leaf(&self) -> Option<PaneLeaf> {
+        self.leaves()
+            .into_iter()
+            .filter(|leaf| leaf.focus_serial() > 0)
+            .max_by_key(PaneLeaf::focus_serial)
     }
 
     fn first_leaf(&self) -> Option<PaneLeaf> {

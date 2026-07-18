@@ -37,6 +37,14 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_PROBE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RANKED_NAMES: usize = 12;
 
+fn correction_monitor_enabled(
+    ai_enabled: bool,
+    command_correction_enabled: bool,
+    agent_active: bool,
+) -> bool {
+    ai_enabled && command_correction_enabled && !agent_active
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CorrectionEvidence {
     AptIndex,
@@ -198,12 +206,18 @@ fn attach_term_view(
     let view_weak = Rc::downgrade(&view);
     let window_weak = window.downgrade();
     view.connect_block_finished(move |command, exit_code, output| {
-        if pending.get()
-            || !config.borrow().ai_enabled
-            || agent_dialog
-                .upgrade()
-                .is_some_and(|slot| slot.borrow().is_some())
-        {
+        let agent_active = agent_dialog
+            .upgrade()
+            .is_some_and(|slot| slot.borrow().is_some());
+        let monitor_enabled = {
+            let config = config.borrow();
+            correction_monitor_enabled(
+                config.ai_enabled,
+                config.command_correction_enabled,
+                agent_active,
+            )
+        };
+        if pending.get() || !monitor_enabled {
             return;
         }
 
@@ -279,6 +293,10 @@ fn request_correction(
         }
         match rx.borrow().try_recv() {
             Ok(Ok(Some(correction))) => {
+                if !config.borrow().command_correction_enabled {
+                    pending.set(false);
+                    return glib::ControlFlow::Break;
+                }
                 let Some(window) = window_weak.upgrade() else {
                     pending.set(false);
                     return glib::ControlFlow::Break;
@@ -1241,6 +1259,14 @@ fn sample_output(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correction_toggle_and_agent_state_gate_the_monitor() {
+        assert!(correction_monitor_enabled(true, true, false));
+        assert!(!correction_monitor_enabled(false, true, false));
+        assert!(!correction_monitor_enabled(true, false, false));
+        assert!(!correction_monitor_enabled(true, true, true));
+    }
 
     #[test]
     fn apt_package_typo_is_a_correction_candidate() {

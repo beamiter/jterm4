@@ -7,8 +7,10 @@
 //! model without introducing Relm4 or enabling unsafe Block splits prematurely.
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gtk4::glib::prelude::ObjectExt;
+use gtk4::prelude::*;
 use vte4::Terminal;
 
 use crate::block_view::TermView;
@@ -17,6 +19,8 @@ use crate::terminal::{focus_terminal, VteTerminalView};
 const PANE_LEAF_DATA_KEY: &str = "terminal-view-type";
 const PANE_SESSION_ID_DATA_KEY: &str = "terminal-session-id";
 const PANE_REMOTE_DATA_KEY: &str = "terminal-remote-pane";
+const PANE_FOCUS_SERIAL_DATA_KEY: &str = "terminal-pane-focus-serial";
+static NEXT_PANE_FOCUS_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(crate) enum PaneLeaf {
@@ -46,9 +50,39 @@ impl PaneLeaf {
 
     /// Focus the actual live surface rather than the first VTE found in the tree.
     pub(crate) fn grab_focus(&self) {
+        self.mark_active();
         match self {
             Self::Block(view) => view.grab_focus(),
             Self::Vte(view) => focus_terminal(view.vte()),
+        }
+    }
+
+    /// Whether `widget` is this leaf root or one of its descendants.
+    ///
+    /// Block panes contain focusable finished-block VTEs and other controls in
+    /// addition to their live input VTE. Directional pane navigation must treat
+    /// focus on any of those descendants as focus belonging to the Block pane.
+    pub(crate) fn owns_widget(&self, widget: &gtk4::Widget) -> bool {
+        let root = self.root_widget();
+        *widget == root || widget.is_ancestor(&root)
+    }
+
+    pub(crate) fn focus_serial(&self) -> u64 {
+        let root = self.root_widget();
+        unsafe {
+            root.data::<std::cell::Cell<u64>>(PANE_FOCUS_SERIAL_DATA_KEY)
+                .map(|serial| serial.as_ref().get())
+                .unwrap_or(0)
+        }
+    }
+
+    fn mark_active(&self) {
+        let serial = NEXT_PANE_FOCUS_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = self.root_widget();
+        unsafe {
+            if let Some(stored) = root.data::<std::cell::Cell<u64>>(PANE_FOCUS_SERIAL_DATA_KEY) {
+                stored.as_ref().set(serial);
+            }
         }
     }
 
@@ -157,7 +191,27 @@ impl PaneLeaf {
     pub(crate) fn attach_to(&self, widget: &gtk4::Widget) {
         unsafe {
             widget.set_data::<Self>(PANE_LEAF_DATA_KEY, self.clone());
+            widget.set_data::<std::cell::Cell<u64>>(
+                PANE_FOCUS_SERIAL_DATA_KEY,
+                std::cell::Cell::new(0),
+            );
         }
+        let root = widget.downgrade();
+        self.terminal().connect_has_focus_notify(move |terminal| {
+            if terminal.has_focus() {
+                let Some(root) = root.upgrade() else {
+                    return;
+                };
+                let serial = NEXT_PANE_FOCUS_SERIAL.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    if let Some(stored) =
+                        root.data::<std::cell::Cell<u64>>(PANE_FOCUS_SERIAL_DATA_KEY)
+                    {
+                        stored.as_ref().set(serial);
+                    }
+                }
+            }
+        });
     }
 
     /// Recover a directly attached pane leaf from a GTK root widget.

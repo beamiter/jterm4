@@ -436,6 +436,10 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         toml::Value::Integer(config.agent_max_turns as i64),
     );
     table.insert(
+        "command_correction_enabled".into(),
+        toml::Value::Boolean(config.command_correction_enabled),
+    );
+    table.insert(
         "ai_provider".into(),
         toml::Value::String(config.ai_provider.clone()),
     );
@@ -883,6 +887,7 @@ mod tests {
         config.ai_enabled = true;
         config.agent_enabled = true;
         config.agent_max_turns = 17;
+        config.command_correction_enabled = false;
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
         config.ai_api_key_file = Some("~/.config/jterm4/ai.key".into());
@@ -900,6 +905,12 @@ mod tests {
                 .get("agent_max_turns")
                 .and_then(toml::Value::as_integer),
             Some(17)
+        );
+        assert_eq!(
+            table
+                .get("command_correction_enabled")
+                .and_then(toml::Value::as_bool),
+            Some(false)
         );
         assert_eq!(
             table.get("ai_base_url").and_then(toml::Value::as_str),

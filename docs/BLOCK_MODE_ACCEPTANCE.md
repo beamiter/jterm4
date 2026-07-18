@@ -72,6 +72,8 @@ read -r value; printf 'value=%s\n' "$value"
 - 全选不会冻结 UI，active edge 始终唯一。
 - 清空后没有残留空白高度、旧滚动范围或不可见块。
 - 清空后继续执行十条命令，所有新块都能显示、复制、过滤和回填。
+- 在同一方向连续创建 3、4 个 split，所有 pane 应按 1/3、1/4 近似等分，不得保留一个 1/2 主 pane 后把其余 pane 递归挤小；横向、纵向和 2x2 混合树都要检查，divider 仍可手动调整。
+- 在 2x2 split 中分别从 live prompt、finished block 文本和 pane 内滚动控件按 `Ctrl+Alt+方向键`；四个方向都应聚焦最近的对应 pane，外边缘不循环，容器短暂接管焦点时从最后活动 pane 继续。
 
 ## 设置面板
 
@@ -86,6 +88,7 @@ read -r value; printf 'value=%s\n' "$value"
 - 在文件树双击 `.jtnb.md`，逐 cell 与 Run All 均能运行；Stop/Stop All/关闭对话框会终止完整 cell process group。
 - `?` 生成的命令必须先展示供审阅，不能自行向 PTY 写入换行。
 - 在 active Block pane 按 `Ctrl+Alt+G` 打开 Shell Agent；VTE pane、safe mode、`ai_enabled = false` 或 `agent_enabled = false` 都必须拒绝打开。
+- Agent dashboard 应显示固定 cwd、provider/model、shell、review 状态与回合进度；切换 **AI command correction** 后 `command_correction_enabled` 持久化，关闭时新的 typo-like 失败和仍在途的纠正都不得弹框。
 - 要求 Agent 完成一个两步任务：每个严格 JSON proposal 都显示为可编辑卡片；修改后 **Approve & Run** 执行修改值，Reject 会把拒绝写入上下文并请求替代方案。
 - 对 `rm -rf /`、`mkfs` 或 download-pipe-to-shell 类型 proposal 显示醒目危险提示，但仍不得自动执行。
 - prompt 正在运行命令或已有未提交输入时点击批准，必须拒绝且不改动输入；清空并空闲后才允许再次批准。

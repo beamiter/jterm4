@@ -8,6 +8,119 @@ use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
 
+/// Number of equal-size pane slots a subtree occupies along one axis.
+///
+/// A split on the other axis stacks its children instead of consuming more
+/// space on this axis, so only the widest/tallest child determines its span.
+/// This lets a mixed 2x2 tree balance like a grid while repeated same-axis
+/// splits receive one equal slot per leaf instead of 1/2, 1/4, 1/8… widths.
+fn pane_axis_span(widget: &gtk4::Widget, axis: Orientation) -> u32 {
+    let Ok(paned) = widget.clone().downcast::<Paned>() else {
+        return 1;
+    };
+    let Some(start) = paned.start_child() else {
+        return 1;
+    };
+    let Some(end) = paned.end_child() else {
+        return 1;
+    };
+    let start_span = pane_axis_span(&start, axis);
+    let end_span = pane_axis_span(&end, axis);
+    if paned.orientation() == axis {
+        start_span.saturating_add(end_span)
+    } else {
+        start_span.max(end_span)
+    }
+}
+
+fn balanced_split_position(extent: i32, start_span: u32, end_span: u32) -> Option<i32> {
+    if extent <= 1 || start_span == 0 || end_span == 0 {
+        return None;
+    }
+    let total_span = u64::from(start_span) + u64::from(end_span);
+    let position = i64::from(extent) * i64::from(start_span) / total_span as i64;
+    Some(position.clamp(1, i64::from(extent - 1)) as i32)
+}
+
+fn nearest_directional_index(
+    centers: &[(f32, f32)],
+    focused: usize,
+    direction: Direction,
+) -> Option<usize> {
+    let (focused_x, focused_y) = *centers.get(focused)?;
+    centers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &(x, y))| {
+            if index == focused {
+                return None;
+            }
+            let dx = x - focused_x;
+            let dy = y - focused_y;
+            let in_direction = match direction {
+                Direction::Left => dx < -1.0,
+                Direction::Right => dx > 1.0,
+                Direction::Up => dy < -1.0,
+                Direction::Down => dy > 1.0,
+            };
+            if !in_direction {
+                return None;
+            }
+            let distance = match direction {
+                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
+                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
+            };
+            Some((index, distance))
+        })
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+}
+
+/// Rebalance every split according to the number of pane slots below it.
+///
+/// GTK Paned defaults each newly nested split to 50/50. Repeatedly splitting
+/// the newest pane therefore leaves the first pane at half the window and
+/// squeezes every later sibling into the remaining half. Recomputing the
+/// proportions from subtree spans gives three same-axis panes 1/3 each, four
+/// panes 1/4 each, and sensible dimensions for mixed-axis grids.
+fn rebalance_pane_tree(widget: &gtk4::Widget) {
+    let Ok(paned) = widget.clone().downcast::<Paned>() else {
+        return;
+    };
+    let Some(start) = paned.start_child() else {
+        return;
+    };
+    let Some(end) = paned.end_child() else {
+        return;
+    };
+    let axis = paned.orientation();
+    let extent = if axis == Orientation::Horizontal {
+        paned.width()
+    } else {
+        paned.height()
+    };
+    let start_span = pane_axis_span(&start, axis);
+    let end_span = pane_axis_span(&end, axis);
+    if let Some(position) = balanced_split_position(extent, start_span, end_span) {
+        paned.set_position(position);
+    }
+    rebalance_pane_tree(&start);
+    rebalance_pane_tree(&end);
+}
+
+fn schedule_pane_rebalance(page: gtk4::Widget) {
+    // The first idle runs after the new Paned enters the widget tree. A second
+    // pass catches nested panes whose allocation changes because an ancestor
+    // divider moved during the first pass.
+    gtk4::glib::idle_add_local_once(move || {
+        rebalance_pane_tree(&page);
+        let page = page.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            rebalance_pane_tree(&page);
+        });
+    });
+}
+
 impl UiState {
     /// Create a managed conventional-VTE pane leaf.
     ///
@@ -98,6 +211,19 @@ impl UiState {
         let paned = Paned::new(orientation);
         paned.set_hexpand(true);
         paned.set_vexpand(true);
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(true);
+        paned.set_shrink_start_child(true);
+        paned.set_shrink_end_child(true);
+
+        let current_extent = if orientation == Orientation::Horizontal {
+            current_widget.width()
+        } else {
+            current_widget.height()
+        };
+        if let Some(position) = balanced_split_position(current_extent, 1, 1) {
+            paned.set_position(position);
+        }
 
         if let Some(ref parent) = parent {
             if let Ok(parent_paned) = parent.clone().downcast::<Paned>() {
@@ -130,6 +256,13 @@ impl UiState {
             }
         }
 
+        if let Some(page) = self
+            .notebook
+            .current_page()
+            .and_then(|page| self.notebook.nth_page(Some(page)))
+        {
+            schedule_pane_rebalance(page);
+        }
         new_leaf.grab_focus();
     }
 
@@ -200,49 +333,102 @@ impl UiState {
         if leaves.len() <= 1 {
             return;
         }
-        let Some(focused) = node.focused_leaf() else {
+        // Focus can temporarily live on a finished Block VTE, a scrollbar, or
+        // another descendant rather than the leaf's live input VTE. active_leaf
+        // resolves the full focus subtree and falls back to the last active pane
+        // instead of silently dropping the shortcut.
+        let Some(focused) = node.active_leaf() else {
             return;
         };
         let focused_root = focused.root_widget();
-        let Some(bounds) = focused_root.compute_bounds(&page_widget) else {
-            return;
-        };
-        let focused_cx = bounds.x() + bounds.width() / 2.0;
-        let focused_cy = bounds.y() + bounds.height() / 2.0;
 
-        let mut best: Option<(f32, PaneLeaf)> = None;
+        let mut positioned = Vec::with_capacity(leaves.len());
         for leaf in leaves {
             let root = leaf.root_widget();
-            if root == focused_root {
-                continue;
-            }
             let Some(bounds) = root.compute_bounds(&page_widget) else {
                 continue;
             };
             let cx = bounds.x() + bounds.width() / 2.0;
             let cy = bounds.y() + bounds.height() / 2.0;
-            let dx = cx - focused_cx;
-            let dy = cy - focused_cy;
-            let in_direction = match direction {
-                Direction::Left => dx < -1.0,
-                Direction::Right => dx > 1.0,
-                Direction::Up => dy < -1.0,
-                Direction::Down => dy > 1.0,
-            };
-            if !in_direction {
-                continue;
-            }
-            let distance = match direction {
-                Direction::Left | Direction::Right => dx.abs() + dy.abs() * 0.1,
-                Direction::Up | Direction::Down => dy.abs() + dx.abs() * 0.1,
-            };
-            if best.as_ref().is_none_or(|(current, _)| distance < *current) {
-                best = Some((distance, leaf));
-            }
+            positioned.push((leaf, (cx, cy)));
         }
 
-        if let Some((_, leaf)) = best {
-            leaf.grab_focus();
-        }
+        let Some(focused_index) = positioned
+            .iter()
+            .position(|(leaf, _)| leaf.root_widget() == focused_root)
+        else {
+            return;
+        };
+        let centers = positioned
+            .iter()
+            .map(|(_, center)| *center)
+            .collect::<Vec<_>>();
+        let Some(target) = nearest_directional_index(&centers, focused_index, direction) else {
+            return;
+        };
+        positioned[target].0.grab_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{balanced_split_position, nearest_directional_index};
+    use crate::keybindings::Direction;
+
+    #[test]
+    fn balanced_position_allocates_equal_same_axis_slots() {
+        assert_eq!(balanced_split_position(1_200, 1, 1), Some(600));
+        assert_eq!(balanced_split_position(1_200, 1, 2), Some(400));
+        assert_eq!(balanced_split_position(1_200, 2, 1), Some(800));
+        assert_eq!(balanced_split_position(1_200, 3, 1), Some(900));
+    }
+
+    #[test]
+    fn balanced_position_rejects_unallocated_or_empty_splits() {
+        assert_eq!(balanced_split_position(0, 1, 1), None);
+        assert_eq!(balanced_split_position(100, 0, 1), None);
+        assert_eq!(balanced_split_position(100, 1, 0), None);
+    }
+
+    #[test]
+    fn directional_focus_selects_the_nearest_pane_on_each_axis() {
+        // 2x2 pane grid in visual order.
+        let centers = [(25.0, 25.0), (75.0, 25.0), (25.0, 75.0), (75.0, 75.0)];
+
+        assert_eq!(
+            nearest_directional_index(&centers, 3, Direction::Left),
+            Some(2)
+        );
+        assert_eq!(
+            nearest_directional_index(&centers, 2, Direction::Right),
+            Some(3)
+        );
+        assert_eq!(
+            nearest_directional_index(&centers, 3, Direction::Up),
+            Some(1)
+        );
+        assert_eq!(
+            nearest_directional_index(&centers, 1, Direction::Down),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn directional_focus_does_not_wrap_at_an_outer_edge() {
+        let centers = [(25.0, 25.0), (75.0, 25.0)];
+
+        assert_eq!(
+            nearest_directional_index(&centers, 0, Direction::Left),
+            None
+        );
+        assert_eq!(
+            nearest_directional_index(&centers, 1, Direction::Right),
+            None
+        );
+        assert_eq!(nearest_directional_index(&centers, 0, Direction::Up), None);
+        assert_eq!(
+            nearest_directional_index(&centers, 0, Direction::Down),
+            None
+        );
     }
 }

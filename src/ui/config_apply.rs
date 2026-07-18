@@ -215,7 +215,67 @@ impl UiState {
              }}
              .ai-input-placeholder {{ color: rgba({fr},{fg_g},{fb},0.44); padding: 8px; }}
              .ai-input-hint {{ color: rgba({fr},{fg_g},{fb},0.52); font-size: 0.82em; }}
-             .ai-send-button {{ min-width: 72px; min-height: 32px; }}"
+             .ai-send-button {{ min-width: 72px; min-height: 32px; }}
+             .agent-dashboard {{
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+             }}
+             .agent-overview, .agent-setting-card, .agent-status-card,
+             .agent-composer, .agent-transcript-card {{
+                 background-color: rgba({fr},{fg_g},{fb},0.055);
+                 border: 1px solid rgba({fr},{fg_g},{fb},0.14);
+                 border-radius: 12px;
+             }}
+             .agent-overview {{ padding: 12px; }}
+             .agent-icon {{
+                 color: @accent_color;
+                 background-color: alpha(@accent_bg_color, 0.18);
+                 border-radius: 10px;
+                 padding: 8px;
+             }}
+             .agent-chip {{
+                 color: rgba({fr},{fg_g},{fb},0.78);
+                 background-color: rgba({fr},{fg_g},{fb},0.08);
+                 border-radius: 999px;
+                 padding: 4px 9px;
+                 font-size: 0.82em;
+             }}
+             .agent-safety-chip {{
+                 color: @success_color;
+                 background-color: alpha(@success_bg_color, 0.14);
+             }}
+             .agent-setting-card {{ padding: 10px 12px; }}
+             .agent-section-label {{
+                 color: rgba({fr},{fg_g},{fb},0.58);
+                 font-size: 0.78em;
+                 font-weight: 700;
+                 padding: 9px 11px 7px 11px;
+                 border-bottom: 1px solid rgba({fr},{fg_g},{fb},0.10);
+             }}
+             .agent-transcript, .agent-transcript text {{
+                 background-color: transparent;
+                 color: rgb({fr},{fg_g},{fb});
+             }}
+             .agent-status-card {{ padding: 9px 11px; }}
+             .agent-status {{ color: rgba({fr},{fg_g},{fb},0.78); }}
+             .agent-status-card progressbar trough {{
+                 min-height: 4px;
+                 background-color: rgba({fr},{fg_g},{fb},0.10);
+                 border-radius: 999px;
+             }}
+             .agent-status-card progressbar progress {{
+                 min-height: 4px;
+                 background-color: @accent_bg_color;
+                 border-radius: 999px;
+             }}
+             .agent-proposal-card {{
+                 padding: 12px;
+                 border: 1px solid alpha(@warning_color, 0.48);
+             }}
+             .agent-composer {{ padding: 9px; }}
+             .agent-input {{ min-height: 34px; }}
+             .agent-send {{ min-width: 72px; min-height: 34px; }}
+             .agent-input-hint {{ font-size: 0.82em; }}"
         );
         self.scrollbar_css.load_from_string(&css);
     }

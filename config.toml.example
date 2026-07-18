@@ -80,6 +80,7 @@ show_repo_strip = true
 ai_enabled = true
 agent_enabled = true          # Ctrl+Alt+G；仅绑定当前 Block pane
 agent_max_turns = 20          # 1 .. 100；每条命令可编辑且始终需要单独批准
+command_correction_enabled = true # typo-like Block 命令失败后提供可审阅的 AI/本地纠正
 ai_provider = "anthropic"
 ai_base_url = "https://api.anthropic.com"
 

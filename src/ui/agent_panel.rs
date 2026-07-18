@@ -6,7 +6,8 @@ use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk4::{
-    Box as GBox, Button, Entry, Label, Orientation, ScrolledWindow, TextBuffer, TextView, WrapMode,
+    Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, ScrolledWindow, Spinner,
+    Switch, TextBuffer, TextView, WrapMode,
 };
 use libadwaita as adw;
 
@@ -43,6 +44,9 @@ struct AgentRuntime {
     send: Button,
     cancel: Button,
     status: Label,
+    status_spinner: Spinner,
+    turn_progress: ProgressBar,
+    turn_label: Label,
     proposal_box: GBox,
     pending_command: RefCell<Option<(ProposalId, String)>>,
     busy: Cell<bool>,
@@ -72,6 +76,21 @@ impl AgentRuntime {
         self.proposal_box.set_visible(false);
     }
 
+    fn set_status(&self, message: &str, active: bool) {
+        self.status.set_text(message);
+        if active {
+            self.status_spinner.start();
+        } else {
+            self.status_spinner.stop();
+        }
+        let session = self.session.borrow();
+        let used = session.turns_used();
+        let max = session.max_turns();
+        self.turn_label.set_text(&format!("{used} / {max} turns"));
+        self.turn_progress
+            .set_fraction(f64::from(used) / f64::from(max.max(1)));
+    }
+
     fn set_ready(&self) {
         let ready = self.alive.get()
             && !self.busy.get()
@@ -79,11 +98,7 @@ impl AgentRuntime {
         self.input.set_sensitive(ready);
         self.send.set_sensitive(ready);
         if ready {
-            self.status.set_text(&format!(
-                "Ready · turn {}/{}",
-                self.session.borrow().turns_used(),
-                self.session.borrow().max_turns()
-            ));
+            self.set_status("Ready for the next instruction", false);
             self.input.grab_focus();
         }
     }
@@ -96,8 +111,9 @@ impl AgentRuntime {
         if text.is_empty() {
             return;
         }
-        if let Err(error) = runtime.session.borrow_mut().submit_user(text.clone()) {
-            runtime.status.set_text(&error.to_string());
+        let submit_result = runtime.session.borrow_mut().submit_user(text.clone());
+        if let Err(error) = submit_result {
+            runtime.set_status(&error.to_string(), false);
             return;
         }
         runtime.input.set_text("");
@@ -120,7 +136,7 @@ impl AgentRuntime {
                 let message = error.to_string();
                 let _ = runtime.session.borrow_mut().model_failed(&message);
                 runtime.append("Error", &message);
-                runtime.status.set_text(&message);
+                runtime.set_status(&message, false);
                 runtime.set_ready();
                 return;
             }
@@ -137,12 +153,19 @@ impl AgentRuntime {
         runtime.busy.set(true);
         runtime.input.set_sensitive(false);
         runtime.send.set_sensitive(false);
-        runtime.status.set_text(&format!(
-            "Thinking… ({}, turn {}/{})",
-            client.display_name(),
-            runtime.session.borrow().turns_used() + 1,
-            runtime.session.borrow().max_turns()
-        ));
+        let (next_turn, max_turns) = {
+            let session = runtime.session.borrow();
+            (session.turns_used() + 1, session.max_turns())
+        };
+        runtime.set_status(
+            &format!(
+                "Thinking with {} · turn {}/{}",
+                client.display_name(),
+                next_turn,
+                max_turns
+            ),
+            true,
+        );
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -182,14 +205,14 @@ impl AgentRuntime {
                         }
                         Ok(ModelOutcome::Completed(message)) => {
                             runtime.append("Agent", &message);
-                            runtime.status.set_text("Completed");
+                            runtime.set_status("Task completed", false);
                             runtime.input.set_sensitive(false);
                             runtime.send.set_sensitive(false);
                         }
                         Err(error) => {
                             let message = error.to_string();
                             runtime.append("Protocol error", &message);
-                            runtime.status.set_text(&message);
+                            runtime.set_status(&message, false);
                             runtime.set_ready();
                         }
                     }
@@ -200,7 +223,7 @@ impl AgentRuntime {
                     let message = error.to_string();
                     let _ = runtime.session.borrow_mut().model_failed(&message);
                     runtime.append("Error", &message);
-                    runtime.status.set_text(&message);
+                    runtime.set_status(&message, false);
                     runtime.set_ready();
                     gtk4::glib::ControlFlow::Break
                 }
@@ -210,7 +233,7 @@ impl AgentRuntime {
                     let message = "Agent worker disconnected.";
                     let _ = runtime.session.borrow_mut().model_failed(message);
                     runtime.append("Error", message);
-                    runtime.status.set_text(message);
+                    runtime.set_status(message, false);
                     runtime.set_ready();
                     gtk4::glib::ControlFlow::Break
                 }
@@ -259,9 +282,10 @@ impl AgentRuntime {
         runtime.proposal_box.append(&warning);
         runtime.proposal_box.append(&command_entry);
         runtime.proposal_box.append(&buttons);
-        runtime
-            .status
-            .set_text(&format!("Proposal #{} requires your approval", id.get()));
+        runtime.set_status(
+            &format!("Proposal #{} is waiting for review", id.get()),
+            false,
+        );
 
         let weak = Rc::downgrade(runtime);
         let entry_for_approve = command_entry.clone();
@@ -282,20 +306,21 @@ impl AgentRuntime {
         if !runtime.target.can_accept_agent_command() {
             let message =
                 "The target prompt is busy or already contains input. Clear it and approve again.";
-            runtime.status.set_text(message);
+            runtime.set_status(message, false);
             runtime.append("Safety check", message);
             return;
         }
-        let approved = match runtime.session.borrow_mut().edit_and_approve(id, command) {
+        let approval_result = runtime.session.borrow_mut().edit_and_approve(id, command);
+        let approved = match approval_result {
             Ok(approved) => approved,
             Err(error) => {
-                runtime.status.set_text(&error.to_string());
+                runtime.set_status(&error.to_string(), false);
                 return;
             }
         };
         runtime.clear_proposal();
         runtime.append("Approved", &format!("$ {}", approved.command));
-        runtime.status.set_text("Running approved command…");
+        runtime.set_status("Running approved command…", true);
         *runtime.pending_command.borrow_mut() =
             Some((approved.proposal_id, approved.command.clone()));
         runtime.target.grab_focus();
@@ -310,7 +335,7 @@ impl AgentRuntime {
                 runtime.append("You", "Rejected proposal; ask for another approach.");
                 Self::request_model(runtime);
             }
-            Err(error) => runtime.status.set_text(&error.to_string()),
+            Err(error) => runtime.set_status(&error.to_string(), false),
         }
     }
 
@@ -322,8 +347,9 @@ impl AgentRuntime {
         let Some(id) = id else {
             return;
         };
-        if let Err(error) = runtime.session.borrow_mut().observe(id, exit_code, &output) {
-            runtime.status.set_text(&error.to_string());
+        let observation_result = runtime.session.borrow_mut().observe(id, exit_code, &output);
+        if let Err(error) = observation_result {
+            runtime.set_status(&error.to_string(), false);
             return;
         }
         let output = if output.trim().is_empty() {
@@ -346,7 +372,7 @@ impl AgentRuntime {
         self.input.set_sensitive(false);
         self.send.set_sensitive(false);
         self.cancel.set_sensitive(false);
-        self.status.set_text("Agent cancelled");
+        self.set_status("Agent cancelled", false);
     }
 }
 
@@ -391,25 +417,106 @@ impl UiState {
             return;
         }
         let max_turns = config.agent_max_turns;
+        let correction_enabled = config.command_correction_enabled;
+        let provider = config.ai_provider.clone();
+        let model = config.ai_model.clone();
         drop(config);
         let Some(target) = self.current_term_view() else {
             self.agent_toggle.set_active(false);
             self.show_ai_error("Agent mode requires an active Block pane.");
             return;
         };
+        let cwd = target.cwd();
+        let cwd = if cwd.is_empty() { ".".to_string() } else { cwd };
+        let shell = self
+            .shell_argv
+            .borrow()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "sh".to_string());
 
         let dialog = adw::Dialog::builder()
             .title("Shell Agent")
-            .content_width(720)
-            .content_height(640)
+            .content_width(820)
+            .content_height(720)
             .build();
         let header = adw::HeaderBar::new();
+        let clear = Button::from_icon_name("edit-clear-all-symbolic");
+        clear.set_tooltip_text(Some("Clear the visible activity transcript"));
+        clear.add_css_class("flat");
+        header.pack_start(&clear);
         let cancel = Button::with_label("Cancel Agent");
         cancel.add_css_class("destructive-action");
         header.pack_end(&cancel);
 
+        let overview = GBox::new(Orientation::Vertical, 8);
+        overview.add_css_class("agent-overview");
+        let identity_row = GBox::new(Orientation::Horizontal, 10);
+        let agent_icon = Image::from_icon_name("system-run-symbolic");
+        agent_icon.set_pixel_size(32);
+        agent_icon.add_css_class("agent-icon");
+        let identity_copy = GBox::new(Orientation::Vertical, 2);
+        identity_copy.set_hexpand(true);
+        let title = Label::new(Some("Approval-gated shell assistant"));
+        title.set_xalign(0.0);
+        title.add_css_class("title-3");
+        let target_label = Label::new(Some(&format!("Bound to Block pane · {cwd}")));
+        target_label.set_xalign(0.0);
+        target_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        target_label.set_tooltip_text(Some(&cwd));
+        target_label.add_css_class("dim-label");
+        identity_copy.append(&title);
+        identity_copy.append(&target_label);
+        identity_row.append(&agent_icon);
+        identity_row.append(&identity_copy);
+        overview.append(&identity_row);
+
+        let chips = GBox::new(Orientation::Horizontal, 6);
+        let provider_chip = Label::new(Some(&format!("{provider} · {model}")));
+        provider_chip.set_hexpand(true);
+        provider_chip.set_max_width_chars(44);
+        provider_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        provider_chip.set_tooltip_text(Some(&format!("{provider} · {model}")));
+        provider_chip.add_css_class("agent-chip");
+        let shell_chip = Label::new(Some(&format!("shell: {shell}")));
+        shell_chip.set_max_width_chars(26);
+        shell_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        shell_chip.set_tooltip_text(Some(&shell));
+        shell_chip.add_css_class("agent-chip");
+        let safety_chip = Label::new(Some("Review required"));
+        safety_chip.add_css_class("agent-chip");
+        safety_chip.add_css_class("agent-safety-chip");
+        chips.append(&provider_chip);
+        chips.append(&shell_chip);
+        chips.append(&safety_chip);
+        overview.append(&chips);
+
+        let correction_row = GBox::new(Orientation::Horizontal, 12);
+        correction_row.add_css_class("agent-setting-card");
+        let correction_copy = GBox::new(Orientation::Vertical, 2);
+        correction_copy.set_hexpand(true);
+        let correction_title = Label::new(Some("AI command correction"));
+        correction_title.set_xalign(0.0);
+        correction_title.add_css_class("heading");
+        let correction_hint = Label::new(Some(
+            "After typo-like Block failures, offer an editable correction; never run it automatically.",
+        ));
+        correction_hint.set_xalign(0.0);
+        correction_hint.set_wrap(true);
+        correction_hint.add_css_class("dim-label");
+        correction_copy.append(&correction_title);
+        correction_copy.append(&correction_hint);
+        let correction_switch = Switch::builder()
+            .active(correction_enabled)
+            .valign(gtk4::Align::Center)
+            .build();
+        correction_switch.set_tooltip_text(Some("Enable review-first command correction"));
+        correction_row.append(&correction_copy);
+        correction_row.append(&correction_switch);
+
         let transcript = TextBuffer::new(None);
         let transcript_view = TextView::with_buffer(&transcript);
+        transcript_view.add_css_class("agent-transcript");
         transcript_view.set_editable(false);
         transcript_view.set_cursor_visible(false);
         transcript_view.set_wrap_mode(WrapMode::WordChar);
@@ -421,40 +528,76 @@ impl UiState {
         let transcript_scroll = ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
+            .min_content_height(220)
             .child(&transcript_view)
             .build();
+        let transcript_card = GBox::new(Orientation::Vertical, 0);
+        transcript_card.add_css_class("agent-transcript-card");
+        let activity_label = Label::new(Some("ACTIVITY"));
+        activity_label.set_xalign(0.0);
+        activity_label.add_css_class("agent-section-label");
+        transcript_card.append(&activity_label);
+        transcript_card.append(&transcript_scroll);
 
-        let status = Label::new(Some("Ready"));
+        let status = Label::new(Some("Ready for the next instruction"));
         status.set_xalign(0.0);
         status.set_wrap(true);
-        status.add_css_class("dim-label");
-        let proposal_box = GBox::new(Orientation::Vertical, 6);
+        status.set_hexpand(true);
+        status.add_css_class("agent-status");
+        let status_spinner = Spinner::new();
+        status_spinner.set_spinning(false);
+        let turn_label = Label::new(Some(&format!("0 / {max_turns} turns")));
+        turn_label.add_css_class("dim-label");
+        let turn_progress = ProgressBar::new();
+        turn_progress.set_hexpand(true);
+        turn_progress.set_fraction(0.0);
+        let status_top = GBox::new(Orientation::Horizontal, 8);
+        status_top.append(&status_spinner);
+        status_top.append(&status);
+        status_top.append(&turn_label);
+        let status_card = GBox::new(Orientation::Vertical, 6);
+        status_card.add_css_class("agent-status-card");
+        status_card.append(&status_top);
+        status_card.append(&turn_progress);
+
+        let proposal_box = GBox::new(Orientation::Vertical, 8);
         proposal_box.add_css_class("card");
-        proposal_box.set_margin_start(8);
-        proposal_box.set_margin_end(8);
-        proposal_box.set_margin_top(4);
-        proposal_box.set_margin_bottom(4);
+        proposal_box.add_css_class("agent-proposal-card");
         proposal_box.set_visible(false);
 
         let input = Entry::new();
         input.set_hexpand(true);
-        input.set_placeholder_text(Some(
-            "Describe the task; each command will require approval",
-        ));
+        input.set_placeholder_text(Some("Describe a task for this pane…"));
+        input.add_css_class("agent-input");
         let send = Button::with_label("Send");
         send.add_css_class("suggested-action");
+        send.add_css_class("agent-send");
         let input_row = GBox::new(Orientation::Horizontal, 6);
         input_row.append(&input);
         input_row.append(&send);
+        let input_hint = Label::new(Some(
+            "Enter sends · every proposed command stays editable and requires approval",
+        ));
+        input_hint.set_xalign(0.0);
+        input_hint.add_css_class("dim-label");
+        input_hint.add_css_class("agent-input-hint");
+        let composer = GBox::new(Orientation::Vertical, 6);
+        composer.add_css_class("agent-composer");
+        composer.append(&input_row);
+        composer.append(&input_hint);
 
-        let body = GBox::new(Orientation::Vertical, 6);
-        body.set_margin_start(8);
-        body.set_margin_end(8);
-        body.set_margin_bottom(8);
-        body.append(&transcript_scroll);
+        let body = GBox::new(Orientation::Vertical, 10);
+        body.add_css_class("agent-dashboard");
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        body.set_margin_top(10);
+        body.set_margin_bottom(12);
+        body.append(&overview);
+        body.append(&correction_row);
+        body.append(&transcript_card);
         body.append(&proposal_box);
-        body.append(&status);
-        body.append(&input_row);
+        body.append(&status_card);
+        body.append(&composer);
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&body));
@@ -464,18 +607,16 @@ impl UiState {
             session: RefCell::new(AgentSession::new(max_turns)),
             target: target.clone(),
             config: self.config.clone(),
-            shell: self
-                .shell_argv
-                .borrow()
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "sh".to_string()),
+            shell,
             transcript,
             transcript_view,
             input: input.clone(),
             send: send.clone(),
             cancel: cancel.clone(),
             status,
+            status_spinner,
+            turn_progress,
+            turn_label,
             proposal_box,
             pending_command: RefCell::new(None),
             busy: Cell::new(false),
@@ -487,6 +628,24 @@ impl UiState {
         );
         runtime.set_ready();
 
+        let ui_for_correction = self.clone();
+        correction_switch.connect_active_notify(move |toggle| {
+            ui_for_correction
+                .config
+                .borrow_mut()
+                .command_correction_enabled = toggle.is_active();
+            ui_for_correction.persist_config();
+        });
+        let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
+        clear.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.transcript.set_text("");
+                runtime.append(
+                    "Agent",
+                    "Activity view cleared. The current session context is still retained.",
+                );
+            }
+        });
         let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
         target.connect_block_finished(move |command, exit_code, output| {
             if let Some(runtime) = weak.upgrade() {
@@ -497,9 +656,7 @@ impl UiState {
         target.connect_exited(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 runtime.cancel();
-                runtime
-                    .status
-                    .set_text("Target pane exited; Agent cancelled");
+                runtime.set_status("Target pane exited; Agent cancelled", false);
             }
         });
         let weak = Rc::downgrade(&runtime);

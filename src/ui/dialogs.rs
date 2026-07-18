@@ -1275,6 +1275,16 @@ impl UiState {
         agent_enabled_row.set_sensitive(!safe_mode && config.ai_enabled);
         ai_group.add(&agent_enabled_row);
 
+        let correction_enabled_row = adw::SwitchRow::builder()
+            .title("Correct Mistyped Block Commands")
+            .subtitle(
+                "Offer an editable correction after typo-like failures; never run automatically",
+            )
+            .active(config.command_correction_enabled)
+            .build();
+        correction_enabled_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&correction_enabled_row);
+
         let provider_model = gtk4::StringList::new(&["Anthropic", "OpenAI-compatible", "Ollama"]);
         let provider_row = adw::ComboRow::builder()
             .title("Provider")
@@ -1453,6 +1463,7 @@ impl UiState {
 
         let dependent_rows: Vec<gtk4::Widget> = vec![
             agent_enabled_row.clone().upcast(),
+            correction_enabled_row.clone().upcast(),
             provider_row.clone().upcast(),
             model_row.clone().upcast(),
             base_url_row.clone().upcast(),
@@ -1480,6 +1491,12 @@ impl UiState {
             ui.config.borrow_mut().agent_enabled = enabled;
             turns_for_agent.set_sensitive(enabled);
             ui.sync_agent_toggle();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        correction_enabled_row.connect_active_notify(move |row| {
+            ui.config.borrow_mut().command_correction_enabled = row.is_active();
             ui.persist_config();
         });
 

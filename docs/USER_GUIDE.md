@@ -249,7 +249,7 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 
 后台请求绑定其发起时的稳定 chat ID：切换到其他 chat 不会改变回复目的地，也可让不同 chat 的请求各自完成；如果原 chat 已 Delete，迟到回复会直接丢弃，不能重新创建或污染当前 chat。在途用户 turn、错误回合和命令生成审阅事件不会伪装成已完成回答恢复；待完成或失败的问题会回到可重试 draft，发送期间键入的下一条 draft 也会保留，Ask selected Block 不会清掉已有草稿，关窗会先刷新防抖中的最新内容。开启 `ai_redact_secrets` 时，持久化脱敏覆盖 active、non-active、archived chat，包括标题、turn、draft 和 Block context，而不只处理当前可见对话。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode` 不读取也不发布会话库，`--no-restore` 和显式新工作区仍不领取旧快照，其中 `--no-restore` 继续按既有语义建立新的可持久化工作区。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
 
-自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
+自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent dashboard 显示固定目标 cwd、provider/model、shell、安全状态、回合进度、activity transcript 和 proposal 审阅卡；左上角清空按钮只清空可见 activity，不会改写当前 Agent 上下文。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：
 
@@ -259,6 +259,8 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
 6. **Cancel Agent** 或关闭窗口会取消会话并作废待处理模型回复；`agent_max_turns` 达到上限后停止继续请求。已经由用户批准并启动的普通终端命令不会被取消按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
+
+dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `JTERM4_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
 
