@@ -1,0 +1,97 @@
+name: Resolve project license policy
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'agent/license-policy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out license branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Configure and update branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git merge --no-edit origin/master
+
+      - name: Install native validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream \
+            desktop-file-utils \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libpcre2-dev \
+            libvte-2.91-gtk4-dev \
+            pkg-config
+
+      - name: Apply license policy
+        run: python3 .github/scripts/apply_license_policy.py
+
+      - name: Verify Cargo metadata and license files
+        run: |
+          cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          metadata = json.loads(Path('/tmp/cargo-metadata.json').read_text())
+          package = next(item for item in metadata['packages'] if item['name'] == 'jterm4')
+          assert package['license'] == 'MIT OR Apache-2.0', package['license']
+          assert package['publish'] == [], package['publish']
+          for name in ('LICENSE-MIT', 'LICENSE-APACHE'):
+              path = Path(name)
+              assert path.is_file() and path.stat().st_size > 500, name
+          PY
+
+      - name: Validate metadata and formatting
+        run: |
+          cargo fmt --all -- --check
+          appstreamcli validate --no-net data/io.github.beamiter.jterm4.metainfo.xml
+          bash -n scripts/package-release.sh
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Check dependency licenses
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check licenses
+
+      - name: Verify release archive licensing
+        run: |
+          cargo build --release --all-features --locked
+          scripts/package-release.sh target/release/jterm4
+          archive="$(find target/dist -maxdepth 1 -name 'jterm4-*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-MIT$'
+          tar -tzf "$archive" | grep -E '/share/doc/jterm4/LICENSE-APACHE$'
+
+      - name: Remove one-shot machinery
+        run: |
+          rm .github/scripts/apply_license_policy.py
+          rm .github/workflows/apply-license-policy.yml
+          rm .github/workflows/resolve-license-policy.yml
+
+      - name: Commit verified policy
+        run: |
+          git add -A
+          git commit -m "chore: license jterm4 under MIT or Apache-2.0"
+          git push origin HEAD:${{ github.head_ref }}
