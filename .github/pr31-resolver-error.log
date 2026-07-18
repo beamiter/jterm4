@@ -1,0 +1,10 @@
+stage: apply-original-patch
+command: python3 /tmp/apply_block_mode_ux_final_polish_original.py
+returncode: 1
+--- stdout ---
+
+--- stderr ---
+src/block_view/mod.rs: expected one match, found 2: '                move_finished_block_selection(\n                    &finished,\n                    &s'
+
+--- git status ---
+
