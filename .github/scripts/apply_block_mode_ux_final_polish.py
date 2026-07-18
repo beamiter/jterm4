@@ -36,9 +36,9 @@ def require(stage: str, args: list[str]) -> subprocess.CompletedProcess[str]:
         f"command: {' '.join(args)}\n"
         f"returncode: {result.returncode}\n"
         "--- stdout ---\n"
-        f"{result.stdout}\n"
+        f"{result.stdout[-60000:]}\n"
         "--- stderr ---\n"
-        f"{result.stderr}\n"
+        f"{result.stderr[-60000:]}\n"
         "--- git status ---\n"
         f"{status.stdout}\n"
     )
@@ -108,4 +108,21 @@ require(
     ["git", "merge", "--no-edit", "-X", "ours", "origin/master"],
 )
 require("apply-original-patch", ["python3", str(ORIGINAL)])
+# Run the same gates inside the diagnostic wrapper. If a gate fails, its complete
+# tail is committed to the branch before the surrounding legacy workflow stops.
+require("format-after-patch", ["cargo", "fmt", "--all"])
+require("test-after-patch", ["cargo", "test", "--all-features", "--locked"])
+require(
+    "clippy-after-patch",
+    [
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ],
+)
 DIAGNOSTIC.unlink(missing_ok=True)
