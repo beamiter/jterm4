@@ -263,6 +263,13 @@ pub(crate) fn install_block_css(config: &Config) {
             padding: 0;
             box-shadow: none;
         }}
+        .block-active.block-fullscreen {{
+            border: none;
+            border-radius: 0;
+            margin: 0;
+            padding: 0;
+            box-shadow: none;
+        }}
         .block-prompt-chevron {{
             color: {accent};
             font-family: "{font_family}";
