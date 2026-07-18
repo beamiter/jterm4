@@ -658,16 +658,25 @@ fn scroll_history_to_edge(scroll: &ScrolledWindow, bottom: bool) {
     adj.set_value((adj.upper() - adj.page_size()).max(adj.lower()));
     let scroll = scroll.clone();
     let tries = Rc::new(Cell::new(0u8));
-    glib::idle_add_local(move || {
-        if tries.get() >= 12 {
-            return glib::ControlFlow::Break;
-        }
-        tries.set(tries.get() + 1);
+    let stable_turns = Rc::new(Cell::new(0u8));
+    let last_target = Rc::new(Cell::new(None::<f64>));
+    glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        tries.set(tries.get().saturating_add(1));
         let adj = scroll.vadjustment();
-        let before = adj.value();
         let target = (adj.upper() - adj.page_size()).max(adj.lower());
         adj.set_value(target);
-        if (adj.value() - before).abs() < 1.0 {
+
+        let target_is_stable = last_target
+            .get()
+            .is_some_and(|previous| (previous - target).abs() < 1.0);
+        last_target.set(Some(target));
+        if target_is_stable && (adj.value() - target).abs() < 1.0 {
+            stable_turns.set(stable_turns.get().saturating_add(1));
+        } else {
+            stable_turns.set(0);
+        }
+
+        if stable_turns.get() >= 2 || tries.get() >= 12 {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
@@ -859,9 +868,22 @@ fn install_finished_block_selection(
         let ctrl = state.contains(gtk4::gdk::ModifierType::CONTROL_MASK);
         let shift = state.contains(gtk4::gdk::ModifierType::SHIFT_MASK);
         let over_terminal_surface = y > header_for_click.height() as f64;
-        if !over_terminal_surface || shift {
+        let finished = finished_blocks_for_select.borrow();
+        if over_terminal_surface && !shift {
+            // A normal click/drag in a snapshot VTE means text interaction, not
+            // whole-card interaction. Clear stale keyboard/card selection so
+            // Ctrl+Shift+C copies the visibly selected text and Enter cannot
+            // unexpectedly recall an older command.
+            if selected_for_click.get().is_some() {
+                clear_finished_block_selection(
+                    &finished,
+                    &selected_ids_for_click,
+                    &selected_for_click,
+                    &anchor_for_click,
+                );
+            }
+        } else {
             active_for_click.borrow().grab_focus();
-            let finished = finished_blocks_for_select.borrow();
             if ctrl && shift {
                 toggle_finished_block_selection(
                     &finished,
@@ -1849,7 +1871,7 @@ impl ReaderCtx {
                                     &selection_anchor_id_rc,
                                 );
 
-                                if finished_blocks_for_cb.borrow().len() > max_blocks {
+                                while finished_blocks_for_cb.borrow().len() > max_blocks {
                                     let oldest = finished_blocks_for_cb.borrow_mut().remove(0);
                                     remove_finished_block_from_selection(
                                         &finished_blocks_for_cb.borrow(),
@@ -1872,7 +1894,7 @@ impl ReaderCtx {
                                     widget_pool_for_cb.borrow_mut().release(widget_to_release);
                                 }
 
-                                if block_data_for_cb.borrow().len() > max_blocks {
+                                while block_data_for_cb.borrow().len() > max_blocks {
                                     block_data_for_cb.borrow_mut().pop_front();
                                 }
 
@@ -3343,22 +3365,31 @@ impl TermView {
                 let scroll = scroll.clone();
                 let programmatic = programmatic.clone();
                 let tries = Rc::new(Cell::new(0u8));
-                glib::idle_add_local(move || {
-                    // Runs for a handful of frames (cap below), too fast for the
-                    // user to interrupt — so we don't watch user_scrolled here; the
-                    // value_changed geometry check settles the FAB state afterward.
-                    if tries.get() >= 12 {
-                        return glib::ControlFlow::Break;
-                    }
-                    tries.set(tries.get() + 1);
+                let stable_turns = Rc::new(Cell::new(0u8));
+                let last_target = Rc::new(Cell::new(None::<f64>));
+                glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                    // Run on successive frames so virtualized blocks have time to
+                    // remap and grow `upper`. Position stability alone is not
+                    // enough: the current target can be reached before the true
+                    // bottom geometry has appeared.
+                    tries.set(tries.get().saturating_add(1));
                     let adj = scroll.vadjustment();
-                    let before = adj.value();
                     let target = (adj.upper() - adj.page_size()).max(adj.lower());
                     programmatic.set(true);
                     adj.set_value(target);
                     programmatic.set(false);
-                    // Stable once another pass no longer advances the position.
-                    if (adj.value() - before).abs() < 1.0 {
+
+                    let target_is_stable = last_target
+                        .get()
+                        .is_some_and(|previous| (previous - target).abs() < 1.0);
+                    last_target.set(Some(target));
+                    if target_is_stable && (adj.value() - target).abs() < 1.0 {
+                        stable_turns.set(stable_turns.get().saturating_add(1));
+                    } else {
+                        stable_turns.set(0);
+                    }
+
+                    if stable_turns.get() >= 2 || tries.get() >= 12 {
                         glib::ControlFlow::Break
                     } else {
                         glib::ControlFlow::Continue
@@ -3886,6 +3917,19 @@ impl TermView {
         self.root.clone().upcast()
     }
 
+    fn clear_block_selection_for_input(&self) {
+        if self.selected_block_id.get().is_none() {
+            return;
+        }
+        let finished = self.finished_blocks.borrow();
+        clear_finished_block_selection(
+            &finished,
+            &self.selected_block_ids,
+            &self.selected_block_id,
+            &self.selection_anchor_id,
+        );
+    }
+
     /// Send key bytes into the PTY (user input).
     pub fn write_input(&self, data: &[u8]) {
         let changed_editor = record_external_input(
@@ -4011,6 +4055,12 @@ impl TermView {
     /// the clipboard ourselves, update the shared editor guards, and preserve
     /// bracketed-paste framing in one queued PTY write.
     pub fn paste_from_clipboard(&self) {
+        // Pasting is an explicit return to the live editor. Without clearing the
+        // card selection, the next Enter is intercepted as “recall selected
+        // command” instead of submitting the pasted text.
+        self.clear_block_selection_for_input();
+        self.active.borrow().grab_focus();
+
         let clipboard = self.active_vte.clipboard();
         let pty = self.pty.clone();
         let bracketed_paste = self.bracketed_paste.clone();
@@ -5227,6 +5277,18 @@ mod tests {
         assert_eq!(chars[pos - 1], '好');
         assert_eq!(chars[pos], 'w');
     }
+    #[test]
+    fn clipboard_paste_payload_is_one_ordered_transaction() {
+        assert_eq!(
+            build_clipboard_paste_payload("plain", false).as_slice(),
+            b"plain"
+        );
+        assert_eq!(
+            build_clipboard_paste_payload("one\ntwo", true).as_slice(),
+            b"\x1b[200~one\ntwo\x1b[201~"
+        );
+    }
+
     #[test]
     fn selected_commands_preserve_terminal_order_and_skip_background_blocks() {
         let selected = HashSet::from([1_u64, 2, 3]);

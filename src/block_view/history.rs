@@ -4,7 +4,7 @@
 //! rkyv records (optional zstd). Truncate-on-save (not append) keeps the file
 //! bounded, since the deque was already seeded from this file on startup.
 
-use super::{BlockData, TermView};
+use super::{next_block_id, BlockData, TermView};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_ENCODED_RECORD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 
 fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8>> {
@@ -30,6 +31,40 @@ fn decode_zstd_bounded(data: &[u8], max_decoded_bytes: u64) -> io::Result<Vec<u8
         ));
     }
     Ok(decoded)
+}
+
+fn decode_rkyv_block(data: &[u8]) -> Option<BlockData> {
+    rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(data).ok()
+}
+
+/// History frames predate an on-disk codec marker. Try the configured codec
+/// first, then the alternate representation so toggling compression never makes
+/// the previous session look corrupt.
+fn decode_block_record(data: &[u8], prefer_compressed: bool) -> Option<BlockData> {
+    let decode_compressed = || {
+        decode_zstd_bounded(data, MAX_DECODED_RECORD_BYTES)
+            .ok()
+            .and_then(|decoded| decode_rkyv_block(&decoded))
+    };
+    if prefer_compressed {
+        decode_compressed().or_else(|| decode_rkyv_block(data))
+    } else {
+        decode_rkyv_block(data).or_else(decode_compressed)
+    }
+}
+
+fn history_load_limit(lazy_load_threshold: usize, max_visible_blocks: usize) -> usize {
+    lazy_load_threshold.min(max_visible_blocks)
+}
+
+/// Persisted IDs are process-local implementation details. Reusing them after a
+/// restart collides with the global allocator (which starts from zero again), so
+/// restore every record with a fresh runtime ID before exposing it to selection,
+/// deletion, bookmarks, search, and export.
+fn refresh_loaded_block_ids(blocks: &mut VecDeque<BlockData>) {
+    for block in blocks {
+        block.id = next_block_id();
+    }
 }
 
 /// Expand the shell-style `~/` prefix used in configuration, but leave every
@@ -170,12 +205,15 @@ impl TermView {
 
     /// Load block history from file (if configured).
     pub fn load_history(&self) -> std::io::Result<()> {
-        let (path_opt, compress, lazy_load_threshold) = {
+        let (path_opt, compress, load_limit) = {
             let config = self.config.borrow();
             (
                 config.block_history_path.as_ref().cloned(),
                 config.block_history_compress,
-                config.lazy_load_threshold as usize,
+                history_load_limit(
+                    config.lazy_load_threshold as usize,
+                    config.max_visible_blocks as usize,
+                ),
             )
         };
         if path_opt.is_none() {
@@ -190,40 +228,59 @@ impl TermView {
         let mut file = File::open(path)?;
         let mut recent_blocks = VecDeque::new();
         let mut total_loaded = 0usize;
+        let mut frame_index = 0usize;
 
         loop {
             let mut len_bytes = [0u8; 4];
-            if file.read_exact(&mut len_bytes).is_err() {
-                break;
+            match file.read_exact(&mut len_bytes) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
             }
 
             let len = u32::from_le_bytes(len_bytes) as usize;
-            // Guard against a corrupt/misaligned length causing a giant allocation.
-            const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
-            if len > MAX_RECORD_BYTES {
-                log::warn!("load_history: record length {} exceeds {} — treating file as corrupt, stopping", len, MAX_RECORD_BYTES);
+            if len > MAX_ENCODED_RECORD_BYTES {
+                log::warn!(
+                    "load_history: record length {} exceeds {} — treating file as corrupt, stopping",
+                    len,
+                    MAX_ENCODED_RECORD_BYTES
+                );
                 break;
             }
             let mut data = vec![0u8; len];
-            file.read_exact(&mut data)?;
-
-            let decoded = if compress {
-                decode_zstd_bounded(data.as_slice(), MAX_DECODED_RECORD_BYTES)?
-            } else {
-                data
-            };
-
-            if let Ok(block) = rkyv::from_bytes::<BlockData, rkyv::rancor::Error>(&decoded) {
-                total_loaded += 1;
-                push_bounded_back(&mut recent_blocks, block, lazy_load_threshold);
+            match file.read_exact(&mut data) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    log::warn!(
+                        "load_history: truncated final frame #{frame_index}; preserving earlier records"
+                    );
+                    break;
+                }
+                Err(error) => return Err(error),
             }
+
+            if let Some(block) = decode_block_record(&data, compress) {
+                total_loaded += 1;
+                push_bounded_back(&mut recent_blocks, block, load_limit);
+            } else {
+                log::warn!(
+                    "load_history: skipping undecodable frame #{frame_index} ({} bytes)",
+                    data.len()
+                );
+            }
+            frame_index += 1;
         }
 
-        if total_loaded > lazy_load_threshold {
-            log::info!("Lazy loading history: keeping {} recent blocks out of {} total (skipping {} old blocks)",
-                lazy_load_threshold, total_loaded, total_loaded - lazy_load_threshold);
+        if total_loaded > load_limit {
+            log::info!(
+                "Loading block history: keeping {} recent blocks out of {} total (skipping {} old blocks)",
+                load_limit,
+                total_loaded,
+                total_loaded - load_limit
+            );
         }
 
+        refresh_loaded_block_ids(&mut recent_blocks);
         let mut blocks = self.block_data.borrow_mut();
         let start_idx = total_loaded.saturating_sub(recent_blocks.len());
         for (offset, block) in recent_blocks.into_iter().enumerate() {
@@ -245,7 +302,10 @@ impl TermView {
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_write, decode_zstd_bounded, expand_home_prefix_with, push_bounded_back};
+    use super::{
+        atomic_write, decode_block_record, decode_zstd_bounded, expand_home_prefix_with,
+        history_load_limit, push_bounded_back, refresh_loaded_block_ids, BlockData,
+    };
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
@@ -277,6 +337,60 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_block(id: u64, command: &str) -> BlockData {
+        BlockData {
+            id,
+            prompt: "prompt".to_string(),
+            cmd: command.to_string(),
+            cmd_markup: None,
+            output: "output".to_string(),
+            exit_code: 0,
+            estimated_height: 32,
+            line_count: 1,
+            start_time_ms: None,
+            end_time_ms: None,
+            duration_ms: None,
+            cwd: None,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn history_load_limit_never_exceeds_runtime_block_cap() {
+        assert_eq!(history_load_limit(1_000, 200), 200);
+        assert_eq!(history_load_limit(100, 200), 100);
+        assert_eq!(history_load_limit(0, 200), 0);
+    }
+
+    #[test]
+    fn loaded_blocks_receive_unique_runtime_ids() {
+        let mut blocks = VecDeque::from([sample_block(0, "first"), sample_block(0, "second")]);
+        refresh_loaded_block_ids(&mut blocks);
+        assert_ne!(blocks[0].id, blocks[1].id);
+    }
+
+    #[test]
+    fn history_decoder_accepts_raw_and_compressed_records_after_config_toggle() {
+        let block = sample_block(7, "printf hello");
+        let raw = rkyv::to_bytes::<rkyv::rancor::Error>(&block).unwrap();
+        let compressed = zstd::encode_all(raw.as_slice(), 1).unwrap();
+
+        for prefer_compressed in [false, true] {
+            assert_eq!(
+                decode_block_record(raw.as_slice(), prefer_compressed)
+                    .unwrap()
+                    .cmd,
+                "printf hello"
+            );
+            assert_eq!(
+                decode_block_record(&compressed, prefer_compressed)
+                    .unwrap()
+                    .cmd,
+                "printf hello"
+            );
         }
     }
 
