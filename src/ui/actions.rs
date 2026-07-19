@@ -410,10 +410,16 @@ impl UiState {
         }
         let Some(term_view) = self.current_term_view() else {
             log::debug!("AI: no active block-mode tab");
+            self.show_ai_error(
+                "Ask selected Block requires an active Block-mode pane. Switch to Block mode and select a finished command.",
+            );
             return;
         };
         let Some(ctx) = term_view.selected_block_context(80) else {
             log::debug!("AI: no block selected");
+            self.show_ai_error(
+                "Select a finished command Block first, then ask AI about it again.",
+            );
             return;
         };
         if !self.ai_panel_visible.get() {

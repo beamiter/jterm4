@@ -180,6 +180,7 @@ impl UiState {
              .ai-chat-row.active {{ background-color: rgba({fr},{fg_g},{fb},0.14); }}
              .ai-chat-row.archived {{ color: rgba({fr},{fg_g},{fb},0.62); }}
              .ai-chat-row.unread {{ font-weight: 700; }}
+             .ai-chat-row.error {{ color: @error_color; }}
              .ai-chat-section {{
                  color: rgba({fr},{fg_g},{fb},0.56);
                  font-size: 0.82em;
@@ -193,16 +194,33 @@ impl UiState {
              }}
              .ai-empty-state {{ color: rgba({fr},{fg_g},{fb},0.62); padding: 24px; }}
              .ai-empty-title {{ color: rgba({fr},{fg_g},{fb},0.88); font-weight: 700; font-size: 1.08em; }}
+             .ai-empty-actions {{ margin: 4px 0; }}
+             .ai-empty-action {{
+                 min-height: 32px;
+                 color: rgb({fr},{fg_g},{fb});
+                 border: 1px solid rgba({fr},{fg_g},{fb},0.16);
+                 border-radius: 8px;
+             }}
              .ai-panel-status-row {{
                  min-height: 22px;
                  padding: 2px 10px 4px 10px;
                  color: rgba({fr},{fg_g},{fb},0.66);
              }}
              .ai-panel-status-row.error {{ color: @error_color; }}
+             .ai-status-action {{ min-height: 28px; padding: 2px 8px; }}
              .ai-panel-composer {{
                  padding: 8px;
                  border-top: 1px solid rgba({fr},{fg_g},{fb},0.12);
              }}
+             .ai-context-chip {{
+                 padding: 5px 8px;
+                 color: rgba({fr},{fg_g},{fb},0.82);
+                 background-color: rgba({fr},{fg_g},{fb},0.07);
+                 border: 1px solid rgba({fr},{fg_g},{fb},0.16);
+                 border-radius: 9px;
+             }}
+             .ai-context-label {{ font-size: 0.88em; }}
+             .ai-context-clear {{ min-height: 24px; padding: 1px 6px; }}
              .ai-panel-input {{
                  background-color: rgba({fr},{fg_g},{fb},0.06);
                  border: 1px solid rgba({fr},{fg_g},{fb},0.20);
@@ -225,6 +243,12 @@ impl UiState {
                  background-color: rgba({fr},{fg_g},{fb},0.055);
                  border: 1px solid rgba({fr},{fg_g},{fb},0.14);
                  border-radius: 12px;
+             }}
+             .agent-context-card {{
+                 padding: 8px 10px;
+                 background-color: rgba({fr},{fg_g},{fb},0.045);
+                 border: 1px solid rgba({fr},{fg_g},{fb},0.12);
+                 border-radius: 9px;
              }}
              .agent-overview {{ padding: 12px; }}
              .agent-icon {{
@@ -271,6 +295,12 @@ impl UiState {
              .agent-proposal-card {{
                  padding: 12px;
                  border: 1px solid alpha(@warning_color, 0.48);
+             }}
+             .agent-danger-command {{
+                 padding: 8px;
+                 font-family: monospace;
+                 background-color: alpha(@warning_bg_color, 0.16);
+                 border-radius: 7px;
              }}
              .agent-composer {{ padding: 9px; }}
              .agent-input {{ min-height: 34px; }}

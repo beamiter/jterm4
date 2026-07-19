@@ -762,6 +762,7 @@ mod tests {
             output: "ok".into(),
             cwd: Some("/tmp/project".into()),
             exit_code: 0,
+            truncated: false,
         };
 
         let snapshot =
@@ -989,6 +990,7 @@ mod tests {
             output: "ok".into(),
             cwd: Some("/tmp/project".into()),
             exit_code: 0,
+            truncated: false,
         };
         let old =
             ChatSnapshot::from_completed_history(1, "old", false, &history, Some(&context), "");
@@ -1040,6 +1042,7 @@ mod tests {
             output: "x".repeat(MAX_BLOCK_CONTEXT_BYTES),
             cwd: None,
             exit_code: 0,
+            truncated: false,
         };
         let snapshot =
             ChatSnapshot::from_completed_history(1, "bounded", false, &history, Some(&context), "");
@@ -1055,6 +1058,7 @@ mod tests {
             output: "running".into(),
             cwd: Some("/tmp/project".into()),
             exit_code: 0,
+            truncated: false,
         };
         let in_flight = vec![turn(Role::User, "please inspect")];
         let snapshot = ChatSnapshot::from_completed_history(

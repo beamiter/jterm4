@@ -1221,6 +1221,9 @@ pub fn run() -> glib::ExitCode {
             }
             let _ = crate::config::save_config(&config_for_close.borrow());
 
+            // Stop and reap any in-flight provider processes before widgets
+            // and their request-routing state are destroyed.
+            ai_panel_for_close.cancel_all_requests();
             if session_persistence {
                 // Do not let the composer's draft debounce outlive the final
                 // window snapshot. This also persists an in-flight question as

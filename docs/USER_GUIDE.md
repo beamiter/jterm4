@@ -241,30 +241,38 @@ ai_api_key_file = "~/.config/jterm4/ai.key"
 
 文件必须是当前用户所有的普通文件，Unix 权限不得向 group/other 开放，最大 16 KiB，且只能包含一行非空密钥。环境 Key 优先于文件；`JTERM4_AI_API_KEY_FILE` 可覆盖文件路径。相关配置为 `ai_enabled`、`ai_provider`、`ai_base_url`、`ai_api_key_file`、`ai_model`、`ai_max_tokens` 和 `ai_redact_secrets`。请求通过系统 `curl`/Flatpak host bridge 发送；运行 `--doctor` 可离线检查凭据文件和 curl。右侧聊天面板使用 `Ctrl+Alt+Shift+A`，Block 选择后 `Ctrl+Shift+Q` 可发送命令、退出码、cwd 和截断输出。
 
-面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。
+面板可拖动分隔条，实际宽度会在 400 ms 防抖后写回 `ai_panel_width`，并在启动、配置热重载和重新打开面板时恢复。输入框中 `Enter` 与 `Ctrl+Enter` 均发送，`Shift+Enter` 换行；输入法正在选词时，Enter 只确认候选，不会误发。焦点位于输入框时，`Ctrl+Shift+C/V` 也会作用于输入框，而不是后台终端。空会话提供三个快捷提示，它们只填入 composer，绝不会自动发送。
+
+发送后状态行提供 **Stop**；它会终止并回收对应 curl，而不只是隐藏迟到回复。失败或停止后可 **Retry** 原请求，generation 仍绑定原 chat，期间新输入的 draft 不会被覆盖。删除 busy chat 和关闭窗口同样会先取消 transport。选中 Block 的 command/exit 会显示为 composer 上方的 context chip，可在空闲时 **Clear**；Ask Block 失败后，Retry 实际将使用的 pending context 也会明确显示，若输出因行数或字节预算被裁剪，chip 会标出 `output truncated`。关窗前仍留在内存中的 Ask Block retry 会转成该 chat 的可恢复 draft/context。
 
 **New chat** 会创建并立即选中一个新会话，旧会话不会被清除。打开 **Chats** 会话库可搜索和选择所有保留的 chat；首条问题会生成自动标题，也可 Rename。Archive 将 chat 移入归档列表而不删除内容，Unarchive 可恢复；Delete 会先要求确认，再永久移除该 chat。切换 chat 时，未发送 draft、该 chat 实际发给 provider 的选中 Block context 以及当前选中的 chat 都会跟随窗口快照持久化。
 
 每个窗口最多保存 50 条 chat metadata，每个 chat 最多恢复 100 个完整 turn；active 与 archived chat 都计入集合上限。所有 chat 共用一个 8 MiB 紧凑 JSON 总预算，而不是每个 chat 各有 8 MiB。超过全局预算时会优先裁剪最旧内容、保留 chat 条目，并在受影响会话显示 `truncated`，提示更早内容已不在快照中。工作区的 20 MiB Pane/Tab 上限之外另有 64 KiB 专用于完整 chat metadata；空间紧张时会继续裁剪 payload，而不会静默省略整个 Chats 库。旧版单会话 schema v1 会在读取时自动迁移为 v2 Chats 集合。
 
+运行时和持久化预算彼此独立：Chat 单条输入不超过 64 KiB；live message history 每个 chat 至多 100 个 turn、所有 chat 合计至多 8 MiB；一次 provider 请求保留最近至多 40 个 turn、合计至多 256 KiB；selected Block command/output/cwd 分别限制为 16 KiB/64 KiB/4 KiB；解析后的模型文本不超过 256 KiB，curl stdout/stderr 分别限制为 8 MiB/64 KiB。Chat 与 Agent 的可见 activity buffer 各不超过 1 MiB，Agent 核心 transcript 另有 128 KiB/128 entries 上限。全局最多 4 个 provider 请求并行，其余请求等待槽位且仍可取消。达到 `ai_max_tokens` 时回答会显示明确的截断提示。更早 history 被请求预算省略时，模型会收到说明；超出 live/persistence 预算时只移除完整旧 pair，在途问题不会被裁掉，并标记 `truncated`。
+
+selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。它们会经过字节截断、JSON 转义和可选脱敏后，作为明确标记的“不可信 terminal/environment data”放入 user-role 请求；命令输出、路径中的提示词、代码围栏或伪造策略都只应作为待分析证据。
+
 后台请求绑定其发起时的稳定 chat ID：切换到其他 chat 不会改变回复目的地，也可让不同 chat 的请求各自完成；如果原 chat 已 Delete，迟到回复会直接丢弃，不能重新创建或污染当前 chat。在途用户 turn、错误回合和命令生成审阅事件不会伪装成已完成回答恢复；待完成或失败的问题会回到可重试 draft，发送期间键入的下一条 draft 也会保留，Ask selected Block 不会清掉已有草稿，关窗会先刷新防抖中的最新内容。开启 `ai_redact_secrets` 时，持久化脱敏覆盖 active、non-active、archived chat，包括标题、turn、draft 和 Block context，而不只处理当前可见对话。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode` 不读取也不发布会话库，`--no-restore` 和显式新工作区仍不领取旧快照，其中 `--no-restore` 继续按既有语义建立新的可持久化工作区。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
 
-自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent dashboard 显示固定目标 cwd、provider/model、shell、安全状态、回合进度、activity transcript 和 proposal 审阅卡；左上角清空按钮只清空可见 activity，不会改写当前 Agent 上下文。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
+自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent dashboard 显示固定目标 cwd、provider/model、shell、安全状态、回合进度、activity transcript 和 proposal 审阅卡；左上角清空按钮只清空可见 activity，不会改写当前 Agent 上下文。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可在首个请求前移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：
 
-1. 输入任务后，模型回复必须是严格 JSON `say`、`run` 或 `done`；夹杂 prose、未知字段、错误类型、过期 proposal 或非法控制字符都会失败关闭，不能退化为可运行命令。
-2. `run` 显示单独 proposal 卡片和可编辑命令。识别到顶层 `rm -rf`、`mkfs`、下载后 pipe 到 shell 等模式时显示醒目的危险提示。
-3. 每张卡片只能 **Reject** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；批准执行的是用户最后编辑后的精确文本。
+1. 输入任务后，模型回复必须是严格 JSON `say`、`run` 或 `done`；夹杂 prose、未知字段、错误类型、过期 proposal 或非法控制字符都会 fail closed，不能退化为可运行命令。用户任务也有 16 KiB 上限。
+2. `run` 只能包含一条可见单行命令，CR、LF、Tab、NUL、ESC 等控制字符无论来自模型还是编辑结果都会被拒绝。proposal 卡可复制和编辑；风险提示会随编辑实时重算。
+3. 每张卡片只能 **Reject** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；批准执行的是用户最后编辑后的精确文本。识别到顶层 `rm -rf`、`mkfs`、提权、强制 Git 改写、下载后 pipe 到 shell 等模式时，除醒目提示外还必须在显示精确命令的第二个确认框中再次批准。
 4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
-6. **Cancel Agent** 或关闭窗口会取消会话并作废待处理模型回复；`agent_max_turns` 达到上限后停止继续请求。已经由用户批准并启动的普通终端命令不会被取消按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
+6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收；`agent_max_turns` 达到上限后会停止 spinner、禁用输入并显示明确终态。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
 
 dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `JTERM4_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 
 `agent_enabled = false` 可独立关闭 Agent，`agent_max_turns` 限制模型回合数；`ai_enabled = false` 和 safe mode 都会同时阻止打开。Agent 必须被视为有用户权限的命令执行辅助工具，危险模式提示不是完整 shell 安全分析，也不替代逐字审阅。
 
 `ai_redact_secrets = true` 默认遮蔽常见密钥格式，并在持久化前重新处理所有 active、non-active、archived chat 及其 draft/context；但脱敏不是秘密保护边界，发送前仍应检查上下文。`--safe-mode` 同时关闭 AI 与 Agent。
+
+开发、回归与发布检查见 [AI / Agent / Chat 验收矩阵](AI_AGENT_CHAT_ACCEPTANCE.md)；该矩阵是测试要求，不代表其中所有目标均已实现。
 
 ## 12. 配置保存与快捷键
 

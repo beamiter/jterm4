@@ -38,17 +38,23 @@ struct AgentRuntime {
     target: Rc<TermView>,
     config: Rc<RefCell<crate::config::Config>>,
     shell: String,
+    block_context: RefCell<Option<crate::ai::BlockContext>>,
     transcript: TextBuffer,
     transcript_view: TextView,
     input: Entry,
     send: Button,
     cancel: Button,
+    stop_request: Button,
+    retry_request: Button,
+    context_clear: Button,
+    context_card: GBox,
     status: Label,
     status_spinner: Spinner,
     turn_progress: ProgressBar,
     turn_label: Label,
     proposal_box: GBox,
     pending_command: RefCell<Option<(ProposalId, String)>>,
+    request_cancellation: RefCell<Option<crate::ai::AiCancellationToken>>,
     busy: Cell<bool>,
     alive: Cell<bool>,
 }
@@ -61,6 +67,7 @@ impl AgentRuntime {
         }
         self.transcript
             .insert(&mut end, &format!("{speaker}\n{body}"));
+        super::bounded_text::trim_ai_transcript(&self.transcript);
         let view = self.transcript_view.clone();
         let buffer = self.transcript.clone();
         gtk4::glib::idle_add_local_once(move || {
@@ -91,15 +98,96 @@ impl AgentRuntime {
             .set_fraction(f64::from(used) / f64::from(max.max(1)));
     }
 
-    fn set_ready(&self) {
-        let ready = self.alive.get()
-            && !self.busy.get()
-            && self.session.borrow().state() == AgentState::Ready;
+    fn sync_controls(&self) {
+        let session = self.session.borrow();
+        let ready = self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready;
         self.input.set_sensitive(ready);
-        self.send.set_sensitive(ready);
-        if ready {
-            self.set_status("Ready for the next instruction", false);
-            self.input.grab_focus();
+        self.send
+            .set_sensitive(ready && !self.input.text().trim().is_empty());
+        self.stop_request
+            .set_visible(self.alive.get() && self.busy.get());
+        self.stop_request
+            .set_sensitive(self.alive.get() && self.busy.get());
+        self.retry_request
+            .set_visible(self.alive.get() && !self.busy.get() && session.can_retry_model());
+        self.retry_request
+            .set_sensitive(self.retry_request.is_visible());
+        self.context_clear.set_sensitive(
+            self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready,
+        );
+    }
+
+    fn render_session_state(&self, ready_status: Option<&str>) {
+        self.sync_controls();
+        if self.busy.get() {
+            if let Some(message) = ready_status {
+                self.set_status(message, true);
+            }
+            return;
+        }
+        let state = self.session.borrow().state();
+        match state {
+            AgentState::Ready => {
+                self.set_status(
+                    ready_status.unwrap_or("Ready for the next instruction"),
+                    false,
+                );
+                self.input.grab_focus();
+            }
+            AgentState::AwaitingApproval { proposal_id } => self.set_status(
+                &format!("Proposal #{} is waiting for review", proposal_id.get()),
+                false,
+            ),
+            AgentState::AwaitingObservation { .. } => {
+                self.set_status("Running the approved command…", true)
+            }
+            AgentState::Completed => self.set_status("Task completed", false),
+            AgentState::Cancelled => self.set_status("Agent cancelled", false),
+            AgentState::TurnLimitReached => self.set_status(
+                "Turn limit reached. Start a new Agent session to continue.",
+                false,
+            ),
+            AgentState::AwaitingModel => {
+                self.set_status(ready_status.unwrap_or("Waiting for the model…"), true)
+            }
+        }
+    }
+
+    fn stop_current_request(&self) {
+        if !self.busy.get() || !self.alive.get() {
+            return;
+        }
+        if let Some(cancellation) = self.request_cancellation.borrow().as_ref() {
+            cancellation.cancel();
+            self.stop_request.set_sensitive(false);
+            self.set_status("Stopping the current model request…", true);
+        }
+    }
+
+    fn retry_model(runtime: Rc<Self>) {
+        if runtime.busy.get() || !runtime.alive.get() {
+            return;
+        }
+        let retry_result = runtime.session.borrow_mut().retry_model();
+        match retry_result {
+            Ok(()) => Self::request_model(runtime),
+            Err(error) => {
+                runtime.render_session_state(Some(&error.to_string()));
+            }
+        }
+    }
+
+    fn detach_block_context(&self) {
+        if self.busy.get() || self.session.borrow().state() != AgentState::Ready {
+            return;
+        }
+        if self.block_context.borrow_mut().take().is_some() {
+            self.context_card.set_visible(false);
+            self.append(
+                "Agent",
+                "Selected Block context detached. Session activity is still retained.",
+            );
+            self.render_session_state(None);
         }
     }
 
@@ -113,7 +201,7 @@ impl AgentRuntime {
         }
         let submit_result = runtime.session.borrow_mut().submit_user(text.clone());
         if let Err(error) = submit_result {
-            runtime.set_status(&error.to_string(), false);
+            runtime.render_session_state(Some(&error.to_string()));
             return;
         }
         runtime.input.set_text("");
@@ -126,7 +214,7 @@ impl AgentRuntime {
             || runtime.busy.get()
             || runtime.session.borrow().state() != AgentState::AwaitingModel
         {
-            runtime.set_ready();
+            runtime.render_session_state(None);
             return;
         }
 
@@ -136,23 +224,25 @@ impl AgentRuntime {
                 let message = error.to_string();
                 let _ = runtime.session.borrow_mut().model_failed(&message);
                 runtime.append("Error", &message);
-                runtime.set_status(&message, false);
-                runtime.set_ready();
+                runtime.render_session_state(Some(&message));
                 return;
             }
         };
         let cwd = runtime.target.cwd();
-        let system = crate::ai::build_agent_system_prompt(
+        let system = crate::ai::build_agent_system_prompt();
+        let prompt = crate::ai::agent_user_prompt(
+            &runtime.session.borrow().build_user_prompt(),
             if cwd.is_empty() { "." } else { &cwd },
             &runtime.shell,
             std::env::consts::OS,
+            runtime.block_context.borrow().as_ref(),
         );
-        let prompt = runtime.session.borrow().build_user_prompt();
-        let cancellation = runtime.session.borrow().cancellation_token();
+        let session_cancellation = runtime.session.borrow().cancellation_token();
+        let request_cancellation = crate::ai::AiCancellationToken::new();
+        *runtime.request_cancellation.borrow_mut() = Some(request_cancellation.clone());
 
         runtime.busy.set(true);
-        runtime.input.set_sensitive(false);
-        runtime.send.set_sensitive(false);
+        runtime.sync_controls();
         let (next_turn, max_turns) = {
             let session = runtime.session.borrow();
             (session.turns_used() + 1, session.max_turns())
@@ -169,17 +259,18 @@ impl AgentRuntime {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            if cancellation.is_cancelled() {
+            if session_cancellation.is_cancelled() {
                 return;
             }
-            let result = client.send_turns_blocking(
+            let result = client.send_turns_blocking_cancellable(
                 Some(&system),
                 &[crate::ai::Turn {
                     role: crate::ai::Role::User,
                     text: prompt,
                 }],
+                &request_cancellation,
             );
-            if !cancellation.is_cancelled() {
+            if !session_cancellation.is_cancelled() {
                 let _ = tx.send(result);
             }
         });
@@ -191,6 +282,7 @@ impl AgentRuntime {
             }
             match rx.borrow().try_recv() {
                 Ok(Ok(reply)) => {
+                    runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
                     let outcome = runtime.session.borrow_mut().accept_model_reply(&reply);
                     match outcome {
@@ -201,40 +293,42 @@ impl AgentRuntime {
                         }) => Self::render_proposal(&runtime, id, command, danger),
                         Ok(ModelOutcome::Said(message)) => {
                             runtime.append("Agent", &message);
-                            runtime.set_ready();
+                            runtime.render_session_state(None);
                         }
                         Ok(ModelOutcome::Completed(message)) => {
                             runtime.append("Agent", &message);
-                            runtime.set_status("Task completed", false);
-                            runtime.input.set_sensitive(false);
-                            runtime.send.set_sensitive(false);
+                            runtime.render_session_state(None);
                         }
                         Err(error) => {
                             let message = error.to_string();
                             runtime.append("Protocol error", &message);
-                            runtime.set_status(&message, false);
-                            runtime.set_ready();
+                            runtime.render_session_state(Some(&message));
                         }
                     }
                     gtk4::glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
+                    runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
-                    let message = error.to_string();
+                    let stopped = matches!(error, crate::ai::AiError::Cancelled);
+                    let message = if stopped {
+                        "Model request stopped. Retry it or revise the instruction.".to_string()
+                    } else {
+                        error.to_string()
+                    };
                     let _ = runtime.session.borrow_mut().model_failed(&message);
-                    runtime.append("Error", &message);
-                    runtime.set_status(&message, false);
-                    runtime.set_ready();
+                    runtime.append(if stopped { "Stopped" } else { "Error" }, &message);
+                    runtime.render_session_state(Some(&message));
                     gtk4::glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => gtk4::glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    runtime.request_cancellation.borrow_mut().take();
                     runtime.busy.set(false);
                     let message = "Agent worker disconnected.";
                     let _ = runtime.session.borrow_mut().model_failed(message);
                     runtime.append("Error", message);
-                    runtime.set_status(message, false);
-                    runtime.set_ready();
+                    runtime.render_session_state(Some(message));
                     gtk4::glib::ControlFlow::Break
                 }
             }
@@ -266,32 +360,48 @@ impl AgentRuntime {
         command_entry.set_text(&command);
         command_entry.set_hexpand(true);
         command_entry.set_tooltip_text(Some("This exact text will run only after approval"));
+        command_entry
+            .update_property(&[gtk4::accessible::Property::Label("Proposed shell command")]);
 
         let approve = Button::with_label("Approve & Run");
-        approve.add_css_class(if danger.is_some() {
-            "destructive-action"
-        } else {
-            "suggested-action"
-        });
+        sync_proposal_risk(&warning, &approve, &command);
         let reject = Button::with_label("Reject");
+        let copy = Button::with_label("Copy");
+        copy.set_tooltip_text(Some("Copy the proposed command without running it"));
         let buttons = GBox::new(Orientation::Horizontal, 6);
         buttons.set_halign(gtk4::Align::End);
+        buttons.append(&copy);
         buttons.append(&reject);
         buttons.append(&approve);
 
         runtime.proposal_box.append(&warning);
         runtime.proposal_box.append(&command_entry);
         runtime.proposal_box.append(&buttons);
-        runtime.set_status(
-            &format!("Proposal #{} is waiting for review", id.get()),
-            false,
-        );
+        runtime.render_session_state(None);
+        command_entry.grab_focus();
+
+        {
+            let warning = warning.clone();
+            let approve = approve.clone();
+            command_entry.connect_changed(move |entry| {
+                sync_proposal_risk(&warning, &approve, &entry.text());
+            });
+        }
 
         let weak = Rc::downgrade(runtime);
         let entry_for_approve = command_entry.clone();
         approve.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 Self::approve(runtime, id, entry_for_approve.text().to_string());
+            }
+        });
+        let weak = Rc::downgrade(runtime);
+        let entry_for_copy = command_entry.clone();
+        copy.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                let command = entry_for_copy.text();
+                runtime.transcript_view.clipboard().set_text(&command);
+                runtime.set_status("Command copied; nothing was run.", false);
             }
         });
         let weak = Rc::downgrade(runtime);
@@ -303,6 +413,54 @@ impl AgentRuntime {
     }
 
     fn approve(runtime: Rc<Self>, id: ProposalId, command: String) {
+        let command = match crate::review_input::validate(&command) {
+            Ok(command) => command.to_string(),
+            Err(error) => {
+                runtime.set_status(&format!("Cannot approve: {error}"), false);
+                return;
+            }
+        };
+        if let Some(reason) = crate::agent::is_dangerous(&command) {
+            Self::confirm_dangerous_approval(runtime, id, command, reason);
+            return;
+        }
+        Self::approve_validated(runtime, id, command);
+    }
+
+    fn confirm_dangerous_approval(
+        runtime: Rc<Self>,
+        id: ProposalId,
+        command: String,
+        reason: &'static str,
+    ) {
+        let dialog = adw::AlertDialog::new(
+            Some("Run a potentially destructive command?"),
+            Some(&format!(
+                "{reason}. Verify the exact command below before continuing."
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("run", "Run Command")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("run", adw::ResponseAppearance::Destructive);
+        let preview = Label::new(Some(&command));
+        preview.set_selectable(true);
+        preview.set_wrap(true);
+        preview.set_xalign(0.0);
+        preview.add_css_class("agent-danger-command");
+        dialog.set_extra_child(Some(&preview));
+        let weak = Rc::downgrade(&runtime);
+        dialog.connect_response(None, move |_, response| {
+            if response == "run" {
+                if let Some(runtime) = weak.upgrade() {
+                    Self::approve_validated(runtime, id, command.clone());
+                }
+            }
+        });
+        dialog.present(Some(&runtime.proposal_box));
+    }
+
+    fn approve_validated(runtime: Rc<Self>, id: ProposalId, command: String) {
         if !runtime.target.can_accept_agent_command() {
             let message =
                 "The target prompt is busy or already contains input. Clear it and approve again.";
@@ -320,9 +478,9 @@ impl AgentRuntime {
         };
         runtime.clear_proposal();
         runtime.append("Approved", &format!("$ {}", approved.command));
-        runtime.set_status("Running approved command…", true);
         *runtime.pending_command.borrow_mut() =
             Some((approved.proposal_id, approved.command.clone()));
+        runtime.render_session_state(None);
         runtime.target.grab_focus();
         runtime.target.submit_command(&approved.command);
     }
@@ -335,7 +493,7 @@ impl AgentRuntime {
                 runtime.append("You", "Rejected proposal; ask for another approach.");
                 Self::request_model(runtime);
             }
-            Err(error) => runtime.set_status(&error.to_string(), false),
+            Err(error) => runtime.render_session_state(Some(&error.to_string())),
         }
     }
 
@@ -349,7 +507,7 @@ impl AgentRuntime {
         };
         let observation_result = runtime.session.borrow_mut().observe(id, exit_code, &output);
         if let Err(error) = observation_result {
-            runtime.set_status(&error.to_string(), false);
+            runtime.render_session_state(Some(&error.to_string()));
             return;
         }
         let output = if output.trim().is_empty() {
@@ -365,14 +523,74 @@ impl AgentRuntime {
         if !self.alive.replace(false) {
             return;
         }
+        if let Some(cancellation) = self.request_cancellation.borrow_mut().take() {
+            cancellation.cancel();
+            if !cancellation.wait_for_inactive(std::time::Duration::from_millis(500)) {
+                log::warn!("Timed out waiting for the Agent request to shut down");
+            }
+        }
         self.session.borrow_mut().cancel();
         self.pending_command.borrow_mut().take();
         self.busy.set(false);
         self.clear_proposal();
-        self.input.set_sensitive(false);
-        self.send.set_sensitive(false);
         self.cancel.set_sensitive(false);
-        self.set_status("Agent cancelled", false);
+        self.render_session_state(None);
+    }
+}
+
+fn sync_proposal_risk(warning: &Label, approve: &Button, command: &str) {
+    if let Some(reason) = crate::agent::is_dangerous(command) {
+        warning.set_text(&format!("Potentially destructive: {reason}"));
+        warning.add_css_class("error");
+        approve.remove_css_class("suggested-action");
+        approve.add_css_class("destructive-action");
+        approve.set_tooltip_text(Some("A second confirmation is required"));
+    } else {
+        warning.set_text("Proposed command — edit before approval if needed");
+        warning.remove_css_class("error");
+        approve.remove_css_class("destructive-action");
+        approve.add_css_class("suggested-action");
+        approve.set_tooltip_text(Some("Run this exact command after approval"));
+    }
+}
+
+fn agent_block_context_label(context: &crate::ai::BlockContext) -> String {
+    let truncation = if context.truncated {
+        " · output truncated"
+    } else {
+        ""
+    };
+    format!(
+        "Selected Block · exit {}{truncation} · {}",
+        context.exit_code,
+        compact_one_line(&context.cmd, 56)
+    )
+}
+
+fn agent_block_context_tooltip(context: &crate::ai::BlockContext) -> String {
+    let cwd = context.cwd.as_deref().unwrap_or("unknown cwd");
+    format!(
+        "Attached as untrusted context\nexit: {}\noutput: {}\ncwd: {cwd}\ncommand: {}",
+        context.exit_code,
+        if context.truncated {
+            "truncated"
+        } else {
+            "complete"
+        },
+        compact_one_line(&context.cmd, 160)
+    )
+}
+
+fn compact_one_line(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else if preview.is_empty() {
+        "(empty command)".to_string()
+    } else {
+        preview
     }
 }
 
@@ -426,6 +644,7 @@ impl UiState {
             self.show_ai_error("Agent mode requires an active Block pane.");
             return;
         };
+        let block_context = target.selected_block_context(80);
         let cwd = target.cwd();
         let cwd = if cwd.is_empty() { ".".to_string() } else { cwd };
         let shell = self
@@ -491,6 +710,31 @@ impl UiState {
         chips.append(&safety_chip);
         overview.append(&chips);
 
+        let context_card = GBox::new(Orientation::Horizontal, 8);
+        context_card.add_css_class("agent-context-card");
+        let context_label = Label::new(
+            block_context
+                .as_ref()
+                .map(agent_block_context_label)
+                .as_deref(),
+        );
+        context_label.set_xalign(0.0);
+        context_label.set_hexpand(true);
+        context_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        context_label.set_tooltip_text(
+            block_context
+                .as_ref()
+                .map(agent_block_context_tooltip)
+                .as_deref(),
+        );
+        let context_clear = Button::from_icon_name("window-close-symbolic");
+        context_clear.add_css_class("flat");
+        context_clear.set_tooltip_text(Some("Detach selected Block context"));
+        context_card.append(&context_label);
+        context_card.append(&context_clear);
+        context_card.set_visible(block_context.is_some());
+        overview.append(&context_card);
+
         let correction_row = GBox::new(Orientation::Horizontal, 12);
         correction_row.add_css_class("agent-setting-card");
         let correction_copy = GBox::new(Orientation::Vertical, 2);
@@ -525,6 +769,11 @@ impl UiState {
         transcript_view.set_right_margin(10);
         transcript_view.set_top_margin(10);
         transcript_view.set_bottom_margin(10);
+        transcript_view.set_accessible_role(gtk4::AccessibleRole::Log);
+        transcript_view.update_property(&[
+            gtk4::accessible::Property::Label("Shell Agent activity"),
+            gtk4::accessible::Property::ReadOnly(true),
+        ]);
         let transcript_scroll = ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
@@ -544,16 +793,28 @@ impl UiState {
         status.set_wrap(true);
         status.set_hexpand(true);
         status.add_css_class("agent-status");
+        status.set_accessible_role(gtk4::AccessibleRole::Status);
         let status_spinner = Spinner::new();
         status_spinner.set_spinning(false);
         let turn_label = Label::new(Some(&format!("0 / {max_turns} turns")));
         turn_label.add_css_class("dim-label");
+        let retry_request = Button::with_label("Retry");
+        retry_request.set_visible(false);
+        retry_request.set_tooltip_text(Some(
+            "Retry the failed model turn without duplicating input",
+        ));
+        let stop_request = Button::with_label("Stop");
+        stop_request.set_visible(false);
+        stop_request.add_css_class("destructive-action");
+        stop_request.set_tooltip_text(Some("Stop this model request and keep the Agent session"));
         let turn_progress = ProgressBar::new();
         turn_progress.set_hexpand(true);
         turn_progress.set_fraction(0.0);
         let status_top = GBox::new(Orientation::Horizontal, 8);
         status_top.append(&status_spinner);
         status_top.append(&status);
+        status_top.append(&retry_request);
+        status_top.append(&stop_request);
         status_top.append(&turn_label);
         let status_card = GBox::new(Orientation::Vertical, 6);
         status_card.add_css_class("agent-status-card");
@@ -567,9 +828,15 @@ impl UiState {
 
         let input = Entry::new();
         input.set_hexpand(true);
-        input.set_placeholder_text(Some("Describe a task for this pane…"));
+        input.set_placeholder_text(Some(if block_context.is_some() {
+            "Ask about the selected Block or describe a task…"
+        } else {
+            "Describe a task for this pane…"
+        }));
         input.add_css_class("agent-input");
+        input.update_property(&[gtk4::accessible::Property::Label("Shell Agent instruction")]);
         let send = Button::with_label("Send");
+        send.set_sensitive(false);
         send.add_css_class("suggested-action");
         send.add_css_class("agent-send");
         let input_row = GBox::new(Orientation::Horizontal, 6);
@@ -608,25 +875,33 @@ impl UiState {
             target: target.clone(),
             config: self.config.clone(),
             shell,
+            block_context: RefCell::new(block_context.clone()),
             transcript,
             transcript_view,
             input: input.clone(),
             send: send.clone(),
             cancel: cancel.clone(),
+            stop_request: stop_request.clone(),
+            retry_request: retry_request.clone(),
+            context_clear: context_clear.clone(),
+            context_card: context_card.clone(),
             status,
             status_spinner,
             turn_progress,
             turn_label,
             proposal_box,
             pending_command: RefCell::new(None),
+            request_cancellation: RefCell::new(None),
             busy: Cell::new(false),
             alive: Cell::new(true),
         });
-        runtime.append(
-            "Agent",
-            "Bound to this Block pane. I can propose commands, but cannot run one without your explicit approval.",
-        );
-        runtime.set_ready();
+        let intro = if block_context.is_some() {
+            "Bound to this Block pane with the selected finished Block attached as untrusted context. I can propose commands, but cannot run one without your explicit approval."
+        } else {
+            "Bound to this Block pane. I can propose commands, but cannot run one without your explicit approval."
+        };
+        runtime.append("Agent", intro);
+        runtime.render_session_state(None);
 
         let ui_for_correction = self.clone();
         correction_switch.connect_active_notify(move |toggle| {
@@ -669,6 +944,30 @@ impl UiState {
         input.connect_activate(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 AgentRuntime::submit(runtime);
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
+        input.connect_changed(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.sync_controls();
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
+        stop_request.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.stop_current_request();
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
+        retry_request.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                AgentRuntime::retry_model(runtime);
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
+        context_clear.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                runtime.detach_block_context();
             }
         });
         let weak = Rc::downgrade(&runtime);

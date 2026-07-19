@@ -49,6 +49,11 @@ All notable user-visible and operational changes are recorded here.
 - AI persistence schema v2 stores the current selection and up to 50 chat rows, automatically migrates v1 single-chat snapshots, retains at most 100 turns per chat, and compacts the oldest history with a visible `truncated` marker to keep the complete JSON collection within 8 MiB.
 - Failed or interrupted sends are recoverable as drafts, selected-Block requests preserve unrelated composer text, and window close flushes pending draft persistence before the final snapshot.
 - Window snapshots reserve 64 KiB exclusively for all bounded chat metadata; constrained Pane/Tab state triggers deterministic payload compaction instead of silently omitting the whole chat collection.
+- AI Chat now has true transport-level Stop, generation-safe Retry (including selected-Block requests), visible/clearable active and pending-retry context chips, bounded quick prompts, owner-specific error status, and shutdown cancellation for busy or deleted chats.
+- Shell Agent can attach the selected finished Block as visible untrusted context, stop/retry only the current model turn, copy proposals, recompute risk after edits, and settle spinner/input state correctly at completion or the turn limit.
+- Provider traffic now uses a four-request global concurrency bound, recent-history request compaction, explicit output-limit notices, cancellable curl child reaping, and hard request/context/response capture budgets.
+- Live Chat/Agent activity and the Agent core transcript are now independently bounded; compaction preserves in-flight questions, Block output truncation is visible, and memory-only Ask Block retries become durable draft/context during shutdown.
+- Agent pane environment metadata moved out of the system prompt into bounded untrusted user-role JSON; edited approvals preserve exact whitespace and dangerous-command recognition handles common `env`/`command`, assignment, and Git global-option wrappers.
 - Temporary round-two source-export workflows and marker files were removed.
 
 ### Security
@@ -58,6 +63,8 @@ All notable user-visible and operational changes are recorded here.
 - AI chat metadata, completed pairs, drafts, and provider-bound Block context share the bounded, owner-only, atomically replaced per-window snapshot. Redaction covers active, non-active, and archived chats, and in-flight requests are never restored as completed replies.
 - AI/Agent command proposals never submit or execute a command without an explicit user action.
 - Agent approval is refused while the bound Block prompt is busy or already contains input; malformed model output never degrades into a runnable proposal.
+- Agent proposals and edits must be one visible line with no control characters; recognized privilege, destructive filesystem/system/container, and forced-Git operations require a second exact-command confirmation.
+- Selected Block command/output/cwd bytes are bounded, JSON-escaped and sent as explicitly untrusted user-role data instead of being interpolated into the system prompt.
 - History, workflow, file-tree and AI review insertions reject line breaks and terminal control characters before writing to a PTY.
 - Support archives are created owner-only, make no network requests, and exclude configuration/history/session contents, credentials, host identity, SSH targets, and local paths.
 - The repository is dual-licensed under `MIT OR Apache-2.0`; crates.io publication remains separately disabled with `publish = false`.

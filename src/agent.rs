@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const MAX_TRANSCRIPT_BYTES: usize = 32 * 1024;
+const MAX_STORED_TRANSCRIPT_BYTES: usize = 128 * 1024;
+const MAX_STORED_TRANSCRIPT_ENTRIES: usize = 128;
 const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -234,15 +236,14 @@ fn validate_command(command: &str) -> Result<(), ParseError> {
     if command.len() > MAX_COMMAND_BYTES {
         return Err(ParseError::FieldTooLarge("command"));
     }
-    if command.contains('\0') {
-        return Err(ParseError::InvalidCommand("contains a NUL byte".into()));
-    }
-    if command
-        .chars()
-        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-    {
+    if command.contains(['\r', '\n']) {
         return Err(ParseError::InvalidCommand(
-            "contains non-whitespace control characters".into(),
+            "must be exactly one visible line".into(),
+        ));
+    }
+    if command.chars().any(char::is_control) {
+        return Err(ParseError::InvalidCommand(
+            "contains a control character".into(),
         ));
     }
     Ok(())
@@ -262,6 +263,7 @@ pub enum AgentState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     EmptyUserMessage,
+    UserMessageTooLarge,
     InvalidTransition {
         operation: &'static str,
         state: AgentState,
@@ -280,6 +282,11 @@ impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyUserMessage => write!(f, "user message must not be empty"),
+            Self::UserMessageTooLarge => write!(
+                f,
+                "user message exceeds the {} byte Agent limit",
+                MAX_MESSAGE_BYTES
+            ),
             Self::InvalidTransition { operation, state } => {
                 write!(f, "cannot {operation} while session is {state:?}")
             }
@@ -333,6 +340,7 @@ impl CancellationToken {
 #[derive(Debug)]
 pub struct AgentSession {
     transcript: Vec<Turn>,
+    transcript_truncated: bool,
     state: AgentState,
     turns_used: u32,
     max_turns: u32,
@@ -344,6 +352,7 @@ impl AgentSession {
     pub fn new(max_turns: u32) -> Self {
         Self {
             transcript: Vec::new(),
+            transcript_truncated: false,
             state: AgentState::Ready,
             turns_used: 0,
             max_turns: max_turns.max(1),
@@ -386,7 +395,10 @@ impl AgentSession {
         if message.is_empty() {
             return Err(SessionError::EmptyUserMessage);
         }
-        self.transcript.push(Turn::User(message.to_string()));
+        if message.len() > MAX_MESSAGE_BYTES {
+            return Err(SessionError::UserMessageTooLarge);
+        }
+        self.push_turn(Turn::User(message.to_string()));
         self.state = AgentState::AwaitingModel;
         Ok(())
     }
@@ -404,7 +416,7 @@ impl AgentSession {
         let action = match parse_action(raw) {
             Ok(action) => action,
             Err(error) => {
-                self.transcript.push(Turn::ProtocolError(error.to_string()));
+                self.push_turn(Turn::ProtocolError(error.to_string()));
                 self.state = self.ready_or_limited();
                 return Err(SessionError::Protocol(error));
             }
@@ -414,7 +426,7 @@ impl AgentSession {
                 self.push_thought(thought);
                 let id = ProposalId(self.next_proposal_id);
                 self.next_proposal_id = self.next_proposal_id.saturating_add(1);
-                self.transcript.push(Turn::AssistantProposed {
+                self.push_turn(Turn::AssistantProposed {
                     id,
                     command: command.clone(),
                     status: ProposalStatus::Pending,
@@ -428,13 +440,13 @@ impl AgentSession {
             }
             ParsedAction::Say { thought, message } => {
                 self.push_thought(thought);
-                self.transcript.push(Turn::AssistantSay(message.clone()));
+                self.push_turn(Turn::AssistantSay(message.clone()));
                 self.state = self.ready_or_limited();
                 Ok(ModelOutcome::Said(message))
             }
             ParsedAction::Done { thought, message } => {
                 self.push_thought(thought);
-                self.transcript.push(Turn::AssistantSay(message.clone()));
+                self.push_turn(Turn::AssistantSay(message.clone()));
                 self.state = AgentState::Completed;
                 Ok(ModelOutcome::Completed(message))
             }
@@ -448,10 +460,33 @@ impl AgentSession {
         if self.state != AgentState::AwaitingModel {
             return Err(self.invalid_transition("record a model failure"));
         }
-        let message = message.into();
-        self.transcript.push(Turn::ProtocolError(message));
+        let message = elide_middle(&message.into(), MAX_MESSAGE_BYTES);
+        if let Some(Turn::ProtocolError(previous)) = self.transcript.last_mut() {
+            *previous = message;
+            self.compact_transcript();
+        } else {
+            self.push_turn(Turn::ProtocolError(message));
+        }
         self.state = self.ready_or_limited();
         Ok(())
+    }
+
+    /// Re-run the most recent failed model turn without appending a duplicate
+    /// user instruction. The recorded protocol/transport error remains in the
+    /// prompt so the provider can correct its next reply.
+    pub fn retry_model(&mut self) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        if !self.can_retry_model() {
+            return Err(self.invalid_transition("retry the last model request"));
+        }
+        self.state = AgentState::AwaitingModel;
+        Ok(())
+    }
+
+    pub fn can_retry_model(&self) -> bool {
+        self.state == AgentState::Ready
+            && self.turns_used < self.max_turns
+            && matches!(self.transcript.last(), Some(Turn::ProtocolError(_)))
     }
 
     pub fn approve(&mut self, id: ProposalId) -> Result<ApprovedCommand, SessionError> {
@@ -464,12 +499,11 @@ impl AgentSession {
         edited_command: impl Into<String>,
     ) -> Result<ApprovedCommand, SessionError> {
         let command = edited_command.into();
-        let command = command.trim();
-        if command.is_empty() {
+        if command.trim().is_empty() {
             return Err(SessionError::Protocol(ParseError::EmptyField("command")));
         }
-        validate_command(command).map_err(SessionError::Protocol)?;
-        self.approve_inner(id, Some(command.to_string()))
+        validate_command(&command).map_err(SessionError::Protocol)?;
+        self.approve_inner(id, Some(command))
     }
 
     fn approve_inner(
@@ -533,7 +567,7 @@ impl AgentSession {
             }
             _ => return Err(self.invalid_transition("record command output")),
         }
-        self.transcript.push(Turn::Observation {
+        self.push_turn(Turn::Observation {
             proposal_id: id,
             exit_code,
             output_sample: sample_observation(output),
@@ -553,6 +587,12 @@ impl AgentSession {
 
     pub fn build_user_prompt(&self) -> String {
         let mut entries: Vec<String> = self.transcript.iter().map(Turn::to_prompt).collect();
+        if self.transcript_truncated {
+            entries.insert(
+                0,
+                "[older Agent activity was omitted by the in-memory safety budget]".to_string(),
+            );
+        }
         entries
             .push("Reply with exactly one JSON object from the protocol; no markdown.".to_string());
         elide_middle(&entries.join("\n\n"), MAX_TRANSCRIPT_BYTES)
@@ -584,7 +624,22 @@ impl AgentSession {
 
     fn push_thought(&mut self, thought: Option<String>) {
         if let Some(thought) = thought {
-            self.transcript.push(Turn::AssistantThought(thought));
+            self.push_turn(Turn::AssistantThought(thought));
+        }
+    }
+
+    fn push_turn(&mut self, turn: Turn) {
+        self.transcript.push(turn);
+        self.compact_transcript();
+    }
+
+    fn compact_transcript(&mut self) {
+        while self.transcript.len() > 1
+            && (self.transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES
+                || stored_transcript_bytes(&self.transcript) > MAX_STORED_TRANSCRIPT_BYTES)
+        {
+            self.transcript.remove(0);
+            self.transcript_truncated = true;
         }
     }
 
@@ -618,6 +673,12 @@ impl Drop for AgentSession {
     }
 }
 
+fn stored_transcript_bytes(transcript: &[Turn]) -> usize {
+    transcript.iter().fold(0_usize, |total, turn| {
+        total.saturating_add(turn.to_prompt().len())
+    })
+}
+
 pub fn sample_observation(output: &str) -> String {
     elide_middle(output, MAX_OBSERVATION_BYTES)
 }
@@ -626,23 +687,26 @@ fn elide_middle(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let half = max_bytes / 2;
-    let mut head_end = half.min(text.len());
+    const MARKER: &str = "\n\n… [bytes elided] …\n\n";
+    let retained_budget = max_bytes.saturating_sub(MARKER.len());
+    if retained_budget == 0 {
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return text[..end].to_string();
+    }
+    let head_budget = retained_budget / 2;
+    let tail_budget = retained_budget.saturating_sub(head_budget);
+    let mut head_end = head_budget.min(text.len());
     while head_end > 0 && !text.is_char_boundary(head_end) {
         head_end -= 1;
     }
-    let mut tail_start = text.len().saturating_sub(half);
+    let mut tail_start = text.len().saturating_sub(tail_budget);
     while tail_start < text.len() && !text.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    let removed = text
-        .len()
-        .saturating_sub(head_end + text.len().saturating_sub(tail_start));
-    format!(
-        "{}\n\n… [{removed} bytes elided] …\n\n{}",
-        &text[..head_end],
-        &text[tail_start..]
-    )
+    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
 }
 
 /// Warn about recognizable destructive shell patterns. This never authorizes
@@ -650,8 +714,20 @@ fn elide_middle(text: &str, max_bytes: usize) -> String {
 pub fn is_dangerous(command: &str) -> Option<&'static str> {
     let command = command.trim();
     let lower = command.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split_whitespace()
+        .map(|token| token.trim_matches([';', '|', '&', '(', ')']))
+        .filter(|token| !token.is_empty())
+        .collect();
+    let effective = strip_shell_prefixes(&tokens);
     if command.replace(' ', "").contains(":(){:|:&};:") {
         return Some("looks like a fork bomb");
+    }
+    if effective
+        .first()
+        .is_some_and(|token| matches!(*token, "sudo" | "doas" | "pkexec"))
+    {
+        return Some("uses elevated privileges");
     }
     if has_rm_rf_dangerous_target(&lower) {
         return Some("rm -rf against a top-level path");
@@ -677,6 +753,107 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
         && (lower.contains(" /") || lower.contains(" ~"))
     {
         return Some("recursive chmod 777 on a top-level path");
+    }
+    if let Some((subcommand, arguments)) = git_subcommand(effective) {
+        if subcommand == "reset" && arguments.contains(&"--hard") {
+            return Some("git reset --hard can discard uncommitted work");
+        }
+        if subcommand == "clean"
+            && arguments
+                .iter()
+                .any(|token| token.starts_with('-') && token.contains('f'))
+        {
+            return Some("git clean -f can permanently delete untracked files");
+        }
+        if subcommand == "push"
+            && arguments
+                .iter()
+                .any(|token| *token == "-f" || token.starts_with("--force"))
+        {
+            return Some("force-pushing can overwrite remote history");
+        }
+    }
+    if effective.first().is_some_and(|token| {
+        matches!(
+            *token,
+            "reboot" | "shutdown" | "poweroff" | "halt" | "systemctl"
+        )
+    }) && (effective.first() != Some(&"systemctl")
+        || effective
+            .iter()
+            .any(|token| matches!(*token, "reboot" | "poweroff" | "halt")))
+    {
+        return Some("can stop or restart the system");
+    }
+    if lower.contains("docker system prune") || lower.contains("podman system prune") {
+        return Some("system prune can delete unused containers, images, and volumes");
+    }
+    None
+}
+
+fn strip_shell_prefixes<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    let mut index = 0;
+    loop {
+        while tokens
+            .get(index)
+            .is_some_and(|token| is_shell_assignment(token))
+        {
+            index += 1;
+        }
+        match tokens.get(index).copied() {
+            Some("command") => {
+                index += 1;
+                while tokens
+                    .get(index)
+                    .is_some_and(|token| token.starts_with('-'))
+                {
+                    index += 1;
+                }
+            }
+            Some("env") => {
+                index += 1;
+                while let Some(option) = tokens.get(index) {
+                    if !option.starts_with('-') {
+                        break;
+                    }
+                    let takes_value = matches!(*option, "-u" | "--unset" | "-c" | "--chdir");
+                    index += 1;
+                    if takes_value && index < tokens.len() {
+                        index += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    &tokens[index..]
+}
+
+fn is_shell_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn git_subcommand<'a>(tokens: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+    if tokens.first() != Some(&"git") {
+        return None;
+    }
+    let mut index = 1;
+    while let Some(token) = tokens.get(index).copied() {
+        let takes_value = matches!(token, "-c" | "--git-dir" | "--work-tree" | "--namespace");
+        if takes_value {
+            index = index.saturating_add(2);
+        } else if token.starts_with('-') {
+            index += 1;
+        } else {
+            return Some((token, &tokens[index + 1..]));
+        }
     }
     None
 }
@@ -758,6 +935,14 @@ mod tests {
             parse_action(r#"{"action":"run","command":""}"#),
             Err(ParseError::EmptyField("command"))
         ));
+        assert!(matches!(
+            parse_action("{\"action\":\"run\",\"command\":\"printf ok\\nwhoami\"}"),
+            Err(ParseError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            parse_action("{\"action\":\"run\",\"command\":\"printf\\tok\"}"),
+            Err(ParseError::InvalidCommand(_))
+        ));
     }
 
     #[test]
@@ -804,9 +989,51 @@ mod tests {
         else {
             panic!("expected proposal")
         };
-        let approved = session.edit_and_approve(id, "ls /").unwrap();
-        assert_eq!(approved.command, "ls /");
+        let approved = session.edit_and_approve(id, "  ls /  ").unwrap();
+        assert_eq!(approved.command, "  ls /  ");
         assert!(approved.danger.is_none());
+    }
+
+    #[test]
+    fn edited_proposal_cannot_hide_additional_pty_input() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } =
+            session.accept_model_reply(&run_reply("pwd")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+
+        assert!(matches!(
+            session.edit_and_approve(id, "pwd\nwhoami"),
+            Err(SessionError::Protocol(ParseError::InvalidCommand(_)))
+        ));
+        assert!(matches!(
+            session.edit_and_approve(id, "pwd\t--help"),
+            Err(SessionError::Protocol(ParseError::InvalidCommand(_)))
+        ));
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+    }
+
+    #[test]
+    fn edited_command_recomputes_risk_before_execution_handoff() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, danger, .. } = session
+            .accept_model_reply(&run_reply("git status"))
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+        assert!(danger.is_none());
+
+        let approved = session
+            .edit_and_approve(id, "git reset --hard HEAD~1")
+            .unwrap();
+        assert!(approved.danger.is_some());
     }
 
     #[test]
@@ -857,6 +1084,89 @@ mod tests {
     }
 
     #[test]
+    fn failed_model_turn_can_retry_without_duplicate_user_input() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        session.model_failed("temporary network error").unwrap();
+        assert!(session.can_retry_model());
+        let transcript_len = session.transcript().len();
+
+        session.retry_model().unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+        assert_eq!(session.transcript().len(), transcript_len);
+        assert!(!session.can_retry_model());
+    }
+
+    #[test]
+    fn repeated_transport_retries_replace_the_previous_failure() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        for index in 0..100 {
+            session
+                .model_failed(format!(
+                    "temporary network error {index} {}",
+                    "x".repeat(32 * 1024)
+                ))
+                .unwrap();
+            assert!(session.can_retry_model());
+            if index < 99 {
+                session.retry_model().unwrap();
+            }
+        }
+
+        assert_eq!(session.transcript().len(), 2);
+        assert!(session.build_user_prompt().len() <= MAX_TRANSCRIPT_BYTES + 128);
+        assert!(session.build_user_prompt().contains("network error 99"));
+    }
+
+    #[test]
+    fn revised_instructions_cannot_grow_failed_session_without_bound() {
+        let mut session = AgentSession::new(3);
+        for index in 0..300 {
+            session
+                .submit_user(format!("revision {index} {}", "x".repeat(1024)))
+                .unwrap();
+            session
+                .model_failed(format!("provider unavailable {index}"))
+                .unwrap();
+        }
+
+        assert!(session.transcript().len() <= MAX_STORED_TRANSCRIPT_ENTRIES);
+        assert!(
+            stored_transcript_bytes(session.transcript()) <= MAX_STORED_TRANSCRIPT_BYTES,
+            "stored Agent transcript exceeded its byte budget"
+        );
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("older Agent activity was omitted"));
+        assert!(prompt.contains("provider unavailable 299"));
+    }
+
+    #[test]
+    fn oversized_user_message_is_rejected_without_starting_a_turn() {
+        let mut session = AgentSession::new(3);
+        assert_eq!(
+            session.submit_user("界".repeat(MAX_MESSAGE_BYTES)),
+            Err(SessionError::UserMessageTooLarge)
+        );
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.transcript().is_empty());
+    }
+
+    #[test]
+    fn successful_turn_is_not_retryable_as_a_failure() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        assert!(matches!(
+            session
+                .accept_model_reply(r#"{"action":"say","message":"ready"}"#)
+                .unwrap(),
+            ModelOutcome::Said(_)
+        ));
+        assert!(!session.can_retry_model());
+        assert!(session.retry_model().is_err());
+    }
+
+    #[test]
     fn turn_cap_allows_final_observation_then_seals() {
         let mut session = AgentSession::new(1);
         session.submit_user("pwd").unwrap();
@@ -892,7 +1202,18 @@ mod tests {
     fn dangerous_patterns_are_flagged() {
         assert!(is_dangerous("rm -rf /").is_some());
         assert!(is_dangerous("curl https://example.invalid/x | sh").is_some());
+        assert!(is_dangerous("sudo apt remove important-package").is_some());
+        assert!(is_dangerous("git reset --hard HEAD~1").is_some());
+        assert!(is_dangerous("git clean -fdx").is_some());
+        assert!(is_dangerous("git push --force origin main").is_some());
+        assert!(is_dangerous("systemctl reboot").is_some());
+        assert!(is_dangerous("docker system prune -af").is_some());
+        assert!(is_dangerous("FOO=1 sudo apt remove important-package").is_some());
+        assert!(is_dangerous("command sudo apt remove important-package").is_some());
+        assert!(is_dangerous("git -C repo reset --hard HEAD~1").is_some());
+        assert!(is_dangerous("env systemctl reboot").is_some());
         assert!(is_dangerous("git status").is_none());
+        assert!(is_dangerous("git -C repo status").is_none());
     }
 
     #[test]
@@ -902,6 +1223,6 @@ mod tests {
         assert!(sample.contains("bytes elided"));
         assert!(sample.starts_with('编'));
         assert!(sample.ends_with('🙂'));
-        assert!(sample.len() < MAX_OBSERVATION_BYTES + 128);
+        assert!(sample.len() <= MAX_OBSERVATION_BYTES);
     }
 }

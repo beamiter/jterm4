@@ -7,6 +7,7 @@
 //! background reply into the visible conversation.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -25,8 +26,22 @@ use crate::config::Config;
 
 const CHAT_PAGE: &str = "chat";
 const CHAT_LIBRARY_PAGE: &str = "library";
+const STOPPED_STATUS: &str = "Response stopped. You can retry when ready.";
 
 type PersistenceCallback = Rc<dyn Fn()>;
+
+#[derive(Clone, Debug)]
+struct RequestPayload {
+    user_text: String,
+    context: Option<BlockContext>,
+    restore_pending_as_draft: bool,
+}
+
+#[derive(Clone, Debug)]
+struct InflightRequest {
+    cancellation: ai::AiCancellationToken,
+    payload: RequestPayload,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposerKeyAction {
@@ -78,6 +93,9 @@ pub(crate) struct AiPanel {
     convo_view: TextView,
     convo_scroll: ScrolledWindow,
     empty_state: GBox,
+    context_row: GBox,
+    context_label: Label,
+    clear_context_btn: Button,
     input_buffer: TextBuffer,
     input_view: TextView,
     input_placeholder: Label,
@@ -85,6 +103,10 @@ pub(crate) struct AiPanel {
     status_row: GBox,
     status_spinner: Spinner,
     status_label: Label,
+    stop_btn: Button,
+    retry_btn: Button,
+    requests: Rc<RefCell<HashMap<RequestToken, InflightRequest>>>,
+    retry_payloads: Rc<RefCell<HashMap<u64, RequestPayload>>>,
     persistence_callback: Rc<RefCell<Option<PersistenceCallback>>>,
     draft_persist_epoch: Rc<Cell<u64>>,
     config: Rc<RefCell<Config>>,
@@ -200,9 +222,17 @@ impl AiPanel {
         empty_state.add_css_class("ai-empty-state");
         empty_state.set_halign(gtk4::Align::Center);
         empty_state.set_valign(gtk4::Align::Center);
-        empty_state.set_can_target(false);
         empty_state.append(&empty_title);
         empty_state.append(&empty_hint);
+        let explain_prompt_btn = prompt_button("Explain a command");
+        let diagnose_prompt_btn = prompt_button("Diagnose an error");
+        let draft_command_prompt_btn = prompt_button("Draft a command");
+        let empty_actions = GBox::new(Orientation::Vertical, 6);
+        empty_actions.add_css_class("ai-empty-actions");
+        empty_actions.append(&explain_prompt_btn);
+        empty_actions.append(&diagnose_prompt_btn);
+        empty_actions.append(&draft_command_prompt_btn);
+        empty_state.append(&empty_actions);
         empty_state.append(&empty_safety);
         let transcript_overlay = Overlay::new();
         transcript_overlay.set_child(Some(&convo_scroll));
@@ -217,12 +247,39 @@ impl AiPanel {
         status_label.set_wrap(true);
         status_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
         status_label.set_selectable(true);
+        let retry_btn = Button::with_label("Retry");
+        retry_btn.set_tooltip_text(Some("Retry the last failed or stopped request"));
+        retry_btn.add_css_class("flat");
+        retry_btn.add_css_class("ai-status-action");
+        retry_btn.set_visible(false);
+        let stop_btn = Button::with_label("Stop");
+        stop_btn.set_tooltip_text(Some("Stop this response"));
+        stop_btn.add_css_class("destructive-action");
+        stop_btn.add_css_class("ai-status-action");
+        stop_btn.set_visible(false);
         let status_row = GBox::new(Orientation::Horizontal, 6);
         status_row.add_css_class("ai-panel-status-row");
         status_row.append(&status_spinner);
         status_row.append(&status_label);
+        status_row.append(&retry_btn);
+        status_row.append(&stop_btn);
         status_row.set_visible(false);
         status_row.set_accessible_role(gtk4::AccessibleRole::Status);
+
+        let context_label = Label::new(None);
+        context_label.set_halign(gtk4::Align::Start);
+        context_label.set_hexpand(true);
+        context_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        context_label.add_css_class("ai-context-label");
+        let clear_context_btn = Button::with_label("Clear");
+        clear_context_btn.set_tooltip_text(Some("Remove Block context from this chat"));
+        clear_context_btn.add_css_class("flat");
+        clear_context_btn.add_css_class("ai-context-clear");
+        let context_row = GBox::new(Orientation::Horizontal, 6);
+        context_row.add_css_class("ai-context-chip");
+        context_row.append(&context_label);
+        context_row.append(&clear_context_btn);
+        context_row.set_visible(false);
 
         let input_buffer = TextBuffer::new(None);
         let input_view = TextView::with_buffer(&input_buffer);
@@ -272,6 +329,7 @@ impl AiPanel {
         composer_actions.append(&send_btn);
         let composer = GBox::new(Orientation::Vertical, 6);
         composer.add_css_class("ai-panel-composer");
+        composer.append(&context_row);
         composer.append(&input_overlay);
         composer.append(&composer_actions);
 
@@ -343,6 +401,9 @@ impl AiPanel {
             convo_view,
             convo_scroll: convo_scroll.clone(),
             empty_state,
+            context_row,
+            context_label,
+            clear_context_btn: clear_context_btn.clone(),
             input_buffer: input_buffer.clone(),
             input_view: input_view.clone(),
             input_placeholder,
@@ -350,6 +411,10 @@ impl AiPanel {
             status_row,
             status_spinner,
             status_label: status_label.clone(),
+            stop_btn: stop_btn.clone(),
+            retry_btn: retry_btn.clone(),
+            requests: Rc::new(RefCell::new(HashMap::new())),
+            retry_payloads: Rc::new(RefCell::new(HashMap::new())),
             persistence_callback: Rc::new(RefCell::new(None)),
             draft_persist_epoch: Rc::new(Cell::new(0)),
             config,
@@ -418,6 +483,38 @@ impl AiPanel {
         {
             let p = panel.clone();
             send_btn.connect_clicked(move |_| p.send_from_input(None));
+        }
+        {
+            let p = panel.clone();
+            stop_btn.connect_clicked(move |_| p.stop_active_request());
+        }
+        {
+            let p = panel.clone();
+            retry_btn.connect_clicked(move |_| p.retry_active_request());
+        }
+        {
+            let p = panel.clone();
+            clear_context_btn.connect_clicked(move |_| p.clear_active_context());
+        }
+        {
+            let p = panel.clone();
+            explain_prompt_btn.connect_clicked(move |_| {
+                p.fill_composer_prompt("Explain what this command does: ");
+            });
+        }
+        {
+            let p = panel.clone();
+            diagnose_prompt_btn.connect_clicked(move |_| {
+                p.fill_composer_prompt(
+                    "Diagnose this terminal error and suggest the safest next step:\n",
+                );
+            });
+        }
+        {
+            let p = panel.clone();
+            draft_command_prompt_btn.connect_clicked(move |_| {
+                p.fill_composer_prompt("Draft a shell command for review that ");
+            });
         }
         {
             let p = panel.clone();
@@ -516,12 +613,115 @@ impl AiPanel {
         self.render_active_chat();
     }
 
+    pub(crate) fn cancel_all_requests(&self) {
+        let requests = std::mem::take(&mut *self.requests.borrow_mut());
+        let retry_payloads = std::mem::take(&mut *self.retry_payloads.borrow_mut());
+        let mut cancellations = Vec::with_capacity(requests.len());
+        let mut store = self.store.borrow_mut();
+        for (token, request) in requests {
+            request.cancellation.cancel();
+            cancellations.push(request.cancellation);
+            let _ = store.cancel_request(
+                token,
+                "Response stopped because the window is closing.".to_string(),
+            );
+            if !request.payload.restore_pending_as_draft {
+                store.recover_retry_payload(
+                    token.chat_id,
+                    &request.payload.user_text,
+                    request.payload.context,
+                );
+            }
+        }
+        for (chat_id, payload) in retry_payloads {
+            if !payload.restore_pending_as_draft {
+                store.recover_retry_payload(chat_id, &payload.user_text, payload.context);
+            }
+        }
+        drop(store);
+
+        // Give worker threads a short shared deadline to kill and reap curl
+        // before application teardown. Tokens whose workers have not started
+        // are already cancelled and cannot spawn a child later.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        for cancellation in cancellations {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || !cancellation.wait_for_inactive(remaining) {
+                log::warn!("Timed out waiting for an AI request to shut down");
+                break;
+            }
+        }
+    }
+
     pub(crate) fn focus_input(&self) {
         self.show_chat_page();
         if self.store.borrow().active_archived() {
             self.convo_view.grab_focus();
         } else {
             self.input_view.grab_focus();
+        }
+    }
+
+    fn stop_active_request(&self) {
+        let Some(token) = self.store.borrow().active_request_token() else {
+            return;
+        };
+        let Some(request) = self.requests.borrow_mut().remove(&token) else {
+            return;
+        };
+        request.cancellation.cancel();
+        let owner_active = self
+            .store
+            .borrow_mut()
+            .cancel_request(token, STOPPED_STATUS.to_string());
+        let Some(owner_active) = owner_active else {
+            return;
+        };
+        self.retry_payloads
+            .borrow_mut()
+            .insert(token.chat_id, request.payload);
+        if owner_active {
+            self.render_active_chat();
+            self.input_view.grab_focus();
+        } else {
+            self.refresh_chat_library();
+        }
+        self.publish_persisted_conversation();
+    }
+
+    fn retry_active_request(&self) {
+        let (chat_id, available) = {
+            let store = self.store.borrow();
+            (
+                store.active_id(),
+                !store.is_active_busy() && !store.active_archived(),
+            )
+        };
+        if !available {
+            return;
+        }
+        let Some(payload) = self.retry_payloads.borrow().get(&chat_id).cloned() else {
+            return;
+        };
+
+        self.render_active_chat();
+        let original_draft = self.input_text();
+        if payload.restore_pending_as_draft {
+            let remaining = draft_without_retry_message(&payload.user_text, &original_draft);
+            if remaining != original_draft {
+                self.input_buffer.set_text(&remaining);
+            }
+        }
+        if self.send_with_context(
+            payload.user_text.clone(),
+            payload.context.clone(),
+            payload.restore_pending_as_draft,
+            false,
+        ) {
+            self.retry_payloads.borrow_mut().remove(&chat_id);
+            self.sync_request_actions();
+        } else if self.input_text() != original_draft {
+            self.input_buffer.set_text(&original_draft);
         }
     }
 
@@ -636,6 +836,20 @@ impl AiPanel {
             if response != "delete" {
                 return;
             }
+            let (deleted_id, token) = {
+                let store = p.store.borrow();
+                (store.active_id(), store.active_request_token())
+            };
+            if let Some(token) = token {
+                if let Some(request) = p.requests.borrow_mut().remove(&token) {
+                    request.cancellation.cancel();
+                }
+                let _ = p
+                    .store
+                    .borrow_mut()
+                    .cancel_request(token, "Chat deleted.".to_string());
+            }
+            p.retry_payloads.borrow_mut().remove(&deleted_id);
             p.store.borrow_mut().delete_active();
             p.render_active_chat();
             p.publish_persisted_conversation();
@@ -734,6 +948,8 @@ impl AiPanel {
     fn append_chat_row(&self, summary: &ChatSummary) {
         let subtitle = if summary.busy {
             "Thinking…".to_string()
+        } else if summary.error {
+            format!("Error · {}", summary.preview)
         } else if summary.unread {
             format!("New response · {}", summary.preview)
         } else if summary.history_truncated {
@@ -756,7 +972,12 @@ impl AiPanel {
             icon.set_tooltip_text(Some("Archived"));
             row.add_suffix(&icon);
         }
-        if summary.unread {
+        if summary.error {
+            row.add_css_class("error");
+            let badge = Label::new(Some("Error"));
+            badge.add_css_class("error");
+            row.add_suffix(&badge);
+        } else if summary.unread {
             row.add_css_class("unread");
             let badge = Label::new(Some("New"));
             badge.add_css_class("accent");
@@ -792,6 +1013,7 @@ impl AiPanel {
         self.input_buffer.set_text(&draft);
         self.sync_empty_state();
         self.sync_composer_state();
+        self.sync_context_chip();
         self.sync_active_status();
         self.refresh_chat_chrome();
         self.refresh_chat_library();
@@ -807,6 +1029,77 @@ impl AiPanel {
         let start = self.input_buffer.start_iter();
         let end = self.input_buffer.end_iter();
         self.input_buffer.text(&start, &end, false).to_string()
+    }
+
+    fn fill_composer_prompt(&self, prompt: &str) {
+        if self.store.borrow().active_archived() {
+            return;
+        }
+        self.input_buffer.set_text(prompt);
+        let end = self.input_buffer.end_iter();
+        self.input_buffer.place_cursor(&end);
+        self.input_view.grab_focus();
+    }
+
+    fn clear_active_context(&self) {
+        let result = self.store.borrow_mut().clear_active_context();
+        match result {
+            Ok(store_cleared) => {
+                let active_id = self.store.borrow().active_id();
+                let retry_cleared = self
+                    .retry_payloads
+                    .borrow_mut()
+                    .get_mut(&active_id)
+                    .and_then(|payload| payload.context.take())
+                    .is_some();
+                self.sync_context_chip();
+                if store_cleared || retry_cleared {
+                    self.sync_active_status();
+                    self.publish_persisted_conversation();
+                    self.input_view.grab_focus();
+                }
+            }
+            Err(ChatStoreError::Busy) => self.sync_active_status(),
+            Err(_) => {}
+        }
+    }
+
+    fn sync_context_chip(&self) {
+        let (active_id, active_context, busy) = {
+            let store = self.store.borrow();
+            (
+                store.active_id(),
+                store.active_context().cloned(),
+                store.is_active_busy(),
+            )
+        };
+        let retry_context = self
+            .retry_payloads
+            .borrow()
+            .get(&active_id)
+            .and_then(|payload| payload.context.clone());
+        // A failed replacement request will have rolled the store back to its
+        // previous durable context. Show the context that Retry would actually
+        // send, so no hidden Block data can unexpectedly replace it.
+        let pending_retry = retry_context.is_some();
+        let context = retry_context.or(active_context);
+        let Some(context) = context else {
+            self.context_label.set_text("");
+            self.context_label.set_tooltip_text(None);
+            self.context_row.set_visible(false);
+            return;
+        };
+        self.context_label
+            .set_text(&context_chip_text(&context, pending_retry));
+        self.context_label.set_tooltip_text(Some(
+            &context
+                .cwd
+                .as_deref()
+                .map(|cwd| format!("cwd: {cwd}"))
+                .unwrap_or_else(|| "cwd unavailable".to_string()),
+        ));
+        self.clear_context_btn.set_sensitive(!busy);
+        self.context_row.set_visible(true);
     }
 
     fn sync_composer_state(&self) {
@@ -851,6 +1144,32 @@ impl AiPanel {
             }
             ChatStatus::Idle => self.clear_status_widgets(),
         }
+        self.sync_request_actions();
+        self.sync_context_chip();
+    }
+
+    fn sync_request_actions(&self) {
+        let (active_id, archived, token) = {
+            let store = self.store.borrow();
+            (
+                store.active_id(),
+                store.active_archived(),
+                store.active_request_token(),
+            )
+        };
+        let can_stop = token.is_some_and(|token| self.requests.borrow().contains_key(&token));
+        let can_retry =
+            !archived && token.is_none() && self.retry_payloads.borrow().contains_key(&active_id);
+        self.stop_btn.set_visible(can_stop);
+        self.stop_btn.set_sensitive(can_stop);
+        self.retry_btn.set_visible(can_retry);
+        self.retry_btn.set_sensitive(can_retry);
+        self.status_row.set_visible(
+            self.status_spinner.is_visible()
+                || !self.status_label.text().is_empty()
+                || can_stop
+                || can_retry,
+        );
     }
 
     fn clear_status_widgets(&self) {
@@ -1037,6 +1356,7 @@ impl AiPanel {
         let start = self.convo_buffer.iter_at_offset(label_start);
         let end = self.convo_buffer.iter_at_offset(label_end);
         self.convo_buffer.apply_tag_by_name(role_tag, &start, &end);
+        super::bounded_text::trim_ai_transcript(&self.convo_buffer);
     }
 
     fn scroll_transcript_to_end(&self) {
@@ -1076,8 +1396,7 @@ impl AiPanel {
             return;
         }
         let user_text = trimmed.to_string();
-        self.input_buffer.set_text("");
-        self.send_with_context(user_text, None, true);
+        self.send_with_context(user_text, None, true, true);
     }
 
     pub(crate) fn ask_about_block(&self, ctx: BlockContext) {
@@ -1092,6 +1411,7 @@ impl AiPanel {
             self.publish_persisted_conversation();
         }
         if self.store.borrow().is_active_busy() {
+            self.sync_active_status();
             return;
         }
         let prompt = if ctx.exit_code == 0 {
@@ -1100,7 +1420,7 @@ impl AiPanel {
             "This command failed. Diagnose the error and suggest a fix."
         };
         self.show_chat_page();
-        self.send_with_context(prompt.to_string(), Some(ctx), false);
+        self.send_with_context(prompt.to_string(), Some(ctx), false, false);
     }
 
     pub(crate) fn command_generation_started(&self, request: &str) -> u64 {
@@ -1135,7 +1455,8 @@ impl AiPanel {
         user_text: String,
         context: Option<BlockContext>,
         restore_pending_as_draft: bool,
-    ) {
+        clear_composer_on_start: bool,
+    ) -> bool {
         let (user_text, context) = {
             let config = self.config.borrow();
             if config.ai_redact_secrets {
@@ -1145,11 +1466,17 @@ impl AiPanel {
                     output: crate::redact::redact_secrets(&context.output),
                     cwd: context.cwd.map(|cwd| crate::redact::redact_secrets(&cwd)),
                     exit_code: context.exit_code,
+                    truncated: context.truncated,
                 });
                 (user_text, context)
             } else {
                 (user_text, context)
             }
+        };
+        let payload = RequestPayload {
+            user_text: user_text.clone(),
+            context: context.clone(),
+            restore_pending_as_draft,
         };
 
         let client = ai::AiClient::from_config(&self.config.borrow());
@@ -1174,26 +1501,57 @@ impl AiPanel {
             Ok(start) => start,
             Err(ChatStoreError::Archived) => {
                 self.show_info_status("Unarchive this chat before sending a message.");
-                return;
+                self.sync_request_actions();
+                return false;
             }
-            Err(ChatStoreError::Busy | ChatStoreError::EmptyMessage) => return,
-            Err(ChatStoreError::LimitReached) => return,
-            Err(ChatStoreError::SnapshotInvalid) => return,
+            Err(ChatStoreError::MessageTooLarge) => {
+                self.store.borrow_mut().set_active_error(
+                    "Message is too large to send. Shorten it to less than 64 KiB and try again.",
+                );
+                self.sync_active_status();
+                self.refresh_chat_library();
+                return false;
+            }
+            Err(ChatStoreError::Busy | ChatStoreError::EmptyMessage) => return false,
+            Err(ChatStoreError::LimitReached | ChatStoreError::SnapshotInvalid) => return false,
         };
 
+        if clear_composer_on_start {
+            self.input_buffer.set_text("");
+        }
         self.append_visible("You", "role-user", &visible_user);
+        let system = ai::build_system_prompt(None);
+        let mut history = start.history;
+        if let Some(last_user) = history
+            .iter_mut()
+            .rev()
+            .find(|turn| turn.role == Role::User)
+        {
+            last_user.text = ai::user_prompt_with_block_context(
+                &last_user.text,
+                start.effective_context.as_ref(),
+            );
+        }
+        let token = start.token;
+        let cancellation = ai::AiCancellationToken::new();
+        self.requests.borrow_mut().insert(
+            token,
+            InflightRequest {
+                cancellation: cancellation.clone(),
+                payload,
+            },
+        );
+        self.retry_payloads.borrow_mut().remove(&token.chat_id);
         self.sync_composer_state();
         self.sync_active_status();
         self.refresh_chat_chrome();
         self.refresh_chat_library();
-        let system = ai::build_system_prompt(start.effective_context.as_ref());
-        let history = start.history;
-        let token = start.token;
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<String, ai::AiError>>();
         std::thread::spawn(move || {
-            let result =
-                client.and_then(|client| client.send_turns_blocking(system.as_deref(), &history));
+            let result = client.and_then(|client| {
+                client.send_turns_blocking_cancellable(system.as_deref(), &history, &cancellation)
+            });
             let _ = tx.send(result);
         });
 
@@ -1202,14 +1560,19 @@ impl AiPanel {
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             match rx.borrow().try_recv() {
                 Ok(Ok(text)) => {
+                    if p.requests.borrow_mut().remove(&token).is_none() {
+                        return glib::ControlFlow::Break;
+                    }
                     let owner_active = p.store.borrow_mut().complete_success(token, text.clone());
                     let Some(owner_active) = owner_active else {
                         return glib::ControlFlow::Break;
                     };
+                    p.retry_payloads.borrow_mut().remove(&token.chat_id);
                     if owner_active {
                         p.append_visible("Assistant", "role-asst", &text);
                         p.sync_active_status();
                         p.sync_composer_state();
+                        p.sync_context_chip();
                         p.refresh_chat_chrome();
                     }
                     p.refresh_chat_library();
@@ -1227,9 +1590,13 @@ impl AiPanel {
                 }
             }
         });
+        true
     }
 
     fn finish_request_error(&self, token: RequestToken, message: String) {
+        let Some(request) = self.requests.borrow_mut().remove(&token) else {
+            return;
+        };
         let owner_active = self
             .store
             .borrow_mut()
@@ -1237,15 +1604,17 @@ impl AiPanel {
         let Some(owner_active) = owner_active else {
             return;
         };
+        self.retry_payloads
+            .borrow_mut()
+            .insert(token.chat_id, request.payload);
         if owner_active {
-            let draft = self.store.borrow().active_draft().to_string();
-            self.input_buffer.set_text(&draft);
-            self.show_error_status(&message);
-            self.append_visible("Assistant", "role-err", &message);
-            self.sync_composer_state();
-            self.refresh_chat_chrome();
+            // The failed user turn was rolled back into a recoverable draft.
+            // Re-render from the store so Retry adds it exactly once instead
+            // of leaving a duplicate transient row in the shared TextBuffer.
+            self.render_active_chat();
+        } else {
+            self.refresh_chat_library();
         }
-        self.refresh_chat_library();
         self.publish_persisted_conversation();
     }
 }
@@ -1259,6 +1628,51 @@ fn menu_button(label: &str) -> Button {
     }
     button.add_css_class("flat");
     button
+}
+
+fn prompt_button(label: &str) -> Button {
+    let button = Button::with_label(label);
+    button.set_halign(gtk4::Align::Fill);
+    button.add_css_class("flat");
+    button.add_css_class("ai-empty-action");
+    button
+}
+
+fn context_chip_text(context: &BlockContext, pending_retry: bool) -> String {
+    let collapsed = context.cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    let command = if collapsed.is_empty() {
+        "(no command)".to_string()
+    } else {
+        let mut chars = collapsed.chars();
+        let preview: String = chars.by_ref().take(56).collect();
+        if chars.next().is_some() {
+            format!("{preview}…")
+        } else {
+            preview
+        }
+    };
+    let prefix = if pending_retry {
+        "Pending retry · Block"
+    } else {
+        "Block"
+    };
+    let truncation = if context.truncated {
+        " · output truncated"
+    } else {
+        ""
+    };
+    format!(
+        "{prefix} · exit {}{truncation} · {command}",
+        context.exit_code
+    )
+}
+
+fn draft_without_retry_message(message: &str, draft: &str) -> String {
+    if draft == message {
+        return String::new();
+    }
+    let prefix = format!("{message}\n\n");
+    draft.strip_prefix(&prefix).unwrap_or(draft).to_string()
 }
 
 fn plural(count: usize) -> &'static str {
@@ -1310,5 +1724,44 @@ mod tests {
         for (key, modifiers, expected) in cases {
             assert_eq!(classify_composer_key(key, modifiers), expected);
         }
+    }
+
+    #[test]
+    fn retry_removes_only_the_recovered_request_from_the_draft() {
+        assert_eq!(
+            draft_without_retry_message("failed request", "failed request\n\nfollow-up notes"),
+            "follow-up notes"
+        );
+        assert_eq!(
+            draft_without_retry_message("failed request", "edited failed request"),
+            "edited failed request"
+        );
+        assert_eq!(
+            draft_without_retry_message("failed request", "failed request"),
+            ""
+        );
+    }
+
+    #[test]
+    fn context_chip_is_single_line_bounded_and_reports_exit_status() {
+        let context = BlockContext {
+            cmd: format!("cargo\n{}", "test ".repeat(30)),
+            output: String::new(),
+            cwd: Some("/tmp/repo".into()),
+            exit_code: 101,
+            truncated: false,
+        };
+        let text = context_chip_text(&context, false);
+        assert!(text.starts_with("Block · exit 101 · cargo test"));
+        assert!(!text.contains('\n'));
+        assert!(text.ends_with('…'));
+        assert!(text.chars().count() < 90);
+
+        let pending = context_chip_text(&context, true);
+        assert!(pending.starts_with("Pending retry · Block · exit 101 · cargo test"));
+
+        let mut truncated = context;
+        truncated.truncated = true;
+        assert!(context_chip_text(&truncated, false).contains("output truncated"));
     }
 }

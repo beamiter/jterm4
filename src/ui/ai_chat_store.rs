@@ -10,6 +10,9 @@ use crate::ai::{
 };
 
 pub(super) const DEFAULT_CHAT_TITLE: &str = "New chat";
+pub(super) const MAX_LIVE_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_LIVE_TURNS_PER_CHAT: usize = 100;
+const MAX_LIVE_ALL_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHAT_TITLE_BYTES: usize = 256;
 const MAX_CHAT_TITLE_CHARS: usize = 80;
 
@@ -22,7 +25,7 @@ pub(super) enum ChatStatus {
     Error(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) struct RequestToken {
     pub(super) chat_id: u64,
     pub(super) epoch: u64,
@@ -44,6 +47,7 @@ pub(super) struct ChatSummary {
     pub(super) active: bool,
     pub(super) busy: bool,
     pub(super) unread: bool,
+    pub(super) error: bool,
     pub(super) history_truncated: bool,
 }
 
@@ -53,6 +57,7 @@ pub(super) enum ChatStoreError {
     Archived,
     Busy,
     EmptyMessage,
+    MessageTooLarge,
     SnapshotInvalid,
 }
 
@@ -273,6 +278,14 @@ impl ChatStore {
         self.active().is_busy()
     }
 
+    pub(super) fn active_request_token(&self) -> Option<RequestToken> {
+        let chat = self.active();
+        chat.active_epoch.map(|epoch| RequestToken {
+            chat_id: chat.id,
+            epoch,
+        })
+    }
+
     pub(super) fn len(&self) -> usize {
         self.chats.len()
     }
@@ -287,6 +300,13 @@ impl ChatStore {
         }
         self.active_mut().draft = draft;
         true
+    }
+
+    pub(super) fn clear_active_context(&mut self) -> Result<bool, ChatStoreError> {
+        if self.active().is_busy() {
+            return Err(ChatStoreError::Busy);
+        }
+        Ok(self.active_mut().block_context.take().is_some())
     }
 
     pub(super) fn new_chat(&mut self) -> Result<u64, ChatStoreError> {
@@ -383,6 +403,9 @@ impl ChatStore {
         if text.trim().is_empty() {
             return Err(ChatStoreError::EmptyMessage);
         }
+        if text.len() > MAX_LIVE_MESSAGE_BYTES {
+            return Err(ChatStoreError::MessageTooLarge);
+        }
         if self.active().archived {
             return Err(ChatStoreError::Archived);
         }
@@ -424,21 +447,51 @@ impl ChatStore {
     /// Returns whether the owner chat is still the visible chat.
     pub(super) fn complete_success(&mut self, token: RequestToken, text: String) -> Option<bool> {
         let active_chat_id = self.active_chat_id;
-        let chat = self.chat_mut(token.chat_id)?;
-        if chat.active_epoch != Some(token.epoch) {
-            return None;
+        let owner_active = {
+            let chat = self.chat_mut(token.chat_id)?;
+            if chat.active_epoch != Some(token.epoch) {
+                return None;
+            }
+            chat.active_epoch = None;
+            chat.pending_user = None;
+            chat.restore_pending_as_draft = false;
+            chat.previous_context = None;
+            chat.history.push(Turn {
+                role: Role::Assistant,
+                text,
+            });
+            chat.status = ChatStatus::Idle;
+            chat.unread = chat.id != active_chat_id;
+            chat.id == active_chat_id
+        };
+        self.compact_live_histories();
+        Some(owner_active)
+    }
+
+    fn compact_live_histories(&mut self) {
+        for chat in &mut self.chats {
+            while chat.history.len() > MAX_LIVE_TURNS_PER_CHAT {
+                if !drop_oldest_live_pair(chat) {
+                    break;
+                }
+            }
         }
-        chat.active_epoch = None;
-        chat.pending_user = None;
-        chat.restore_pending_as_draft = false;
-        chat.previous_context = None;
-        chat.history.push(Turn {
-            role: Role::Assistant,
-            text,
-        });
-        chat.status = ChatStatus::Idle;
-        chat.unread = chat.id != active_chat_id;
-        Some(chat.id == active_chat_id)
+        while live_history_bytes(&self.chats) > MAX_LIVE_ALL_HISTORY_BYTES {
+            let active_id = self.active_chat_id;
+            let candidate = self
+                .chats
+                .iter()
+                .position(|chat| chat.id != active_id && has_oldest_complete_pair(chat))
+                .or_else(|| {
+                    self.chats
+                        .iter()
+                        .position(|chat| chat.id == active_id && has_oldest_complete_pair(chat))
+                });
+            let Some(index) = candidate else {
+                break;
+            };
+            debug_assert!(drop_oldest_live_pair(&mut self.chats[index]));
+        }
     }
 
     /// Roll back only the request owner's trailing user turn.
@@ -448,29 +501,45 @@ impl ChatStore {
         if chat.active_epoch != Some(token.epoch) {
             return None;
         }
-        chat.active_epoch = None;
-        let popped_user = if chat
-            .history
-            .last()
-            .is_some_and(|turn| turn.role == Role::User)
-        {
-            chat.history.pop().map(|turn| turn.text)
-        } else {
-            None
-        };
-        let pending_user = chat.pending_user.take().or(popped_user);
-        if chat.restore_pending_as_draft {
-            if let Some(pending_user) = pending_user {
-                chat.draft = merge_drafts(&pending_user, &chat.draft);
-            }
-        }
-        chat.restore_pending_as_draft = false;
-        if let Some(previous_context) = chat.previous_context.take() {
-            chat.block_context = previous_context;
-        }
+        rollback_pending_request(chat);
         chat.status = ChatStatus::Error(message);
         chat.unread = chat.id != active_chat_id;
         Some(chat.id == active_chat_id)
+    }
+
+    pub(super) fn cancel_request(&mut self, token: RequestToken, message: String) -> Option<bool> {
+        let active_chat_id = self.active_chat_id;
+        let chat = self.chat_mut(token.chat_id)?;
+        if chat.active_epoch != Some(token.epoch) {
+            return None;
+        }
+        rollback_pending_request(chat);
+        chat.status = ChatStatus::Info(message);
+        chat.unread = chat.id != active_chat_id;
+        Some(chat.id == active_chat_id)
+    }
+
+    /// Convert a memory-only retry (notably Ask selected Block) into durable
+    /// draft/context state before window teardown.
+    pub(super) fn recover_retry_payload(
+        &mut self,
+        chat_id: u64,
+        user_text: &str,
+        context: Option<BlockContext>,
+    ) -> bool {
+        let Some(chat) = self.chat_mut(chat_id) else {
+            return false;
+        };
+        if chat.is_busy() {
+            return false;
+        }
+        if !user_text.trim().is_empty() {
+            chat.draft = merge_drafts(user_text, &chat.draft);
+        }
+        if let Some(context) = context {
+            chat.block_context = Some(context);
+        }
+        true
     }
 
     pub(super) fn set_active_info(&mut self, message: impl Into<String>) {
@@ -499,6 +568,7 @@ impl ChatStore {
                 active: chat.id == self.active_chat_id,
                 busy: chat.is_busy(),
                 unread: chat.unread,
+                error: matches!(chat.status, ChatStatus::Error(_)),
                 history_truncated: chat.history_truncated,
             })
             .collect()
@@ -613,6 +683,66 @@ fn durable_context(chat: &ChatRuntime) -> Option<BlockContext> {
         .unwrap_or_else(|| chat.block_context.clone())
 }
 
+fn rollback_pending_request(chat: &mut ChatRuntime) {
+    chat.active_epoch = None;
+    let popped_user = if chat
+        .history
+        .last()
+        .is_some_and(|turn| turn.role == Role::User)
+    {
+        chat.history.pop().map(|turn| turn.text)
+    } else {
+        None
+    };
+    let pending_user = chat.pending_user.take().or(popped_user);
+    if chat.restore_pending_as_draft {
+        if let Some(pending_user) = pending_user {
+            chat.draft = merge_drafts(&pending_user, &chat.draft);
+        }
+    }
+    chat.restore_pending_as_draft = false;
+    if let Some(previous_context) = chat.previous_context.take() {
+        chat.block_context = previous_context;
+    }
+}
+
+fn has_oldest_complete_pair(chat: &ChatRuntime) -> bool {
+    matches!(
+        chat.history.as_slice(),
+        [
+            Turn {
+                role: Role::User,
+                ..
+            },
+            Turn {
+                role: Role::Assistant,
+                ..
+            },
+            ..
+        ]
+    )
+}
+
+fn drop_oldest_live_pair(chat: &mut ChatRuntime) -> bool {
+    if !has_oldest_complete_pair(chat) {
+        return false;
+    }
+    chat.history.drain(..2);
+    chat.history_truncated = true;
+    if chat.history.is_empty() {
+        chat.block_context = None;
+    }
+    true
+}
+
+fn live_history_bytes(chats: &[ChatRuntime]) -> usize {
+    chats.iter().fold(0_usize, |total, chat| {
+        chat.history
+            .iter()
+            .fold(total, |total, turn| total.saturating_add(turn.text.len()))
+    })
+}
+
 fn merge_drafts(first: &str, second: &str) -> String {
     if first.is_empty() || first == second {
         return second.to_string();
@@ -661,6 +791,7 @@ mod tests {
             output: "first output".into(),
             cwd: Some("/tmp/first".into()),
             exit_code: 0,
+            truncated: false,
         };
         let first_token = store
             .begin_turn(
@@ -680,6 +811,7 @@ mod tests {
             output: "second output".into(),
             cwd: Some("/tmp/second".into()),
             exit_code: 1,
+            truncated: false,
         };
         let second_token = store
             .begin_turn(
@@ -723,6 +855,27 @@ mod tests {
         assert!(store.select_chat(first));
         assert_eq!(store.active_history().len(), 2);
         assert_eq!(store.active_history()[1].text, "answer one");
+    }
+
+    #[test]
+    fn background_failure_is_summarized_as_an_error_not_a_response() {
+        let mut store = ChatStore::default();
+        let failed_chat = store.active_id();
+        let token = start(&mut store, "question that fails");
+        store.new_chat().unwrap();
+
+        assert_eq!(
+            store.complete_error(token, "network failed".into()),
+            Some(false)
+        );
+        let summary = store
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.id == failed_chat)
+            .unwrap();
+        assert!(summary.error);
+        assert!(summary.unread);
+        assert!(!summary.busy);
     }
 
     #[test]
@@ -774,6 +927,7 @@ mod tests {
             output: "old output".into(),
             cwd: Some("/tmp/old".into()),
             exit_code: 0,
+            truncated: false,
         };
         let old_request = store
             .begin_turn(
@@ -790,6 +944,7 @@ mod tests {
             output: "new output".into(),
             cwd: Some("/tmp/new".into()),
             exit_code: 1,
+            truncated: false,
         };
         let replacement = store
             .begin_turn(
@@ -824,6 +979,7 @@ mod tests {
                     output: "failed".into(),
                     cwd: None,
                     exit_code: 1,
+                    truncated: false,
                 }),
                 "Thinking…".into(),
                 false,
@@ -847,6 +1003,92 @@ mod tests {
     }
 
     #[test]
+    fn live_message_budget_rejects_oversized_text_without_mutating_chat() {
+        let mut store = ChatStore::default();
+        let oversized = "界".repeat(MAX_LIVE_MESSAGE_BYTES / "界".len() + 1);
+        assert!(matches!(
+            store.begin_turn(oversized, None, "Thinking…".into(), true),
+            Err(ChatStoreError::MessageTooLarge)
+        ));
+        assert!(store.active_history().is_empty());
+        assert!(!store.is_active_busy());
+    }
+
+    #[test]
+    fn live_history_is_bounded_by_turns_and_total_bytes() {
+        let mut store = ChatStore::default();
+        {
+            let chat = store.active_mut();
+            for index in 0..60 {
+                chat.history.push(Turn {
+                    role: Role::User,
+                    text: format!("question {index} {}", "u".repeat(96 * 1024)),
+                });
+                chat.history.push(Turn {
+                    role: Role::Assistant,
+                    text: format!("answer {index} {}", "a".repeat(96 * 1024)),
+                });
+            }
+        }
+
+        store.compact_live_histories();
+        assert!(store.active_history().len() <= MAX_LIVE_TURNS_PER_CHAT);
+        assert!(live_history_bytes(&store.chats) <= MAX_LIVE_ALL_HISTORY_BYTES);
+        assert!(store.active_history_truncated());
+        assert_eq!(store.active_history().len() % 2, 0);
+        assert_eq!(store.active_history().first().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn global_live_compaction_preserves_a_background_inflight_question() {
+        let mut store = ChatStore::default();
+        let background_token = start(&mut store, "background question");
+        let background_id = background_token.chat_id;
+
+        store.new_chat().unwrap();
+        {
+            let active = store.active_mut();
+            for index in 0..17 {
+                active.history.push(Turn {
+                    role: Role::User,
+                    text: format!("large question {index} {}", "u".repeat(256 * 1024)),
+                });
+                active.history.push(Turn {
+                    role: Role::Assistant,
+                    text: format!("large answer {index} {}", "a".repeat(256 * 1024)),
+                });
+            }
+        }
+        let foreground_token = start(&mut store, "foreground question");
+        assert_eq!(
+            store.complete_success(foreground_token, "foreground answer".into()),
+            Some(true)
+        );
+
+        let background = store
+            .chats
+            .iter()
+            .find(|chat| chat.id == background_id)
+            .unwrap();
+        assert_eq!(background.active_epoch, Some(background_token.epoch));
+        assert_eq!(background.history.len(), 1);
+        assert_eq!(background.history[0].role, Role::User);
+        assert_eq!(background.history[0].text, "background question");
+
+        assert_eq!(
+            store.complete_success(background_token, "background answer".into()),
+            Some(false)
+        );
+        let background = store
+            .chats
+            .iter()
+            .find(|chat| chat.id == background_id)
+            .unwrap();
+        assert_eq!(background.history.len(), 2);
+        assert_eq!(background.history[1].role, Role::Assistant);
+    }
+
+    #[test]
     fn deleting_an_inflight_chat_makes_late_completion_a_noop() {
         let mut store = ChatStore::default();
         let token = start(&mut store, "will be deleted");
@@ -854,6 +1096,127 @@ mod tests {
         assert_eq!(deleted.deleted_chat_id, token.chat_id);
         assert_eq!(store.complete_success(token, "late".into()), None);
         assert!(store.active_history().is_empty());
+    }
+
+    #[test]
+    fn cancelling_request_restores_draft_and_invalidates_late_completion() {
+        let mut store = ChatStore::default();
+        let token = start(&mut store, "please stop and retry");
+        store.set_active_draft("follow-up notes".into());
+
+        assert_eq!(store.active_request_token(), Some(token));
+        assert_eq!(
+            store.cancel_request(token, "Stopped by user".into()),
+            Some(true)
+        );
+        assert_eq!(store.active_request_token(), None);
+        assert!(!store.is_active_busy());
+        assert!(store.active_history().is_empty());
+        assert_eq!(
+            store.active_draft(),
+            "please stop and retry\n\nfollow-up notes"
+        );
+        assert_eq!(
+            store.active_status(),
+            &ChatStatus::Info("Stopped by user".into())
+        );
+
+        assert_eq!(store.complete_success(token, "late success".into()), None);
+        assert_eq!(store.complete_error(token, "late error".into()), None);
+        assert!(store.active_history().is_empty());
+        assert_eq!(
+            store.active_draft(),
+            "please stop and retry\n\nfollow-up notes"
+        );
+        assert_eq!(
+            store.active_status(),
+            &ChatStatus::Info("Stopped by user".into())
+        );
+    }
+
+    #[test]
+    fn shutdown_recovery_persists_an_independent_block_retry() {
+        let mut store = ChatStore::default();
+        store.set_active_draft("unrelated notes".into());
+        let context = BlockContext {
+            cmd: "false".into(),
+            output: "failed".into(),
+            cwd: Some("/tmp".into()),
+            exit_code: 1,
+            truncated: false,
+        };
+        let start = store
+            .begin_turn(
+                "diagnose the selected block".into(),
+                Some(context.clone()),
+                "Thinking…".into(),
+                false,
+            )
+            .unwrap();
+        store.cancel_request(start.token, "closing".into()).unwrap();
+
+        assert!(store.recover_retry_payload(
+            start.token.chat_id,
+            "diagnose the selected block",
+            Some(context.clone())
+        ));
+        assert_eq!(
+            store.active_draft(),
+            "diagnose the selected block\n\nunrelated notes"
+        );
+        assert_eq!(store.active_context(), Some(&context));
+    }
+
+    #[test]
+    fn clearing_context_is_refused_while_busy_and_succeeds_after_cancel() {
+        let mut store = ChatStore::default();
+        let old_context = BlockContext {
+            cmd: "cargo test".into(),
+            output: "old output".into(),
+            cwd: Some("/tmp/old".into()),
+            exit_code: 0,
+            truncated: false,
+        };
+        let initial = store
+            .begin_turn(
+                "explain the old block".into(),
+                Some(old_context.clone()),
+                "Thinking…".into(),
+                false,
+            )
+            .unwrap();
+        store.complete_success(initial.token, "old answer".into());
+        store.set_active_draft("unrelated draft".into());
+
+        let replacement_context = BlockContext {
+            cmd: "cargo clippy".into(),
+            output: "new output".into(),
+            cwd: Some("/tmp/new".into()),
+            exit_code: 1,
+            truncated: false,
+        };
+        let replacement = store
+            .begin_turn(
+                "explain the replacement block".into(),
+                Some(replacement_context.clone()),
+                "Thinking…".into(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(store.active_context(), Some(&replacement_context));
+        assert_eq!(store.clear_active_context(), Err(ChatStoreError::Busy));
+        assert_eq!(
+            store.cancel_request(replacement.token, "Stopped".into()),
+            Some(true)
+        );
+        assert_eq!(store.active_context(), Some(&old_context));
+        assert_eq!(store.active_draft(), "unrelated draft");
+        assert_eq!(store.active_history().len(), 2);
+
+        assert_eq!(store.clear_active_context(), Ok(true));
+        assert!(store.active_context().is_none());
+        assert_eq!(store.clear_active_context(), Ok(false));
     }
 
     #[test]
@@ -903,6 +1266,7 @@ mod tests {
             output: format!("output {SECRET}"),
             cwd: Some(format!("/tmp/{SECRET}")),
             exit_code: 0,
+            truncated: false,
         };
         let start = store
             .begin_turn(
@@ -966,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_compaction_marks_the_live_chat_immediately() {
+    fn live_compaction_marks_the_chat_before_persistence() {
         let mut store = ChatStore::default();
         for index in 0..51 {
             finish(
@@ -976,9 +1340,10 @@ mod tests {
             );
         }
 
-        let (snapshot, changed) = store.snapshot_for_persistence(false).unwrap();
-        assert!(changed);
         assert!(store.active_history_truncated());
+        assert_eq!(store.active_history().len(), 100);
+        let (snapshot, changed) = store.snapshot_for_persistence(false).unwrap();
+        assert!(!changed);
         assert!(snapshot.active_chat().unwrap().history_truncated());
         assert_eq!(snapshot.active_chat().unwrap().turns().len(), 100);
 

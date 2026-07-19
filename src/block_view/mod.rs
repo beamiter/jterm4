@@ -4879,13 +4879,17 @@ impl TermView {
         let data = self.block_data.borrow();
         let bd = data.iter().find(|b| b.id == id);
 
-        let output =
-            block.with_stripped_output(|s| crate::ai::truncate_for_context(s, lines_per_side));
+        let (output, truncated) = block.with_stripped_output(|raw| {
+            let output = crate::ai::truncate_for_context(raw, lines_per_side);
+            let truncated = output != raw;
+            (output, truncated)
+        });
         Some(crate::ai::BlockContext {
             cmd: block.cmd_text.clone(),
             output,
             cwd: bd.and_then(|b| b.cwd.clone()),
             exit_code: bd.map(|b| b.exit_code).unwrap_or(0),
+            truncated,
         })
     }
 }
