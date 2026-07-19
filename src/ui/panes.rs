@@ -4,6 +4,7 @@ use gtk4::{Orientation, Paned};
 use std::rc::Rc;
 
 use super::*;
+use crate::block_view::TermView;
 use crate::keybindings::Direction;
 use crate::state::generate_session_id;
 use crate::terminal::{setup_terminal_click_handler, terminal_working_directory, VteTerminalView};
@@ -184,6 +185,128 @@ impl UiState {
         leaf
     }
 
+    /// Create a managed Block pane leaf.
+    ///
+    /// Mirrors `create_vte_leaf` so Block tabs split into Block panes instead of
+    /// silently downgrading the new pane to the conventional VTE backend.
+    pub(crate) fn create_block_leaf(
+        &self,
+        working_directory: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
+        tab_widget_name: Option<String>,
+    ) -> PaneLeaf {
+        let sid = session_id
+            .map(str::to_owned)
+            .unwrap_or_else(generate_session_id);
+        let shell_argv = self.shell_argv.borrow();
+        let view = Rc::new(TermView::new(
+            &self.config.borrow(),
+            shell_argv.as_slice(),
+            working_directory,
+            Some(&sid),
+            initial_commands,
+        ));
+        drop(shell_argv);
+
+        let terminal = view.vte().clone();
+        setup_terminal_click_handler(&terminal);
+        self.setup_context_menu(&terminal);
+
+        let ui_for_exit = UiState::clone(self);
+        let view_for_exit = view.clone();
+        let root_for_exit = view.widget();
+        view.connect_exited(move |_| {
+            let _ = view_for_exit.save_history();
+            ui_for_exit.handle_terminal_exited(&root_for_exit);
+        });
+
+        self.connect_block_command_history(&view);
+
+        let leaf = PaneLeaf::Block(view);
+        let root = leaf.root_widget();
+        leaf.attach_to(&root);
+        leaf.set_session_id(&sid);
+        leaf.set_remote(false);
+        if tab_widget_name.is_some() {
+            if let PaneLeaf::Block(view) = &leaf {
+                let ui_for_bell = self.clone();
+                let leaf_for_bell = leaf.clone();
+                view.connect_bell(move || {
+                    log::debug!("Bell signal received (split)");
+                    ui_for_bell.mark_tab_bell(&leaf_for_bell.root_widget().widget_name());
+                });
+
+                let ui_for_activity = self.clone();
+                let leaf_for_activity = leaf.clone();
+                view.connect_activity(move || {
+                    ui_for_activity
+                        .mark_tab_activity(&leaf_for_activity.root_widget().widget_name());
+                });
+            }
+        }
+        leaf
+    }
+
+    /// Append finished Block commands to the cross-session command history.
+    /// Shared by tab-level Block views and Block split leaves.
+    pub(crate) fn connect_block_command_history(&self, view: &Rc<TermView>) {
+        let config_for_history = self.config.clone();
+        let view_for_history = Rc::downgrade(view);
+        view.connect_block_finished(move |command, exit_code, _output_sample| {
+            let config = config_for_history.borrow();
+            if !config.command_history_enabled {
+                return;
+            }
+            let Some(path) = config.command_history_path.as_deref() else {
+                return;
+            };
+            let cwd = view_for_history
+                .upgrade()
+                .map(|view| view.cwd())
+                .filter(|cwd| !cwd.is_empty());
+            let end_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+            if let Err(err) = crate::command_history::append(
+                std::path::Path::new(path),
+                config.command_history_max_entries as usize,
+                &command,
+                cwd.as_deref(),
+                exit_code,
+                end_time_ms,
+            ) {
+                log::warn!("failed to append command history: {err}");
+            }
+        });
+    }
+
+    /// Create a split/restore pane leaf matching the requested terminal mode.
+    pub(crate) fn create_pane_leaf(
+        &self,
+        mode: &crate::config::TerminalMode,
+        working_directory: Option<&str>,
+        session_id: Option<&str>,
+        initial_commands: Option<&str>,
+        tab_widget_name: Option<String>,
+    ) -> PaneLeaf {
+        match mode {
+            crate::config::TerminalMode::Block => self.create_block_leaf(
+                working_directory,
+                session_id,
+                initial_commands,
+                tab_widget_name,
+            ),
+            crate::config::TerminalMode::Vte => self.create_vte_leaf(
+                working_directory,
+                session_id,
+                initial_commands,
+                tab_widget_name,
+            ),
+        }
+    }
+
     pub(crate) fn split_current(&self, orientation: Orientation) {
         let Some(page_num) = self.notebook.current_page() else {
             return;
@@ -199,13 +322,31 @@ impl UiState {
             return;
         };
         let current_term = current_leaf.terminal().clone();
-        let working_directory = terminal_working_directory(&current_term);
+        // Block views track cwd themselves (their PTY is not owned by the live
+        // VTE), so prefer that over VTE's OSC 7 / child-pid inspection.
+        let working_directory = current_leaf
+            .block_view()
+            .map(|view| view.cwd())
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| terminal_working_directory(&current_term));
         let tab_widget_name = Some(page_widget.widget_name().to_string());
         let current_widget = current_leaf.root_widget();
         let parent = current_widget.parent();
 
-        let new_leaf =
-            self.create_vte_leaf(working_directory.as_deref(), None, None, tab_widget_name);
+        // The new pane inherits the backend of the pane being split so a Block
+        // tab splits into Block panes rather than a conventional VTE sibling.
+        let split_mode = if current_leaf.is_block() {
+            crate::config::TerminalMode::Block
+        } else {
+            crate::config::TerminalMode::Vte
+        };
+        let new_leaf = self.create_pane_leaf(
+            &split_mode,
+            working_directory.as_deref(),
+            None,
+            None,
+            tab_widget_name,
+        );
         let new_widget = new_leaf.root_widget();
 
         let paned = Paned::new(orientation);

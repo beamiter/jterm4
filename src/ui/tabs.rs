@@ -1176,35 +1176,7 @@ impl UiState {
                 // Keep a lightweight cross-session index. Full block output
                 // remains governed by block_history_path; this record contains
                 // only command metadata and is safe for palette use.
-                let config_for_history = self.config.clone();
-                let view_for_history = Rc::downgrade(term_view);
-                term_view.connect_block_finished(move |command, exit_code, _output_sample| {
-                    let config = config_for_history.borrow();
-                    if !config.command_history_enabled {
-                        return;
-                    }
-                    let Some(path) = config.command_history_path.as_deref() else {
-                        return;
-                    };
-                    let cwd = view_for_history
-                        .upgrade()
-                        .map(|view| view.cwd())
-                        .filter(|cwd| !cwd.is_empty());
-                    let end_time_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-                    if let Err(err) = crate::command_history::append(
-                        std::path::Path::new(path),
-                        config.command_history_max_entries as usize,
-                        &command,
-                        cwd.as_deref(),
-                        exit_code,
-                        end_time_ms,
-                    ) {
-                        log::warn!("failed to append command history: {err}");
-                    }
-                });
+                self.connect_block_command_history(term_view);
             }
             PaneLeaf::Vte(vte_view) => {
                 let ui_for_exit = UiState::clone(self);

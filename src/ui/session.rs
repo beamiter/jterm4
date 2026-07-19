@@ -131,8 +131,17 @@ impl UiState {
                 let root = if let Some(existing) = first_leaf.take() {
                     existing
                 } else {
-                    self.create_vte_leaf(Some(&dir), Some(&sid), cmds.as_deref(), tab_widget_name)
-                        .root_widget()
+                    // Restored split siblings follow the configured terminal
+                    // mode, matching what `split_current` would have created.
+                    let mode = self.config.borrow().terminal_mode.clone();
+                    self.create_pane_leaf(
+                        &mode,
+                        Some(&dir),
+                        Some(&sid),
+                        cmds.as_deref(),
+                        tab_widget_name,
+                    )
+                    .root_widget()
                 };
                 if pinned == Some(true) {
                     unsafe {
