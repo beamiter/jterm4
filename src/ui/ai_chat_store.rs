@@ -490,7 +490,13 @@ impl ChatStore {
             let Some(index) = candidate else {
                 break;
             };
-            debug_assert!(drop_oldest_live_pair(&mut self.chats[index]));
+            // The drop must run in release builds too — wrapping the call in
+            // `debug_assert!` compiled it away and left this loop spinning
+            // forever once the byte budget was exceeded.
+            if !drop_oldest_live_pair(&mut self.chats[index]) {
+                debug_assert!(false, "candidate chat lost its complete pair");
+                break;
+            }
         }
     }
 
