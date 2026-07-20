@@ -1046,6 +1046,10 @@ pub struct TermView {
     /// them (Warp's FindWithinBlock). Tags are stripped on close via clear_find.
     find_state: Rc<RefCell<FindState>>,
     current_cwd: Rc<RefCell<String>>,
+    /// The tab's persistent session id (window snapshot `sid`). Keys the
+    /// per-tab block-history file so concurrent tabs never overwrite each
+    /// other's saved history.
+    session_id: Option<String>,
     /// Per-frame resize tick installed on `root`. Held so it can be removed on
     /// Drop — otherwise the callback runs forever and keeps its Rc captures
     /// (pty/active/vte/vte_box) alive past tab close.
@@ -4003,6 +4007,7 @@ impl TermView {
             bookmarks: block_bookmarks,
             find_state: Rc::new(RefCell::new(FindState::default())),
             current_cwd: current_cwd.clone(),
+            session_id: session_id_owned,
             resize_tick_id: RefCell::new(None),
             sticky_timer_id: RefCell::new(Some(sticky_timer_id)),
             cross_selection,

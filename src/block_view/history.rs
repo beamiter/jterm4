@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_ENCODED_RECORD_BYTES: usize = 256 * 1024 * 1024;
@@ -79,6 +80,102 @@ fn expand_home_prefix_with(path: &str, home: Option<&Path>) -> PathBuf {
 fn history_path(path: &str) -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     expand_home_prefix_with(path, home.as_deref())
+}
+
+/// Session-history files older than this are removed opportunistically after a
+/// successful save. Closed tabs never delete their own file (the session id in
+/// the window snapshot may be restored later), so orphans from tabs that were
+/// never restored again would otherwise accumulate forever.
+const STALE_SESSION_HISTORY_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 3600);
+
+/// Restrict a session id to filename-safe characters. Ids are `pid-timestamp`
+/// today, but they round-trip through the user-editable window snapshot.
+fn sanitize_session_component(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// Per-tab history file derived from the configured path: `<stem>-<sid>.<ext>`
+/// in the same directory. The configured path itself was previously shared by
+/// every tab, so concurrent tabs overwrote each other's history on close
+/// (last close wins); keying the file by the tab's persistent session id gives
+/// each restored tab its own history.
+fn per_session_history_path(base: &Path, session_id: &str) -> PathBuf {
+    let sid = sanitize_session_component(session_id);
+    let stem = base
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "blocks".to_string());
+    let name = match base.extension() {
+        Some(ext) => format!("{stem}-{sid}.{}", ext.to_string_lossy()),
+        None => format!("{stem}-{sid}"),
+    };
+    base.with_file_name(name)
+}
+
+/// Where to read history from: the tab's own file when it exists, otherwise
+/// the legacy shared file (pre-split sessions saved there). Returns `None`
+/// when neither exists yet.
+fn choose_load_path(base: &Path, per_session: Option<&Path>) -> Option<PathBuf> {
+    if let Some(session_path) = per_session {
+        if session_path.exists() {
+            return Some(session_path.to_path_buf());
+        }
+    }
+    base.exists().then(|| base.to_path_buf())
+}
+
+/// Remove sibling per-session history files that have not been touched within
+/// `max_age`. Only names matching this base's `<stem>-*.<ext>` shape are
+/// candidates; `keep` (the file just written) always survives.
+fn prune_stale_session_histories(base: &Path, keep: &Path, max_age: std::time::Duration) {
+    let Some(parent) = base.parent() else {
+        return;
+    };
+    let Some(stem) = base.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let prefix = format!("{stem}-");
+    let extension = base.extension().map(|ext| ext.to_string_lossy().into_owned());
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if path.extension().map(|ext| ext.to_string_lossy().into_owned()) != extension {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            if let Err(error) = fs::remove_file(&path) {
+                log::warn!(
+                    "prune stale block history {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 fn temp_file_name(target: &Path) -> io::Result<OsString> {
@@ -165,14 +262,19 @@ impl TermView {
             return Ok(());
         }
 
-        let path = history_path(&path_opt.unwrap());
+        let base = history_path(&path_opt.unwrap());
+        let session_id = self.session_id.clone();
+        let path = match session_id.as_deref() {
+            Some(sid) => per_session_history_path(&base, sid),
+            None => base.clone(),
+        };
         let blocks = self.block_data.borrow();
 
         // Overwrite (do NOT append). The in-memory deque was itself seeded from
         // this file at startup, so appending it re-wrote every loaded block on
         // each session. Encode into a sibling temp file first so a crash or
         // serialization error never truncates the last good history.
-        atomic_write(&path, |file| {
+        let result = atomic_write(&path, |file| {
             for block in blocks.iter() {
                 let serialized = rkyv::to_bytes::<rkyv::rancor::Error>(block)
                     .map_err(|e| io::Error::other(e.to_string()))?;
@@ -200,7 +302,23 @@ impl TermView {
                 file.write_all(record.as_ref())?;
             }
             Ok(())
-        })
+        });
+
+        if result.is_ok() && session_id.is_some() {
+            // This tab's history now lives in its own file; the legacy shared
+            // file (which every tab used to overwrite on close) is superseded.
+            // Removing it also stops future new tabs from inheriting it.
+            if base != path && base.is_file() {
+                if let Err(error) = fs::remove_file(&base) {
+                    log::warn!(
+                        "remove superseded shared block history {}: {error}",
+                        base.display()
+                    );
+                }
+            }
+            prune_stale_session_histories(&base, &path, STALE_SESSION_HISTORY_MAX_AGE);
+        }
+        result
     }
 
     /// Load block history from file (if configured).
@@ -220,10 +338,14 @@ impl TermView {
             return Ok(());
         }
 
-        let path = history_path(&path_opt.unwrap());
-        if !path.exists() {
+        let base = history_path(&path_opt.unwrap());
+        let session_path = self
+            .session_id
+            .as_deref()
+            .map(|sid| per_session_history_path(&base, sid));
+        let Some(path) = choose_load_path(&base, session_path.as_deref()) else {
             return Ok(());
-        }
+        };
 
         let mut file = File::open(path)?;
         let mut recent_blocks = VecDeque::new();
@@ -303,8 +425,9 @@ impl TermView {
 #[cfg(test)]
 mod tests {
     use super::{
-        atomic_write, decode_block_record, decode_zstd_bounded, expand_home_prefix_with,
-        history_load_limit, push_bounded_back, refresh_loaded_block_ids, BlockData,
+        atomic_write, choose_load_path, decode_block_record, decode_zstd_bounded,
+        expand_home_prefix_with, history_load_limit, per_session_history_path,
+        prune_stale_session_histories, push_bounded_back, refresh_loaded_block_ids, BlockData,
     };
     use std::collections::VecDeque;
     use std::fs;
@@ -488,6 +611,84 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![target.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn per_session_paths_are_distinct_per_tab_and_filename_safe() {
+        // Regression: every tab used to save to the configured path verbatim,
+        // so concurrent tabs overwrote each other's history on close.
+        let base = Path::new("/state/jterm4/blocks.bin");
+        let first = per_session_history_path(base, "747026-1784511309421544366");
+        let second = per_session_history_path(base, "747026-1784511391784501255");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            PathBuf::from("/state/jterm4/blocks-747026-1784511309421544366.bin")
+        );
+
+        assert_eq!(
+            per_session_history_path(Path::new("/state/history"), "sid-1"),
+            PathBuf::from("/state/history-sid-1")
+        );
+        // Ids round-trip through the user-editable window snapshot.
+        assert_eq!(
+            per_session_history_path(base, "../../etc/passwd"),
+            PathBuf::from("/state/jterm4/blocks-.._.._etc_passwd.bin")
+        );
+    }
+
+    #[test]
+    fn load_prefers_own_session_file_and_falls_back_to_legacy_shared_file() {
+        let dir = TestDir::new("load-choice");
+        let base = dir.path().join("blocks.bin");
+        let session = per_session_history_path(&base, "sid-9");
+
+        // Nothing on disk yet: a fresh tab has no history to load.
+        assert_eq!(choose_load_path(&base, Some(&session)), None);
+
+        // Pre-split installs only have the shared file: read it once so the
+        // upgrade does not silently drop the visible history.
+        fs::write(&base, b"legacy").unwrap();
+        assert_eq!(choose_load_path(&base, Some(&session)), Some(base.clone()));
+
+        // Once the tab owns a file, the shared one is ignored.
+        fs::write(&session, b"own").unwrap();
+        assert_eq!(
+            choose_load_path(&base, Some(&session)),
+            Some(session.clone())
+        );
+
+        // No session id (legacy caller): the shared file remains the source.
+        assert_eq!(choose_load_path(&base, None), Some(base.clone()));
+    }
+
+    #[test]
+    fn prune_removes_only_stale_matching_session_siblings() {
+        let dir = TestDir::new("prune");
+        let base = dir.path().join("blocks.bin");
+        let keep = per_session_history_path(&base, "sid-live");
+        let stale = per_session_history_path(&base, "sid-stale");
+        let other_ext = dir.path().join("blocks-sid.log");
+        let unrelated = dir.path().join("notes.bin");
+        for path in [&keep, &stale, &other_ext, &unrelated] {
+            fs::write(path, b"x").unwrap();
+        }
+        fs::write(&base, b"shared").unwrap();
+
+        // Zero max-age marks every candidate stale, which exercises selection
+        // without manipulating file mtimes.
+        prune_stale_session_histories(&base, &keep, std::time::Duration::ZERO);
+
+        assert!(keep.exists(), "the just-written file must survive");
+        assert!(!stale.exists(), "stale session sibling should be removed");
+        assert!(other_ext.exists(), "different extension is not a candidate");
+        assert!(unrelated.exists(), "non-matching stem is not a candidate");
+        assert!(base.exists(), "the shared base file is not prune's concern");
+
+        // A realistic age leaves freshly-written files alone.
+        fs::write(&stale, b"x").unwrap();
+        prune_stale_session_histories(&base, &keep, super::STALE_SESSION_HISTORY_MAX_AGE);
+        assert!(stale.exists());
     }
 
     #[test]
