@@ -293,6 +293,10 @@ impl CellOutcome {
 }
 
 enum WorkerEvent {
+    /// The child has been spawned; carries its process-group id. Emitted once,
+    /// before any output, so an observer can read the group over the ordered
+    /// channel without racing the worker resetting `pgid` to 0 on completion.
+    Started(i32),
     Output(OutputStream, Vec<u8>),
     Done(CellOutcome),
 }
@@ -420,6 +424,7 @@ fn spawn_cell_worker(spec: CommandSpec, handle: &CellHandle) -> mpsc::Receiver<W
         };
         if let Ok(id) = i32::try_from(child.id()) {
             pgid.store(id, Ordering::SeqCst);
+            let _ = sender.send(WorkerEvent::Started(id));
         }
 
         let stdin = child.stdin.take();
@@ -805,6 +810,7 @@ impl CellController {
 
             loop {
                 match receiver.try_recv() {
+                    Ok(WorkerEvent::Started(_)) => {}
                     Ok(WorkerEvent::Output(stream, bytes)) => {
                         if bytes_seen >= MAX_OUTPUT_BYTES {
                             if !truncated {
@@ -1267,6 +1273,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(3))
                 .expect("worker event")
             {
+                WorkerEvent::Started(_) => {}
                 WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
                 WorkerEvent::Output(OutputStream::Stderr, bytes) => stderr.extend(bytes),
                 WorkerEvent::Done(outcome) => break outcome,
@@ -1301,6 +1308,7 @@ mod tests {
                 .recv_timeout(Duration::from_millis(100))
                 .expect("ready output")
             {
+                WorkerEvent::Started(_) => {}
                 WorkerEvent::Output(OutputStream::Stdout, bytes) => stdout.extend(bytes),
                 WorkerEvent::Output(OutputStream::Stderr, _) => {}
                 WorkerEvent::Done(outcome) => panic!("cell ended before cancellation: {outcome:?}"),
@@ -1316,7 +1324,7 @@ mod tests {
                 .expect("worker event")
             {
                 WorkerEvent::Done(outcome) => break outcome,
-                WorkerEvent::Output(_, _) => {}
+                WorkerEvent::Started(_) | WorkerEvent::Output(_, _) => {}
             }
         };
         assert_eq!(outcome, CellOutcome::Cancelled);
@@ -1352,18 +1360,25 @@ mod tests {
             &handle,
         );
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // Read the group from the event stream, not by polling `pgid`: for a
+        // shell that backgrounds a child and exits, the worker can run its whole
+        // lifecycle — publish the group, signal it, then reset `pgid` to 0 — in
+        // the gap before a cold poll first samples it, so polling races to a
+        // spurious "did not publish" timeout. The Started event is ordered ahead
+        // of Done on the channel and cannot be missed.
         let group = loop {
-            let group = handle.pgid.load(Ordering::SeqCst);
-            if group > 0 {
-                break group;
+            match receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker must announce its process group")
+            {
+                WorkerEvent::Started(group) => break group,
+                WorkerEvent::Output(_, _) => {}
+                WorkerEvent::Done(outcome) => {
+                    panic!("cell finished before announcing its group: {outcome:?}")
+                }
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worker did not publish its process group"
-            );
-            std::thread::sleep(Duration::from_millis(5));
         };
+        assert!(group > 0, "worker published an invalid process group");
 
         let outcome = loop {
             match receiver
@@ -1371,7 +1386,7 @@ mod tests {
                 .expect("worker must not hang on inherited output pipes")
             {
                 WorkerEvent::Done(outcome) => break outcome,
-                WorkerEvent::Output(_, _) => {}
+                WorkerEvent::Started(_) | WorkerEvent::Output(_, _) => {}
             }
         };
         assert_eq!(outcome, CellOutcome::Exited(0));
