@@ -564,6 +564,25 @@ fn flash_button_label(btn: &gtk4::Button, label: &'static str, tooltip: &'static
     });
 }
 
+/// SGR reset + home + clear screen + clear scrollback, fed ahead of every
+/// snapshot. `reset()` acts synchronously but `feed()` data is applied
+/// asynchronously: GTK can map a card several times within one main-loop turn
+/// (notebook tab switches re-map pages while virtualization toggles content
+/// visibility), so a later `reset()` runs before an earlier feed has been
+/// processed and the queued snapshots concatenate — output repeated once per
+/// map in the burst. Clearing in-stream keeps the wipe ordered with the data
+/// it must precede, making re-renders idempotent.
+const FINISHED_SNAPSHOT_CLEAR: &[u8] = b"\x1b[0m\x1b[H\x1b[2J\x1b[3J";
+
+/// The exact byte stream a finished-block render feeds: the in-stream clear
+/// followed by the snapshot text (see [`FINISHED_SNAPSHOT_CLEAR`]).
+fn finished_snapshot_stream(display_text: &str) -> Vec<u8> {
+    let mut stream = Vec::with_capacity(FINISHED_SNAPSHOT_CLEAR.len() + display_text.len());
+    stream.extend_from_slice(FINISHED_SNAPSHOT_CLEAR);
+    stream.extend_from_slice(display_text.as_bytes());
+    stream
+}
+
 /// Render a finished snapshot with enough temporary capture capacity for VTE's
 /// real terminal semantics. The post-feed settle pass expands short/full-height
 /// blocks to the actual retained buffer span, covering ANSI cursor movement,
@@ -595,7 +614,7 @@ pub(crate) fn render_bytes_into_finished_vte(
     vte.reset(true, true);
     vte.set_size(cols.max(1), visible_rows);
     vte.set_scrollback_lines(scrollback);
-    vte.feed(display_text.as_bytes());
+    vte.feed(&finished_snapshot_stream(display_text));
     if expand_to_buffer {
         settle_finished_terminal_after_feed(vte);
     } else {
@@ -1784,6 +1803,24 @@ mod tests {
         block_clipboard_text, collapsed_output_summary, command_recall_available,
         filter_output_lines, terminalize_line_breaks, BlockState,
     };
+
+    #[test]
+    fn snapshot_feed_wipes_previous_content_in_stream() {
+        // Regression: feed() applies asynchronously while reset() acts
+        // immediately, so when GTK maps a card several times in one main-loop
+        // turn every queued snapshot survives its following reset and the
+        // copies concatenate ("/home/yj/home/yj…"). The wipe must travel
+        // inside the fed byte stream, ordered before the snapshot it protects.
+        let stream = super::finished_snapshot_stream("/home/yj");
+        assert!(stream.starts_with(super::FINISHED_SNAPSHOT_CLEAR));
+        assert_eq!(&stream[super::FINISHED_SNAPSHOT_CLEAR.len()..], b"/home/yj");
+        // The clear must reach cursor home, screen, and scrollback — dropping
+        // any of the three reintroduces stacked copies on remap bursts.
+        let clear = std::str::from_utf8(super::FINISHED_SNAPSHOT_CLEAR).unwrap();
+        for required in ["\x1b[H", "\x1b[2J", "\x1b[3J"] {
+            assert!(clear.contains(required), "missing {required:?}");
+        }
+    }
 
     #[test]
     fn whole_block_copy_preserves_terminal_grouping() {
