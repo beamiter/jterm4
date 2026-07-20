@@ -122,6 +122,9 @@ ai_redact_secrets = true
 # reinput_selected_commands = "Ctrl+Shift+I"
 # clear_blocks = "Ctrl+Shift+K"
 # toggle_tab_placement = "Ctrl+Alt+B"
+# Pane 焦点/尺寸默认同时绑定方向键和 vim 字母键两套 chord：
+# Ctrl+Alt+方向键 / Ctrl+Alt+H/J/K/L（GNOME 等桌面会抢占 Ctrl+Alt+方向键
+# 用于工作区切换，此时用字母键；在此覆写则只保留你指定的一个 chord）。
 # focus_pane_left = "Ctrl+Alt+Left"
 # focus_pane_right = "Ctrl+Alt+Right"
 # focus_pane_up = "Ctrl+Alt+Up"

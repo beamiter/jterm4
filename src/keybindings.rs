@@ -528,6 +528,17 @@ impl KeybindingMap {
         bind("Ctrl+Alt+Shift+Right", Action::ResizePaneRight);
         bind("Ctrl+Alt+Shift+Up", Action::ResizePaneUp);
         bind("Ctrl+Alt+Shift+Down", Action::ResizePaneDown);
+        // GNOME (and some other DEs) grab Ctrl+Alt+arrows for workspace
+        // switching before the app ever sees the event, so the spatial pane
+        // operations also get vim-letter chords that no DE claims by default.
+        bind("Ctrl+Alt+H", Action::FocusPaneLeft);
+        bind("Ctrl+Alt+J", Action::FocusPaneDown);
+        bind("Ctrl+Alt+K", Action::FocusPaneUp);
+        bind("Ctrl+Alt+L", Action::FocusPaneRight);
+        bind("Ctrl+Alt+Shift+H", Action::ResizePaneLeft);
+        bind("Ctrl+Alt+Shift+J", Action::ResizePaneDown);
+        bind("Ctrl+Alt+Shift+K", Action::ResizePaneUp);
+        bind("Ctrl+Alt+Shift+L", Action::ResizePaneRight);
         bind("Ctrl+Shift+Z", Action::TogglePaneZoom);
         bind("Ctrl+Shift+!", Action::MovePaneToNewTab);
         bind("F12", Action::ToggleDebugDashboard);
@@ -780,6 +791,12 @@ mod tests {
             ("Ctrl+Alt+Right", Action::FocusPaneRight),
             ("Ctrl+Alt+Up", Action::FocusPaneUp),
             ("Ctrl+Alt+Down", Action::FocusPaneDown),
+            // Vim-letter fallbacks for DEs that grab Ctrl+Alt+arrows (GNOME
+            // workspace switching).
+            ("Ctrl+Alt+H", Action::FocusPaneLeft),
+            ("Ctrl+Alt+J", Action::FocusPaneDown),
+            ("Ctrl+Alt+K", Action::FocusPaneUp),
+            ("Ctrl+Alt+L", Action::FocusPaneRight),
             // Block-discovery surface.
             ("Ctrl+Shift+F", Action::ToggleSearch),
             ("Ctrl+Shift+P", Action::ToggleCommandPalette),
@@ -845,6 +862,14 @@ mod tests {
             ("Ctrl+Alt+Shift+Right", Action::ResizePaneRight),
             ("Ctrl+Alt+Shift+Up", Action::ResizePaneUp),
             ("Ctrl+Alt+Shift+Down", Action::ResizePaneDown),
+            ("Ctrl+Alt+H", Action::FocusPaneLeft),
+            ("Ctrl+Alt+J", Action::FocusPaneDown),
+            ("Ctrl+Alt+K", Action::FocusPaneUp),
+            ("Ctrl+Alt+L", Action::FocusPaneRight),
+            ("Ctrl+Alt+Shift+H", Action::ResizePaneLeft),
+            ("Ctrl+Alt+Shift+J", Action::ResizePaneDown),
+            ("Ctrl+Alt+Shift+K", Action::ResizePaneUp),
+            ("Ctrl+Alt+Shift+L", Action::ResizePaneRight),
             ("Ctrl+Tab", Action::NextTab),
             ("Ctrl+Shift+Tab", Action::PrevTab),
             ("Ctrl+=", Action::FontIncrease),
