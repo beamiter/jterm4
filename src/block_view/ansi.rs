@@ -300,6 +300,28 @@ pub(crate) fn output_has_vertical_repaint(input: &str) -> bool {
     false
 }
 
+/// Collapse a full-screen repaint stream (see [`output_has_vertical_repaint`])
+/// to a single clean frame.
+///
+/// The whole stream is accumulated through the 2D cursor model: `top` and
+/// friends repaint *incrementally* — a refresh only rewrites the lines that
+/// changed (clock, CPU%, times) and leaves static rows untouched — so isolating
+/// any single frame would drop the unchanged rows. Merging every frame's writes
+/// reconstructs the final screen exactly.
+///
+/// The screen padding a fixed-width TUI leaves behind is then trimmed: per-line
+/// trailing spaces (top pads each row to the full terminal width; fed verbatim
+/// they land on the finished VTE's right edge and wrap into phantom blank rows)
+/// and the blank rows padding the screen to its full height.
+pub(crate) fn collapse_repaint_output(input: &str) -> String {
+    let stripped = strip_ansi(input);
+    let mut lines: Vec<&str> = stripped.lines().map(str::trim_end).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;

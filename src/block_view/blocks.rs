@@ -728,7 +728,7 @@ impl FinishedBlock {
         // preserving its SGR styling.
         let collapsed;
         let output = if output_has_vertical_repaint(output) {
-            collapsed = strip_ansi(output);
+            collapsed = collapse_repaint_output(output);
             collapsed.as_str()
         } else {
             output

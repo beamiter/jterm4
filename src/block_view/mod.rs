@@ -4904,9 +4904,9 @@ mod tests {
     use super::{
         background_output_has_visible_text, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
-        history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
-        output_has_vertical_repaint, record_external_input, resolve_submitted_command,
-        scroll_delta_to_reveal,
+        collapse_repaint_output, history_edge_navigation_available, normalize_captured_command,
+        normalize_loaded_block_ids, output_has_vertical_repaint, record_external_input,
+        resolve_submitted_command, scroll_delta_to_reveal,
         selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
@@ -5535,6 +5535,28 @@ mod tests {
         assert!(output_has_vertical_repaint("row1\nrow2\u{1b}[Hrepaint"));
         assert!(output_has_vertical_repaint("row1\nrow2\u{1b}[Arewrite"));
         assert!(output_has_vertical_repaint("row1\n\u{1b}[2;1Habsolute"));
+    }
+
+    #[test]
+    fn collapse_repaint_merges_incremental_frames_and_trims_padding() {
+        // top repaints incrementally: frame 1 paints the full screen, later
+        // frames rewrite only changed cells. The merge must keep the untouched
+        // rows, and screen padding (per-line trailing spaces + trailing blank
+        // rows) must be trimmed so the finished VTE does not wrap at its edge.
+        let stream = concat!(
+            "\u{1b}[H",
+            "cpu  1%   \r\n",     // row0, padded
+            "mem  40%  \r\n",     // row1, padded
+            "static    \r\n",     // row2, padded, never rewritten again
+            "          \r\n",     // row3, blank padding row
+            "\u{1b}[H",           // next refresh: only rows 0 and 1 change
+            "cpu  9%   \r\n",
+            "mem  42%  ",
+        );
+        assert_eq!(
+            collapse_repaint_output(stream),
+            "cpu  9%\nmem  42%\nstatic"
+        );
     }
 
     #[test]
