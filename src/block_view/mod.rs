@@ -5541,8 +5541,8 @@ mod tests {
     fn collapse_repaint_merges_incremental_frames_and_trims_padding() {
         // top repaints incrementally: frame 1 paints the full screen, later
         // frames rewrite only changed cells. The merge must keep the untouched
-        // rows, and screen padding (per-line trailing spaces + trailing blank
-        // rows) must be trimmed so the finished VTE does not wrap at its edge.
+        // rows; screen padding (trailing default-styled cells + blank rows) must
+        // be trimmed, and rows are joined with CRLF for the finished VTE.
         let stream = concat!(
             "\u{1b}[H",
             "cpu  1%   \r\n",     // row0, padded
@@ -5553,10 +5553,26 @@ mod tests {
             "cpu  9%   \r\n",
             "mem  42%  ",
         );
+        // No SGR in this stream, so the collapsed frame is plain text with CRLF.
         assert_eq!(
-            collapse_repaint_output(stream),
-            "cpu  9%\nmem  42%\nstatic"
+            collapse_repaint_output(stream, 10),
+            "cpu  9%\r\nmem  42%\r\nstatic"
         );
+    }
+
+    #[test]
+    fn collapse_repaint_preserves_color_and_reverse_bar() {
+        // A reverse-video header that erases to end-of-line paints a full-width
+        // bar (erase fills with the active background); colour must survive and
+        // the bar extend to `cols`, while a plain row's padding is trimmed.
+        let stream = concat!(
+            "\u{1b}[H",
+            "\u{1b}[7m PID\u{1b}[K\r\n",   // reverse bar, erase-to-EOL fills reverse
+            "\u{1b}[0m  1 root\u{1b}[K",    // plain row, padding trimmed
+        );
+        let out = collapse_repaint_output(stream, 8);
+        // Reverse attribute retained and the bar padded to 8 columns.
+        assert_eq!(out, "\u{1b}[0;7m PID    \u{1b}[0m\r\n  1 root");
     }
 
     #[test]

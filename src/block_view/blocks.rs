@@ -722,13 +722,12 @@ impl FinishedBlock {
         // watch, multi-line progress) emits one frame per refresh, each behind a
         // cursor-home. Fed verbatim into the scrollback-backed output VTE those
         // frames stack into an ever-growing block. Collapse such streams to their
-        // final on-screen frame here (the plain shadow the 2D cursor model
-        // reconstructs) so the finished block mirrors what the live VTE showed.
-        // Ordinary colored output has no vertical repaint and is fed unchanged,
-        // preserving its SGR styling.
+        // final on-screen frame — a colour-preserving snapshot with CRLF breaks —
+        // so the finished block mirrors what the live VTE showed. Ordinary output
+        // has no vertical repaint and is fed unchanged.
         let collapsed;
         let output = if output_has_vertical_repaint(output) {
-            collapsed = collapse_repaint_output(output);
+            collapsed = collapse_repaint_output(output, cols.max(1) as usize);
             collapsed.as_str()
         } else {
             output

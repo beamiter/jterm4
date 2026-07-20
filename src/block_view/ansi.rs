@@ -300,26 +300,363 @@ pub(crate) fn output_has_vertical_repaint(input: &str) -> bool {
     false
 }
 
-/// Collapse a full-screen repaint stream (see [`output_has_vertical_repaint`])
-/// to a single clean frame.
-///
-/// The whole stream is accumulated through the 2D cursor model: `top` and
-/// friends repaint *incrementally* — a refresh only rewrites the lines that
-/// changed (clock, CPU%, times) and leaves static rows untouched — so isolating
-/// any single frame would drop the unchanged rows. Merging every frame's writes
-/// reconstructs the final screen exactly.
-///
-/// The screen padding a fixed-width TUI leaves behind is then trimmed: per-line
-/// trailing spaces (top pads each row to the full terminal width; fed verbatim
-/// they land on the finished VTE's right edge and wrap into phantom blank rows)
-/// and the blank rows padding the screen to its full height.
-pub(crate) fn collapse_repaint_output(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    let mut lines: Vec<&str> = stripped.lines().map(str::trim_end).collect();
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SgrColor {
+    Default,
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// The subset of SGR state a repaint snapshot needs to reproduce. `top`'s look
+/// (bold values, reverse-video header/footer bars, colored columns) is entirely
+/// these attributes plus the 16-colour and 256/truecolour palettes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sgr {
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    blink: bool,
+    reverse: bool,
+    hidden: bool,
+    strike: bool,
+    fg: SgrColor,
+    bg: SgrColor,
+}
+
+impl Default for Sgr {
+    fn default() -> Self {
+        Sgr {
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            blink: false,
+            reverse: false,
+            hidden: false,
+            strike: false,
+            fg: SgrColor::Default,
+            bg: SgrColor::Default,
+        }
     }
-    lines.join("\n")
+}
+
+/// Apply an SGR parameter list (`\x1b[…m`) to the running attribute state.
+fn apply_sgr(cur: &mut Sgr, params: &[u8]) {
+    if params.is_empty() {
+        *cur = Sgr::default();
+        return;
+    }
+    let parts: Vec<&[u8]> = params.split(|&b| b == b';').collect();
+    let num = |p: &[u8]| -> usize {
+        let mut v = 0usize;
+        for &b in p {
+            if b.is_ascii_digit() {
+                v = v.saturating_mul(10).saturating_add((b - b'0') as usize);
+            } else {
+                return usize::MAX;
+            }
+        }
+        v
+    };
+    let mut i = 0;
+    while i < parts.len() {
+        match num(parts[i]) {
+            0 | usize::MAX => *cur = Sgr::default(), // bare/`;`/garbage → reset
+            1 => cur.bold = true,
+            2 => cur.dim = true,
+            3 => cur.italic = true,
+            4 => cur.underline = true,
+            5 | 6 => cur.blink = true,
+            7 => cur.reverse = true,
+            8 => cur.hidden = true,
+            9 => cur.strike = true,
+            21 | 22 => {
+                cur.bold = false;
+                cur.dim = false;
+            }
+            23 => cur.italic = false,
+            24 => cur.underline = false,
+            25 => cur.blink = false,
+            27 => cur.reverse = false,
+            28 => cur.hidden = false,
+            29 => cur.strike = false,
+            n @ 30..=37 => cur.fg = SgrColor::Palette((n - 30) as u8),
+            39 => cur.fg = SgrColor::Default,
+            n @ 40..=47 => cur.bg = SgrColor::Palette((n - 40) as u8),
+            49 => cur.bg = SgrColor::Default,
+            n @ 90..=97 => cur.fg = SgrColor::Palette((n - 90 + 8) as u8),
+            n @ 100..=107 => cur.bg = SgrColor::Palette((n - 100 + 8) as u8),
+            sel @ (38 | 48) => {
+                // Extended colour: `38;5;n` (256) or `38;2;r;g;b` (truecolour).
+                let mode = parts.get(i + 1).map(|p| num(p)).unwrap_or(usize::MAX);
+                let color = if mode == 5 {
+                    let idx = parts.get(i + 2).map(|p| num(p)).unwrap_or(0);
+                    i += 2;
+                    SgrColor::Palette(idx.min(255) as u8)
+                } else if mode == 2 {
+                    let c = |k: usize| parts.get(i + k).map(|p| num(p)).unwrap_or(0).min(255) as u8;
+                    let rgb = SgrColor::Rgb(c(2), c(3), c(4));
+                    i += 4;
+                    rgb
+                } else {
+                    SgrColor::Default
+                };
+                if sel == 38 {
+                    cur.fg = color;
+                } else {
+                    cur.bg = color;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Serialise attribute state to SGR parameters, always rebuilt from a `0` reset
+/// so each transition is self-contained.
+fn sgr_codes(s: &Sgr) -> String {
+    let mut v: Vec<String> = vec!["0".into()];
+    for (on, code) in [
+        (s.bold, "1"),
+        (s.dim, "2"),
+        (s.italic, "3"),
+        (s.underline, "4"),
+        (s.blink, "5"),
+        (s.reverse, "7"),
+        (s.hidden, "8"),
+        (s.strike, "9"),
+    ] {
+        if on {
+            v.push(code.into());
+        }
+    }
+    let mut push_color = |c: SgrColor, base: usize, ext: usize| match c {
+        SgrColor::Default => {}
+        SgrColor::Palette(i) if i < 8 => v.push((base + i as usize).to_string()),
+        SgrColor::Palette(i) if i < 16 => v.push((base + 60 + (i as usize - 8)).to_string()),
+        SgrColor::Palette(i) => {
+            v.push(ext.to_string());
+            v.push("5".into());
+            v.push(i.to_string());
+        }
+        SgrColor::Rgb(r, g, b) => {
+            v.push(ext.to_string());
+            v.push("2".into());
+            v.push(r.to_string());
+            v.push(g.to_string());
+            v.push(b.to_string());
+        }
+    };
+    push_color(s.fg, 30, 38);
+    push_color(s.bg, 40, 48);
+    v.join(";")
+}
+
+/// Collapse a full-screen repaint stream (see [`output_has_vertical_repaint`])
+/// to a single clean frame, **preserving colour**.
+///
+/// The whole stream is replayed through a 2D screen model that stores each
+/// cell's character *and* SGR attributes. `top` and friends repaint
+/// *incrementally* — a refresh rewrites only the lines that changed (clock,
+/// CPU%, times) and leaves static rows untouched — so accumulating every write
+/// reconstructs the final screen exactly; isolating a single frame would drop
+/// the unchanged rows. `\x1b[K`/`\x1b[J` erases fill with the active background,
+/// which is how top's reverse-video header/footer bars extend to the screen
+/// edge, so those are reproduced too.
+///
+/// The result is serialised with `\r\n` line breaks (a finished VTE treats a
+/// bare `\n` as line-feed only, which would stair-step the frame) and minimal
+/// SGR transitions. Trailing blank rows and trailing *default-styled* blank
+/// cells are trimmed (coloured trailing cells — the bars — are kept), so the
+/// snapshot is tight without wrapping at the VTE's right edge.
+pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
+    let bytes = input.as_bytes();
+    let width = cols.clamp(1, MAX_GRID_COLS);
+    let blank = (' ', Sgr::default());
+
+    let mut grid: Vec<Vec<(char, Sgr)>> = vec![Vec::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut cur = Sgr::default();
+    let mut i = 0;
+
+    let ensure = |grid: &mut Vec<Vec<(char, Sgr)>>, row: usize| {
+        while grid.len() <= row {
+            grid.push(Vec::new());
+        }
+    };
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    i += 2;
+                    let ps = i;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    let final_byte = bytes[i];
+                    let params = &bytes[ps..i];
+                    i += 1;
+                    if matches!(params.first(), Some(0x3c..=0x3f)) {
+                        continue; // private mode — no cursor/text effect here
+                    }
+                    match final_byte {
+                        b'm' => apply_sgr(&mut cur, params),
+                        b'H' | b'f' => {
+                            row = parse_param_nth(params, 0, 1).saturating_sub(1).min(MAX_GRID_ROWS);
+                            col = parse_param_nth(params, 1, 1).saturating_sub(1).min(width);
+                        }
+                        b'A' => row = row.saturating_sub(parse_param_first(params, 1)),
+                        b'B' | b'e' => row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS),
+                        b'E' => {
+                            row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS);
+                            col = 0;
+                        }
+                        b'F' => {
+                            row = row.saturating_sub(parse_param_first(params, 1));
+                            col = 0;
+                        }
+                        b'd' => {
+                            row = parse_param_first(params, 1).saturating_sub(1).min(MAX_GRID_ROWS)
+                        }
+                        b'C' | b'a' => col = (col + parse_param_first(params, 1)).min(width),
+                        b'D' => col = col.saturating_sub(parse_param_first(params, 1)),
+                        b'G' | b'`' => {
+                            col = parse_param_first(params, 1).saturating_sub(1).min(width)
+                        }
+                        b'K' => {
+                            ensure(&mut grid, row);
+                            let cells = &mut grid[row];
+                            let fill = (' ', cur);
+                            match params {
+                                b"" | b"0" => {
+                                    cells.truncate(col);
+                                    while cells.len() < width {
+                                        cells.push(fill);
+                                    }
+                                }
+                                b"1" => {
+                                    while cells.len() < col {
+                                        cells.push(blank);
+                                    }
+                                    for c in cells.iter_mut().take(col) {
+                                        *c = fill;
+                                    }
+                                }
+                                b"2" => {
+                                    cells.clear();
+                                    for _ in 0..width {
+                                        cells.push(fill);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        b'J' => match params {
+                            b"" | b"0" => {
+                                ensure(&mut grid, row);
+                                let cells = &mut grid[row];
+                                cells.truncate(col);
+                                while cells.len() < width {
+                                    cells.push((' ', cur));
+                                }
+                                grid.truncate(row + 1);
+                            }
+                            b"1" => {
+                                for r in grid.iter_mut().take(row) {
+                                    r.clear();
+                                }
+                                ensure(&mut grid, row);
+                                let cells = &mut grid[row];
+                                while cells.len() < col {
+                                    cells.push(blank);
+                                }
+                                for c in cells.iter_mut().take(col) {
+                                    *c = (' ', cur);
+                                }
+                            }
+                            b"2" | b"3" => {
+                                grid.clear();
+                                grid.push(Vec::new());
+                                row = 0;
+                                col = 0;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                b']' => i = skip_osc_sequence(bytes, i),
+                _ => i = skip_escape_sequence(bytes, i),
+            }
+        } else if bytes[i] == b'\n' {
+            row = (row + 1).min(MAX_GRID_ROWS);
+            col = 0;
+            ensure(&mut grid, row);
+            i += 1;
+        } else if bytes[i] == b'\r' {
+            col = 0;
+            i += 1;
+        } else if bytes[i] == b'\x08' {
+            col = col.saturating_sub(1);
+            i += 1;
+        } else {
+            let ch = input[i..].chars().next().unwrap_or('\u{FFFD}');
+            i += ch.len_utf8();
+            if col < width {
+                ensure(&mut grid, row);
+                let cells = &mut grid[row];
+                while cells.len() <= col {
+                    cells.push(blank);
+                }
+                cells[col] = (ch, cur);
+            }
+            col += 1;
+        }
+    }
+
+    // Drop screen-padding rows at the bottom that carry no visible content.
+    let is_blank_row = |r: &[(char, Sgr)]| r.iter().all(|&(ch, s)| ch == ' ' && s == Sgr::default());
+    while grid.len() > 1 && grid.last().is_some_and(|r| is_blank_row(r)) {
+        grid.pop();
+    }
+
+    let mut out = String::with_capacity(input.len().min(64 * 1024));
+    for (ri, cells) in grid.iter().enumerate() {
+        if ri > 0 {
+            out.push_str("\r\n");
+        }
+        // Keep coloured trailing cells (the bars); trim default-styled padding.
+        let mut end = cells.len();
+        while end > 0 {
+            let (ch, s) = cells[end - 1];
+            if ch == ' ' && s == Sgr::default() {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut emitted = Sgr::default();
+        for &(ch, s) in &cells[..end] {
+            if s != emitted {
+                out.push_str("\x1b[");
+                out.push_str(&sgr_codes(&s));
+                out.push('m');
+                emitted = s;
+            }
+            out.push(ch);
+        }
+        if emitted != Sgr::default() {
+            out.push_str("\x1b[0m");
+        }
+    }
+    out
 }
 
 pub(crate) fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
