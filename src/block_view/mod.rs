@@ -4905,7 +4905,8 @@ mod tests {
         background_output_has_visible_text, build_clipboard_paste, build_command_recall,
         build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
         history_edge_navigation_available, normalize_captured_command, normalize_loaded_block_ids,
-        record_external_input, resolve_submitted_command, scroll_delta_to_reveal,
+        output_has_vertical_repaint, record_external_input, resolve_submitted_command,
+        scroll_delta_to_reveal,
         selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
@@ -5486,6 +5487,64 @@ mod tests {
             strip_ansi_with_clear_detect("\u{1b}[0J"),
             ("".to_string(), false)
         );
+    }
+
+    #[test]
+    fn cursor_home_repaint_collapses_to_final_frame() {
+        // A `top`-style repaint: each frame is drawn behind a cursor-home, so
+        // only the final frame must survive rather than being concatenated.
+        let frame = |n: char| format!("header {n}\nrow-a {n}\nrow-b {n}");
+        let stream = format!(
+            "{}\u{1b}[H{}\u{1b}[H{}",
+            frame('1'),
+            frame('2'),
+            frame('3'),
+        );
+        assert_eq!(strip_ansi(&stream), frame('3'));
+    }
+
+    #[test]
+    fn absolute_positioning_overwrites_earlier_row() {
+        // CSI <row>;<col>H writes into an existing row instead of appending.
+        assert_eq!(
+            strip_ansi("line1\nline2\nline3\u{1b}[2;1HLINE2"),
+            "line1\nLINE2\nline3"
+        );
+    }
+
+    #[test]
+    fn cursor_up_rewrites_previous_line() {
+        // Multi-line progress: go up one row and overwrite it.
+        assert_eq!(
+            strip_ansi("step 1: pending\nstep 2: pending\u{1b}[A\rstep 1: done   "),
+            "step 1: done   \nstep 2: pending"
+        );
+    }
+
+    #[test]
+    fn erase_to_end_of_screen_drops_stale_rows() {
+        // A shorter repaint clears the tail of a taller previous frame.
+        assert_eq!(
+            strip_ansi("aaa\nbbb\nccc\u{1b}[Hxxx\n\u{1b}[J"),
+            "xxx\n"
+        );
+    }
+
+    #[test]
+    fn vertical_repaint_detected_for_reposition_streams() {
+        assert!(output_has_vertical_repaint("row1\nrow2\u{1b}[Hrepaint"));
+        assert!(output_has_vertical_repaint("row1\nrow2\u{1b}[Arewrite"));
+        assert!(output_has_vertical_repaint("row1\n\u{1b}[2;1Habsolute"));
+    }
+
+    #[test]
+    fn vertical_repaint_not_flagged_for_plain_or_horizontal_output() {
+        // Leading home before any line, colored output, and CR spinners are not
+        // repaint streams — they keep their raw (colored) bytes.
+        assert!(!output_has_vertical_repaint("\u{1b}[Hgit status output\nmore"));
+        assert!(!output_has_vertical_repaint("\u{1b}[32mgreen\u{1b}[0m\nplain"));
+        assert!(!output_has_vertical_repaint("working\rdone\nnext line"));
+        assert!(!output_has_vertical_repaint("\u{1b}[?25lhidden cursor\nline"));
     }
 
     #[test]

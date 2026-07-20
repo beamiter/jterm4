@@ -717,6 +717,23 @@ impl FinishedBlock {
         recycled: Option<gtk4::Box>,
     ) -> Self {
         let is_background = cmd.trim().is_empty();
+
+        // A command that repaints in place without the alternate screen (top,
+        // watch, multi-line progress) emits one frame per refresh, each behind a
+        // cursor-home. Fed verbatim into the scrollback-backed output VTE those
+        // frames stack into an ever-growing block. Collapse such streams to their
+        // final on-screen frame here (the plain shadow the 2D cursor model
+        // reconstructs) so the finished block mirrors what the live VTE showed.
+        // Ordinary colored output has no vertical repaint and is fed unchanged,
+        // preserving its SGR styling.
+        let collapsed;
+        let output = if output_has_vertical_repaint(output) {
+            collapsed = strip_ansi(output);
+            collapsed.as_str()
+        } else {
+            output
+        };
+
         let output_rows = output_visual_row_count(output, cols);
         let fallback_viewport_cap = (config.finished_block_viewport_rows as i64).max(3);
         let viewport_cap =
