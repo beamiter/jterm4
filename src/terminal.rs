@@ -18,18 +18,20 @@ use vte4::{TerminalExt, TerminalExtManual};
 use crate::config::Config;
 
 fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
-    let mut page_child = terminal.clone().upcast::<gtk4::Widget>();
-    while let Some(parent) = page_child.parent() {
-        if let Ok(notebook) = parent.clone().downcast::<gtk4::Notebook>() {
-            return notebook.current_page().is_some_and(|page| {
-                notebook
-                    .nth_page(Some(page))
-                    .is_some_and(|selected| selected == page_child)
-            });
-        }
-        page_child = parent;
-    }
-    true
+    // GTK4 Notebook keeps its pages inside an internal GtkStack, so walking
+    // plain `parent()` links never lands on a widget that equals `nth_page`.
+    // Resolve the Notebook ancestor first, then test page membership downward.
+    let widget = terminal.clone().upcast::<gtk4::Widget>();
+    let Some(notebook) = widget
+        .ancestor(gtk4::Notebook::static_type())
+        .and_downcast::<gtk4::Notebook>()
+    else {
+        return true;
+    };
+    notebook
+        .current_page()
+        .and_then(|page| notebook.nth_page(Some(page)))
+        .is_some_and(|selected| widget == selected || widget.is_ancestor(&selected))
 }
 
 /// Focus a mapped terminal now, then once more after the current container
@@ -42,13 +44,25 @@ fn belongs_to_selected_notebook_page(terminal: &Terminal) -> bool {
 /// Never logically focus an unmapped VTE: doing so can prevent its IM context
 /// from receiving a real focus-in when the widget is first mapped.
 pub(crate) fn focus_terminal(terminal: &Terminal) {
-    if terminal.is_mapped() && belongs_to_selected_notebook_page(terminal) {
-        terminal.grab_focus();
+    let mapped = terminal.is_mapped();
+    let on_page = belongs_to_selected_notebook_page(terminal);
+    if mapped && on_page {
+        let grabbed = terminal.grab_focus();
+        log::debug!(
+            "focus_terminal: grab_focus -> {grabbed}, has_focus={}",
+            terminal.has_focus()
+        );
+    } else {
+        log::debug!("focus_terminal: skipped immediate grab (mapped={mapped} on_page={on_page})");
     }
     let deferred = terminal.clone();
     glib::idle_add_local_once(move || {
         if deferred.is_mapped() && belongs_to_selected_notebook_page(&deferred) {
-            deferred.grab_focus();
+            let grabbed = deferred.grab_focus();
+            log::debug!(
+                "focus_terminal(deferred): grab_focus -> {grabbed}, has_focus={}",
+                deferred.has_focus()
+            );
         }
     });
 }

@@ -918,6 +918,7 @@ pub fn run() -> glib::ExitCode {
             };
 
             if let Some(action) = action {
+                log::debug!("window shortcut matched: {action:?} ({combo:?})");
                 match action {
                     Action::NewTab => {
                         // Keep the old VTE/IME context focused until it has seen

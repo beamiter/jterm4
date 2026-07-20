@@ -461,17 +461,22 @@ impl UiState {
     }
 
     pub(crate) fn focus_pane_directional(&self, direction: Direction) {
+        log::debug!("focus_pane_directional: {direction:?}");
         let Some(page_num) = self.notebook.current_page() else {
+            log::debug!("focus_pane_directional: no current page");
             return;
         };
         let Some(page_widget) = self.notebook.nth_page(Some(page_num)) else {
+            log::debug!("focus_pane_directional: no page widget");
             return;
         };
         let Some(node) = PaneNode::from_widget(&page_widget) else {
+            log::debug!("focus_pane_directional: page widget has no PaneNode");
             return;
         };
         let leaves = node.leaves();
         if leaves.len() <= 1 {
+            log::debug!("focus_pane_directional: single leaf, nothing to focus");
             return;
         }
         // Focus can temporarily live on a finished Block VTE, a scrollbar, or
@@ -479,9 +484,17 @@ impl UiState {
         // resolves the full focus subtree and falls back to the last active pane
         // instead of silently dropping the shortcut.
         let Some(focused) = node.active_leaf() else {
+            log::debug!("focus_pane_directional: no active leaf");
             return;
         };
         let focused_root = focused.root_widget();
+        if log::log_enabled!(log::Level::Debug) {
+            let focus_widget = page_widget.root().and_then(|root| root.focus());
+            log::debug!(
+                "focus_pane_directional: window focus widget = {:?}",
+                focus_widget.as_ref().map(|widget| widget.type_().name())
+            );
+        }
 
         let mut positioned = Vec::with_capacity(leaves.len());
         for leaf in leaves {
@@ -498,6 +511,7 @@ impl UiState {
             .iter()
             .position(|(leaf, _)| leaf.root_widget() == focused_root)
         else {
+            log::debug!("focus_pane_directional: focused leaf not in positioned set");
             return;
         };
         let centers = positioned
@@ -505,8 +519,13 @@ impl UiState {
             .map(|(_, center)| *center)
             .collect::<Vec<_>>();
         let Some(target) = nearest_directional_index(&centers, focused_index, direction) else {
+            log::debug!(
+                "focus_pane_directional: no pane {direction:?} of index {focused_index} \
+                 (centers: {centers:?})"
+            );
             return;
         };
+        log::debug!("focus_pane_directional: focusing pane {target}");
         positioned[target].0.grab_focus();
     }
 }
