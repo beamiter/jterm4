@@ -693,6 +693,9 @@ impl UiState {
         let chips = GBox::new(Orientation::Horizontal, 6);
         let provider_chip = Label::new(Some(&format!("{provider} · {model}")));
         provider_chip.set_hexpand(true);
+        // Keep the pill hugging its text; hexpand alone stretches the
+        // background into a long empty capsule.
+        provider_chip.set_halign(gtk4::Align::Start);
         provider_chip.set_max_width_chars(44);
         provider_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         provider_chip.set_tooltip_text(Some(&format!("{provider} · {model}")));
@@ -866,6 +869,10 @@ impl UiState {
         body.append(&status_card);
         body.append(&composer);
         let toolbar = adw::ToolbarView::new();
+        // Paint the whole dialog surface (including behind the header bar)
+        // with the terminal palette so no system-theme background leaks
+        // through the body margins.
+        toolbar.add_css_class("agent-surface");
         toolbar.add_top_bar(&header);
         toolbar.set_content(Some(&body));
         dialog.set_child(Some(&toolbar));

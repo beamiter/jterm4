@@ -234,6 +234,15 @@ impl UiState {
              .ai-input-placeholder {{ color: rgba({fr},{fg_g},{fb},0.44); padding: 8px; }}
              .ai-input-hint {{ color: rgba({fr},{fg_g},{fb},0.52); font-size: 0.82em; }}
              .ai-send-button {{ min-width: 72px; min-height: 32px; }}
+             .agent-surface {{
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+             }}
+             .agent-surface headerbar {{
+                 background-color: rgb({br},{bg_g},{bb});
+                 color: rgb({fr},{fg_g},{fb});
+                 box-shadow: none;
+             }}
              .agent-dashboard {{
                  background-color: rgb({br},{bg_g},{bb});
                  color: rgb({fr},{fg_g},{fb});
