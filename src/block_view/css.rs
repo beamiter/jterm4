@@ -258,6 +258,52 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-status-background {{
             color: rgba({acc_r},{acc_g},{acc_b},0.92);
         }}
+        .block-correction {{
+            border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
+        }}
+        .correction-icon {{
+            color: {accent};
+            font-family: "{font_family}";
+        }}
+        .correction-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .correction-evidence {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .correction-message {{
+            color: {fg_hex};
+        }}
+        .correction-warning {{
+            color: {err_hex};
+        }}
+        .correction-error {{
+            color: {err_hex};
+            font-size: 0.9em;
+        }}
+        .correction-entry {{
+            font-family: "{font_family}";
+            font-size: {font_size};
+            background-color: {bg_hex};
+            color: {fg_hex};
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-radius: 6px;
+            padding: 4px 8px;
+        }}
+        .correction-entry:focus {{
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+        }}
+        .correction-run {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.18);
+            color: {ok_hex};
+            border-radius: 6px;
+        }}
+        .correction-run:hover {{
+            background-color: rgba({acc_r},{acc_g},{acc_b},0.30);
+        }}
         .block-finished.block-compact, .block-active.block-compact {{
             border-radius: 6px;
             padding: 0;

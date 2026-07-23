@@ -4267,6 +4267,29 @@ impl TermView {
         self.submit_input();
     }
 
+    /// Insert a transient notice card (e.g. an AI command-correction proposal)
+    /// into the block list just above the live prompt, so it reads like part of
+    /// the block conversation. The card is not a `FinishedBlock`: it never joins
+    /// `finished_blocks`/`block_data`, so virtualization, selection, and history
+    /// persistence all ignore it.
+    pub fn insert_inline_notice(&self, widget: &gtk4::Widget) {
+        widget.insert_before(&self.block_list, Some(self.active.borrow().widget()));
+        self.block_list.queue_allocate();
+        self.scroll_debouncer.pin_to_bottom_deferred(&self.block_scroll);
+    }
+
+    /// Remove a card previously added by `insert_inline_notice`. Safe to call
+    /// twice: removal is skipped when the widget is no longer in the block list.
+    pub fn remove_inline_notice(&self, widget: &gtk4::Widget) {
+        if widget
+            .parent()
+            .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk4::Widget>())
+        {
+            self.block_list.remove(widget);
+            self.block_list.queue_allocate();
+        }
+    }
+
     /// Agent commands may only be submitted into a clean, idle shell editor.
     pub fn can_accept_agent_command(&self) -> bool {
         self.bstate.get() == BlockState::AwaitingCommand

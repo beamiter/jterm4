@@ -5,7 +5,11 @@
 //! environment that will run the command. The configured AI provider is used
 //! only as a fallback. Every result remains editable and requires an explicit
 //! user action; AI-only proposals can be inserted for review but cannot be run
-//! directly from the dialog.
+//! directly from the card.
+//!
+//! The proposal renders as an inline card in the block conversation — inserted
+//! just above the live prompt, styled like a finished block — rather than as a
+//! modal dialog, so accepting or dismissing it stays in the normal block flow.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -15,9 +19,9 @@ use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Duration;
 
-use adw::prelude::*;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -138,25 +142,21 @@ impl UiState {
         let pending = Rc::new(Cell::new(false));
         for index in 0..self.notebook.n_pages() {
             if let Some(page) = self.notebook.nth_page(Some(index)) {
-                attach_page(&page, &self.window, &self.config, &agent_dialog, &pending);
+                attach_page(&page, &self.config, &agent_dialog, &pending);
             }
         }
 
-        let window = self.window.downgrade();
         let config = self.config.clone();
         self.notebook
             .connect_page_added(move |_notebook, page, _page_num| {
                 // Page creation attaches PaneLeaf controllers after insertion.
                 // Deferring one main-loop turn avoids racing that attachment.
                 let page = page.clone();
-                let window = window.clone();
                 let config = config.clone();
                 let agent_dialog = agent_dialog.clone();
                 let pending = pending.clone();
                 glib::idle_add_local_once(move || {
-                    if let Some(window) = window.upgrade() {
-                        attach_page(&page, &window, &config, &agent_dialog, &pending);
-                    }
+                    attach_page(&page, &config, &agent_dialog, &pending);
                 });
             });
     }
@@ -164,7 +164,6 @@ impl UiState {
 
 fn attach_page(
     page: &gtk4::Widget,
-    window: &adw::ApplicationWindow,
     config: &Rc<RefCell<Config>>,
     agent_dialog: &std::rc::Weak<RefCell<Option<adw::Dialog>>>,
     pending: &Rc<Cell<bool>>,
@@ -177,7 +176,6 @@ fn attach_page(
         if let Some(view) = leaf.block_view() {
             attach_term_view(
                 view,
-                window.clone(),
                 config.clone(),
                 agent_dialog.clone(),
                 pending.clone(),
@@ -189,7 +187,6 @@ fn attach_page(
 
 fn attach_term_view(
     view: Rc<TermView>,
-    window: adw::ApplicationWindow,
     config: Rc<RefCell<Config>>,
     agent_dialog: std::rc::Weak<RefCell<Option<adw::Dialog>>>,
     pending: Rc<Cell<bool>>,
@@ -203,9 +200,18 @@ fn attach_term_view(
         root.set_data(VIEW_DATA_KEY, true);
     }
 
+    // At most one correction card per pane; a newly finished command makes any
+    // visible card stale, so it is dropped before this failure is classified.
+    let card_slot: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
     let view_weak = Rc::downgrade(&view);
-    let window_weak = window.downgrade();
     view.connect_block_finished(move |command, exit_code, output| {
+        if let Some(card) = card_slot.borrow_mut().take() {
+            if let Some(view) = view_weak.upgrade() {
+                view.remove_inline_notice(&card);
+            }
+            pending.set(false);
+        }
+
         let agent_active = agent_dialog
             .upgrade()
             .is_some_and(|slot| slot.borrow().is_some());
@@ -227,15 +233,12 @@ fn attach_term_view(
         let Some(view) = view_weak.upgrade() else {
             return;
         };
-        let Some(window) = window_weak.upgrade() else {
-            return;
-        };
 
         pending.set(true);
         request_correction(
-            window,
             config.clone(),
             Rc::downgrade(&view),
+            card_slot.clone(),
             pending.clone(),
             command,
             exit_code,
@@ -249,9 +252,9 @@ fn attach_term_view(
 
 #[allow(clippy::too_many_arguments)]
 fn request_correction(
-    window: adw::ApplicationWindow,
     config: Rc<RefCell<Config>>,
     target: std::rc::Weak<TermView>,
+    card_slot: Rc<RefCell<Option<gtk4::Widget>>>,
     pending: Rc<Cell<bool>>,
     original_command: String,
     exit_code: i32,
@@ -284,29 +287,24 @@ fn request_correction(
         let _ = tx.send(result);
     });
 
-    let window_weak = window.downgrade();
     let rx = RefCell::new(rx);
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        if window_weak.upgrade().is_none() || target.upgrade().is_none() {
+        let Some(view) = target.upgrade() else {
             pending.set(false);
             return glib::ControlFlow::Break;
-        }
+        };
         match rx.borrow().try_recv() {
             Ok(Ok(Some(correction))) => {
                 if !config.borrow().command_correction_enabled {
                     pending.set(false);
                     return glib::ControlFlow::Break;
                 }
-                let Some(window) = window_weak.upgrade() else {
-                    pending.set(false);
-                    return glib::ControlFlow::Break;
-                };
-                show_correction_dialog(
-                    &window,
-                    target.clone(),
+                show_correction_card(
+                    &view,
+                    &card_slot,
                     pending.clone(),
+                    &config,
                     &original_command,
-                    if cwd.is_empty() { "." } else { &cwd },
                     correction,
                 );
                 glib::ControlFlow::Break
@@ -597,12 +595,19 @@ fn edit_distance(left: &str, right: &str) -> usize {
     matrix[left.len()][right.len()]
 }
 
-fn show_correction_dialog(
-    window: &adw::ApplicationWindow,
-    target: std::rc::Weak<TermView>,
+/// Present a correction proposal as an inline card in the block conversation.
+///
+/// The card is inserted just above the live prompt and styled like a finished
+/// block, so reviewing, editing, accepting, or dismissing the proposal reads
+/// like part of the normal Block-mode command dialogue instead of a modal
+/// window. `pending` stays set while the card is visible so a second proposal
+/// cannot stack on top of it.
+fn show_correction_card(
+    view: &Rc<TermView>,
+    card_slot: &Rc<RefCell<Option<gtk4::Widget>>>,
     pending: Rc<Cell<bool>>,
+    config: &Rc<RefCell<Config>>,
     original_command: &str,
-    cwd: &str,
     correction: CommandCorrection,
 ) {
     let danger = crate::agent::is_dangerous(&correction.command);
@@ -614,123 +619,233 @@ fn show_correction_dialog(
         CorrectionEvidence::TargetOutput => "The command suggested a correction",
         CorrectionEvidence::AiUnverified => "AI found a possible correction",
     };
-    let mut body = format!(
-        "{}\n\n{}\n\nOriginal command:\n{}\n\nTarget directory:\n{}",
-        correction.message,
-        correction.evidence.label(),
-        original_command,
-        cwd
-    );
-    if let Some(reason) = danger {
-        body.push_str(&format!(
-            "\n\nWarning: this command may be destructive ({reason}). Direct run is disabled; insert it only after reviewing every character."
-        ));
-    } else if correction.evidence.is_verified() {
-        body.push_str(
-            "\n\nThe exact verified candidate may be inserted or run. Editing it removes that verification.",
-        );
-    } else if correction.evidence == CorrectionEvidence::TargetOutput {
-        body.push_str(
-            "\n\nThis tool-provided proposal is not independently verified and can only be inserted for review.",
-        );
+
+    let compact = config.borrow().block_compact;
+    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    outer.add_css_class("block-finished");
+    outer.add_css_class("block-correction");
+    outer.set_hexpand(true);
+    outer.set_vexpand(false);
+    if compact {
+        outer.add_css_class("block-compact");
+        outer.set_margin_top(1);
+        outer.set_margin_bottom(1);
+        outer.set_margin_start(4);
+        outer.set_margin_end(4);
     } else {
-        body.push_str(
-            "\n\nThis AI-only proposal is unverified and can only be inserted for review.",
-        );
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+    }
+
+    // ── Header row: icon, title, evidence chip, close ─────────────────────
+    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    header.add_css_class("block-header");
+    if compact {
+        header.set_margin_start(8);
+        header.set_margin_end(6);
+        header.set_margin_top(3);
+        header.set_margin_bottom(1);
+    } else {
+        header.set_margin_start(12);
+        header.set_margin_end(8);
+        header.set_margin_top(6);
+        header.set_margin_bottom(2);
+    }
+    let icon = gtk4::Label::new(Some("\u{f0eb}")); // nf-fa-lightbulb_o
+    icon.add_css_class("correction-icon");
+    header.append(&icon);
+    let title_label = gtk4::Label::new(Some(title));
+    title_label.add_css_class("correction-title");
+    title_label.set_xalign(0.0);
+    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    header.append(&title_label);
+    let evidence_label = gtk4::Label::new(Some(correction.evidence.label()));
+    evidence_label.add_css_class("correction-evidence");
+    evidence_label.set_hexpand(true);
+    evidence_label.set_halign(gtk4::Align::End);
+    evidence_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    header.append(&evidence_label);
+    let close_btn = gtk4::Button::with_label("\u{2715}");
+    close_btn.add_css_class("flat");
+    close_btn.set_focusable(false);
+    close_btn.set_tooltip_text(Some("Dismiss suggestion (Esc)"));
+    header.append(&close_btn);
+    outer.append(&header);
+
+    // ── Body: reason, editable candidate, inline error, actions ──────────
+    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+    body.set_margin_start(if compact { 8 } else { 12 });
+    body.set_margin_end(if compact { 8 } else { 12 });
+    body.set_margin_top(2);
+    body.set_margin_bottom(if compact { 6 } else { 10 });
+    let message_label = gtk4::Label::new(Some(&format!(
+        "{} (for `{original_command}`)",
+        correction.message
+    )));
+    message_label.add_css_class("correction-message");
+    message_label.set_xalign(0.0);
+    message_label.set_wrap(true);
+    body.append(&message_label);
+    if let Some(reason) = danger {
+        let warning = gtk4::Label::new(Some(&format!(
+            "Warning: this command may be destructive ({reason}). Direct run is disabled; insert it only after reviewing every character."
+        )));
+        warning.add_css_class("correction-warning");
+        warning.set_xalign(0.0);
+        warning.set_wrap(true);
+        body.append(&warning);
     }
 
     let command_entry = gtk4::Entry::new();
+    command_entry.add_css_class("correction-entry");
     command_entry.set_text(&correction.command);
     command_entry.set_hexpand(true);
-    command_entry.set_tooltip_text(Some(
-        "This exact text will be inserted or run only after your explicit choice",
-    ));
-
-    let command_label = gtk4::Label::new(Some("Suggested command"));
-    command_label.set_xalign(0.0);
-    command_label.add_css_class("heading");
-    let command_box = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    command_box.append(&command_label);
-    command_box.append(&command_entry);
-
-    let dialog = adw::AlertDialog::new(Some(title), Some(&body));
-    dialog.set_extra_child(Some(&command_box));
-    dialog.add_response("dismiss", "Dismiss");
-    dialog.add_response("insert", "Insert only");
-    if direct_run {
-        dialog.add_response("run", "Run verified command");
-        dialog.set_response_appearance("run", adw::ResponseAppearance::Suggested);
+    command_entry.set_tooltip_text(Some(if direct_run {
+        "Enter runs the exact verified candidate; editing it removes that verification"
     } else {
-        dialog.set_response_appearance("insert", adw::ResponseAppearance::Suggested);
-    }
-    dialog.set_close_response("dismiss");
-    dialog.set_default_response(Some("insert"));
+        "Enter inserts this text at the prompt for review"
+    }));
+    body.append(&command_entry);
 
+    let error_label = gtk4::Label::new(None);
+    error_label.add_css_class("correction-error");
+    error_label.set_xalign(0.0);
+    error_label.set_wrap(true);
+    error_label.set_visible(false);
+    body.append(&error_label);
+
+    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    actions.set_halign(gtk4::Align::End);
+    let dismiss_btn = gtk4::Button::with_label("Dismiss");
+    dismiss_btn.add_css_class("flat");
+    actions.append(&dismiss_btn);
+    let insert_btn = gtk4::Button::with_label("Insert only");
+    if !direct_run {
+        insert_btn.add_css_class("suggested-action");
+    }
+    actions.append(&insert_btn);
+    let run_btn = direct_run.then(|| {
+        let btn = gtk4::Button::with_label("Run verified command");
+        btn.add_css_class("correction-run");
+        btn.add_css_class("suggested-action");
+        actions.append(&btn);
+        btn
+    });
+    body.append(&actions);
+    outer.append(&body);
+
+    // ── Insert into the block conversation ────────────────────────────────
+    let card: gtk4::Widget = outer.clone().upcast();
+    *card_slot.borrow_mut() = Some(card.clone());
+    view.insert_inline_notice(&card);
+    // Take keyboard focus only when the prompt is clean and idle; a prompt the
+    // user is already typing into must keep its keystrokes.
+    if view.can_accept_agent_command() {
+        command_entry.grab_focus();
+    }
+
+    let view_weak = Rc::downgrade(view);
+    let dismiss = {
+        let view_weak = view_weak.clone();
+        let card_slot = card_slot.clone();
+        let card = card.clone();
+        let pending = pending.clone();
+        Rc::new(move |refocus_terminal: bool| {
+            card_slot.borrow_mut().take();
+            pending.set(false);
+            if let Some(view) = view_weak.upgrade() {
+                view.remove_inline_notice(&card);
+                if refocus_terminal {
+                    view.grab_focus();
+                }
+            }
+        })
+    };
+
+    {
+        let dismiss = dismiss.clone();
+        close_btn.connect_clicked(move |_| dismiss(true));
+    }
+    {
+        let dismiss = dismiss.clone();
+        dismiss_btn.connect_clicked(move |_| dismiss(true));
+    }
+    // Esc anywhere inside the card dismisses it, mirroring dialog behavior.
+    {
+        let dismiss = dismiss.clone();
+        let key_ctrl = gtk4::EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gdk::Key::Escape {
+                dismiss(true);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        outer.add_controller(key_ctrl);
+    }
+
+    // Shared accept path for the Insert/Run buttons and the entry's Enter.
     let proposed_command = correction.command.clone();
     let evidence = correction.evidence;
-    let window_weak = window.downgrade();
-    let command_entry_for_response = command_entry.clone();
-    dialog.connect_response(None, move |_dialog, response| {
-        pending.set(false);
-        if !matches!(response, "insert" | "run") {
-            return;
-        }
-        let Some(target) = target.upgrade() else {
+    let entry_for_accept = command_entry.clone();
+    let accept = Rc::new(move |run: bool| {
+        let Some(view) = view_weak.upgrade() else {
             return;
         };
-        let edited = command_entry_for_response.text().to_string();
+        let show_error = |text: &str| {
+            error_label.set_text(text);
+            error_label.set_visible(true);
+        };
+        let edited = entry_for_accept.text().to_string();
         let command = match validate_candidate(&edited, "") {
             Ok(command) => command,
             Err(error) => {
-                if let Some(window) = window_weak.upgrade() {
-                    show_action_error(&window, "Invalid corrected command", &error);
-                }
+                show_error(&format!("Invalid corrected command: {error}"));
                 return;
             }
         };
 
-        if response == "run"
+        if run
             && (!evidence.is_verified()
                 || command != proposed_command
                 || crate::agent::is_dangerous(&command).is_some())
         {
-            if let Some(window) = window_weak.upgrade() {
-                show_action_error(
-                    &window,
-                    "Direct run was refused",
-                    "Only the exact, verified, non-destructive candidate can run from this dialog. Use Insert only to review an edited or unverified command.",
-                );
-            }
+            show_error(
+                "Only the exact, verified, non-destructive candidate can run from this card. Use Insert only to review an edited or unverified command.",
+            );
             return;
         }
-        if !target.can_accept_agent_command() {
-            if let Some(window) = window_weak.upgrade() {
-                show_action_error(
-                    &window,
-                    "Command was not inserted",
-                    "The originating prompt is busy or already contains input. Clear it and choose the correction again after the prompt is idle.",
-                );
-            }
+        if !view.can_accept_agent_command() {
+            show_error(
+                "The prompt is busy or already contains input. Clear it, then choose the correction again once the prompt is idle.",
+            );
             return;
         }
 
-        target.grab_focus();
-        if response == "run" {
-            target.submit_command(&command);
+        view.grab_focus();
+        if run {
+            view.submit_command(&command);
         } else {
-            target.write_input(command.as_bytes());
+            view.write_input(command.as_bytes());
         }
+        dismiss(false);
     });
-    dialog.present(Some(window));
-    command_entry.grab_focus();
-}
 
-fn show_action_error(window: &adw::ApplicationWindow, title: &str, message: &str) {
-    let dialog = adw::AlertDialog::new(Some(title), Some(message));
-    dialog.add_response("ok", "OK");
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("ok");
-    dialog.present(Some(window));
+    {
+        let accept = accept.clone();
+        insert_btn.connect_clicked(move |_| accept(false));
+    }
+    if let Some(run_btn) = run_btn {
+        let accept = accept.clone();
+        run_btn.connect_clicked(move |_| accept(true));
+    }
+    // Enter in the entry triggers the primary action: run when the verified
+    // fast path is available, insert-for-review otherwise.
+    command_entry.connect_activate(move |_| accept(direct_run));
 }
 
 fn correction_system_prompt() -> &'static str {
