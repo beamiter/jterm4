@@ -1562,7 +1562,7 @@ impl UiState {
             let path = ui
                 .config
                 .borrow()
-                .ai_api_key_file
+                .ai_api_key_file_configured
                 .clone()
                 .unwrap_or_else(crate::config::default_ai_api_key_path);
             if let Err(error) = crate::ai::write_api_key_file(&path, row.text().as_str()) {
@@ -1571,7 +1571,12 @@ impl UiState {
             }
             row.set_text("");
             row.set_title("API Key stored — enter a new value to replace it");
-            ui.config.borrow_mut().ai_api_key_file = Some(path);
+            let mut config = ui.config.borrow_mut();
+            config.ai_api_key_file_configured = Some(path.clone());
+            if crate::config::ai_api_key_file_env_override().is_none() {
+                config.ai_api_key_file = Some(path);
+            }
+            drop(config);
             ui.ai_panel.refresh_config_display();
             ui.persist_config();
         });

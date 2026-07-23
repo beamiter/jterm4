@@ -269,7 +269,7 @@ impl UiState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-            if let Err(err) = crate::command_history::append(
+            if let Err(err) = crate::command_history::append_async(
                 std::path::Path::new(path),
                 config.command_history_max_entries as usize,
                 &command,

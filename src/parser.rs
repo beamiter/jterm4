@@ -10,6 +10,9 @@ const MAX_OSC_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Kitty graphics uses APC. Keep a practical encoded-image ceiling while
 /// preventing one unterminated sequence from retaining arbitrary PTY output.
 const MAX_APC_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+/// Sixel and terminal-query DCS payloads are passed through only when complete.
+/// Oversized unterminated payloads are discarded until their real terminator.
+const MAX_DCS_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_CLIPBOARD_BASE64_BYTES: usize = 4 * 1024 * 1024;
 
 /// Which color slot an OSC 10/11/12/4 query asked about.
@@ -121,6 +124,10 @@ enum State {
     Dcs { buf: Vec<u8> },
     /// Saw ESC while in DCS — next byte should be '\' for ST.
     DcsEsc { payload: Vec<u8> },
+    /// DCS exceeded its hard payload limit. Ignore bytes until BEL or ST.
+    DcsDiscard,
+    /// Saw ESC while discarding an oversized DCS; '\' completes ST.
+    DcsDiscardEsc,
     /// Inside PM (ESC ^) — consume until ST and discard.
     Ignore,
     /// Saw ESC while in PM — consume the ST final byte too.
@@ -625,12 +632,11 @@ impl Parser {
                         self.state = State::DcsEsc { payload };
                     }
                     _ => {
-                        buf.push(b);
-                        // Bound runaway DCS (malformed stream) the same way CSI is bounded.
-                        if buf.len() > 1 << 20 {
-                            let payload = std::mem::take(buf);
-                            self.state = State::Ground;
-                            emit_dcs_passthrough(&payload, &mut self.passthrough);
+                        if buf.len() >= MAX_DCS_PAYLOAD_BYTES {
+                            log::warn!("Dropping DCS larger than {MAX_DCS_PAYLOAD_BYTES} bytes");
+                            self.state = State::DcsDiscard;
+                        } else {
+                            buf.push(b);
                         }
                     }
                 },
@@ -644,6 +650,20 @@ impl Parser {
                     } else {
                         self.passthrough.push(b);
                     }
+                }
+
+                State::DcsDiscard => match b {
+                    0x07 => self.state = State::Ground,
+                    0x1b => self.state = State::DcsDiscardEsc,
+                    _ => {}
+                },
+
+                State::DcsDiscardEsc => {
+                    self.state = match b {
+                        b'\\' | 0x07 => State::Ground,
+                        0x1b => State::DcsDiscardEsc,
+                        _ => State::DcsDiscard,
+                    };
                 }
 
                 State::Ignore => {
@@ -953,6 +973,23 @@ mod tests {
         assert!(bytes.windows(5).any(|w| w == b"after"));
         assert!(bytes.windows(3).any(|w| w == b"\x1bPq"));
         assert!(bytes.windows(2).any(|w| w == b"\x1b\\"));
+    }
+
+    #[test]
+    fn oversized_dcs_is_discarded_until_its_actual_terminator() {
+        let mut p = Parser::new();
+        let mut events = Vec::new();
+        p.feed(b"before\x1bPq", &mut events);
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..=(MAX_DCS_PAYLOAD_BYTES / chunk.len()) {
+            p.feed(&chunk, &mut events);
+        }
+        assert!(matches!(p.state, State::DcsDiscard));
+
+        p.feed(b"must-not-leak\x1b", &mut events);
+        assert!(matches!(p.state, State::DcsDiscardEsc));
+        p.feed(b"\\after", &mut events);
+        assert_eq!(collect_bytes(&events), b"beforeafter");
     }
 
     #[test]

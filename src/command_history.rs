@@ -8,13 +8,154 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, OnceLock};
+use std::time::Duration;
 
 const COMPACT_EVERY: u64 = 128;
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 static APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
+static HISTORY_WORKER: OnceLock<mpsc::SyncSender<HistoryMessage>> = OnceLock::new();
+
+struct HistoryLock {
+    file: File,
+}
+
+impl HistoryLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path(path))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        loop {
+            if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Drop for HistoryLock {
+    fn drop(&mut self) {
+        unsafe {
+            nix::libc::flock(self.file.as_raw_fd(), nix::libc::LOCK_UN);
+        }
+    }
+}
+
+struct AppendRequest {
+    path: PathBuf,
+    max_entries: usize,
+    command: String,
+    cwd: Option<String>,
+    exit_code: i32,
+    end_time_ms: Option<u64>,
+}
+
+enum HistoryMessage {
+    Append(AppendRequest),
+    Flush(mpsc::Sender<()>),
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+fn history_worker() -> &'static mpsc::SyncSender<HistoryMessage> {
+    HISTORY_WORKER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(1024);
+        let spawn_result = std::thread::Builder::new()
+            .name("jterm4-command-history".to_string())
+            .spawn(move || {
+                for message in receiver {
+                    match message {
+                        HistoryMessage::Append(request) => {
+                            if let Err(error) = append(
+                                &request.path,
+                                request.max_entries,
+                                &request.command,
+                                request.cwd.as_deref(),
+                                request.exit_code,
+                                request.end_time_ms,
+                            ) {
+                                log::warn!("failed to append command history: {error}");
+                            }
+                        }
+                        HistoryMessage::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            });
+        if let Err(error) = spawn_result {
+            log::error!("failed to start command-history worker: {error}");
+        }
+        sender
+    })
+}
+
+pub(crate) fn append_async(
+    path: &Path,
+    max_entries: usize,
+    command: &str,
+    cwd: Option<&str>,
+    exit_code: i32,
+    end_time_ms: Option<u64>,
+) -> io::Result<()> {
+    if command.trim().is_empty() {
+        return Ok(());
+    }
+    let request = AppendRequest {
+        path: path.to_path_buf(),
+        max_entries,
+        command: command.to_string(),
+        cwd: cwd.map(str::to_string),
+        exit_code,
+        end_time_ms,
+    };
+    history_worker()
+        .try_send(HistoryMessage::Append(request))
+        .map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "command-history queue is full")
+            }
+            mpsc::TrySendError::Disconnected(_) => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "command-history worker is unavailable",
+            ),
+        })
+}
+
+/// Wait for all records queued before this call to reach durable storage.
+pub(crate) fn flush_async(timeout: Duration) -> bool {
+    let Some(worker) = HISTORY_WORKER.get() else {
+        return true;
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    if worker.try_send(HistoryMessage::Flush(done_tx)).is_err() {
+        return false;
+    }
+    done_rx.recv_timeout(timeout).is_ok()
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct CommandHistoryRecord {
@@ -64,6 +205,10 @@ pub(crate) fn append(
         ));
     }
 
+    // The same history path can be shared by multiple jterm4 windows or
+    // processes. Hold one advisory lock across append and any compaction so a
+    // rename can never discard another process's freshly appended record.
+    let _lock = HistoryLock::acquire(path)?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -77,15 +222,16 @@ pub(crate) fn append(
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(&encoded)?;
-    file.write_all(b"\n")?;
+    let mut line = encoded;
+    line.push(b'\n');
+    file.write_all(&line)?;
     file.flush()?;
 
     let append_number = APPEND_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let oversized = file.metadata()?.len() > MAX_FILE_BYTES;
     drop(file);
     if oversized || append_number.is_multiple_of(COMPACT_EVERY) {
-        compact(path, max_entries.max(1))?;
+        compact_unlocked(path, max_entries.max(1))?;
     }
     Ok(())
 }
@@ -132,6 +278,11 @@ pub(crate) fn read_recent(
 }
 
 fn compact(path: &Path, max_entries: usize) -> io::Result<()> {
+    let _lock = HistoryLock::acquire(path)?;
+    compact_unlocked(path, max_entries)
+}
+
+fn compact_unlocked(path: &Path, max_entries: usize) -> io::Result<()> {
     let input = File::open(path)?;
     let mut reader = BufReader::new(input);
     let mut recent = VecDeque::with_capacity(max_entries.min(16_384));
@@ -195,6 +346,11 @@ mod tests {
         ))
     }
 
+    fn remove_history_files(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock_path(path));
+    }
+
     #[test]
     fn append_writes_private_palette_compatible_jsonl() {
         let path = temp_path("append");
@@ -212,7 +368,7 @@ mod tests {
                 0o600
             );
         }
-        let _ = fs::remove_file(path);
+        remove_history_files(&path);
     }
 
     #[test]
@@ -232,7 +388,7 @@ mod tests {
             vec!["one", "two"]
         );
         assert_eq!(records[0].exit_code, 0);
-        let _ = fs::remove_file(path);
+        remove_history_files(&path);
     }
 
     #[test]
@@ -254,7 +410,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["safe"]
         );
-        let _ = fs::remove_file(path);
+        remove_history_files(&path);
     }
 
     #[test]
@@ -271,6 +427,45 @@ mod tests {
         assert!(!text.contains("not-json"));
         assert!(text.contains("two"));
         assert!(text.contains("three"));
-        let _ = fs::remove_file(path);
+        remove_history_files(&path);
+    }
+
+    #[test]
+    fn concurrent_append_preserves_every_jsonl_record() {
+        let path = std::sync::Arc::new(temp_path("concurrent"));
+        let mut threads = Vec::new();
+        for worker in 0..8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                for entry in 0..20 {
+                    append(
+                        &path,
+                        1_000,
+                        &format!("echo worker-{worker}-{entry}"),
+                        Some("/tmp"),
+                        0,
+                        None,
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let records = read_recent(&path, 1_000).unwrap();
+        assert_eq!(records.len(), 160);
+        remove_history_files(&path);
+    }
+
+    #[test]
+    fn async_append_flushes_without_blocking_the_caller_on_io() {
+        let path = temp_path("async");
+        append_async(&path, 100, "cargo check", Some("/tmp"), 0, Some(42)).unwrap();
+        assert!(flush_async(Duration::from_secs(5)));
+        let records = read_recent(&path, 10).unwrap();
+        assert_eq!(records[0].command, "cargo check");
+        remove_history_files(&path);
     }
 }

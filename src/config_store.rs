@@ -447,7 +447,7 @@ fn apply_config_to_table(config: &Config, table: &mut toml::Table) {
         "ai_base_url".into(),
         toml::Value::String(config.ai_base_url.clone()),
     );
-    if let Some(path) = &config.ai_api_key_file {
+    if let Some(path) = &config.ai_api_key_file_configured {
         table.insert("ai_api_key_file".into(), toml::Value::String(path.clone()));
     } else {
         table.remove("ai_api_key_file");
@@ -890,7 +890,8 @@ mod tests {
         config.command_correction_enabled = false;
         config.ai_provider = "ollama".into();
         config.ai_base_url = "http://localhost:11434".into();
-        config.ai_api_key_file = Some("~/.config/jterm4/ai.key".into());
+        config.ai_api_key_file = Some("/run/secrets/provider-api-key".into());
+        config.ai_api_key_file_configured = Some("~/.config/jterm4/ai.key".into());
         config.ai_model = "qwen2.5-coder:7b".into();
         config.ai_max_tokens = 2048;
         save_config_to_path(&path, &config, Some(&ConfigRevision::missing())).unwrap();

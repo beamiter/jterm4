@@ -142,7 +142,9 @@ fn prune_stale_session_histories(base: &Path, keep: &Path, max_age: std::time::D
         return;
     };
     let prefix = format!("{stem}-");
-    let extension = base.extension().map(|ext| ext.to_string_lossy().into_owned());
+    let extension = base
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned());
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
@@ -158,7 +160,11 @@ fn prune_stale_session_histories(base: &Path, keep: &Path, max_age: std::time::D
         if !name.starts_with(&prefix) {
             continue;
         }
-        if path.extension().map(|ext| ext.to_string_lossy().into_owned()) != extension {
+        if path
+            .extension()
+            .map(|ext| ext.to_string_lossy().into_owned())
+            != extension
+        {
             continue;
         }
         let stale = entry
@@ -169,10 +175,7 @@ fn prune_stale_session_histories(base: &Path, keep: &Path, max_age: std::time::D
             .is_some_and(|age| age >= max_age);
         if stale {
             if let Err(error) = fs::remove_file(&path) {
-                log::warn!(
-                    "prune stale block history {}: {error}",
-                    path.display()
-                );
+                log::warn!("prune stale block history {}: {error}", path.display());
             }
         }
     }

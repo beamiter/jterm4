@@ -3,9 +3,13 @@ use nix::libc;
 use nix::pty::{openpty, OpenptyResult};
 use nix::unistd::{self, ForkResult, Pid};
 use std::borrow::Cow;
-use std::ffi::CString;
+use std::collections::BTreeMap;
+use std::ffi::{CString, OsString};
+use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -215,6 +219,83 @@ fn spawn_fd_writer(fd: OwnedFd) -> io::Result<mpsc::Sender<Vec<u8>>> {
     Ok(tx)
 }
 
+fn invalid_nul(context: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{context} contains an embedded NUL byte"),
+    )
+}
+
+fn resolve_executable(argument: &str, cwd: Option<&str>) -> io::Result<PathBuf> {
+    let executable = Path::new(argument);
+    let current_directory = std::env::current_dir()?;
+    let base = cwd
+        .filter(|value| !value.is_empty())
+        .map(Path::new)
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                current_directory.join(path)
+            }
+        })
+        .unwrap_or(current_directory);
+
+    if argument.as_bytes().contains(&b'/') {
+        return Ok(if executable.is_absolute() {
+            executable.to_path_buf()
+        } else {
+            base.join(executable)
+        });
+    }
+
+    let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+    for directory in std::env::split_paths(&path) {
+        let candidate = if directory.is_absolute() {
+            directory.join(executable)
+        } else {
+            base.join(directory).join(executable)
+        };
+        let candidate_bytes = candidate.as_os_str().as_bytes();
+        let Ok(candidate_c) = CString::new(candidate_bytes) else {
+            continue;
+        };
+        if candidate.is_file() && unsafe { libc::access(candidate_c.as_ptr(), libc::X_OK) } == 0 {
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("PTY executable '{argument}' was not found in PATH"),
+    ))
+}
+
+fn child_environment(env_extra: &[(&str, &str)]) -> io::Result<Vec<CString>> {
+    let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    environment.insert(OsString::from("TERM"), OsString::from("xterm-256color"));
+    for (key, value) in env_extra {
+        if key.is_empty() || key.contains('=') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid PTY environment variable name '{key}'"),
+            ));
+        }
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+
+    environment
+        .into_iter()
+        .map(|(key, value)| {
+            let mut entry = Vec::with_capacity(key.len() + value.len() + 1);
+            entry.extend_from_slice(key.as_os_str().as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(entry).map_err(|_| invalid_nul("PTY environment"))
+        })
+        .collect()
+}
+
 impl OwnedPty {
     fn close_master_fd(&self) {
         if let Ok(mut guard) = self.master.lock() {
@@ -233,6 +314,44 @@ impl OwnedPty {
             ));
         }
 
+        // Prepare every allocation and environment lookup before fork. GTK is
+        // multi-threaded, so the child may only use async-signal-safe libc
+        // operations until exec replaces the process image.
+        let executable =
+            resolve_executable(&executable_argv[0], if host_bridge { None } else { cwd })?;
+        let executable_c = CString::new(executable.as_os_str().as_bytes())
+            .map_err(|_| invalid_nul("PTY executable path"))?;
+        let c_argv: Vec<CString> = executable_argv
+            .iter()
+            .map(|argument| {
+                CString::new(argument.as_str()).map_err(|_| invalid_nul("PTY argument"))
+            })
+            .collect::<io::Result<_>>()?;
+        let mut argv_ptrs: Vec<*const libc::c_char> =
+            c_argv.iter().map(|argument| argument.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        // execvp historically falls back to /bin/sh for an executable text
+        // file without a shebang. Preserve that behavior while keeping the
+        // fallback argv allocation on the safe side of fork.
+        let mut shell_fallback_ptrs: Vec<*const libc::c_char> =
+            Vec::with_capacity(c_argv.len() + 2);
+        shell_fallback_ptrs.push(c"sh".as_ptr());
+        shell_fallback_ptrs.push(executable_c.as_ptr());
+        shell_fallback_ptrs.extend(c_argv.iter().skip(1).map(|argument| argument.as_ptr()));
+        shell_fallback_ptrs.push(std::ptr::null());
+        let c_environment = child_environment(env_extra)?;
+        let mut environment_ptrs: Vec<*const libc::c_char> =
+            c_environment.iter().map(|entry| entry.as_ptr()).collect();
+        environment_ptrs.push(std::ptr::null());
+        let cwd_file = if host_bridge {
+            None
+        } else {
+            cwd.filter(|value| !value.is_empty())
+                .map(File::open)
+                .transpose()?
+        };
+        let cwd_fd = cwd_file.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1);
+
         let initial_size = nix::pty::Winsize {
             ws_row: 24,
             ws_col: 80,
@@ -241,41 +360,48 @@ impl OwnedPty {
         };
         let OpenptyResult { master, slave } =
             openpty(Some(&initial_size), None).map_err(io::Error::other)?;
+        let master_fd = master.as_raw_fd();
+        let slave_fd = slave.as_raw_fd();
 
         match unsafe { unistd::fork() } {
-            Ok(ForkResult::Child) => {
-                drop(master);
-                let slave_fd = slave.as_raw_fd();
-
-                unsafe {
-                    if libc::setsid() < 0 {
-                        eprintln!("setsid() failed: {}", std::io::Error::last_os_error());
-                        std::process::exit(1);
-                    }
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
-                    libc::dup2(slave_fd, 0);
-                    libc::dup2(slave_fd, 1);
-                    libc::dup2(slave_fd, 2);
+            Ok(ForkResult::Child) => unsafe {
+                libc::close(master_fd);
+                if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                    libc::_exit(126);
                 }
-                drop(slave);
-
-                if !host_bridge {
-                    if let Some(dir) = cwd {
-                        let _ = std::env::set_current_dir(dir);
+                if cwd_fd >= 0 {
+                    if libc::fchdir(cwd_fd) < 0 {
+                        libc::_exit(126);
+                    }
+                    if cwd_fd > libc::STDERR_FILENO {
+                        libc::close(cwd_fd);
                     }
                 }
-                for (key, val) in env_extra {
-                    unsafe { std::env::set_var(key, val) };
+                if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0
+                    || libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(slave_fd, libc::STDERR_FILENO) < 0
+                {
+                    libc::_exit(126);
                 }
-                unsafe { std::env::set_var("TERM", "xterm-256color") };
-
-                let c_argv: Vec<CString> = executable_argv
-                    .iter()
-                    .map(|argument| CString::new(argument.as_str()).unwrap())
-                    .collect();
-                let _ = unistd::execvp(&c_argv[0], &c_argv);
-                std::process::exit(127);
-            }
+                if slave_fd > libc::STDERR_FILENO {
+                    libc::close(slave_fd);
+                }
+                libc::execve(
+                    executable_c.as_ptr(),
+                    argv_ptrs.as_ptr(),
+                    environment_ptrs.as_ptr(),
+                );
+                let exec_error = *libc::__errno_location();
+                if exec_error == libc::ENOEXEC {
+                    libc::execve(
+                        c"/bin/sh".as_ptr(),
+                        shell_fallback_ptrs.as_ptr(),
+                        environment_ptrs.as_ptr(),
+                    );
+                    libc::_exit(126);
+                }
+                libc::_exit(if exec_error == libc::ENOENT { 127 } else { 126 });
+            },
             Ok(ForkResult::Parent { child }) => {
                 drop(slave);
                 let writer_fd = match master.try_clone() {
@@ -619,6 +745,68 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn spawned_child_receives_prepared_environment_and_cwd() {
+        let pty = OwnedPty::spawn(
+            &["/bin/sh", "-c", "printf '%s|' \"$TERM_PROGRAM\"; pwd"],
+            Some("/tmp"),
+            &[("TERM_PROGRAM", "jterm4-test")],
+        )
+        .expect("spawn PTY child");
+        let fd = pty.master_fd_raw();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut output = Vec::new();
+
+        while std::time::Instant::now() < deadline {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 100) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll PTY output: {error}");
+            }
+            if ready == 0 {
+                continue;
+            }
+
+            let mut buffer = [0u8; 256];
+            let read =
+                unsafe { libc::read(fd, buffer.as_mut_ptr().cast::<libc::c_void>(), buffer.len()) };
+            if read > 0 {
+                output.extend_from_slice(&buffer[..read as usize]);
+                if output
+                    .windows(b"jterm4-test|/tmp".len())
+                    .any(|window| window == b"jterm4-test|/tmp")
+                {
+                    break;
+                }
+            } else if read < 0 {
+                let error = io::Error::last_os_error();
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) && error.raw_os_error() != Some(libc::EIO)
+                {
+                    panic!("read PTY output: {error}");
+                }
+            }
+        }
+
+        assert!(
+            output
+                .windows(b"jterm4-test|/tmp".len())
+                .any(|window| window == b"jterm4-test|/tmp"),
+            "unexpected PTY output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 
     #[test]
     fn complete_writer_delivers_the_entire_payload() {

@@ -256,8 +256,12 @@ pub struct Config {
     /// Provider API root. Endpoint suffixes are added by the AI client.
     pub(crate) ai_base_url: String,
     /// Optional owner-only file used when no AI API key environment variable
-    /// is present. The path is persisted; the credential itself is not.
+    /// is present. This is the effective path after environment overrides.
     pub(crate) ai_api_key_file: Option<String>,
+    /// File-configured key path used as the Settings write target and persisted
+    /// back to TOML. Keeping it separate prevents an environment-managed
+    /// secret path from accidentally becoming writable UI state.
+    pub(crate) ai_api_key_file_configured: Option<String>,
     /// Show the right-side AI chat panel. Toggled via Ctrl+Alt+Shift+A and
     /// persisted across sessions.
     pub(crate) ai_panel_visible: bool,
@@ -349,6 +353,7 @@ impl Config {
             ai_provider: "anthropic".to_string(),
             ai_base_url: "https://api.anthropic.com".to_string(),
             ai_api_key_file: None,
+            ai_api_key_file_configured: None,
             ai_panel_visible: false,
             ai_panel_width: 360,
             ai_model: "claude-sonnet-4-6".to_string(),
@@ -536,6 +541,10 @@ pub(crate) fn default_ai_api_key_path() -> String {
         .join("ai.key")
         .to_string_lossy()
         .into_owned()
+}
+
+pub(crate) fn ai_api_key_file_env_override() -> Option<String> {
+    env_string("JTERM4_AI_API_KEY_FILE")
 }
 
 pub(crate) fn default_command_history_path() -> String {
@@ -1554,9 +1563,9 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         .unwrap_or_else(|| default_ai_base_url.to_string())
         .trim_end_matches('/')
         .to_string();
-    let ai_api_key_file = env_string("JTERM4_AI_API_KEY_FILE")
-        .or(fc.ai_api_key_file)
-        .filter(|path| !path.trim().is_empty());
+    let ai_api_key_file_configured = fc.ai_api_key_file.filter(|path| !path.trim().is_empty());
+    let ai_api_key_file =
+        ai_api_key_file_env_override().or_else(|| ai_api_key_file_configured.clone());
 
     let config = Config {
         window_opacity,
@@ -1600,6 +1609,7 @@ pub(crate) fn load_config() -> (Config, Vec<Theme>, KeybindingMap) {
         ai_provider,
         ai_base_url,
         ai_api_key_file,
+        ai_api_key_file_configured,
         ai_panel_visible: fc.ai_panel_visible.unwrap_or(false),
         ai_panel_width: fc.ai_panel_width.unwrap_or(360).clamp(240, 1200),
         ai_model,
@@ -1993,6 +2003,7 @@ unknown_action = "F8"
         config.block_history_path = Some("/tmp/blocks".into());
         config.ai_enabled = true;
         config.ai_api_key_file = Some("/tmp/ai-key".into());
+        config.ai_api_key_file_configured = Some("/tmp/ai-key".into());
         config.agent_enabled = true;
         config.command_correction_enabled = true;
         config.ai_panel_visible = true;
@@ -2020,6 +2031,7 @@ unknown_action = "F8"
         assert!(config.block_history_path.is_none());
         assert!(!config.ai_enabled);
         assert!(config.ai_api_key_file.is_none());
+        assert!(config.ai_api_key_file_configured.is_none());
         assert!(!config.agent_enabled);
         assert!(!config.command_correction_enabled);
         assert!(!config.ai_panel_visible);

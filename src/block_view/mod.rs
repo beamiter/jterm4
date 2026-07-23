@@ -4365,7 +4365,8 @@ impl TermView {
             widget.insert_before(&self.block_list, Some(&active_widget));
         }
         self.block_list.queue_allocate();
-        self.scroll_debouncer.pin_to_bottom_deferred(&self.block_scroll);
+        self.scroll_debouncer
+            .pin_to_bottom_deferred(&self.block_scroll);
     }
 
     /// Remove a card previously added by `insert_inline_notice`. Safe to call
@@ -5651,12 +5652,7 @@ mod tests {
         // A `top`-style repaint: each frame is drawn behind a cursor-home, so
         // only the final frame must survive rather than being concatenated.
         let frame = |n: char| format!("header {n}\nrow-a {n}\nrow-b {n}");
-        let stream = format!(
-            "{}\u{1b}[H{}\u{1b}[H{}",
-            frame('1'),
-            frame('2'),
-            frame('3'),
-        );
+        let stream = format!("{}\u{1b}[H{}\u{1b}[H{}", frame('1'), frame('2'), frame('3'),);
         assert_eq!(strip_ansi(&stream), frame('3'));
     }
 
@@ -5681,10 +5677,7 @@ mod tests {
     #[test]
     fn erase_to_end_of_screen_drops_stale_rows() {
         // A shorter repaint clears the tail of a taller previous frame.
-        assert_eq!(
-            strip_ansi("aaa\nbbb\nccc\u{1b}[Hxxx\n\u{1b}[J"),
-            "xxx\n"
-        );
+        assert_eq!(strip_ansi("aaa\nbbb\nccc\u{1b}[Hxxx\n\u{1b}[J"), "xxx\n");
     }
 
     #[test]
@@ -5702,11 +5695,11 @@ mod tests {
         // be trimmed, and rows are joined with CRLF for the finished VTE.
         let stream = concat!(
             "\u{1b}[H",
-            "cpu  1%   \r\n",     // row0, padded
-            "mem  40%  \r\n",     // row1, padded
-            "static    \r\n",     // row2, padded, never rewritten again
-            "          \r\n",     // row3, blank padding row
-            "\u{1b}[H",           // next refresh: only rows 0 and 1 change
+            "cpu  1%   \r\n", // row0, padded
+            "mem  40%  \r\n", // row1, padded
+            "static    \r\n", // row2, padded, never rewritten again
+            "          \r\n", // row3, blank padding row
+            "\u{1b}[H",       // next refresh: only rows 0 and 1 change
             "cpu  9%   \r\n",
             "mem  42%  ",
         );
@@ -5724,8 +5717,8 @@ mod tests {
         // the bar extend to `cols`, while a plain row's padding is trimmed.
         let stream = concat!(
             "\u{1b}[H",
-            "\u{1b}[7m PID\u{1b}[K\r\n",   // reverse bar, erase-to-EOL fills reverse
-            "\u{1b}[0m  1 root\u{1b}[K",    // plain row, padding trimmed
+            "\u{1b}[7m PID\u{1b}[K\r\n", // reverse bar, erase-to-EOL fills reverse
+            "\u{1b}[0m  1 root\u{1b}[K", // plain row, padding trimmed
         );
         let out = collapse_repaint_output(stream, 8);
         // Reverse attribute retained and the bar padded to 8 columns.
@@ -5736,10 +5729,16 @@ mod tests {
     fn vertical_repaint_not_flagged_for_plain_or_horizontal_output() {
         // Leading home before any line, colored output, and CR spinners are not
         // repaint streams — they keep their raw (colored) bytes.
-        assert!(!output_has_vertical_repaint("\u{1b}[Hgit status output\nmore"));
-        assert!(!output_has_vertical_repaint("\u{1b}[32mgreen\u{1b}[0m\nplain"));
+        assert!(!output_has_vertical_repaint(
+            "\u{1b}[Hgit status output\nmore"
+        ));
+        assert!(!output_has_vertical_repaint(
+            "\u{1b}[32mgreen\u{1b}[0m\nplain"
+        ));
         assert!(!output_has_vertical_repaint("working\rdone\nnext line"));
-        assert!(!output_has_vertical_repaint("\u{1b}[?25lhidden cursor\nline"));
+        assert!(!output_has_vertical_repaint(
+            "\u{1b}[?25lhidden cursor\nline"
+        ));
     }
 
     #[test]

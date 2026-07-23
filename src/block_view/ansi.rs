@@ -509,11 +509,15 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                     match final_byte {
                         b'm' => apply_sgr(&mut cur, params),
                         b'H' | b'f' => {
-                            row = parse_param_nth(params, 0, 1).saturating_sub(1).min(MAX_GRID_ROWS);
+                            row = parse_param_nth(params, 0, 1)
+                                .saturating_sub(1)
+                                .min(MAX_GRID_ROWS);
                             col = parse_param_nth(params, 1, 1).saturating_sub(1).min(width);
                         }
                         b'A' => row = row.saturating_sub(parse_param_first(params, 1)),
-                        b'B' | b'e' => row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS),
+                        b'B' | b'e' => {
+                            row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS)
+                        }
                         b'E' => {
                             row = (row + parse_param_first(params, 1)).min(MAX_GRID_ROWS);
                             col = 0;
@@ -523,7 +527,9 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
                             col = 0;
                         }
                         b'd' => {
-                            row = parse_param_first(params, 1).saturating_sub(1).min(MAX_GRID_ROWS)
+                            row = parse_param_first(params, 1)
+                                .saturating_sub(1)
+                                .min(MAX_GRID_ROWS)
                         }
                         b'C' | b'a' => col = (col + parse_param_first(params, 1)).min(width),
                         b'D' => col = col.saturating_sub(parse_param_first(params, 1)),
@@ -622,7 +628,8 @@ pub(crate) fn collapse_repaint_output(input: &str, cols: usize) -> String {
     }
 
     // Drop screen-padding rows at the bottom that carry no visible content.
-    let is_blank_row = |r: &[(char, Sgr)]| r.iter().all(|&(ch, s)| ch == ' ' && s == Sgr::default());
+    let is_blank_row =
+        |r: &[(char, Sgr)]| r.iter().all(|&(ch, s)| ch == ' ' && s == Sgr::default());
     while grid.len() > 1 && grid.last().is_some_and(|r| is_blank_row(r)) {
         grid.pop();
     }
