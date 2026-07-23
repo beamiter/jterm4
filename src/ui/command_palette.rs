@@ -228,10 +228,9 @@ impl CommandSuggestionRuntime {
                 return;
             }
         };
-        if !runtime.target.can_accept_agent_command() {
-            feedback.set_text(
-                "The pinned Block prompt is busy or already contains input. Clear it, then try again.",
-            );
+        let prompt_status = runtime.target.command_prompt_status();
+        if !prompt_status.is_ready() {
+            feedback.set_text(prompt_status.blocked_message());
             feedback.add_css_class("error");
             feedback.set_visible(true);
             return;

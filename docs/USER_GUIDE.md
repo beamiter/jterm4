@@ -259,7 +259,7 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 
 一次性建议、失败命令纠正与 Shell Agent proposal 共用同一套审阅卡逻辑：编辑时实时重算危险模式，Copy 永不写入 PTY，Enter 只触发卡片上明确标出的主操作。已验证的本地纠正只有在文本完全未改且非危险时才显示 **Run verified command**；任何编辑或新风险都会立即降级成 **Insert for review**。
 
-`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell 和命令纠正开关。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
+`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度、实时 prompt readiness 和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell 和命令纠正开关。readiness 会区分空闲、已有输入、命令运行中、全屏程序、prompt 初始化和缺少 shell integration，审批失败时给出对应恢复步骤。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：
 
@@ -268,7 +268,7 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 3. 每张卡片可 **Reject**、**Insert only** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；Insert only 把最后编辑值写入普通 shell 编辑行供手动处理，不发送 Enter，并把“未执行”写入 Agent transcript；批准执行的是用户最后编辑后的精确文本。识别到顶层 `rm -rf`、`mkfs`、提权、强制 Git 改写、下载后 pipe 到 shell 等模式时，除醒目提示外还必须在显示精确命令的第二个确认框中再次批准。
 4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
-6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收；`agent_max_turns` 达到上限后会停止 spinner、禁用输入并显示明确终态。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
+6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。模型以 `done` 完成任务后，**Follow up** 会保留 transcript 并重新开放输入；`agent_max_turns` 达到上限后，**New task** 可在同一 pane 清空旧模型上下文并恢复完整回合预算。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
 
 dashboard 和 Settings 中的 **AI command correction** 开关控制 `command_correction_enabled`。开启后，Block 命令出现 typo、unknown executable/package、invalid subcommand/option 等窄范围错误时才会提供可编辑纠正；候选不会自动插入或执行。关闭开关会立即阻止新的纠正，也会丢弃仍在解析中的待显示结果。默认开启，可用 `JTERM4_COMMAND_CORRECTION_ENABLED` 临时覆盖；确定性目标提示与本地索引优先，AI 仅为 fallback，完整边界见 `docs/SMART_COMMAND_CORRECTION.md`。
 

@@ -76,6 +76,7 @@ python3 -c 'print("x" * 1000000)'
 | A-6 | 终止状态 | Cancel、target exit、protocol error、transport error、done 与 turn limit 都有明确状态；迟到回复不能生成 proposal，终止后输入/按钮状态一致。 | unit + mock GUI |
 | A-7 | 统一命令审阅 | `?` 建议、命令纠正与 Agent proposal 使用相同的编辑校验、Copy 和动态风险反馈；各自主操作必须准确标出 Insert 或 Run，Enter 不得绕过其语义。 | unit + GUI |
 | A-8 | 手动审阅分支 | Agent **Insert only** 保留编辑后的精确单行文本、只写入 shell 编辑行且不提交，transcript 明确记录未执行，后续不得等待或伪造 observation。 | unit + PTY GUI |
+| A-9 | Prompt 诊断与续接 | Agent 实时区分 ready、已有输入、运行中、alt-screen、初始化和缺少 shell integration；`done` 后 **Follow up** 保留上下文，turn limit 后 **New task** 清空模型 transcript 并恢复预算。 | unit + GUI |
 
 ### Privacy、accessibility 与性能
 

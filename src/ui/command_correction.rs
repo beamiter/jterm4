@@ -736,10 +736,9 @@ fn show_correction_card(
                 return;
             }
         };
-        if !view.can_accept_agent_command() {
-            show_error(
-                "The prompt is busy or already contains input. Clear it, then choose the correction again once the prompt is idle.",
-            );
+        let prompt_status = view.command_prompt_status();
+        if !prompt_status.is_ready() {
+            show_error(prompt_status.blocked_message());
             return;
         }
 

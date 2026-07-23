@@ -303,7 +303,14 @@ impl UiState {
              }}
              .agent-proposal-card {{
                  padding: 12px;
+                 color: rgb({fr},{fg_g},{fb});
+                 background-color: rgb({br},{bg_g},{bb});
                  border: 1px solid alpha(@warning_color, 0.48);
+                 border-radius: 12px;
+                 box-shadow: none;
+             }}
+             .agent-proposal-card .command-review {{
+                 color: rgb({fr},{fg_g},{fb});
              }}
              .agent-danger-command {{
                  padding: 8px;
@@ -312,9 +319,31 @@ impl UiState {
                  border-radius: 7px;
              }}
              .agent-composer {{ padding: 9px; }}
-             .agent-input {{ min-height: 34px; }}
+             .agent-input {{
+                 min-height: 34px;
+                 color: rgb({fr},{fg_g},{fb});
+                 caret-color: rgb({fr},{fg_g},{fb});
+                 background-color: rgba({br},{bg_g},{bb},0.62);
+                 border-color: rgba({fr},{fg_g},{fb},0.20);
+             }}
+             .agent-input text {{
+                 color: rgb({fr},{fg_g},{fb});
+                 caret-color: rgb({fr},{fg_g},{fb});
+             }}
+             .agent-input placeholder, .agent-input text placeholder {{
+                 color: rgba({fr},{fg_g},{fb},0.56);
+             }}
+             .agent-input:disabled, .agent-input:disabled text {{
+                 color: rgba({fr},{fg_g},{fb},0.58);
+             }}
+             .agent-turn-label {{
+                 color: rgba({fr},{fg_g},{fb},0.68);
+             }}
              .agent-send {{ min-width: 72px; min-height: 34px; }}
-             .agent-input-hint {{ font-size: 0.82em; }}"
+             .agent-input-hint {{
+                 color: rgba({fr},{fg_g},{fb},0.58);
+                 font-size: 0.82em;
+             }}"
         );
         self.scrollbar_css.load_from_string(&css);
     }

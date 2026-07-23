@@ -381,6 +381,40 @@ impl AgentSession {
         self.max_turns
     }
 
+    /// A `done` reply closes one task, but the user may still ask a follow-up
+    /// while this session has model-turn budget left. The transcript is kept so
+    /// the follow-up retains the completed task's context.
+    pub fn can_continue_after_completion(&self) -> bool {
+        self.state == AgentState::Completed
+            && self.turns_used < self.max_turns
+            && !self.cancelled.is_cancelled()
+    }
+
+    pub fn continue_after_completion(&mut self) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        if !self.can_continue_after_completion() {
+            return Err(self.invalid_transition("continue a completed task"));
+        }
+        self.state = AgentState::Ready;
+        Ok(())
+    }
+
+    /// Completed or exhausted sessions can start a fresh task in the same
+    /// pinned pane without closing and rebuilding the Agent UI. This explicitly
+    /// drops the old model transcript and restores the configured turn budget.
+    pub fn start_new_task(&mut self) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        if !matches!(
+            self.state,
+            AgentState::Completed | AgentState::TurnLimitReached
+        ) {
+            return Err(self.invalid_transition("start a new task"));
+        }
+        let max_turns = self.max_turns;
+        *self = Self::new(max_turns);
+        Ok(())
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancelled.clone()
     }
@@ -1240,6 +1274,56 @@ mod tests {
         ));
         assert!(!session.can_retry_model());
         assert!(session.retry_model().is_err());
+    }
+
+    #[test]
+    fn completed_task_can_reopen_for_a_context_preserving_follow_up() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        assert!(matches!(
+            session
+                .accept_model_reply(r#"{"action":"done","message":"inspection complete"}"#)
+                .unwrap(),
+            ModelOutcome::Completed(_)
+        ));
+        let transcript_len = session.transcript().len();
+        assert!(session.can_continue_after_completion());
+
+        session.continue_after_completion().unwrap();
+        assert_eq!(session.state(), AgentState::Ready);
+        assert_eq!(session.transcript().len(), transcript_len);
+        session.submit_user("now show a concise summary").unwrap();
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("inspection complete"));
+        assert!(prompt.contains("now show a concise summary"));
+    }
+
+    #[test]
+    fn terminal_session_can_start_a_fresh_task_with_a_reset_budget() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("inspect").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"say","message":"one turn used"}"#)
+            .unwrap();
+        assert_eq!(session.state(), AgentState::TurnLimitReached);
+        assert_eq!(session.turns_used(), 1);
+        assert!(!session.transcript().is_empty());
+
+        session.start_new_task().unwrap();
+        assert_eq!(session.state(), AgentState::Ready);
+        assert_eq!(session.turns_used(), 0);
+        assert_eq!(session.max_turns(), 1);
+        assert!(session.transcript().is_empty());
+        session.submit_user("fresh task").unwrap();
+    }
+
+    #[test]
+    fn active_task_cannot_be_reset_or_reopened_accidentally() {
+        let mut session = AgentSession::new(3);
+        assert!(session.start_new_task().is_err());
+        assert!(session.continue_after_completion().is_err());
+        session.submit_user("inspect").unwrap();
+        assert!(session.start_new_task().is_err());
     }
 
     #[test]

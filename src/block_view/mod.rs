@@ -45,6 +45,57 @@ pub(crate) fn prof_enabled() -> bool {
 // Global block ID counter
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Why a review-gated command can or cannot be written to the live Block
+/// prompt. Keeping this richer than a boolean lets every AI surface explain
+/// the exact recovery step without weakening the empty, idle-prompt boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandPromptStatus {
+    Ready,
+    HasInput,
+    Running,
+    Fullscreen,
+    Initializing,
+    ShellIntegrationUnavailable,
+}
+
+impl CommandPromptStatus {
+    pub(crate) fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::Ready => "Prompt ready",
+            Self::HasInput => "Prompt has input",
+            Self::Running => "Command running",
+            Self::Fullscreen => "Full-screen app active",
+            Self::Initializing => "Prompt initializing",
+            Self::ShellIntegrationUnavailable => "Shell integration required",
+        }
+    }
+
+    pub(crate) fn blocked_message(self) -> &'static str {
+        match self {
+            Self::Ready => "The pinned Block prompt is ready.",
+            Self::HasInput => {
+                "The pinned shell prompt already contains input. Clear it and press Enter to reach a fresh prompt, then try again."
+            }
+            Self::Running => {
+                "A command is still running in the pinned Block pane. Wait for it to finish and for a fresh prompt, then try again."
+            }
+            Self::Fullscreen => {
+                "A full-screen terminal application owns the pinned pane. Exit it before inserting or approving a command."
+            }
+            Self::Initializing => {
+                "The pinned Block prompt is still initializing. Wait for the shell prompt, then try again."
+            }
+            Self::ShellIntegrationUnavailable => {
+                "Shell integration is not active, so jterm4 cannot safely verify an idle prompt. Load the jterm4 shell integration and open a new shell."
+            }
+        }
+    }
+}
+
 fn next_block_id() -> u64 {
     BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
@@ -209,6 +260,31 @@ pub(crate) fn build_command_recall(command: &str, bracketed_paste: bool) -> (Str
 
 fn external_input_changes_editor(state: BlockState, data: &[u8]) -> bool {
     state == BlockState::AwaitingCommand && data.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+}
+
+fn classify_command_prompt_status(
+    state: BlockState,
+    fullscreen: bool,
+    idle_input_dirty: bool,
+    pty_synced: bool,
+    typed_command_empty: bool,
+) -> CommandPromptStatus {
+    if fullscreen || state == BlockState::AltScreen {
+        return CommandPromptStatus::Fullscreen;
+    }
+    match state {
+        BlockState::AwaitingCommand => {
+            if idle_input_dirty || pty_synced || !typed_command_empty {
+                CommandPromptStatus::HasInput
+            } else {
+                CommandPromptStatus::Ready
+            }
+        }
+        BlockState::CollectingOutput | BlockState::PostCommand => CommandPromptStatus::Running,
+        BlockState::RawFallback => CommandPromptStatus::ShellIntegrationUnavailable,
+        BlockState::Idle | BlockState::CollectingPrompt => CommandPromptStatus::Initializing,
+        BlockState::AltScreen => CommandPromptStatus::Fullscreen,
+    }
 }
 
 /// Mirror input that bypasses VTE's `commit` signal (clipboard, Agent, and other
@@ -4304,13 +4380,21 @@ impl TermView {
         }
     }
 
-    /// Agent commands may only be submitted into a clean, idle shell editor.
+    /// Review-gated commands may only be inserted or submitted into a clean,
+    /// idle shell editor. The status is intentionally diagnostic so callers can
+    /// distinguish a running command from stale input or missing integration.
+    pub(crate) fn command_prompt_status(&self) -> CommandPromptStatus {
+        classify_command_prompt_status(
+            self.bstate.get(),
+            self.fullscreen.get(),
+            self.idle_input_dirty.get(),
+            self.pty_synced.get(),
+            self.typed_cmd.borrow().trim().is_empty(),
+        )
+    }
+
     pub fn can_accept_agent_command(&self) -> bool {
-        self.bstate.get() == BlockState::AwaitingCommand
-            && !self.fullscreen.get()
-            && !self.idle_input_dirty.get()
-            && !self.pty_synced.get()
-            && self.typed_cmd.borrow().trim().is_empty()
+        self.command_prompt_status().is_ready()
     }
 
     /// Resize the PTY.
@@ -4940,14 +5024,14 @@ impl TermView {
 mod tests {
     use super::{
         background_output_has_visible_text, build_clipboard_paste, build_command_recall,
-        build_keyboard_query_reply, coalesce_bytes_events, compute_viewport_state,
-        collapse_repaint_output, history_edge_navigation_available, normalize_captured_command,
-        normalize_loaded_block_ids, output_has_vertical_repaint, record_external_input,
-        resolve_submitted_command, scroll_delta_to_reveal,
+        build_keyboard_query_reply, classify_command_prompt_status, coalesce_bytes_events,
+        collapse_repaint_output, compute_viewport_state, history_edge_navigation_available,
+        normalize_captured_command, normalize_loaded_block_ids, output_has_vertical_repaint,
+        record_external_input, resolve_submitted_command, scroll_delta_to_reveal,
         selected_command_text, selected_id_range, should_buffer_background_output, strip_ansi,
         strip_ansi_with_clear_detect, take_background_output, truncate_plain_output_for_height,
         viewport_state_for_scroll, visible_indices_for_viewport, BlockData, BlockState,
-        ViewportState,
+        CommandPromptStatus, ViewportState,
     };
     use crate::parser::{KeyboardProtocolQuery, ParserEvent};
     use std::cell::{Cell, RefCell};
@@ -4978,6 +5062,42 @@ mod tests {
         assert!(should_buffer_background_output(false, false));
         assert!(!should_buffer_background_output(true, false));
         assert!(!should_buffer_background_output(false, true));
+    }
+
+    #[test]
+    fn command_prompt_status_explains_each_agent_gate() {
+        assert_eq!(
+            classify_command_prompt_status(BlockState::AwaitingCommand, false, false, false, true),
+            CommandPromptStatus::Ready
+        );
+        for (dirty, synced, typed_empty) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                classify_command_prompt_status(
+                    BlockState::AwaitingCommand,
+                    false,
+                    dirty,
+                    synced,
+                    typed_empty
+                ),
+                CommandPromptStatus::HasInput
+            );
+        }
+        assert_eq!(
+            classify_command_prompt_status(BlockState::CollectingOutput, false, false, false, true),
+            CommandPromptStatus::Running
+        );
+        assert_eq!(
+            classify_command_prompt_status(BlockState::RawFallback, false, false, false, true),
+            CommandPromptStatus::ShellIntegrationUnavailable
+        );
+        assert_eq!(
+            classify_command_prompt_status(BlockState::AwaitingCommand, true, false, false, true),
+            CommandPromptStatus::Fullscreen
+        );
     }
 
     #[test]

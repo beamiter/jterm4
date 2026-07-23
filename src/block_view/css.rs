@@ -286,6 +286,19 @@ pub(crate) fn install_block_css(config: &Config) {
             color: {dim_fg};
             font-size: 0.85em;
         }}
+        .agent-prompt-status {{
+            border-radius: 999px;
+            padding: 2px 7px;
+            font-size: 0.82em;
+        }}
+        .agent-prompt-status.agent-prompt-ready {{
+            color: {ok_hex};
+            background-color: rgba({ok_r},{ok_g},{ok_b},0.10);
+        }}
+        .agent-prompt-status.agent-prompt-blocked {{
+            color: {err_hex};
+            background-color: rgba({err_r},{err_g},{err_b},0.10);
+        }}
         .assistant-card-icon {{
             color: {accent};
             font-family: "{font_family}";

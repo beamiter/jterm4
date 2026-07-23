@@ -65,8 +65,10 @@ struct AgentRuntime {
     context_card: GBox,
     status: Label,
     status_spinner: Spinner,
+    prompt_status: Label,
     turn_progress: ProgressBar,
     turn_label: Label,
+    session_action: Button,
     proposal_box: GBox,
     pending_command: RefCell<Option<(ProposalId, String)>>,
     request_cancellation: RefCell<Option<crate::ai::AiCancellationToken>>,
@@ -128,6 +130,79 @@ impl AgentRuntime {
         self.context_clear.set_sensitive(
             self.alive.get() && !self.busy.get() && session.state() == AgentState::Ready,
         );
+        let can_follow_up =
+            self.alive.get() && !self.busy.get() && session.can_continue_after_completion();
+        let can_start_new = self.alive.get()
+            && !self.busy.get()
+            && matches!(
+                session.state(),
+                AgentState::Completed | AgentState::TurnLimitReached
+            )
+            && !can_follow_up;
+        self.session_action
+            .set_visible(can_follow_up || can_start_new);
+        self.session_action
+            .set_sensitive(can_follow_up || can_start_new);
+        if can_follow_up {
+            self.session_action.set_label("Follow up");
+            self.session_action.set_tooltip_text(Some(
+                "Continue with the completed task and keep its Agent context",
+            ));
+        } else if can_start_new {
+            self.session_action.set_label("New task");
+            self.session_action.set_tooltip_text(Some(
+                "Start a fresh Agent task in this pane with a reset turn budget",
+            ));
+        }
+        drop(session);
+        self.sync_prompt_status();
+    }
+
+    fn sync_prompt_status(&self) {
+        let prompt_status = self.target.command_prompt_status();
+        self.prompt_status.set_text(prompt_status.short_label());
+        self.prompt_status
+            .set_tooltip_text(Some(prompt_status.blocked_message()));
+        self.prompt_status.remove_css_class("agent-prompt-ready");
+        self.prompt_status.remove_css_class("agent-prompt-blocked");
+        if prompt_status.is_ready() {
+            self.prompt_status.add_css_class("agent-prompt-ready");
+        } else {
+            self.prompt_status.add_css_class("agent-prompt-blocked");
+        }
+    }
+
+    fn resume_or_start_new(runtime: Rc<Self>) {
+        if runtime.busy.get() || !runtime.alive.get() {
+            return;
+        }
+        let result = {
+            let mut session = runtime.session.borrow_mut();
+            if session.can_continue_after_completion() {
+                session.continue_after_completion().map(|()| false)
+            } else {
+                session.start_new_task().map(|()| true)
+            }
+        };
+        match result {
+            Ok(started_new) => {
+                if started_new {
+                    runtime.clear_proposal();
+                    runtime.pending_command.borrow_mut().take();
+                    runtime.input.set_text("");
+                    runtime.append(
+                        "Agent",
+                        "Started a fresh task in this pane. Previous activity remains visible but is no longer sent to the model.",
+                    );
+                    runtime.render_session_state(Some("Ready for a new task"));
+                } else {
+                    runtime.render_session_state(Some(
+                        "Completed task reopened for a follow-up instruction",
+                    ));
+                }
+            }
+            Err(error) => runtime.render_session_state(Some(&error.to_string())),
+        }
     }
 
     fn render_session_state(&self, ready_status: Option<&str>) {
@@ -157,7 +232,7 @@ impl AgentRuntime {
             AgentState::Completed => self.set_status("Task completed", false),
             AgentState::Cancelled => self.set_status("Agent cancelled", false),
             AgentState::TurnLimitReached => self.set_status(
-                "Turn limit reached. Start a new Agent session to continue.",
+                "Turn limit reached. Start a new task to reset the Agent context and budget.",
                 false,
             ),
             AgentState::AwaitingModel => {
@@ -424,10 +499,9 @@ impl AgentRuntime {
                 return;
             }
         };
-        if !runtime.target.can_accept_agent_command() {
-            feedback.set_text(
-                "The pinned Block prompt is busy or already contains input. Clear it, then try again.",
-            );
+        let prompt_status = runtime.target.command_prompt_status();
+        if !prompt_status.is_ready() {
+            feedback.set_text(prompt_status.blocked_message());
             feedback.add_css_class("error");
             feedback.set_visible(true);
             return;
@@ -506,9 +580,9 @@ impl AgentRuntime {
     }
 
     fn approve_validated(runtime: Rc<Self>, id: ProposalId, command: String) {
-        if !runtime.target.can_accept_agent_command() {
-            let message =
-                "The target prompt is busy or already contains input. Clear it and approve again.";
+        let prompt_status = runtime.target.command_prompt_status();
+        if !prompt_status.is_ready() {
+            let message = prompt_status.blocked_message();
             runtime.set_status(message, false);
             runtime.append("Safety check", message);
             return;
@@ -978,6 +1052,7 @@ impl UiState {
         status_spinner.set_spinning(false);
         let turn_label = Label::new(Some(&format!("0 / {max_turns} turns")));
         turn_label.add_css_class("dim-label");
+        turn_label.add_css_class("agent-turn-label");
         let retry_request = Button::with_label("Retry");
         retry_request.set_visible(false);
         retry_request.set_tooltip_text(Some(
@@ -987,6 +1062,15 @@ impl UiState {
         stop_request.set_visible(false);
         stop_request.add_css_class("destructive-action");
         stop_request.set_tooltip_text(Some("Stop this model request and keep the Agent session"));
+        let session_action = Button::with_label("Follow up");
+        session_action.set_visible(false);
+        session_action.set_tooltip_text(Some(
+            "Continue the completed task or start a fresh task when the turn limit is reached",
+        ));
+        let prompt_status = Label::new(Some("Prompt initializing"));
+        prompt_status.add_css_class("agent-prompt-status");
+        prompt_status.add_css_class("agent-prompt-blocked");
+        prompt_status.set_accessible_role(gtk4::AccessibleRole::Status);
         let turn_progress = ProgressBar::new();
         turn_progress.set_hexpand(true);
         turn_progress.set_fraction(0.0);
@@ -995,6 +1079,8 @@ impl UiState {
         status_top.append(&status);
         status_top.append(&retry_request);
         status_top.append(&stop_request);
+        status_top.append(&session_action);
+        status_top.append(&prompt_status);
         status_top.append(&turn_label);
         let status_card = GBox::new(Orientation::Vertical, 6);
         status_card.add_css_class("agent-status-card");
@@ -1002,7 +1088,6 @@ impl UiState {
         status_card.append(&turn_progress);
 
         let proposal_box = GBox::new(Orientation::Vertical, 8);
-        proposal_box.add_css_class("card");
         proposal_box.add_css_class("agent-proposal-card");
         proposal_box.set_visible(false);
 
@@ -1060,8 +1145,10 @@ impl UiState {
             context_card: context_card.clone(),
             status,
             status_spinner,
+            prompt_status,
             turn_progress,
             turn_label,
+            session_action: session_action.clone(),
             proposal_box,
             pending_command: RefCell::new(None),
             request_cancellation: RefCell::new(None),
@@ -1153,10 +1240,27 @@ impl UiState {
             }
         });
         let weak = Rc::downgrade(&runtime);
+        session_action.connect_clicked(move |_| {
+            if let Some(runtime) = weak.upgrade() {
+                AgentRuntime::resume_or_start_new(runtime);
+            }
+        });
+        let weak = Rc::downgrade(&runtime);
         context_clear.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 runtime.detach_block_context();
             }
+        });
+        let weak = Rc::downgrade(&runtime);
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let Some(runtime) = weak.upgrade() else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            if !runtime.alive.get() {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            runtime.sync_prompt_status();
+            gtk4::glib::ControlFlow::Continue
         });
 
         *self.agent_session.borrow_mut() = Some(AgentHandle { runtime });
