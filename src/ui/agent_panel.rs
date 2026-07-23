@@ -11,11 +11,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use gtk4::{
-    Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, Spinner, Switch,
-};
+use gtk4::{Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, Spinner, Switch};
 use libadwaita as adw;
 
+use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
 use super::UiState;
 use crate::agent::{AgentSession, AgentState, ModelOutcome, ProposalId};
 use crate::block_view::TermView;
@@ -353,58 +352,31 @@ impl AgentRuntime {
         runtime: &Rc<Self>,
         id: ProposalId,
         command: String,
-        danger: Option<&'static str>,
+        _danger: Option<&'static str>,
     ) {
         runtime.clear_proposal();
         runtime.proposal_box.set_visible(true);
-
-        let heading = if let Some(reason) = danger {
-            format!("Potentially destructive: {reason}")
-        } else {
-            "Proposed command — edit if needed · Enter approves & runs".to_string()
-        };
-        let warning = Label::new(Some(&heading));
-        warning.set_xalign(0.0);
-        warning.set_wrap(true);
-        if danger.is_some() {
-            warning.add_css_class("error");
-        }
-
-        let command_entry = Entry::new();
-        command_entry.set_text(&command);
-        command_entry.set_hexpand(true);
-        command_entry.set_tooltip_text(Some("This exact text will run only after approval"));
-        command_entry
-            .update_property(&[gtk4::accessible::Property::Label("Proposed shell command")]);
-
-        let approve = Button::with_label("Approve & Run");
-        sync_proposal_risk(&warning, &approve, &command);
-        let reject = Button::with_label("Reject");
-        let copy = Button::with_label("Copy");
-        copy.set_tooltip_text(Some("Copy the proposed command without running it"));
-        let buttons = GBox::new(Orientation::Horizontal, 6);
-        buttons.set_halign(gtk4::Align::End);
-        buttons.append(&copy);
-        buttons.append(&reject);
-        buttons.append(&approve);
-
-        runtime.proposal_box.append(&warning);
-        runtime.proposal_box.append(&command_entry);
-        runtime.proposal_box.append(&buttons);
+        let review = CommandReviewCard::new(CommandReviewSpec {
+            presentation: ReviewPresentation::Embedded,
+            compact: runtime.config.borrow().block_compact,
+            icon: "\u{f544}", // nf-fa-robot
+            title: "Command proposal".to_string(),
+            badge: format!("Shell Agent · #{}", id.get()),
+            description: "Edit or copy the proposal, insert it for manual review without running, reject it, or explicitly approve execution.".to_string(),
+            command,
+            primary_label: "Approve & Run".to_string(),
+            primary_executes: true,
+            auxiliary_label: Some("Insert only".to_string()),
+            secondary_label: Some("Reject".to_string()),
+            close_button: false,
+        });
+        runtime.proposal_box.append(&review.root);
         runtime.render_session_state(None);
-        command_entry.grab_focus();
-
-        {
-            let warning = warning.clone();
-            let approve = approve.clone();
-            command_entry.connect_changed(move |entry| {
-                sync_proposal_risk(&warning, &approve, &entry.text());
-            });
-        }
+        review.focus();
 
         let weak = Rc::downgrade(runtime);
-        let entry_for_approve = command_entry.clone();
-        approve.connect_clicked(move |_| {
+        let entry_for_approve = review.entry.clone();
+        review.primary.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 Self::approve(runtime, id, entry_for_approve.text().to_string());
             }
@@ -412,26 +384,77 @@ impl AgentRuntime {
         // Enter in the command entry approves & runs; dangerous commands
         // still go through the extra confirmation dialog in `approve`.
         let weak = Rc::downgrade(runtime);
-        command_entry.connect_activate(move |entry| {
+        review.entry.connect_activate(move |entry| {
             if let Some(runtime) = weak.upgrade() {
                 Self::approve(runtime, id, entry.text().to_string());
             }
         });
-        let weak = Rc::downgrade(runtime);
-        let entry_for_copy = command_entry.clone();
-        copy.connect_clicked(move |_| {
-            if let Some(runtime) = weak.upgrade() {
-                let command = entry_for_copy.text();
-                runtime.card.clipboard().set_text(&command);
-                runtime.set_status("Command copied; nothing was run.", false);
+        if let Some(insert) = review.auxiliary.as_ref() {
+            let weak = Rc::downgrade(runtime);
+            let entry = review.entry.clone();
+            let feedback = review.feedback.clone();
+            insert.connect_clicked(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    Self::insert_for_manual_review(runtime, id, &entry, &feedback);
+                }
+            });
+        }
+        if let Some(reject) = review.secondary.as_ref() {
+            let weak = Rc::downgrade(runtime);
+            reject.connect_clicked(move |_| {
+                if let Some(runtime) = weak.upgrade() {
+                    Self::reject(runtime, id);
+                }
+            });
+        }
+    }
+
+    fn insert_for_manual_review(
+        runtime: Rc<Self>,
+        id: ProposalId,
+        entry: &Entry,
+        feedback: &Label,
+    ) {
+        let command = match crate::review_input::validate(&entry.text()) {
+            Ok(command) => command.to_string(),
+            Err(error) => {
+                feedback.set_text(&format!("Cannot insert: {error}"));
+                feedback.add_css_class("error");
+                feedback.set_visible(true);
+                return;
             }
-        });
-        let weak = Rc::downgrade(runtime);
-        reject.connect_clicked(move |_| {
-            if let Some(runtime) = weak.upgrade() {
-                Self::reject(runtime, id);
+        };
+        if !runtime.target.can_accept_agent_command() {
+            feedback.set_text(
+                "The pinned Block prompt is busy or already contains input. Clear it, then try again.",
+            );
+            feedback.add_css_class("error");
+            feedback.set_visible(true);
+            return;
+        }
+        let command = match runtime
+            .session
+            .borrow_mut()
+            .edit_for_manual_review(id, command)
+        {
+            Ok(command) => command,
+            Err(error) => {
+                feedback.set_text(&error.to_string());
+                feedback.add_css_class("error");
+                feedback.set_visible(true);
+                return;
             }
-        });
+        };
+        runtime.clear_proposal();
+        runtime.append(
+            "You",
+            "Moved the proposal to the shell prompt for manual review. The Agent did not run it and will not assume a result.",
+        );
+        runtime.render_session_state(Some(
+            "Command inserted for manual review; edit or run it in the normal prompt.",
+        ));
+        runtime.target.grab_focus();
+        runtime.target.write_input(command.as_bytes());
     }
 
     fn approve(runtime: Rc<Self>, id: ProposalId, command: String) {
@@ -574,6 +597,7 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
 
     let outer = GBox::new(Orientation::Vertical, 0);
     outer.add_css_class("block-finished");
+    outer.add_css_class("block-assistant");
     outer.add_css_class("block-agent");
     outer.set_hexpand(true);
     outer.set_vexpand(false);
@@ -609,9 +633,11 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
         "\u{f544}" // nf-fa-robot
     }));
     icon.add_css_class("agent-card-icon");
+    icon.add_css_class("assistant-card-icon");
     header.append(&icon);
     let title = Label::new(Some("Shell Agent"));
     title.add_css_class("agent-card-title");
+    title.add_css_class("assistant-card-title");
     title.set_xalign(0.0);
     header.append(&title);
     let speaker_chip = Label::new(Some(speaker));
@@ -637,22 +663,6 @@ fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::
     outer.append(&body_label);
 
     outer.upcast()
-}
-
-fn sync_proposal_risk(warning: &Label, approve: &Button, command: &str) {
-    if let Some(reason) = crate::agent::is_dangerous(command) {
-        warning.set_text(&format!("Potentially destructive: {reason}"));
-        warning.add_css_class("error");
-        approve.remove_css_class("suggested-action");
-        approve.add_css_class("destructive-action");
-        approve.set_tooltip_text(Some("A second confirmation is required"));
-    } else {
-        warning.set_text("Proposed command — edit if needed · Enter approves & runs");
-        warning.remove_css_class("error");
-        approve.remove_css_class("destructive-action");
-        approve.add_css_class("suggested-action");
-        approve.set_tooltip_text(Some("Run this exact command after approval"));
-    }
 }
 
 fn agent_block_context_label(context: &crate::ai::BlockContext) -> String {
@@ -811,12 +821,18 @@ impl UiState {
     /// Keep the visible top-bar Agent control aligned with both configuration
     /// availability and the lifetime of the active Agent session.
     pub(crate) fn sync_agent_toggle(&self) {
-        let available = {
+        let (ai_available, available) = {
             let config = self.config.borrow();
-            config.ai_enabled && config.agent_enabled
+            (config.ai_enabled, config.ai_enabled && config.agent_enabled)
         };
         self.agent_toggle.set_sensitive(available);
 
+        if !ai_available {
+            let suggestion = self.command_suggestion.borrow_mut().take();
+            if let Some(suggestion) = suggestion {
+                suggestion.shutdown();
+            }
+        }
         if !available {
             // Take the handle out of the slot before shutdown so anything
             // observing the slot already sees the session as closed.
@@ -867,6 +883,7 @@ impl UiState {
         // ── Inline agent card, styled like a block ────────────────────────
         let outer = GBox::new(Orientation::Vertical, 0);
         outer.add_css_class("block-finished");
+        outer.add_css_class("block-assistant");
         outer.add_css_class("block-agent");
         outer.set_hexpand(true);
         outer.set_vexpand(false);
@@ -898,15 +915,18 @@ impl UiState {
         }
         let icon = Label::new(Some("\u{f544}")); // nf-fa-robot
         icon.add_css_class("agent-card-icon");
+        icon.add_css_class("assistant-card-icon");
         header.append(&icon);
         let title = Label::new(Some("Shell Agent"));
         title.add_css_class("agent-card-title");
+        title.add_css_class("assistant-card-title");
         title.set_xalign(0.0);
         header.append(&title);
         let binding_label = Label::new(Some(&format!(
             "{cwd} · review required · every command needs approval"
         )));
         binding_label.add_css_class("agent-card-binding");
+        binding_label.add_css_class("assistant-card-badge");
         binding_label.set_hexpand(true);
         binding_label.set_halign(gtk4::Align::End);
         binding_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);

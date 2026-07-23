@@ -74,6 +74,8 @@ python3 -c 'print("x" * 1000000)'
 | A-4 | observation 关联 | 只有该 pane 中已批准 proposal 对应的 finished foreground block 可回灌；exit code 与有界 output 正确，不相关/background block 被忽略。 | PTY integration |
 | A-5 | 危险提示 | 顶层 `rm -rf`、`mkfs`、raw-device write、download-pipe-to-shell 等识别结果醒目且不靠颜色单独表达；提示本身不授权执行。 | unit + GUI |
 | A-6 | 终止状态 | Cancel、target exit、protocol error、transport error、done 与 turn limit 都有明确状态；迟到回复不能生成 proposal，终止后输入/按钮状态一致。 | unit + mock GUI |
+| A-7 | 统一命令审阅 | `?` 建议、命令纠正与 Agent proposal 使用相同的编辑校验、Copy 和动态风险反馈；各自主操作必须准确标出 Insert 或 Run，Enter 不得绕过其语义。 | unit + GUI |
+| A-8 | 手动审阅分支 | Agent **Insert only** 保留编辑后的精确单行文本、只写入 shell 编辑行且不提交，transcript 明确记录未执行，后续不得等待或伪造 observation。 | unit + PTY GUI |
 
 ### Privacy、accessibility 与性能
 

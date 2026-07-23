@@ -27,6 +27,7 @@ use gtk4::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::command_review::{CommandReviewCard, CommandReviewSpec, ReviewPresentation};
 use super::{PaneNode, UiState};
 use crate::ai::{AiClient, Role, Turn};
 use crate::block_view::TermView;
@@ -609,8 +610,8 @@ fn show_correction_card(
     original_command: &str,
     correction: CommandCorrection,
 ) {
-    let danger = crate::agent::is_dangerous(&correction.command);
-    let direct_run = correction.evidence.is_verified() && danger.is_none();
+    let direct_run = correction.evidence.is_verified()
+        && crate::agent::is_dangerous(&correction.command).is_none();
     let title = match correction.evidence {
         CorrectionEvidence::AptIndex | CorrectionEvidence::ExecutablePath => {
             "Verified command correction"
@@ -618,144 +619,51 @@ fn show_correction_card(
         CorrectionEvidence::TargetOutput => "The command suggested a correction",
         CorrectionEvidence::AiUnverified => "AI found a possible correction",
     };
-
     let compact = config.borrow().block_compact;
-    let outer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    outer.add_css_class("block-finished");
-    outer.add_css_class("block-correction");
-    outer.set_hexpand(true);
-    outer.set_vexpand(false);
-    if compact {
-        outer.add_css_class("block-compact");
-        outer.set_margin_top(1);
-        outer.set_margin_bottom(1);
-        outer.set_margin_start(4);
-        outer.set_margin_end(4);
-    } else {
-        outer.set_margin_top(4);
-        outer.set_margin_bottom(4);
-        outer.set_margin_start(8);
-        outer.set_margin_end(8);
-    }
-
-    // ── Header row: icon, title, evidence chip, close ─────────────────────
-    let header = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-    header.add_css_class("block-header");
-    if compact {
-        header.set_margin_start(8);
-        header.set_margin_end(6);
-        header.set_margin_top(3);
-        header.set_margin_bottom(1);
-    } else {
-        header.set_margin_start(12);
-        header.set_margin_end(8);
-        header.set_margin_top(6);
-        header.set_margin_bottom(2);
-    }
-    let icon = gtk4::Label::new(Some("\u{f0eb}")); // nf-fa-lightbulb_o
-    icon.add_css_class("correction-icon");
-    header.append(&icon);
-    let title_label = gtk4::Label::new(Some(title));
-    title_label.add_css_class("correction-title");
-    title_label.set_xalign(0.0);
-    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    header.append(&title_label);
-    let evidence_label = gtk4::Label::new(Some(correction.evidence.label()));
-    evidence_label.add_css_class("correction-evidence");
-    evidence_label.set_hexpand(true);
-    evidence_label.set_halign(gtk4::Align::End);
-    evidence_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    header.append(&evidence_label);
-    let close_btn = gtk4::Button::with_label("\u{2715}");
-    close_btn.add_css_class("flat");
-    close_btn.set_focusable(false);
-    close_btn.set_tooltip_text(Some("Dismiss suggestion (Esc)"));
-    header.append(&close_btn);
-    outer.append(&header);
-
-    // ── Body: reason, editable candidate, inline error, actions ──────────
-    let body = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
-    body.set_margin_start(if compact { 8 } else { 12 });
-    body.set_margin_end(if compact { 8 } else { 12 });
-    body.set_margin_top(2);
-    body.set_margin_bottom(if compact { 6 } else { 10 });
-    let message_label = gtk4::Label::new(Some(&format!(
-        "{} (for `{original_command}`)",
-        correction.message
-    )));
-    message_label.add_css_class("correction-message");
-    message_label.set_xalign(0.0);
-    message_label.set_wrap(true);
-    body.append(&message_label);
-    if let Some(reason) = danger {
-        let warning = gtk4::Label::new(Some(&format!(
-            "Warning: this command may be destructive ({reason}). Direct run is disabled; insert it only after reviewing every character."
-        )));
-        warning.add_css_class("correction-warning");
-        warning.set_xalign(0.0);
-        warning.set_wrap(true);
-        body.append(&warning);
-    }
-
-    let command_entry = gtk4::Entry::new();
-    command_entry.add_css_class("correction-entry");
-    command_entry.set_text(&correction.command);
-    command_entry.set_hexpand(true);
-    command_entry.set_tooltip_text(Some(if direct_run {
-        "Enter runs the exact verified candidate; editing it removes that verification"
-    } else {
-        "Enter inserts this text at the prompt for review"
-    }));
-    body.append(&command_entry);
-
-    let error_label = gtk4::Label::new(None);
-    error_label.add_css_class("correction-error");
-    error_label.set_xalign(0.0);
-    error_label.set_wrap(true);
-    error_label.set_visible(false);
-    body.append(&error_label);
-
-    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-    actions.set_halign(gtk4::Align::End);
-    let dismiss_btn = gtk4::Button::with_label("Dismiss");
-    dismiss_btn.add_css_class("flat");
-    actions.append(&dismiss_btn);
-    let insert_btn = gtk4::Button::with_label("Insert only");
-    if !direct_run {
-        insert_btn.add_css_class("suggested-action");
-    }
-    actions.append(&insert_btn);
-    let run_btn = direct_run.then(|| {
-        let btn = gtk4::Button::with_label("Run verified command");
-        btn.add_css_class("correction-run");
-        btn.add_css_class("suggested-action");
-        actions.append(&btn);
-        btn
+    let review = CommandReviewCard::new(CommandReviewSpec {
+        presentation: ReviewPresentation::Standalone,
+        compact,
+        icon: "\u{f0eb}", // nf-fa-lightbulb_o
+        title: title.to_string(),
+        badge: correction.evidence.label().to_string(),
+        description: format!("{} (for `{original_command}`)", correction.message),
+        command: correction.command.clone(),
+        primary_label: if direct_run {
+            "Run verified command".to_string()
+        } else {
+            "Insert for review".to_string()
+        },
+        primary_executes: direct_run,
+        auxiliary_label: None,
+        secondary_label: Some("Dismiss".to_string()),
+        close_button: true,
     });
-    body.append(&actions);
-    outer.append(&body);
 
     // ── Insert into the block conversation ────────────────────────────────
-    let card: gtk4::Widget = outer.clone().upcast();
+    review.root.add_css_class("block-correction");
+    let card: gtk4::Widget = review.root.clone().upcast();
     *card_slot.borrow_mut() = Some(card.clone());
     view.insert_inline_notice(&card);
     // Take keyboard focus only when the prompt is clean and idle; a prompt the
     // user is already typing into must keep its keystrokes.
     if view.can_accept_agent_command() {
-        command_entry.grab_focus();
+        review.focus();
     }
 
     let view_weak = Rc::downgrade(view);
+    let card_weak = card.downgrade();
     let dismiss = {
         let view_weak = view_weak.clone();
         let card_slot = card_slot.clone();
-        let card = card.clone();
+        let card_weak = card_weak.clone();
         let pending = pending.clone();
         Rc::new(move |refocus_terminal: bool| {
             card_slot.borrow_mut().take();
             pending.set(false);
             if let Some(view) = view_weak.upgrade() {
-                view.remove_inline_notice(&card);
+                if let Some(card) = card_weak.upgrade() {
+                    view.remove_inline_notice(&card);
+                }
                 if refocus_terminal {
                     view.grab_focus();
                 }
@@ -763,15 +671,14 @@ fn show_correction_card(
         })
     };
 
-    {
+    if let Some(close) = review.close.as_ref() {
         let dismiss = dismiss.clone();
-        close_btn.connect_clicked(move |_| dismiss(true));
+        close.connect_clicked(move |_| dismiss(true));
     }
-    {
+    if let Some(dismiss_button) = review.secondary.as_ref() {
         let dismiss = dismiss.clone();
-        dismiss_btn.connect_clicked(move |_| dismiss(true));
+        dismiss_button.connect_clicked(move |_| dismiss(true));
     }
-    // Esc anywhere inside the card dismisses it, mirroring dialog behavior.
     {
         let dismiss = dismiss.clone();
         let key_ctrl = gtk4::EventControllerKey::new();
@@ -784,22 +691,44 @@ fn show_correction_card(
                 glib::Propagation::Proceed
             }
         });
-        outer.add_controller(key_ctrl);
+        review.root.add_controller(key_ctrl);
     }
 
-    // Shared accept path for the Insert/Run buttons and the entry's Enter.
+    // Editing a verified candidate immediately turns the primary action into a
+    // non-executing insertion. Returning exactly to the verified text restores
+    // the direct-run affordance.
     let proposed_command = correction.command.clone();
     let evidence = correction.evidence;
-    let entry_for_accept = command_entry.clone();
-    let accept = Rc::new(move |run: bool| {
+    {
+        let proposed_command = proposed_command.clone();
+        let primary = review.primary_controller();
+        review.entry.connect_changed(move |entry| {
+            let command = entry.text();
+            let executable = evidence.is_verified()
+                && command.as_str() == proposed_command
+                && crate::agent::is_dangerous(&command).is_none();
+            primary.set(
+                if executable {
+                    "Run verified command"
+                } else {
+                    "Insert for review"
+                },
+                executable,
+                &command,
+            );
+        });
+    }
+
+    let feedback = review.feedback.clone();
+    let accept = Rc::new(move |edited: String| {
         let Some(view) = view_weak.upgrade() else {
             return;
         };
         let show_error = |text: &str| {
-            error_label.set_text(text);
-            error_label.set_visible(true);
+            feedback.set_text(text);
+            feedback.add_css_class("error");
+            feedback.set_visible(true);
         };
-        let edited = entry_for_accept.text().to_string();
         let command = match validate_candidate(&edited, "") {
             Ok(command) => command,
             Err(error) => {
@@ -807,17 +736,6 @@ fn show_correction_card(
                 return;
             }
         };
-
-        if run
-            && (!evidence.is_verified()
-                || command != proposed_command
-                || crate::agent::is_dangerous(&command).is_some())
-        {
-            show_error(
-                "Only the exact, verified, non-destructive candidate can run from this card. Use Insert only to review an edited or unverified command.",
-            );
-            return;
-        }
         if !view.can_accept_agent_command() {
             show_error(
                 "The prompt is busy or already contains input. Clear it, then choose the correction again once the prompt is idle.",
@@ -825,6 +743,9 @@ fn show_correction_card(
             return;
         }
 
+        let run = evidence.is_verified()
+            && command == proposed_command
+            && crate::agent::is_dangerous(&command).is_none();
         view.grab_focus();
         if run {
             view.submit_command(&command);
@@ -836,15 +757,14 @@ fn show_correction_card(
 
     {
         let accept = accept.clone();
-        insert_btn.connect_clicked(move |_| accept(false));
+        let entry = review.entry.clone();
+        review
+            .primary
+            .connect_clicked(move |_| accept(entry.text().to_string()));
     }
-    if let Some(run_btn) = run_btn {
-        let accept = accept.clone();
-        run_btn.connect_clicked(move |_| accept(true));
-    }
-    // Enter in the entry triggers the primary action: run when the verified
-    // fast path is available, insert-for-review otherwise.
-    command_entry.connect_activate(move |_| accept(direct_run));
+    review
+        .entry
+        .connect_activate(move |entry| accept(entry.text().to_string()));
 }
 
 fn correction_system_prompt() -> &'static str {

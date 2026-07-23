@@ -641,6 +641,7 @@ pub fn run() -> glib::ExitCode {
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
             agent_session: Rc::new(RefCell::new(None)),
+            command_suggestion: Rc::new(RefCell::new(None)),
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),
@@ -1166,6 +1167,8 @@ pub fn run() -> glib::ExitCode {
         let ai_panel_visible_for_close = ui.ai_panel_visible.clone();
         let ai_panel_width_restoring_for_close = ui.ai_panel_width_restoring.clone();
         let ai_panel_for_close = ui.ai_panel.clone();
+        let agent_session_for_close = ui.agent_session.clone();
+        let command_suggestion_for_close = ui.command_suggestion.clone();
         let zoom_for_close = ui.zoom_state.clone();
         let close_allowed = Rc::new(Cell::new(false));
         let close_confirmation_open = Rc::new(Cell::new(false));
@@ -1224,6 +1227,12 @@ pub fn run() -> glib::ExitCode {
 
             // Stop and reap any in-flight provider processes before widgets
             // and their request-routing state are destroyed.
+            if let Some(suggestion) = command_suggestion_for_close.borrow_mut().take() {
+                suggestion.shutdown();
+            }
+            if let Some(agent) = agent_session_for_close.borrow_mut().take() {
+                agent.shutdown();
+            }
             ai_panel_for_close.cancel_all_requests();
             if session_persistence {
                 // Do not let the composer's draft debounce outlive the final

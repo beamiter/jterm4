@@ -86,10 +86,10 @@ read -r value; printf 'value=%s\n' "$value"
 - 执行若干成功/失败命令后，`Ctrl+Shift+P` 的 `@` 历史只显示 command/cwd/status，不包含输出；接受只回填不执行。
 - `:` 能模糊匹配安装的 YAML 示例和用户 TOML/YAML workflow，参数替换后只写入编辑行。
 - 在文件树双击 `.jtnb.md`，逐 cell 与 Run All 均能运行；Stop/Stop All/关闭对话框会终止完整 cell process group。
-- `?` 生成的命令必须先展示供审阅，不能自行向 PTY 写入换行。
+- `?` 请求必须固定当前 Block pane，在块流中显示 selected Block/context、Stop/Retry/Regenerate 和可编辑候选；切换 tab 不得漂移目标，关闭或 Stop 必须取消 transport。**Insert for review** 只能写入单行审阅文本，不能自行向 PTY 写入 Enter。
 - 在 active Block pane 按 `Ctrl+Alt+G` 打开 Shell Agent；VTE pane、safe mode、`ai_enabled = false` 或 `agent_enabled = false` 都必须拒绝打开。
 - Agent dashboard 应显示固定 cwd、provider/model、shell、review 状态与回合进度；切换 **AI command correction** 后 `command_correction_enabled` 持久化，关闭时新的 typo-like 失败和仍在途的纠正都不得弹框。
-- 要求 Agent 完成一个两步任务：每个严格 JSON proposal 都显示为可编辑卡片；修改后 **Approve & Run** 执行修改值，Reject 会把拒绝写入上下文并请求替代方案。
+- 要求 Agent 完成一个两步任务：每个严格 JSON proposal 都显示为与一次性建议一致的可编辑审阅卡；修改后 **Approve & Run** 执行修改值，Reject 会把拒绝写入上下文并请求替代方案。**Insert only** 只回填普通 prompt、记录未执行并回到可输入状态，不能等待或伪造 observation。
 - 对 `rm -rf /`、`mkfs` 或 download-pipe-to-shell 类型 proposal 显示醒目危险提示，但仍不得自动执行。
 - prompt 正在运行命令或已有未提交输入时点击批准，必须拒绝且不改动输入；清空并空闲后才允许再次批准。
 - 批准命令完成后，Agent transcript 显示 exit code/输出并自动进入下一轮；不相关 Block 完成事件不能被误关联。

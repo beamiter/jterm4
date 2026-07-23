@@ -17,6 +17,7 @@ mod ai_panel;
 mod bounded_text;
 mod command_correction;
 mod command_palette;
+mod command_review;
 mod config_apply;
 mod dialogs;
 mod file_tree;
@@ -34,6 +35,7 @@ mod zoom;
 
 pub(crate) use agent_panel::AgentHandle;
 pub(crate) use ai_panel::AiPanel;
+pub(crate) use command_palette::CommandSuggestionHandle;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
 pub(crate) use pane_leaf::PaneLeaf;
 pub(crate) use pane_node::PaneNode;
@@ -121,6 +123,9 @@ pub(crate) struct UiState {
     /// The single active Shell Agent session, rendered as an inline card in
     /// its bound Block pane's conversation (not a dialog).
     pub(crate) agent_session: Rc<RefCell<Option<AgentHandle>>>,
+    /// The single in-flight or reviewable natural-language command suggestion.
+    /// Like the Shell Agent, it is pinned to the Block pane where it started.
+    pub(crate) command_suggestion: Rc<RefCell<Option<CommandSuggestionHandle>>>,
     /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,

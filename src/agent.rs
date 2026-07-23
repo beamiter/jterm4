@@ -30,6 +30,7 @@ pub enum ProposalStatus {
     Pending,
     Approved,
     Rejected,
+    ManualReview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,9 @@ impl Turn {
                     ProposalStatus::Pending => "[awaiting user approval]",
                     ProposalStatus::Approved => "[user approved; awaiting/received output]",
                     ProposalStatus::Rejected => "[user rejected this proposal]",
+                    ProposalStatus::ManualReview => {
+                        "[user moved this command to the prompt for manual review; it was not executed]"
+                    }
                 };
                 format!("Assistant: {action}\n{verdict}")
             }
@@ -548,6 +552,36 @@ impl AgentSession {
             AgentState::AwaitingModel
         };
         Ok(())
+    }
+
+    /// Move an edited proposal into the shell's normal line editor without
+    /// authorizing execution. The UI owns the actual review-only PTY insertion;
+    /// this transition merely records that the Agent must not expect output or
+    /// assume the command ran.
+    pub fn edit_for_manual_review(
+        &mut self,
+        id: ProposalId,
+        edited_command: impl Into<String>,
+    ) -> Result<String, SessionError> {
+        self.check_not_cancelled()?;
+        self.expect_pending_proposal(id, "move a proposal to manual review")?;
+        let edited_command = edited_command.into();
+        if edited_command.trim().is_empty() {
+            return Err(SessionError::Protocol(ParseError::EmptyField("command")));
+        }
+        validate_command(&edited_command).map_err(SessionError::Protocol)?;
+        let turn = self.proposal_mut(id)?;
+        let Turn::AssistantProposed {
+            command, status, ..
+        } = turn
+        else {
+            unreachable!("proposal_mut only returns proposal turns")
+        };
+        *command = edited_command;
+        *status = ProposalStatus::ManualReview;
+        let command = command.clone();
+        self.state = self.ready_or_limited();
+        Ok(command)
     }
 
     pub fn observe(
@@ -1049,6 +1083,48 @@ mod tests {
         assert_eq!(session.state(), AgentState::AwaitingModel);
         assert!(session.build_user_prompt().contains("user rejected"));
         assert!(session.approve(id).is_err());
+    }
+
+    #[test]
+    fn manual_review_records_non_execution_and_returns_to_user_control() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(&run_reply("find . -maxdepth 1"))
+            .unwrap()
+        else {
+            panic!("expected proposal")
+        };
+
+        let command = session
+            .edit_for_manual_review(id, "  find . -maxdepth 2  ")
+            .unwrap();
+        assert_eq!(command, "  find . -maxdepth 2  ");
+        assert_eq!(session.state(), AgentState::Ready);
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("manual review"));
+        assert!(prompt.contains("it was not executed"));
+        assert!(session.approve(id).is_err());
+    }
+
+    #[test]
+    fn manual_review_rejects_hidden_submission_bytes() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let ModelOutcome::Proposal { id, .. } =
+            session.accept_model_reply(&run_reply("pwd")).unwrap()
+        else {
+            panic!("expected proposal")
+        };
+
+        assert!(matches!(
+            session.edit_for_manual_review(id, "pwd\rwhoami"),
+            Err(SessionError::Protocol(ParseError::InvalidCommand(_)))
+        ));
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
     }
 
     #[test]

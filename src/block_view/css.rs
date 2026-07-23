@@ -266,7 +266,7 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-status-background {{
             color: rgba({acc_r},{acc_g},{acc_b},0.92);
         }}
-        .block-correction {{
+        .block-correction, .command-suggestion, .command-review-standalone {{
             border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
         }}
@@ -285,6 +285,66 @@ pub(crate) fn install_block_css(config: &Config) {
         .agent-card-binding {{
             color: {dim_fg};
             font-size: 0.85em;
+        }}
+        .assistant-card-icon {{
+            color: {accent};
+            font-family: "{font_family}";
+        }}
+        .assistant-card-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .assistant-card-badge {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .assistant-context-chip {{
+            color: {dim_fg};
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.055);
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.12);
+            border-radius: 8px;
+            padding: 5px 8px;
+            font-size: 0.88em;
+        }}
+        .assistant-status-row {{
+            padding: 5px 0;
+        }}
+        .assistant-status {{
+            color: {dim_fg};
+        }}
+        .command-review-embedded {{
+            background-color: rgba({fg_r},{fg_g},{fg_b},0.045);
+            border: 1px solid rgba({acc_r},{acc_g},{acc_b},0.34);
+            border-radius: 9px;
+        }}
+        .command-review-description {{
+            color: {fg_hex};
+        }}
+        .command-review-risk {{
+            color: {dim_fg};
+            font-size: 0.9em;
+        }}
+        .command-review-risk.error, .command-review-feedback.error {{
+            color: {err_hex};
+        }}
+        .command-review-feedback {{
+            color: {dim_fg};
+            font-size: 0.9em;
+        }}
+        .command-review-entry {{
+            font-family: "{font_family}";
+            font-size: {font_size};
+            background-color: {bg_hex};
+            color: {fg_hex};
+            border: 1px solid rgba({fg_r},{fg_g},{fg_b},0.18);
+            border-radius: 6px;
+            padding: 4px 8px;
+        }}
+        .command-review-entry:focus {{
+            border-color: rgba({acc_r},{acc_g},{acc_b},0.75);
+        }}
+        .command-review-actions {{
+            margin-top: 2px;
         }}
         .agent-msg-body {{
             font-family: "{font_family}";

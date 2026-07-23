@@ -1423,33 +1423,6 @@ impl AiPanel {
         self.send_with_context(prompt.to_string(), Some(ctx), false, false);
     }
 
-    pub(crate) fn command_generation_started(&self, request: &str) -> u64 {
-        let id = self.store.borrow().active_id();
-        self.append_visible("You", "role-user", &format!("Generate command: {request}"));
-        self.show_busy_status("Generating a reviewable command…");
-        id
-    }
-
-    pub(crate) fn command_generation_review_required(&self, chat_id: u64, command: &str) {
-        if chat_id == self.store.borrow().active_id() {
-            self.show_info_status("Review the generated command before inserting it.");
-            self.append_visible("Assistant", "role-asst", command);
-        }
-    }
-
-    pub(crate) fn command_generation_inserted(&self, chat_id: u64) {
-        if chat_id == self.store.borrow().active_id() {
-            self.show_info_status("Inserted in the terminal for review; it was not run.");
-        }
-    }
-
-    pub(crate) fn command_generation_failed(&self, chat_id: u64, error: &str) {
-        if chat_id == self.store.borrow().active_id() {
-            self.show_error_status(error);
-            self.append_visible("Assistant", "role-err", error);
-        }
-    }
-
     fn send_with_context(
         &self,
         user_text: String,

@@ -255,13 +255,17 @@ selected Block、pane cwd 与配置 shell 不再拼进高信任 system prompt。
 
 后台请求绑定其发起时的稳定 chat ID：切换到其他 chat 不会改变回复目的地，也可让不同 chat 的请求各自完成；如果原 chat 已 Delete，迟到回复会直接丢弃，不能重新创建或污染当前 chat。在途用户 turn、错误回合和命令生成审阅事件不会伪装成已完成回答恢复；待完成或失败的问题会回到可重试 draft，发送期间键入的下一条 draft 也会保留，Ask selected Block 不会清掉已有草稿，关窗会先刷新防抖中的最新内容。开启 `ai_redact_secrets` 时，持久化脱敏覆盖 active、non-active、archived chat，包括标题、turn、draft 和 Block context，而不只处理当前可见对话。该数据与标签/Pane 状态一起使用有界、原子替换的 owner-only 文件；`--safe-mode` 不读取也不发布会话库，`--no-restore` 和显式新工作区仍不领取旧快照，其中 `--no-restore` 继续按既有语义建立新的可持久化工作区。对话仍可能包含敏感命令或输出，发送和保留前应自行检查。
 
-自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent dashboard 显示固定目标 cwd、provider/model、shell、安全状态、回合进度、activity transcript 和 proposal 审阅卡；左上角清空按钮只清空可见 activity，不会改写当前 Agent 上下文。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可在首个请求前移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
+自然语言转命令与 Agent 坚持 review-first：模型只能提出候选，不会自行写入 PTY、提交 Enter 或执行。在命令面板输入 `? 请求` 会把一次性建议固定到当前 Block pane，以块内卡片显示请求、provider、cwd、selected Block context、busy/error 状态和可编辑候选；请求可 **Stop/Retry**，成功后可 **Regenerate**、复制或 **Insert for review**。插入只写入普通 shell 编辑行，不发送 Enter；VTE pane 不提供这张上下文感知卡。
+
+一次性建议、失败命令纠正与 Shell Agent proposal 共用同一套审阅卡逻辑：编辑时实时重算危险模式，Copy 永不写入 PTY，Enter 只触发卡片上明确标出的主操作。已验证的本地纠正只有在文本完全未改且非危险时才显示 **Run verified command**；任何编辑或新风险都会立即降级成 **Insert for review**。
+
+`Ctrl+Alt+G` 或顶部栏的 **Agent** 开关在当前 active Block pane 打开原生 **Shell Agent**；开关保持选中时表示 Agent 会话正在激活。Agent 卡显示固定目标 cwd、安全状态、回合进度和 proposal 审阅区，活动消息以普通块留在同一条 conversation flow 中；设置按钮显示 provider/model、shell 和命令纠正开关。打开 Agent 时若已有 selected finished Block，它会作为可见的“不可信上下文”chip 附加，也可移除。Agent 在打开时固定目标 pane，切换标签不会悄悄改变执行目标。VTE pane 不提供 Agent。
 
 一次 Agent 会话的安全流程是：
 
 1. 输入任务后，模型回复必须是严格 JSON `say`、`run` 或 `done`；夹杂 prose、未知字段、错误类型、过期 proposal 或非法控制字符都会 fail closed，不能退化为可运行命令。用户任务也有 16 KiB 上限。
 2. `run` 只能包含一条可见单行命令，CR、LF、Tab、NUL、ESC 等控制字符无论来自模型还是编辑结果都会被拒绝。proposal 卡可复制和编辑；风险提示会随编辑实时重算。
-3. 每张卡片只能 **Reject** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；批准执行的是用户最后编辑后的精确文本。识别到顶层 `rm -rf`、`mkfs`、提权、强制 Git 改写、下载后 pipe 到 shell 等模式时，除醒目提示外还必须在显示精确命令的第二个确认框中再次批准。
+3. 每张卡片可 **Reject**、**Insert only** 或显式 **Approve & Run**。Reject 会进入 transcript 并要求模型换方案；Insert only 把最后编辑值写入普通 shell 编辑行供手动处理，不发送 Enter，并把“未执行”写入 Agent transcript；批准执行的是用户最后编辑后的精确文本。识别到顶层 `rm -rf`、`mkfs`、提权、强制 Git 改写、下载后 pipe 到 shell 等模式时，除醒目提示外还必须在显示精确命令的第二个确认框中再次批准。
 4. 批准前再次检查固定 Block prompt：正在运行任务或已有未提交输入时拒绝写入，待 prompt 空闲且清空后才能重试。
 5. 已批准命令形成 finished block 后，匹配的 exit code 和有界输出作为 observation 回灌，Agent 才能提出下一步。不相关命令不会被当成该 proposal 的结果。
 6. 模型请求进行中可 **Stop** 当前 turn，并在保留 Agent session 的前提下 **Retry**，不会复制 user turn。**Cancel Agent** 或关闭窗口则取消整个会话并等待 transport 回收；`agent_max_turns` 达到上限后会停止 spinner、禁用输入并显示明确终态。已经由用户批准并启动的普通终端命令不会被这些按钮暗中 kill，仍使用标准 pane/tab 关闭确认管理。
