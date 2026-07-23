@@ -72,7 +72,8 @@ show_repo_strip = true
 # provider: anthropic | openai-compatible | ollama
 # Anthropic: export ANTHROPIC_API_KEY=...
 # OpenAI-compatible: export OPENAI_API_KEY=...（无鉴权的本地服务可不设置）
-# 可选独立密钥文件（必须为当前用户所有，权限不超过 0600）：
+# Settings 中输入的 Key 会写入独立私有文件，不会写入此 TOML。
+# 也可手工配置密钥文件（必须为当前用户所有，权限不超过 0600）：
 # ai_api_key_file = "~/.config/jterm4/ai.key"
 # 环境 Key 优先于文件。路径可由 JTERM4_AI_API_KEY_FILE 覆盖。
 # 通用覆盖：JTERM4_AI_ENABLED、JTERM4_AGENT_ENABLED、JTERM4_AGENT_MAX_TURNS、

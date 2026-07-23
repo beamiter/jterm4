@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -41,6 +41,7 @@ const API_KEY_ENV_NAMES: [&str; 4] = [
     "OPENAI_API_KEY",
     "OLLAMA_API_KEY",
 ];
+static API_KEY_FILE_NONCE: AtomicU64 = AtomicU64::new(1);
 
 mod conversation;
 
@@ -695,14 +696,7 @@ fn expand_api_key_path(raw: &str) -> Result<PathBuf, AiError> {
     Ok(path.to_path_buf())
 }
 
-fn read_api_key_file(raw_path: &str) -> Result<String, AiError> {
-    let path = expand_api_key_path(raw_path)?;
-    let file = fs::File::open(&path).map_err(|error| {
-        AiError::CredentialFile(format!("cannot open {}: {error}", path.display()))
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        AiError::CredentialFile(format!("cannot inspect {}: {error}", path.display()))
-    })?;
+fn validate_api_key_file_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), AiError> {
     if !metadata.is_file() {
         return Err(AiError::CredentialFile(format!(
             "{} is not a regular file",
@@ -737,6 +731,138 @@ fn read_api_key_file(raw_path: &str) -> Result<String, AiError> {
             )));
         }
     }
+    Ok(())
+}
+
+/// Store a Settings-entered credential outside config.toml using a private,
+/// durable atomic replacement. The caller persists only `raw_path`.
+pub(crate) fn write_api_key_file(raw_path: &str, raw_key: &str) -> Result<(), AiError> {
+    let path = expand_api_key_path(raw_path)?;
+    let key = raw_key.trim();
+    if key.is_empty() {
+        return Err(AiError::CredentialFile("key must not be empty".into()));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(AiError::CredentialFile(
+            "key must be a single line without control characters".into(),
+        ));
+    }
+    if key.len() as u64 + 1 > MAX_API_KEY_FILE_BYTES {
+        return Err(AiError::CredentialFile(format!(
+            "key exceeds {} bytes",
+            MAX_API_KEY_FILE_BYTES - 1
+        )));
+    }
+
+    let parent = path.parent().ok_or_else(|| {
+        AiError::CredentialFile(format!("{} has no parent directory", path.display()))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            AiError::CredentialFile(format!("{} has no valid file name", path.display()))
+        })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AiError::CredentialFile(format!("cannot create {}: {error}", parent.display()))
+    })?;
+
+    match fs::metadata(&path) {
+        Ok(metadata) => validate_api_key_file_metadata(&path, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AiError::CredentialFile(format!(
+                "cannot inspect {}: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    let mut staged = None;
+    for _ in 0..16 {
+        let nonce = API_KEY_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.next.{}.{}",
+            std::process::id(),
+            nonce
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                staged = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(AiError::CredentialFile(format!(
+                    "cannot create a private file beside {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let Some((staged_path, mut file)) = staged else {
+        return Err(AiError::CredentialFile(format!(
+            "cannot allocate a temporary file beside {}",
+            path.display()
+        )));
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(&staged_path);
+            return Err(AiError::CredentialFile(format!(
+                "cannot set private permissions on {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    if let Err(error) = file
+        .write_all(key.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&staged_path);
+        return Err(AiError::CredentialFile(format!(
+            "cannot write {}: {error}",
+            path.display()
+        )));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&staged_path, &path) {
+        let _ = fs::remove_file(&staged_path);
+        return Err(AiError::CredentialFile(format!(
+            "cannot replace {}: {error}",
+            path.display()
+        )));
+    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            AiError::CredentialFile(format!("cannot sync {}: {error}", parent.display()))
+        })?;
+    Ok(())
+}
+
+fn read_api_key_file(raw_path: &str) -> Result<String, AiError> {
+    let path = expand_api_key_path(raw_path)?;
+    let file = fs::File::open(&path).map_err(|error| {
+        AiError::CredentialFile(format!("cannot open {}: {error}", path.display()))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        AiError::CredentialFile(format!("cannot inspect {}: {error}", path.display()))
+    })?;
+    validate_api_key_file_metadata(&path, &metadata)?;
     let mut contents = String::new();
     file.take(MAX_API_KEY_FILE_BYTES + 1)
         .read_to_string(&mut contents)
@@ -1859,5 +1985,37 @@ mod tests {
         assert!(matches!(error, AiError::CredentialFile(_)));
         assert!(error.to_string().contains("chmod 600"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_api_key_write_is_private_atomic_and_single_line() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = API_KEY_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "jterm4-ai-settings-key-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let path = directory.join("ai.key");
+        let path_text = path.to_str().unwrap();
+
+        write_api_key_file(path_text, "sk-settings-secret").unwrap();
+        assert_eq!(read_api_key_file(path_text).unwrap(), "sk-settings-secret");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "sk-settings-secret\n");
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".next.")));
+
+        let error = write_api_key_file(path_text, "first\nsecond").unwrap_err();
+        assert!(matches!(error, AiError::CredentialFile(_)));
+        assert_eq!(read_api_key_file(path_text).unwrap(), "sk-settings-secret");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

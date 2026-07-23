@@ -214,7 +214,9 @@ multiplex = true
 
 ## 11. AI 与 Agent 安全边界
 
-AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先，也可配置独立的 owner-only 密钥文件：
+AI 总开关、provider 和 endpoint 由配置控制。支持 Anthropic、OpenAI-compatible 和 Ollama wire protocol。密钥内容不会写入 TOML；环境变量优先。也可直接在 **Settings → AI & Agent → API Key** 输入密钥并按 Apply：jterm4 会将它原子写入 owner-only 的 `~/.config/jterm4/ai.key`，并只把文件路径写入配置。设置面板不会回显已经保存的密钥，再次输入并 Apply 可替换它。
+
+也可通过环境变量配置：
 
 ```bash
 export ANTHROPIC_API_KEY='...'
@@ -222,7 +224,7 @@ export ANTHROPIC_API_KEY='...'
 jterm4
 ```
 
-不便向桌面启动器传递环境变量时，可创建独立文件：
+若要手工管理密钥文件，可执行：
 
 ```bash
 mkdir -p ~/.config/jterm4

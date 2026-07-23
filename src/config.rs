@@ -530,6 +530,14 @@ pub(crate) fn config_file_path() -> PathBuf {
     glib::user_config_dir().join("jterm4").join("config.toml")
 }
 
+pub(crate) fn default_ai_api_key_path() -> String {
+    glib::user_config_dir()
+        .join("jterm4")
+        .join("ai.key")
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub(crate) fn default_command_history_path() -> String {
     xdg_state_home()
         .join("jterm4")

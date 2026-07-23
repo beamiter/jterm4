@@ -20,6 +20,7 @@ All notable user-visible and operational changes are recorded here.
 - Installed YAML workflow examples and multi-directory workflow precedence with both `{name}` and `{{name}}` placeholders.
 - Executable `.jtnb.md` notebooks with per-cell/Run All execution, separate stdout/stderr, bounded output, and process-group cancellation.
 - Provider-neutral AI for Anthropic, OpenAI-compatible endpoints, and Ollama, plus natural-language command generation and a native Block-bound Shell Agent. Its bounded multi-turn UI strictly parses JSON proposals, permits edit/reject/per-command approval, flags recognizable destructive patterns, feeds completed command results back to the model, and supports cancellation.
+- Settings can now accept and replace the AI API key directly while storing it atomically in a separate owner-only credential file instead of `config.toml`.
 - A searchable per-window AI Chats library with automatic titles, selection, rename, archive/unarchive, confirmed deletion, and durable per-chat drafts and provider-bound selected-block context.
 - Foreground-process discovery and close confirmation across Block/VTE panes, split tabs, batch tab closure, zoomed layouts, and whole windows.
 - Privacy-preserving `jterm4-support-bundle` diagnostics plus richer doctor checks for config permissions/backups/locks, provider readiness, workflows, Notebook assets, history, display, and remote tooling.

@@ -1258,7 +1258,7 @@ impl UiState {
         let ai_group = adw::PreferencesGroup::new();
         ai_group.set_title("AI & Agent");
         ai_group.set_description(Some(
-            "API key contents come from the environment or an owner-only file and are never saved in config.toml",
+            "Environment variables take priority. Keys entered here are stored in a private ai.key file, never in config.toml",
         ));
         let ai_enabled_row = adw::SwitchRow::builder()
             .title("Enable AI Features")
@@ -1309,6 +1309,13 @@ impl UiState {
         base_url_row.set_text(&config.ai_base_url);
         base_url_row.set_sensitive(!safe_mode && config.ai_enabled);
         ai_group.add(&base_url_row);
+
+        let api_key_row = adw::PasswordEntryRow::builder()
+            .title("API Key — enter a new value and press Apply")
+            .show_apply_button(true)
+            .build();
+        api_key_row.set_sensitive(!safe_mode && config.ai_enabled);
+        ai_group.add(&api_key_row);
 
         let max_tokens_adj = Adjustment::new(
             config.ai_max_tokens as f64,
@@ -1467,6 +1474,7 @@ impl UiState {
             provider_row.clone().upcast(),
             model_row.clone().upcast(),
             base_url_row.clone().upcast(),
+            api_key_row.clone().upcast(),
             max_tokens_row.clone().upcast(),
             redact_row.clone().upcast(),
         ];
@@ -1546,6 +1554,25 @@ impl UiState {
                 return;
             }
             ui.config.borrow_mut().ai_base_url = row.text().to_string();
+            ui.persist_config();
+        });
+
+        let ui = self.clone();
+        api_key_row.connect_apply(move |row| {
+            let path = ui
+                .config
+                .borrow()
+                .ai_api_key_file
+                .clone()
+                .unwrap_or_else(crate::config::default_ai_api_key_path);
+            if let Err(error) = crate::ai::write_api_key_file(&path, row.text().as_str()) {
+                ui.show_config_error("API Key was not saved", &error.to_string());
+                return;
+            }
+            row.set_text("");
+            row.set_title("API Key stored — enter a new value to replace it");
+            ui.config.borrow_mut().ai_api_key_file = Some(path);
+            ui.ai_panel.refresh_config_display();
             ui.persist_config();
         });
 

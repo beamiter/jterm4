@@ -15,7 +15,7 @@ use crate::config::{
 use crate::terminal::collect_terminals;
 
 impl UiState {
-    fn show_config_error(&self, title: &str, message: &str) {
+    pub(crate) fn show_config_error(&self, title: &str, message: &str) {
         if self.config_save_error_visible.replace(true) {
             return;
         }
