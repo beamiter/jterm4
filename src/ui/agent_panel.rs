@@ -347,7 +347,7 @@ impl AgentRuntime {
         let heading = if let Some(reason) = danger {
             format!("Potentially destructive: {reason}")
         } else {
-            "Proposed command — edit before approval if needed".to_string()
+            "Proposed command — edit if needed · Enter approves & runs".to_string()
         };
         let warning = Label::new(Some(&heading));
         warning.set_xalign(0.0);
@@ -393,6 +393,14 @@ impl AgentRuntime {
         approve.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 Self::approve(runtime, id, entry_for_approve.text().to_string());
+            }
+        });
+        // Enter in the command entry approves & runs; dangerous commands
+        // still go through the extra confirmation dialog in `approve`.
+        let weak = Rc::downgrade(runtime);
+        command_entry.connect_activate(move |entry| {
+            if let Some(runtime) = weak.upgrade() {
+                Self::approve(runtime, id, entry.text().to_string());
             }
         });
         let weak = Rc::downgrade(runtime);
@@ -546,7 +554,7 @@ fn sync_proposal_risk(warning: &Label, approve: &Button, command: &str) {
         approve.add_css_class("destructive-action");
         approve.set_tooltip_text(Some("A second confirmation is required"));
     } else {
-        warning.set_text("Proposed command — edit before approval if needed");
+        warning.set_text("Proposed command — edit if needed · Enter approves & runs");
         warning.remove_css_class("error");
         approve.remove_css_class("destructive-action");
         approve.add_css_class("suggested-action");
