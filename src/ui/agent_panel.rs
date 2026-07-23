@@ -1,13 +1,18 @@
 //! Native GTK shell Agent UI. The model can only propose commands; every
 //! command remains editable and requires an explicit per-command approval.
+//!
+//! The session renders as an inline card in the bound Block pane's
+//! conversation, pinned directly above the live prompt: activity, proposals,
+//! approval, and the instruction composer all live in the block flow.
+//! Configuration-type content (identity, provider chips, the correction
+//! toggle) stays in a small settings dialog opened from the card header.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk4::{
-    Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, ScrolledWindow, Spinner,
-    Switch, TextBuffer, TextView, WrapMode,
+    Box as GBox, Button, Entry, Image, Label, Orientation, ProgressBar, Spinner, Switch,
 };
 use libadwaita as adw;
 
@@ -33,17 +38,28 @@ fn take_pending_for_finished_block<T>(
     Some(value)
 }
 
+/// The one live Shell Agent session, stored in `UiState::agent_session`.
+/// Closing it cancels the session and removes its inline card.
+pub(crate) struct AgentHandle {
+    runtime: Rc<AgentRuntime>,
+}
+
+impl AgentHandle {
+    pub(crate) fn shutdown(&self) {
+        self.runtime.shutdown();
+    }
+}
+
 struct AgentRuntime {
     session: RefCell<AgentSession>,
     target: Rc<TermView>,
     config: Rc<RefCell<crate::config::Config>>,
     shell: String,
     block_context: RefCell<Option<crate::ai::BlockContext>>,
-    transcript: TextBuffer,
-    transcript_view: TextView,
+    /// The inline card widget inserted into the target pane's block list.
+    card: gtk4::Widget,
     input: Entry,
     send: Button,
-    cancel: Button,
     stop_request: Button,
     retry_request: Button,
     context_clear: Button,
@@ -60,20 +76,18 @@ struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Add one conversation message as its own block in the pane's block flow,
+    /// directly above the pinned Agent card. Messages are ordinary blocks in
+    /// the conversation: they stay in place as history and survive the session
+    /// card being closed.
     fn append(&self, speaker: &str, body: &str) {
-        let mut end = self.transcript.end_iter();
-        if self.transcript.char_count() > 0 {
-            self.transcript.insert(&mut end, "\n\n");
-        }
-        self.transcript
-            .insert(&mut end, &format!("{speaker}\n{body}"));
-        super::bounded_text::trim_ai_transcript(&self.transcript);
-        let view = self.transcript_view.clone();
-        let buffer = self.transcript.clone();
-        gtk4::glib::idle_add_local_once(move || {
-            let mut end = buffer.end_iter();
-            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
-        });
+        let compact = self.config.borrow().block_compact;
+        let message = build_agent_message_block(speaker, body, compact);
+        self.target.insert_inline_notice(&message);
+        // Keep the session card below the newest message, pinned above the
+        // live prompt. (On the intro message this also performs the card's
+        // initial insertion.)
+        self.target.insert_inline_notice(&self.card);
     }
 
     fn clear_proposal(&self) {
@@ -408,7 +422,7 @@ impl AgentRuntime {
         copy.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
                 let command = entry_for_copy.text();
-                runtime.transcript_view.clipboard().set_text(&command);
+                runtime.card.clipboard().set_text(&command);
                 runtime.set_status("Command copied; nothing was run.", false);
             }
         });
@@ -485,7 +499,8 @@ impl AgentRuntime {
             }
         };
         runtime.clear_proposal();
-        runtime.append("Approved", &format!("$ {}", approved.command));
+        // No visible "approved" message: the approved command runs immediately
+        // and its real finished block lands in the conversation right here.
         *runtime.pending_command.borrow_mut() =
             Some((approved.proposal_id, approved.command.clone()));
         runtime.render_session_state(None);
@@ -518,12 +533,8 @@ impl AgentRuntime {
             runtime.render_session_state(Some(&error.to_string()));
             return;
         }
-        let output = if output.trim().is_empty() {
-            "(no output)".to_string()
-        } else {
-            output
-        };
-        runtime.append("Command result", &format!("exit {exit_code}\n{output}"));
+        // The command's own finished block already shows the result in the
+        // conversation; only the session (model context) records it here.
         Self::request_model(runtime);
     }
 
@@ -541,9 +552,91 @@ impl AgentRuntime {
         self.pending_command.borrow_mut().take();
         self.busy.set(false);
         self.clear_proposal();
-        self.cancel.set_sensitive(false);
         self.render_session_state(None);
     }
+
+    /// Cancel the session and remove its inline card. Idempotent.
+    fn shutdown(&self) {
+        self.cancel();
+        self.target.remove_inline_notice(&self.card);
+    }
+}
+
+/// Build one Shell Agent conversation message styled like a finished block:
+/// a header row identifying the Shell Agent dialogue and the speaker, then the
+/// message body. It is inserted as an inline notice, so it never joins block
+/// history or virtualization.
+fn build_agent_message_block(speaker: &str, body: &str, compact: bool) -> gtk4::Widget {
+    let error_speaker = matches!(
+        speaker,
+        "Error" | "Protocol error" | "Stopped" | "Safety check"
+    );
+
+    let outer = GBox::new(Orientation::Vertical, 0);
+    outer.add_css_class("block-finished");
+    outer.add_css_class("block-agent");
+    outer.set_hexpand(true);
+    outer.set_vexpand(false);
+    if compact {
+        outer.add_css_class("block-compact");
+        outer.set_margin_top(1);
+        outer.set_margin_bottom(1);
+        outer.set_margin_start(4);
+        outer.set_margin_end(4);
+    } else {
+        outer.set_margin_top(4);
+        outer.set_margin_bottom(4);
+        outer.set_margin_start(8);
+        outer.set_margin_end(8);
+    }
+
+    let header = GBox::new(Orientation::Horizontal, 8);
+    header.add_css_class("block-header");
+    if compact {
+        header.set_margin_start(8);
+        header.set_margin_end(6);
+        header.set_margin_top(3);
+        header.set_margin_bottom(1);
+    } else {
+        header.set_margin_start(12);
+        header.set_margin_end(8);
+        header.set_margin_top(6);
+        header.set_margin_bottom(2);
+    }
+    let icon = Label::new(Some(if speaker == "You" {
+        "\u{f007}" // nf-fa-user
+    } else {
+        "\u{f544}" // nf-fa-robot
+    }));
+    icon.add_css_class("agent-card-icon");
+    header.append(&icon);
+    let title = Label::new(Some("Shell Agent"));
+    title.add_css_class("agent-card-title");
+    title.set_xalign(0.0);
+    header.append(&title);
+    let speaker_chip = Label::new(Some(speaker));
+    speaker_chip.add_css_class("agent-chip");
+    if error_speaker {
+        speaker_chip.add_css_class("agent-msg-error");
+    }
+    speaker_chip.set_halign(gtk4::Align::Start);
+    speaker_chip.set_hexpand(true);
+    header.append(&speaker_chip);
+    outer.append(&header);
+
+    let body_label = Label::new(Some(body));
+    body_label.add_css_class("agent-msg-body");
+    body_label.set_xalign(0.0);
+    body_label.set_wrap(true);
+    body_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+    body_label.set_selectable(true);
+    body_label.set_margin_start(if compact { 8 } else { 12 });
+    body_label.set_margin_end(if compact { 8 } else { 12 });
+    body_label.set_margin_top(2);
+    body_label.set_margin_bottom(if compact { 6 } else { 10 });
+    outer.append(&body_label);
+
+    outer.upcast()
 }
 
 fn sync_proposal_risk(warning: &Label, approve: &Button, command: &str) {
@@ -602,9 +695,121 @@ fn compact_one_line(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Configuration-type Shell Agent content lives in this small dialog, opened
+/// from the inline card's header: identity, provider/shell chips, and the AI
+/// command-correction toggle. Session activity never renders here.
+fn show_agent_settings_dialog(ui: &UiState, cwd: &str, shell: &str) {
+    let (provider, model, correction_enabled) = {
+        let config = ui.config.borrow();
+        (
+            config.ai_provider.clone(),
+            config.ai_model.clone(),
+            config.command_correction_enabled,
+        )
+    };
+
+    let dialog = adw::Dialog::builder()
+        .title("Shell Agent settings")
+        .content_width(620)
+        .build();
+    let header = adw::HeaderBar::new();
+
+    let overview = GBox::new(Orientation::Vertical, 8);
+    overview.add_css_class("agent-overview");
+    let identity_row = GBox::new(Orientation::Horizontal, 10);
+    let agent_icon = Image::from_icon_name("system-run-symbolic");
+    agent_icon.set_pixel_size(32);
+    agent_icon.add_css_class("agent-icon");
+    let identity_copy = GBox::new(Orientation::Vertical, 2);
+    identity_copy.set_hexpand(true);
+    let title = Label::new(Some("Approval-gated shell assistant"));
+    title.set_xalign(0.0);
+    title.add_css_class("title-3");
+    let target_label = Label::new(Some(&format!("Bound to Block pane · {cwd}")));
+    target_label.set_xalign(0.0);
+    target_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    target_label.set_tooltip_text(Some(cwd));
+    target_label.add_css_class("dim-label");
+    identity_copy.append(&title);
+    identity_copy.append(&target_label);
+    identity_row.append(&agent_icon);
+    identity_row.append(&identity_copy);
+    overview.append(&identity_row);
+
+    let chips = GBox::new(Orientation::Horizontal, 6);
+    let provider_chip = Label::new(Some(&format!("{provider} · {model}")));
+    provider_chip.set_hexpand(true);
+    // Keep the pill hugging its text; hexpand alone stretches the
+    // background into a long empty capsule.
+    provider_chip.set_halign(gtk4::Align::Start);
+    provider_chip.set_max_width_chars(44);
+    provider_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    provider_chip.set_tooltip_text(Some(&format!("{provider} · {model}")));
+    provider_chip.add_css_class("agent-chip");
+    let shell_chip = Label::new(Some(&format!("shell: {shell}")));
+    shell_chip.set_max_width_chars(26);
+    shell_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    shell_chip.set_tooltip_text(Some(shell));
+    shell_chip.add_css_class("agent-chip");
+    let safety_chip = Label::new(Some("Review required"));
+    safety_chip.add_css_class("agent-chip");
+    safety_chip.add_css_class("agent-safety-chip");
+    chips.append(&provider_chip);
+    chips.append(&shell_chip);
+    chips.append(&safety_chip);
+    overview.append(&chips);
+
+    let correction_row = GBox::new(Orientation::Horizontal, 12);
+    correction_row.add_css_class("agent-setting-card");
+    let correction_copy = GBox::new(Orientation::Vertical, 2);
+    correction_copy.set_hexpand(true);
+    let correction_title = Label::new(Some("AI command correction"));
+    correction_title.set_xalign(0.0);
+    correction_title.add_css_class("heading");
+    let correction_hint = Label::new(Some(
+        "After typo-like Block failures, offer an editable correction; never run it automatically.",
+    ));
+    correction_hint.set_xalign(0.0);
+    correction_hint.set_wrap(true);
+    correction_hint.add_css_class("dim-label");
+    correction_copy.append(&correction_title);
+    correction_copy.append(&correction_hint);
+    let correction_switch = Switch::builder()
+        .active(correction_enabled)
+        .valign(gtk4::Align::Center)
+        .build();
+    correction_switch.set_tooltip_text(Some("Enable review-first command correction"));
+    correction_row.append(&correction_copy);
+    correction_row.append(&correction_switch);
+
+    let ui_for_correction = ui.clone();
+    correction_switch.connect_active_notify(move |toggle| {
+        ui_for_correction
+            .config
+            .borrow_mut()
+            .command_correction_enabled = toggle.is_active();
+        ui_for_correction.persist_config();
+    });
+
+    let body = GBox::new(Orientation::Vertical, 10);
+    body.add_css_class("agent-dashboard");
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.set_margin_top(10);
+    body.set_margin_bottom(12);
+    body.append(&overview);
+    body.append(&correction_row);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_css_class("agent-surface");
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&body));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(&ui.window));
+}
+
 impl UiState {
     /// Keep the visible top-bar Agent control aligned with both configuration
-    /// availability and the lifetime of the active Agent dialog.
+    /// availability and the lifetime of the active Agent session.
     pub(crate) fn sync_agent_toggle(&self) {
         let available = {
             let config = self.config.borrow();
@@ -613,25 +818,24 @@ impl UiState {
         self.agent_toggle.set_sensitive(available);
 
         if !available {
-            // Drop the RefCell borrow before force_close because `closed`
-            // clears the same slot synchronously.
-            let dialog_to_close = self.agent_dialog.borrow_mut().take();
-            if let Some(dialog) = dialog_to_close {
-                dialog.force_close();
+            // Take the handle out of the slot before shutdown so anything
+            // observing the slot already sees the session as closed.
+            let session = self.agent_session.borrow_mut().take();
+            if let Some(session) = session {
+                session.shutdown();
             }
             self.agent_toggle.set_active(false);
         } else {
             self.agent_toggle
-                .set_active(self.agent_dialog.borrow().is_some());
+                .set_active(self.agent_session.borrow().is_some());
         }
     }
 
     pub(crate) fn toggle_agent_panel(&self) {
-        // Drop the RefCell borrow before `force_close`: libadwaita emits
-        // `closed` synchronously and that callback clears the same slot.
-        let dialog_to_close = self.agent_dialog.borrow_mut().take();
-        if let Some(dialog) = dialog_to_close {
-            dialog.force_close();
+        // Toggle off: close the active inline session.
+        let existing = self.agent_session.borrow_mut().take();
+        if let Some(session) = existing {
+            session.shutdown();
             self.agent_toggle.set_active(false);
             return;
         }
@@ -643,9 +847,7 @@ impl UiState {
             return;
         }
         let max_turns = config.agent_max_turns;
-        let correction_enabled = config.command_correction_enabled;
-        let provider = config.ai_provider.clone();
-        let model = config.ai_model.clone();
+        let compact = config.block_compact;
         drop(config);
         let Some(target) = self.current_term_view() else {
             self.agent_toggle.set_active(false);
@@ -662,64 +864,65 @@ impl UiState {
             .cloned()
             .unwrap_or_else(|| "sh".to_string());
 
-        let dialog = adw::Dialog::builder()
-            .title("Shell Agent")
-            .content_width(820)
-            .content_height(720)
-            .build();
-        let header = adw::HeaderBar::new();
-        let clear = Button::from_icon_name("edit-clear-all-symbolic");
-        clear.set_tooltip_text(Some("Clear the visible activity transcript"));
-        clear.add_css_class("flat");
-        header.pack_start(&clear);
-        let cancel = Button::with_label("Cancel Agent");
-        cancel.add_css_class("destructive-action");
-        header.pack_end(&cancel);
+        // ── Inline agent card, styled like a block ────────────────────────
+        let outer = GBox::new(Orientation::Vertical, 0);
+        outer.add_css_class("block-finished");
+        outer.add_css_class("block-agent");
+        outer.set_hexpand(true);
+        outer.set_vexpand(false);
+        if compact {
+            outer.add_css_class("block-compact");
+            outer.set_margin_top(1);
+            outer.set_margin_bottom(1);
+            outer.set_margin_start(4);
+            outer.set_margin_end(4);
+        } else {
+            outer.set_margin_top(4);
+            outer.set_margin_bottom(4);
+            outer.set_margin_start(8);
+            outer.set_margin_end(8);
+        }
 
-        let overview = GBox::new(Orientation::Vertical, 8);
-        overview.add_css_class("agent-overview");
-        let identity_row = GBox::new(Orientation::Horizontal, 10);
-        let agent_icon = Image::from_icon_name("system-run-symbolic");
-        agent_icon.set_pixel_size(32);
-        agent_icon.add_css_class("agent-icon");
-        let identity_copy = GBox::new(Orientation::Vertical, 2);
-        identity_copy.set_hexpand(true);
-        let title = Label::new(Some("Approval-gated shell assistant"));
+        let header = GBox::new(Orientation::Horizontal, 8);
+        header.add_css_class("block-header");
+        if compact {
+            header.set_margin_start(8);
+            header.set_margin_end(6);
+            header.set_margin_top(3);
+            header.set_margin_bottom(1);
+        } else {
+            header.set_margin_start(12);
+            header.set_margin_end(8);
+            header.set_margin_top(6);
+            header.set_margin_bottom(2);
+        }
+        let icon = Label::new(Some("\u{f544}")); // nf-fa-robot
+        icon.add_css_class("agent-card-icon");
+        header.append(&icon);
+        let title = Label::new(Some("Shell Agent"));
+        title.add_css_class("agent-card-title");
         title.set_xalign(0.0);
-        title.add_css_class("title-3");
-        let target_label = Label::new(Some(&format!("Bound to Block pane · {cwd}")));
-        target_label.set_xalign(0.0);
-        target_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        target_label.set_tooltip_text(Some(&cwd));
-        target_label.add_css_class("dim-label");
-        identity_copy.append(&title);
-        identity_copy.append(&target_label);
-        identity_row.append(&agent_icon);
-        identity_row.append(&identity_copy);
-        overview.append(&identity_row);
-
-        let chips = GBox::new(Orientation::Horizontal, 6);
-        let provider_chip = Label::new(Some(&format!("{provider} · {model}")));
-        provider_chip.set_hexpand(true);
-        // Keep the pill hugging its text; hexpand alone stretches the
-        // background into a long empty capsule.
-        provider_chip.set_halign(gtk4::Align::Start);
-        provider_chip.set_max_width_chars(44);
-        provider_chip.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        provider_chip.set_tooltip_text(Some(&format!("{provider} · {model}")));
-        provider_chip.add_css_class("agent-chip");
-        let shell_chip = Label::new(Some(&format!("shell: {shell}")));
-        shell_chip.set_max_width_chars(26);
-        shell_chip.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        shell_chip.set_tooltip_text(Some(&shell));
-        shell_chip.add_css_class("agent-chip");
-        let safety_chip = Label::new(Some("Review required"));
-        safety_chip.add_css_class("agent-chip");
-        safety_chip.add_css_class("agent-safety-chip");
-        chips.append(&provider_chip);
-        chips.append(&shell_chip);
-        chips.append(&safety_chip);
-        overview.append(&chips);
+        header.append(&title);
+        let binding_label = Label::new(Some(&format!(
+            "{cwd} · review required · every command needs approval"
+        )));
+        binding_label.add_css_class("agent-card-binding");
+        binding_label.set_hexpand(true);
+        binding_label.set_halign(gtk4::Align::End);
+        binding_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        binding_label.set_tooltip_text(Some(&cwd));
+        header.append(&binding_label);
+        let settings_btn = Button::with_label("\u{f013}"); // nf-fa-cog
+        settings_btn.add_css_class("flat");
+        settings_btn.set_focusable(false);
+        settings_btn.set_tooltip_text(Some("Shell Agent settings"));
+        header.append(&settings_btn);
+        let close_btn = Button::with_label("\u{2715}");
+        close_btn.add_css_class("flat");
+        close_btn.set_focusable(false);
+        close_btn.set_tooltip_text(Some("Cancel Agent and close this card"));
+        header.append(&close_btn);
+        outer.append(&header);
 
         let context_card = GBox::new(Orientation::Horizontal, 8);
         context_card.add_css_class("agent-context-card");
@@ -744,60 +947,6 @@ impl UiState {
         context_card.append(&context_label);
         context_card.append(&context_clear);
         context_card.set_visible(block_context.is_some());
-        overview.append(&context_card);
-
-        let correction_row = GBox::new(Orientation::Horizontal, 12);
-        correction_row.add_css_class("agent-setting-card");
-        let correction_copy = GBox::new(Orientation::Vertical, 2);
-        correction_copy.set_hexpand(true);
-        let correction_title = Label::new(Some("AI command correction"));
-        correction_title.set_xalign(0.0);
-        correction_title.add_css_class("heading");
-        let correction_hint = Label::new(Some(
-            "After typo-like Block failures, offer an editable correction; never run it automatically.",
-        ));
-        correction_hint.set_xalign(0.0);
-        correction_hint.set_wrap(true);
-        correction_hint.add_css_class("dim-label");
-        correction_copy.append(&correction_title);
-        correction_copy.append(&correction_hint);
-        let correction_switch = Switch::builder()
-            .active(correction_enabled)
-            .valign(gtk4::Align::Center)
-            .build();
-        correction_switch.set_tooltip_text(Some("Enable review-first command correction"));
-        correction_row.append(&correction_copy);
-        correction_row.append(&correction_switch);
-
-        let transcript = TextBuffer::new(None);
-        let transcript_view = TextView::with_buffer(&transcript);
-        transcript_view.add_css_class("agent-transcript");
-        transcript_view.set_editable(false);
-        transcript_view.set_cursor_visible(false);
-        transcript_view.set_wrap_mode(WrapMode::WordChar);
-        transcript_view.set_monospace(true);
-        transcript_view.set_left_margin(10);
-        transcript_view.set_right_margin(10);
-        transcript_view.set_top_margin(10);
-        transcript_view.set_bottom_margin(10);
-        transcript_view.set_accessible_role(gtk4::AccessibleRole::Log);
-        transcript_view.update_property(&[
-            gtk4::accessible::Property::Label("Shell Agent activity"),
-            gtk4::accessible::Property::ReadOnly(true),
-        ]);
-        let transcript_scroll = ScrolledWindow::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .min_content_height(220)
-            .child(&transcript_view)
-            .build();
-        let transcript_card = GBox::new(Orientation::Vertical, 0);
-        transcript_card.add_css_class("agent-transcript-card");
-        let activity_label = Label::new(Some("ACTIVITY"));
-        activity_label.set_xalign(0.0);
-        activity_label.add_css_class("agent-section-label");
-        transcript_card.append(&activity_label);
-        transcript_card.append(&transcript_scroll);
 
         let status = Label::new(Some("Ready for the next instruction"));
         status.set_xalign(0.0);
@@ -864,38 +1013,27 @@ impl UiState {
         composer.append(&input_row);
         composer.append(&input_hint);
 
-        let body = GBox::new(Orientation::Vertical, 10);
-        body.add_css_class("agent-dashboard");
-        body.set_margin_start(12);
-        body.set_margin_end(12);
-        body.set_margin_top(10);
-        body.set_margin_bottom(12);
-        body.append(&overview);
-        body.append(&correction_row);
-        body.append(&transcript_card);
+        let body = GBox::new(Orientation::Vertical, 8);
+        body.set_margin_start(if compact { 8 } else { 12 });
+        body.set_margin_end(if compact { 8 } else { 12 });
+        body.set_margin_top(2);
+        body.set_margin_bottom(if compact { 6 } else { 10 });
+        body.append(&context_card);
         body.append(&proposal_box);
         body.append(&status_card);
         body.append(&composer);
-        let toolbar = adw::ToolbarView::new();
-        // Paint the whole dialog surface (including behind the header bar)
-        // with the terminal palette so no system-theme background leaks
-        // through the body margins.
-        toolbar.add_css_class("agent-surface");
-        toolbar.add_top_bar(&header);
-        toolbar.set_content(Some(&body));
-        dialog.set_child(Some(&toolbar));
+        outer.append(&body);
 
+        let card: gtk4::Widget = outer.clone().upcast();
         let runtime = Rc::new(AgentRuntime {
             session: RefCell::new(AgentSession::new(max_turns)),
             target: target.clone(),
             config: self.config.clone(),
-            shell,
+            shell: shell.clone(),
             block_context: RefCell::new(block_context.clone()),
-            transcript,
-            transcript_view,
+            card: card.clone(),
             input: input.clone(),
             send: send.clone(),
-            cancel: cancel.clone(),
             stop_request: stop_request.clone(),
             retry_request: retry_request.clone(),
             context_clear: context_clear.clone(),
@@ -918,37 +1056,52 @@ impl UiState {
         runtime.append("Agent", intro);
         runtime.render_session_state(None);
 
-        let ui_for_correction = self.clone();
-        correction_switch.connect_active_notify(move |toggle| {
-            ui_for_correction
-                .config
-                .borrow_mut()
-                .command_correction_enabled = toggle.is_active();
-            ui_for_correction.persist_config();
+        // Close this specific session: clear the UiState slot only when it
+        // still holds this runtime (the pane's exited callback outlives the
+        // session and must never tear down a newer one).
+        let close_session = {
+            let slot = self.agent_session.clone();
+            let toggle = self.agent_toggle.clone();
+            let weak = Rc::downgrade(&runtime);
+            Rc::new(move || {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                let is_current = slot
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| Rc::ptr_eq(&session.runtime, &runtime));
+                if is_current {
+                    slot.borrow_mut().take();
+                    toggle.set_active(false);
+                }
+                runtime.shutdown();
+            })
+        };
+
+        let ui_for_settings = self.clone();
+        let cwd_for_settings = cwd.clone();
+        let shell_for_settings = shell.clone();
+        settings_btn.connect_clicked(move |_| {
+            show_agent_settings_dialog(&ui_for_settings, &cwd_for_settings, &shell_for_settings);
         });
-        let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
-        clear.connect_clicked(move |_| {
-            if let Some(runtime) = weak.upgrade() {
-                runtime.transcript.set_text("");
-                runtime.append(
-                    "Agent",
-                    "Activity view cleared. The current session context is still retained.",
-                );
-            }
-        });
+        {
+            let close_session = close_session.clone();
+            close_btn.connect_clicked(move |_| close_session());
+        }
         let weak: Weak<AgentRuntime> = Rc::downgrade(&runtime);
         target.connect_block_finished(move |command, exit_code, output| {
             if let Some(runtime) = weak.upgrade() {
+                // The freshly finished block was inserted below this card;
+                // re-pin the card so it stays directly above the live prompt.
+                runtime.target.insert_inline_notice(&runtime.card);
                 AgentRuntime::observe(runtime, command, exit_code, output);
             }
         });
-        let weak = Rc::downgrade(&runtime);
-        target.connect_exited(move |_| {
-            if let Some(runtime) = weak.upgrade() {
-                runtime.cancel();
-                runtime.set_status("Target pane exited; Agent cancelled", false);
-            }
-        });
+        {
+            let close_session = close_session.clone();
+            target.connect_exited(move |_| close_session());
+        }
         let weak = Rc::downgrade(&runtime);
         send.connect_clicked(move |_| {
             if let Some(runtime) = weak.upgrade() {
@@ -985,32 +1138,10 @@ impl UiState {
                 runtime.detach_block_context();
             }
         });
-        let weak = Rc::downgrade(&runtime);
-        cancel.connect_clicked(move |_| {
-            if let Some(runtime) = weak.upgrade() {
-                runtime.cancel();
-            }
-        });
 
-        let slot = self.agent_dialog.clone();
-        let agent_toggle = self.agent_toggle.clone();
-        let weak = Rc::downgrade(&runtime);
-        unsafe {
-            dialog.set_data::<Rc<AgentRuntime>>("jterm4-agent-runtime", runtime.clone());
-        }
-        dialog.connect_closed(move |closed_dialog| {
-            if let Some(runtime) = weak.upgrade() {
-                runtime.cancel();
-            }
-            unsafe {
-                let _ = closed_dialog.steal_data::<Rc<AgentRuntime>>("jterm4-agent-runtime");
-            }
-            *slot.borrow_mut() = None;
-            agent_toggle.set_active(false);
-        });
-        *self.agent_dialog.borrow_mut() = Some(dialog.clone());
+        *self.agent_session.borrow_mut() = Some(AgentHandle { runtime });
         self.agent_toggle.set_active(true);
-        dialog.present(Some(&self.window));
+        target.insert_inline_notice(&card);
         input.grab_focus();
     }
 }

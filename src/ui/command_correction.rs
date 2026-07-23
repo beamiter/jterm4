@@ -24,7 +24,6 @@ use fuzzy_matcher::FuzzyMatcher;
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
-use libadwaita as adw;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -138,11 +137,11 @@ impl UiState {
             self.notebook.set_data(MONITOR_DATA_KEY, true);
         }
 
-        let agent_dialog = Rc::downgrade(&self.agent_dialog);
+        let agent_session = Rc::downgrade(&self.agent_session);
         let pending = Rc::new(Cell::new(false));
         for index in 0..self.notebook.n_pages() {
             if let Some(page) = self.notebook.nth_page(Some(index)) {
-                attach_page(&page, &self.config, &agent_dialog, &pending);
+                attach_page(&page, &self.config, &agent_session, &pending);
             }
         }
 
@@ -153,10 +152,10 @@ impl UiState {
                 // Deferring one main-loop turn avoids racing that attachment.
                 let page = page.clone();
                 let config = config.clone();
-                let agent_dialog = agent_dialog.clone();
+                let agent_session = agent_session.clone();
                 let pending = pending.clone();
                 glib::idle_add_local_once(move || {
-                    attach_page(&page, &config, &agent_dialog, &pending);
+                    attach_page(&page, &config, &agent_session, &pending);
                 });
             });
     }
@@ -165,7 +164,7 @@ impl UiState {
 fn attach_page(
     page: &gtk4::Widget,
     config: &Rc<RefCell<Config>>,
-    agent_dialog: &std::rc::Weak<RefCell<Option<adw::Dialog>>>,
+    agent_session: &std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
     pending: &Rc<Cell<bool>>,
 ) {
     let Some(node) = PaneNode::from_widget(page) else {
@@ -177,7 +176,7 @@ fn attach_page(
             attach_term_view(
                 view,
                 config.clone(),
-                agent_dialog.clone(),
+                agent_session.clone(),
                 pending.clone(),
                 remote,
             );
@@ -188,7 +187,7 @@ fn attach_page(
 fn attach_term_view(
     view: Rc<TermView>,
     config: Rc<RefCell<Config>>,
-    agent_dialog: std::rc::Weak<RefCell<Option<adw::Dialog>>>,
+    agent_session: std::rc::Weak<RefCell<Option<super::AgentHandle>>>,
     pending: Rc<Cell<bool>>,
     remote: bool,
 ) {
@@ -212,7 +211,7 @@ fn attach_term_view(
             pending.set(false);
         }
 
-        let agent_active = agent_dialog
+        let agent_active = agent_session
             .upgrade()
             .is_some_and(|slot| slot.borrow().is_some());
         let monitor_enabled = {

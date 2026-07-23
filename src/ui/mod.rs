@@ -32,6 +32,7 @@ mod tab_strip;
 mod tabs;
 mod zoom;
 
+pub(crate) use agent_panel::AgentHandle;
 pub(crate) use ai_panel::AiPanel;
 pub(crate) use file_tree::{build_file_tree_widgets, FileTreeModel};
 pub(crate) use pane_leaf::PaneLeaf;
@@ -117,8 +118,10 @@ pub(crate) struct UiState {
     pub(crate) workflows_palette_dialog: Rc<RefCell<Option<adw::Dialog>>>,
     pub(crate) settings_dialog: Rc<RefCell<Option<adw::PreferencesDialog>>>,
     pub(crate) debug_dashboard_dialog: Rc<RefCell<Option<adw::Dialog>>>,
-    pub(crate) agent_dialog: Rc<RefCell<Option<adw::Dialog>>>,
-    /// Visible top-bar control reflecting whether a Shell Agent dialog is
+    /// The single active Shell Agent session, rendered as an inline card in
+    /// its bound Block pane's conversation (not a dialog).
+    pub(crate) agent_session: Rc<RefCell<Option<AgentHandle>>>,
+    /// Visible top-bar control reflecting whether a Shell Agent session is
     /// currently active.
     pub(crate) agent_toggle: ToggleButton,
     /// Suppresses a storm of identical persistence alerts while a continuous

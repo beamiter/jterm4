@@ -428,7 +428,7 @@ pub fn run() -> glib::ExitCode {
         top_bar.append(&spacer);
 
         // A visible, stateful counterpart to Ctrl+Alt+G. Its checked state
-        // follows the lifetime of the approval-gated Shell Agent dialog.
+        // follows the lifetime of the approval-gated Shell Agent session.
         let agent_toggle = gtk4::ToggleButton::with_label("Agent");
         agent_toggle.set_focus_on_click(false);
         agent_toggle.set_can_focus(false);
@@ -640,7 +640,7 @@ pub fn run() -> glib::ExitCode {
             workflows_palette_dialog: Rc::new(RefCell::new(None)),
             settings_dialog: Rc::new(RefCell::new(None)),
             debug_dashboard_dialog: Rc::new(RefCell::new(None)),
-            agent_dialog: Rc::new(RefCell::new(None)),
+            agent_session: Rc::new(RefCell::new(None)),
             agent_toggle: agent_toggle.clone(),
             config_save_error_visible: Rc::new(Cell::new(false)),
             keybinding_map: Rc::new(RefCell::new(keybinding_map)),

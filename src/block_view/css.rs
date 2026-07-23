@@ -159,6 +159,14 @@ pub(crate) fn install_block_css(config: &Config) {
     let fg_g = (fg.green() * 255.0) as u8;
     let fg_b = (fg.blue() * 255.0) as u8;
 
+    // Shell Agent inline cards use the theme's blue (palette 4) so they read
+    // distinctly from success/correction accents (palette 2).
+    let agent = &config.palette[4];
+    let agent_hex = rgba_to_hex(agent);
+    let agent_r = (agent.red() * 255.0) as u8;
+    let agent_g = (agent.green() * 255.0) as u8;
+    let agent_b = (agent.blue() * 255.0) as u8;
+
     // Slightly different background for finished blocks (3% toward fg)
     let bg_r = (bg.red() * 255.0) as u8;
     let bg_g = (bg.green() * 255.0) as u8;
@@ -261,6 +269,30 @@ pub(crate) fn install_block_css(config: &Config) {
         .block-correction {{
             border-left-color: rgba({acc_r},{acc_g},{acc_b},0.85);
             background-color: rgba({acc_r},{acc_g},{acc_b},0.05);
+        }}
+        .block-agent {{
+            border-left-color: rgba({agent_r},{agent_g},{agent_b},0.85);
+            background-color: rgba({agent_r},{agent_g},{agent_b},0.05);
+        }}
+        .agent-card-icon {{
+            color: {agent_hex};
+            font-family: "{font_family}";
+        }}
+        .agent-card-title {{
+            color: {fg_hex};
+            font-weight: bold;
+        }}
+        .agent-card-binding {{
+            color: {dim_fg};
+            font-size: 0.85em;
+        }}
+        .agent-msg-body {{
+            font-family: "{font_family}";
+            font-size: {font_size};
+            color: {fg_hex};
+        }}
+        .agent-msg-error {{
+            color: {err_hex};
         }}
         .correction-icon {{
             color: {accent};

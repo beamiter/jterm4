@@ -4267,13 +4267,27 @@ impl TermView {
         self.submit_input();
     }
 
-    /// Insert a transient notice card (e.g. an AI command-correction proposal)
-    /// into the block list just above the live prompt, so it reads like part of
-    /// the block conversation. The card is not a `FinishedBlock`: it never joins
-    /// `finished_blocks`/`block_data`, so virtualization, selection, and history
-    /// persistence all ignore it.
+    /// Insert a transient notice card (e.g. an AI command-correction proposal
+    /// or the Shell Agent session card) into the block list just above the live
+    /// prompt, so it reads like part of the block conversation. The card is not
+    /// a `FinishedBlock`: it never joins `finished_blocks`/`block_data`, so
+    /// virtualization, selection, and history persistence all ignore it.
+    ///
+    /// Calling this again for a widget already in the block list re-pins it
+    /// directly above the prompt (used after a finished block lands below it).
     pub fn insert_inline_notice(&self, widget: &gtk4::Widget) {
-        widget.insert_before(&self.block_list, Some(self.active.borrow().widget()));
+        let active_widget = self.active.borrow().widget().clone();
+        let already_inserted = widget
+            .parent()
+            .is_some_and(|parent| parent == *self.block_list.upcast_ref::<gtk4::Widget>());
+        if already_inserted {
+            let anchor = active_widget.prev_sibling();
+            if anchor.as_ref() != Some(widget) {
+                self.block_list.reorder_child_after(widget, anchor.as_ref());
+            }
+        } else {
+            widget.insert_before(&self.block_list, Some(&active_widget));
+        }
         self.block_list.queue_allocate();
         self.scroll_debouncer.pin_to_bottom_deferred(&self.block_scroll);
     }
