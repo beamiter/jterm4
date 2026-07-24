@@ -26,7 +26,23 @@ nix develop
 cargo run
 ```
 
-也可以在安装 GTK4、libadwaita、VTE GTK4、PCRE2 与 `pkg-config` 开发包后直接使用 Cargo。完整质量门禁：
+也可以在安装 GTK4、libadwaita、VTE GTK4、PCRE2 与 `pkg-config` 开发包后直接使用 Cargo。
+
+GTK4 栈必须足够新（glib >= 2.80、pango >= 1.52、gtk4 >= 4.14、libadwaita >= 1.5，
+以及 GTK4 版 VTE `vte-2.91-gtk4` >= 0.76）。Ubuntu 22.04 等稳定发行版自带的这些库过旧，
+或根本没有 `vte-2.91-gtk4`，会导致 `cargo install --path .` 在 `*-sys` 构建脚本处失败。
+运行 `./scripts/bootstrap_deps.sh` 一键准备依赖：
+
+```bash
+./scripts/bootstrap_deps.sh            # 配好推荐工具链（Nix）
+./scripts/bootstrap_deps.sh --check    # 只检测缺什么，不安装
+./scripts/bootstrap_deps.sh --backend system --install   # 改用发行版系统包
+```
+
+脚本默认使用 Nix（精确固定匹配的库版本、不污染系统包），也可用 `--backend system`
+改装发行版 `-dev` 包。
+
+完整质量门禁：
 
 ```bash
 cargo fmt --all -- --check
