@@ -953,12 +953,13 @@ fn stream_download_to_file(
     Ok(())
 }
 
-/// `rename` would silently clobber a `dst` created after the pre-stream
-/// check, so re-check immediately before it. Called with the temp file still
-/// guarded, so a failure here still unlinks the partial download.
+/// Commit a finished download. The pre-check gives the readable error; the
+/// no-replace rename is what actually prevents clobbering a `dst` created
+/// during the transfer. Called with the temp file still guarded, so a failure
+/// here still unlinks the partial download.
 fn finalize_download(temp: &Path, dst: &Path) -> io::Result<()> {
     fail_if_exists(dst)?;
-    std::fs::rename(temp, dst)
+    rename_noreplace(temp, dst)
 }
 
 /// Stream a local regular file into a probe's stdin (`put` payload). The
@@ -1295,10 +1296,13 @@ pub(crate) fn download_dir(
         control.clone(),
     )?;
     let staged = validated_staged_tree(&staging.path, name)?;
-    // `dst` was proved absent above and the rename is within one directory, so
-    // this either publishes the whole tree or leaves nothing behind. Staging is
-    // still removed by the guard, which by then holds only an empty directory.
-    std::fs::rename(&staged, dst)?;
+    // `dst` was proved absent before the transfer — minutes ago, for a large
+    // tree — so the commit carries the guarantee rather than the check. The
+    // kernel already refuses to replace a non-empty directory or a file, but an
+    // empty directory created in that window would be swallowed silently.
+    // Staging is still removed by the guard, which by then holds only an empty
+    // directory.
+    rename_noreplace(&staged, dst)?;
     Ok(())
 }
 
@@ -2417,7 +2421,7 @@ pub(crate) fn rename_with_overlay(
     match remote_host_with_overlay(loc, hosts, overlay)? {
         None => {
             fail_if_exists(dst)?;
-            std::fs::rename(src, dst)
+            rename_noreplace(src, dst)
         }
         Some(host) => run_probe(
             &host,
@@ -2465,6 +2469,65 @@ pub(crate) fn copy_with_overlay(
 /// `rename`/`copy` must not clobber: probe exit 17 and this check share the
 /// AlreadyExists contract. `symlink_metadata` also catches dangling symlinks,
 /// which `Path::exists` would miss.
+/// Commit a rename that refuses to replace an existing destination, in one
+/// namespace operation.
+///
+/// `fail_if_exists` in front of `std::fs::rename` is a check-then-act: anything
+/// created in the window between them is silently destroyed, because
+/// `rename(2)` overwrites a destination file without complaint. The pre-check
+/// stays as the friendly diagnostic — it produces the message a user reads —
+/// but the commit itself has to be authoritative when another process wins the
+/// race. anvil made the same move; forge already uses `renameat2` this way for
+/// the session snapshot in `crate::state`.
+fn rename_noreplace(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let src_c = CString::new(src.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let dst_c = CString::new(dst.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        // SAFETY: both names are live for the call and are absolute or relative
+        // to the cwd; renameat2 retains no pointers.
+        let result = unsafe {
+            nix::libc::renameat2(
+                nix::libc::AT_FDCWD,
+                src_c.as_ptr(),
+                nix::libc::AT_FDCWD,
+                dst_c.as_ptr(),
+                nix::libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            let error = io::Error::last_os_error();
+            // A filesystem without RENAME_NOREPLACE support must fail loudly
+            // rather than fall back to a replacing rename, which would reopen
+            // exactly the hole this closes.
+            Err(match error.raw_os_error() {
+                Some(nix::libc::ENOSYS) | Some(nix::libc::EINVAL) | Some(nix::libc::EOPNOTSUPP) => {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!(
+                            "{} does not support an atomic no-replace rename",
+                            dst.display()
+                        ),
+                    )
+                }
+                _ => error,
+            })
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fail_if_exists(dst)?;
+        std::fs::rename(src, dst)
+    }
+}
+
 fn fail_if_exists(path: &Path) -> io::Result<()> {
     if std::fs::symlink_metadata(path).is_ok() {
         return Err(io::Error::new(
@@ -2555,6 +2618,39 @@ pub(crate) fn paste_destination(target_dir: &Path, source: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pre-check is a diagnostic, not a guarantee: whatever appears between
+    /// it and the rename must not be destroyed. Only the commit can enforce
+    /// that, so assert on the commit directly.
+    #[test]
+    fn rename_noreplace_refuses_an_existing_destination_without_clobbering_it() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-rename-noreplace-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::write(&src, b"new").unwrap();
+
+        // Absent destination: the commit succeeds.
+        super::rename_noreplace(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+
+        // Occupied destination: refused, and the victim survives intact — this
+        // is the case a bare `std::fs::rename` overwrites without complaint.
+        std::fs::write(&src, b"second").unwrap();
+        let error = super::rename_noreplace(&src, &dst).expect_err("must refuse");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Unsupported
+        ));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert!(src.exists(), "a refused commit must not consume the source");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use super::*;
 
     /// A hostile host answering a download of `~/proj` returns `proj/...` and,
