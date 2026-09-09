@@ -12,7 +12,11 @@
 terminal_mode = "block"
 opacity = 0.95                 # 0.01 .. 1.0
 scrollback = 5000             # 0 .. 1000000
-font = "Monospace 14"
+font = "JetBrainsMono Nerd Font Mono 14"
+# Family used for icon glyphs `font` does not cover (Nerd Font powerline
+# separators, devicons, codicons). Unset auto-picks an installed Nerd Font;
+# set "none" to leave those glyphs to fontconfig's own fallback.
+# icon_font = "Symbols Nerd Font Mono"
 font_scale = 1.0              # 0.1 .. 10.0
 
 # default, light, solarized-dark, solarized-light, gruvbox-dark,

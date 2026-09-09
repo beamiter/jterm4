@@ -2,7 +2,6 @@
 use adw::prelude::*;
 use gtk4::gdk::RGBA;
 use gtk4::glib;
-use gtk4::pango::FontDescription;
 use libadwaita as adw;
 use vte4::Terminal;
 use vte4::{TerminalExt, TerminalExtManual};
@@ -671,7 +670,8 @@ impl UiState {
 
     pub(crate) fn apply_font_all(&self) {
         let config = self.config.borrow();
-        let font_desc = FontDescription::from_string(&config.font_desc);
+        let desc = config.font_desc.clone();
+        let font_desc = crate::font::terminal_font_description(&desc, &config);
         drop(config);
         for i in 0..self.notebook.n_pages() {
             if let Some(widget) = self.notebook.nth_page(Some(i)) {
@@ -680,7 +680,7 @@ impl UiState {
                 };
                 for leaf in node.leaves() {
                     if let Some(view) = leaf.block_view() {
-                        view.set_font(&font_desc);
+                        view.set_font(&desc);
                     } else {
                         leaf.terminal().set_font(Some(&font_desc));
                     }

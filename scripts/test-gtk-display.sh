@@ -66,6 +66,7 @@ tests=(
     block_view::scroll::tests::widget_pool_releases_heavy_children_and_stale_controllers
     block_view::tests::entering_alt_screen_ends_the_block_selection_it_hides
     block_view::css::tests::the_generated_stylesheet_parses_without_error
+    font::tests::a_real_vte_is_given_the_icon_family_behind_the_configured_one
     block_view::onboarding::tests::block_onboarding_overlay_is_non_measuring_and_non_targetable
     block_view::tests::a_stranded_focus_mount_declines_only_what_the_focused_widget_owns
     block_view::blocks::tests::revealing_a_cards_actions_does_not_move_its_metadata

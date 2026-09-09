@@ -5494,7 +5494,12 @@ mod tests {
         use vte4::TerminalExt;
 
         gtk4::init().expect("gtk init");
-        let (config, _, _) = crate::config::load_config();
+        let (mut config, _, _) = crate::config::load_config();
+        // Pin the font: every row count below is really a column count, and the
+        // column count comes from the cell width. A different default font — or
+        // a developer's own — rewraps the fixture and moves the geometry this
+        // harness exists to observe.
+        config.font_desc = "Monospace 14".to_string();
 
         // Synthetic `ls -C` capture: 6 colored rows, leading + trailing CRLF,
         // as the PTY delivers them.
