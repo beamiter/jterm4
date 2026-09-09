@@ -135,34 +135,22 @@ pub(crate) fn sanitize_history_replay(
     text: &str,
     max_bytes: usize,
 ) -> Result<String, ReviewTextError> {
-    if text.len() > max_bytes {
-        return Err(ReviewTextError::TooLarge { limit: max_bytes });
-    }
-    let mut sanitized = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\r' => {
-                if characters.peek() == Some(&'\n') {
-                    characters.next();
-                }
-                sanitized.push('\n');
+    // One implementation, in the crate that owns the replay channel. The
+    // wrapper survives only to keep this module's error vocabulary.
+    jterm_core::agent_task::replay_text::sanitize_history_replay(text, max_bytes).map_err(|error| {
+        match error {
+            jterm_core::agent_task::replay_text::ReplayTextError::Empty => ReviewTextError::Empty,
+            jterm_core::agent_task::replay_text::ReplayTextError::TooLarge { limit } => {
+                ReviewTextError::TooLarge { limit }
             }
-            '\n' | '\t' => sanitized.push(character),
-            control if is_c0_or_c1(control) => {}
-            visual if is_visual_spoofing_character(visual) => {
-                return Err(ReviewTextError::VisualSpoof)
+            jterm_core::agent_task::replay_text::ReplayTextError::ControlCharacter => {
+                ReviewTextError::ControlCharacter
             }
-            visible => sanitized.push(visible),
+            jterm_core::agent_task::replay_text::ReplayTextError::VisualSpoof => {
+                ReviewTextError::VisualSpoof
+            }
         }
-    }
-    if sanitized
-        .trim_matches(|character| matches!(character, ' ' | '\n' | '\t'))
-        .is_empty()
-    {
-        return Err(ReviewTextError::Empty);
-    }
-    Ok(sanitized)
+    })
 }
 
 /// Make dangerous-to-display code points explicit without retaining their

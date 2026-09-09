@@ -784,7 +784,7 @@ dependencies = [
 [[package]]
 name = "jterm_core"
 version = "0.2.0"
-source = "git+https://github.com/beamiter/jterm_core.git?rev=74475209c7f18be73782607caa0ec58e5b5bc70f#74475209c7f18be73782607caa0ec58e5b5bc70f"
+source = "git+https://github.com/beamiter/jterm_core.git?rev=1ef0212d0e80a269c9b9a30ba2b179d6f570bb92#1ef0212d0e80a269c9b9a30ba2b179d6f570bb92"
 dependencies = [
  "crossbeam-channel",
  "dirs",
@@ -795,11 +795,13 @@ dependencies = [
  "lru",
  "memchr",
  "once_cell",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "toml",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]
