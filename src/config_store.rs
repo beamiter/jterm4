@@ -157,6 +157,22 @@ fn validate_private_regular_file(file: &fs::File, path: &Path) -> io::Result<fs:
                 format!("{} is not owned by the current user", path.display()),
             ));
         }
+        // The parent-directory guard below stops an attacker who can create or
+        // rename entries in the config dir; it says nothing about a config file
+        // that is itself mode 0664, which is what a permissive umask or a
+        // `chmod -R` leaves behind. This config names the shell to spawn, the
+        // remote hosts, and the agent settings, so a group-writable one is
+        // process-launch injection. anvil refuses it; so does forge now.
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must not be writable by group or other users (run: chmod g-w,o-w {})",
+                    path.display(),
+                    path.display()
+                ),
+            ));
+        }
     }
     Ok(metadata)
 }
@@ -1980,6 +1996,38 @@ mod tests {
             0o777
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A private directory is not enough: the file's own mode decides who can
+    /// rewrite the shell we spawn, the remote hosts and the agent settings.
+    /// anvil has refused a group/other-writable config all along.
+    #[test]
+    fn a_group_or_world_writable_config_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("forge-cfg-mode-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "font = \"Monospace 14\"\n").unwrap();
+
+        for mode in [0o600, 0o640, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                read_private_bytes(&path, 64 * 1024).is_ok(),
+                "mode {mode:o} should be readable"
+            );
+        }
+        for mode in [0o660, 0o666, 0o622] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let error =
+                read_private_bytes(&path, 64 * 1024).expect_err("a writable mode must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
